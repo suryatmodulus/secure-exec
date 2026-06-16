@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/unzip",
+  "type": "wasm",
+  "description": "unzip archive extraction",
+  "aptName": "unzip",
+  "source": "c"
+}

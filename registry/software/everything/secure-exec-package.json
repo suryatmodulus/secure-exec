@@ -1,0 +1,25 @@
+{
+  "name": "@agent-os-pkgs/everything",
+  "type": "meta",
+  "description": "All available WASM command packages in a single bundle",
+  "includes": [
+    "coreutils",
+    "sed",
+    "grep",
+    "gawk",
+    "findutils",
+    "diffutils",
+    "tar",
+    "gzip",
+    "curl",
+    "zip",
+    "unzip",
+    "jq",
+    "ripgrep",
+    "fd",
+    "tree",
+    "file",
+    "yq",
+    "codex"
+  ]
+}

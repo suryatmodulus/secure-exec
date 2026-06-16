@@ -1,17 +1,21 @@
 [package]
 name = "secure-exec-v8-runtime"
-version = "0.1.0"
-edition = "2021"
-description = "V8 runtime process for secure-exec, communicating over Unix domain socket with length-prefixed MessagePack IPC"
-publish = false
-
-[[bin]]
-name = "secure-exec-v8"
-path = "src/main.rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "V8 isolate runtime for secure-exec guest JavaScript execution"
 
 [dependencies]
+secure-exec-bridge = { workspace = true }
 v8 = "130"
 crossbeam-channel = "0.5"
 signal-hook = "0.3"
 libc = "0.2"
-secure-exec-ipc = { path = "../secure-exec-ipc" }
+ciborium = "0.2"
+serde = "1.0"
+openssl = "0.10"
+
+[[test]]
+name = "v8_bridge_build"
+path = "../build-support/v8_bridge_build.rs"

@@ -1,0 +1,453 @@
+#[path = "../../bridge/tests/support.rs"]
+mod bridge_support;
+
+use bridge_support::RecordingBridge;
+use secure_exec_bridge::{
+    CreateJavascriptContextRequest, CreateWasmContextRequest, ExecutionEvent, ExecutionExited,
+    ExecutionSignal, GuestRuntime, KillExecutionRequest, LifecycleState, PollExecutionEventRequest,
+    StartExecutionRequest,
+};
+use secure_exec_kernel::kernel::KernelVmConfig;
+use secure_exec_kernel::permissions::Permissions;
+use secure_exec_kernel::resource_accounting::ResourceLimits;
+use secure_exec_sidecar_browser::{
+    BrowserSidecar, BrowserSidecarConfig, BrowserWorkerBridge, BrowserWorkerEntrypoint,
+    BrowserWorkerHandle, BrowserWorkerHandleRequest, BrowserWorkerSpawnRequest,
+};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+impl BrowserWorkerBridge for RecordingBridge {
+    fn create_worker(
+        &mut self,
+        request: BrowserWorkerSpawnRequest,
+    ) -> Result<BrowserWorkerHandle, Self::Error> {
+        if let Some(error) = self.next_worker_create_error() {
+            return Err(error);
+        }
+
+        let kind = match request.runtime {
+            GuestRuntime::JavaScript => "js",
+            GuestRuntime::WebAssembly => "wasm",
+        };
+
+        Ok(BrowserWorkerHandle {
+            worker_id: format!("{kind}-worker-{}", request.context_id),
+            runtime: request.runtime,
+        })
+    }
+
+    fn terminate_worker(&mut self, request: BrowserWorkerHandleRequest) -> Result<(), Self::Error> {
+        self.terminated_workers
+            .push((request.vm_id, request.execution_id, request.worker_id));
+        Ok(())
+    }
+}
+
+#[test]
+fn browser_sidecar_runs_guest_javascript_from_main_thread_workers() {
+    let mut sidecar =
+        BrowserSidecar::new(RecordingBridge::default(), BrowserSidecarConfig::default());
+    let mut config = KernelVmConfig::new("vm-browser");
+    config.permissions = Permissions::allow_all();
+    sidecar.create_vm(config).expect("create vm");
+
+    let context = sidecar
+        .create_javascript_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-browser"),
+            bootstrap_module: Some(String::from("@secure-exec/browser")),
+        })
+        .expect("create JavaScript context");
+    let started = sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id.clone(),
+            argv: vec![String::from("node"), String::from("script.js")],
+            env: BTreeMap::new(),
+            cwd: String::from("/workspace"),
+        })
+        .expect("start JavaScript execution");
+
+    assert_eq!(sidecar.sidecar_id(), "secure-exec-sidecar-browser");
+    assert_eq!(sidecar.vm_count(), 1);
+    assert_eq!(sidecar.context_count("vm-browser"), 1);
+    assert_eq!(sidecar.active_worker_count("vm-browser"), 1);
+
+    sidecar
+        .bridge_mut()
+        .push_execution_event(ExecutionEvent::Exited(ExecutionExited {
+            vm_id: String::from("vm-browser"),
+            execution_id: started.execution_id.clone(),
+            exit_code: 0,
+        }));
+    let event = sidecar
+        .poll_execution_event(PollExecutionEventRequest {
+            vm_id: String::from("vm-browser"),
+        })
+        .expect("poll execution event");
+
+    assert!(matches!(
+        event,
+        Some(ExecutionEvent::Exited(ExecutionExited {
+            execution_id,
+            exit_code: 0,
+            ..
+        })) if execution_id == started.execution_id
+    ));
+    assert_eq!(sidecar.active_worker_count("vm-browser"), 0);
+
+    let bridge = sidecar.into_bridge();
+    let states = bridge
+        .lifecycle_events
+        .iter()
+        .map(|event| event.state)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        vec![
+            LifecycleState::Starting,
+            LifecycleState::Ready,
+            LifecycleState::Busy,
+            LifecycleState::Ready,
+        ]
+    );
+    let structured_names = bridge
+        .structured_events
+        .iter()
+        .map(|event| event.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        structured_names,
+        vec![
+            "browser.context.created",
+            "browser.worker.spawned",
+            "browser.worker.reaped",
+        ]
+    );
+}
+
+#[test]
+fn browser_sidecar_runs_guest_wasm_from_main_thread_workers() {
+    let mut sidecar =
+        BrowserSidecar::new(RecordingBridge::default(), BrowserSidecarConfig::default());
+    let mut config = KernelVmConfig::new("vm-browser");
+    config.permissions = Permissions::allow_all();
+    sidecar.create_vm(config).expect("create vm");
+
+    let context = sidecar
+        .create_wasm_context(CreateWasmContextRequest {
+            vm_id: String::from("vm-browser"),
+            module_path: Some(String::from("/workspace/app.wasm")),
+        })
+        .expect("create WebAssembly context");
+    let started = sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id.clone(),
+            argv: vec![String::from("wasm"), String::from("/workspace/app.wasm")],
+            env: BTreeMap::new(),
+            cwd: String::from("/workspace"),
+        })
+        .expect("start WebAssembly execution");
+
+    assert_eq!(sidecar.context_count("vm-browser"), 1);
+    assert_eq!(sidecar.active_worker_count("vm-browser"), 1);
+
+    sidecar
+        .kill_execution(KillExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            execution_id: started.execution_id,
+            signal: ExecutionSignal::Kill,
+        })
+        .expect("kill execution");
+    sidecar.dispose_vm("vm-browser").expect("dispose vm");
+
+    assert_eq!(sidecar.vm_count(), 0);
+
+    let bridge = sidecar.into_bridge();
+    assert_eq!(bridge.killed_executions.len(), 1);
+    assert_eq!(
+        bridge
+            .lifecycle_events
+            .last()
+            .expect("final lifecycle event")
+            .state,
+        LifecycleState::Terminated
+    );
+    assert!(bridge.structured_events.iter().any(|event| {
+        event.name == "browser.worker.spawned"
+            && event.fields.get("runtime") == Some(&String::from("webassembly"))
+    }));
+}
+
+#[test]
+fn browser_worker_spawn_requests_preserve_browser_entrypoints() {
+    let javascript = BrowserWorkerSpawnRequest {
+        vm_id: String::from("vm-browser"),
+        context_id: String::from("ctx-js"),
+        runtime: GuestRuntime::JavaScript,
+        entrypoint: BrowserWorkerEntrypoint::JavaScript {
+            bootstrap_module: Some(String::from("@secure-exec/browser")),
+        },
+    };
+    let wasm = BrowserWorkerSpawnRequest {
+        vm_id: String::from("vm-browser"),
+        context_id: String::from("ctx-wasm"),
+        runtime: GuestRuntime::WebAssembly,
+        entrypoint: BrowserWorkerEntrypoint::WebAssembly {
+            module_path: Some(String::from("/workspace/app.wasm")),
+        },
+    };
+
+    assert!(matches!(
+        javascript.entrypoint,
+        BrowserWorkerEntrypoint::JavaScript {
+            bootstrap_module: Some(_)
+        }
+    ));
+    assert!(matches!(
+        wasm.entrypoint,
+        BrowserWorkerEntrypoint::WebAssembly {
+            module_path: Some(_)
+        }
+    ));
+}
+
+#[test]
+fn browser_sidecar_routes_kernel_filesystem_and_execution_state_through_vm_state() {
+    let mut sidecar =
+        BrowserSidecar::new(RecordingBridge::default(), BrowserSidecarConfig::default());
+    sidecar
+        .create_vm(KernelVmConfig::new("vm-browser"))
+        .expect("create vm");
+
+    assert_eq!(
+        sidecar.kernel_state("vm-browser").expect("kernel ready"),
+        LifecycleState::Ready
+    );
+
+    sidecar
+        .mkdir("vm-browser", "/workspace", true)
+        .expect("create workspace");
+    sidecar
+        .write_file("vm-browser", "/workspace/hello.txt", b"hello".to_vec())
+        .expect("write kernel file");
+    assert_eq!(
+        sidecar
+            .read_file("vm-browser", "/workspace/hello.txt")
+            .expect("read kernel file"),
+        b"hello".to_vec()
+    );
+    assert_eq!(
+        sidecar
+            .read_dir("vm-browser", "/workspace")
+            .expect("read workspace"),
+        vec![String::from("hello.txt")]
+    );
+
+    let context = sidecar
+        .create_javascript_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-browser"),
+            bootstrap_module: Some(String::from("@secure-exec/browser")),
+        })
+        .expect("create JavaScript context");
+    let started = sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id,
+            argv: vec![String::from("node"), String::from("script.js")],
+            env: BTreeMap::from([(String::from("MODE"), String::from("browser"))]),
+            cwd: String::from("/workspace"),
+        })
+        .expect("start execution");
+
+    assert_eq!(
+        sidecar.kernel_state("vm-browser").expect("kernel busy"),
+        LifecycleState::Busy
+    );
+
+    sidecar
+        .write_stdin(secure_exec_bridge::WriteExecutionStdinRequest {
+            vm_id: String::from("vm-browser"),
+            execution_id: started.execution_id.clone(),
+            chunk: b"input".to_vec(),
+        })
+        .expect("write stdin");
+    assert_eq!(
+        sidecar
+            .read_execution_stdin(
+                "vm-browser",
+                &started.execution_id,
+                16,
+                Duration::from_millis(5),
+            )
+            .expect("read stdin"),
+        Some(b"input".to_vec())
+    );
+
+    sidecar
+        .bridge_mut()
+        .push_execution_event(ExecutionEvent::Exited(ExecutionExited {
+            vm_id: String::from("vm-browser"),
+            execution_id: started.execution_id,
+            exit_code: 0,
+        }));
+    sidecar
+        .poll_execution_event(PollExecutionEventRequest {
+            vm_id: String::from("vm-browser"),
+        })
+        .expect("poll exit");
+
+    assert_eq!(
+        sidecar
+            .kernel_state("vm-browser")
+            .expect("kernel ready after exit"),
+        LifecycleState::Ready
+    );
+}
+
+#[test]
+fn browser_sidecar_reaps_pending_kernel_process_when_worker_startup_fails() {
+    let mut bridge = RecordingBridge::default();
+    bridge.push_worker_create_error("worker startup failed");
+
+    let mut sidecar = BrowserSidecar::new(bridge, BrowserSidecarConfig::default());
+    let mut config = KernelVmConfig::new("vm-browser");
+    config.resources = ResourceLimits {
+        max_processes: Some(1),
+        ..ResourceLimits::default()
+    };
+    sidecar.create_vm(config).expect("create vm");
+
+    let context = sidecar
+        .create_javascript_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-browser"),
+            bootstrap_module: Some(String::from("@secure-exec/browser")),
+        })
+        .expect("create JavaScript context");
+
+    let failed = sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id.clone(),
+            argv: vec![String::from("node"), String::from("script.js")],
+            env: BTreeMap::new(),
+            cwd: String::from("/workspace"),
+        })
+        .expect_err("worker creation should fail");
+
+    assert!(failed.to_string().contains("worker startup failed"));
+    assert_eq!(sidecar.active_worker_count("vm-browser"), 0);
+    assert_eq!(
+        sidecar.kernel_state("vm-browser").expect("kernel ready"),
+        LifecycleState::Ready
+    );
+
+    let started = sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id,
+            argv: vec![String::from("node"), String::from("script.js")],
+            env: BTreeMap::new(),
+            cwd: String::from("/workspace"),
+        })
+        .expect("leaked pending process would exhaust the one-process limit");
+
+    assert_eq!(started.execution_id, "exec-1");
+    assert_eq!(sidecar.active_worker_count("vm-browser"), 1);
+}
+
+#[test]
+fn browser_sidecar_reaps_pending_kernel_process_when_stdio_setup_fails() {
+    let mut sidecar =
+        BrowserSidecar::new(RecordingBridge::default(), BrowserSidecarConfig::default());
+    let mut config = KernelVmConfig::new("vm-browser");
+    config.resources = ResourceLimits {
+        max_processes: Some(1),
+        max_pipes: Some(0),
+        ..ResourceLimits::default()
+    };
+    sidecar.create_vm(config).expect("create vm");
+
+    let context = sidecar
+        .create_javascript_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-browser"),
+            bootstrap_module: Some(String::from("@secure-exec/browser")),
+        })
+        .expect("create JavaScript context");
+
+    for _ in 0..2 {
+        let failed = sidecar
+            .start_execution(StartExecutionRequest {
+                vm_id: String::from("vm-browser"),
+                context_id: context.context_id.clone(),
+                argv: vec![String::from("node"), String::from("script.js")],
+                env: BTreeMap::new(),
+                cwd: String::from("/workspace"),
+            })
+            .expect_err("stdio setup should fail before worker creation");
+
+        assert!(failed.to_string().contains("maximum pipe count reached"));
+        assert_eq!(sidecar.active_worker_count("vm-browser"), 0);
+        assert_eq!(
+            sidecar.kernel_state("vm-browser").expect("kernel ready"),
+            LifecycleState::Ready
+        );
+    }
+}
+
+#[test]
+fn browser_sidecar_reaps_pending_kernel_process_when_bridge_execution_start_fails() {
+    let mut bridge = RecordingBridge::default();
+    bridge.push_execution_start_error("execution start failed");
+
+    let mut sidecar = BrowserSidecar::new(bridge, BrowserSidecarConfig::default());
+    let mut config = KernelVmConfig::new("vm-browser");
+    config.resources = ResourceLimits {
+        max_processes: Some(1),
+        ..ResourceLimits::default()
+    };
+    sidecar.create_vm(config).expect("create vm");
+
+    let context = sidecar
+        .create_wasm_context(CreateWasmContextRequest {
+            vm_id: String::from("vm-browser"),
+            module_path: Some(String::from("/workspace/app.wasm")),
+        })
+        .expect("create WebAssembly context");
+
+    let failed = sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id.clone(),
+            argv: vec![String::from("wasm"), String::from("/workspace/app.wasm")],
+            env: BTreeMap::new(),
+            cwd: String::from("/workspace"),
+        })
+        .expect_err("execution start should fail");
+
+    assert!(failed.to_string().contains("execution start failed"));
+    assert_eq!(sidecar.active_worker_count("vm-browser"), 0);
+    assert_eq!(
+        sidecar.kernel_state("vm-browser").expect("kernel ready"),
+        LifecycleState::Ready
+    );
+    assert_eq!(
+        sidecar.bridge().terminated_workers,
+        vec![(
+            String::from("vm-browser"),
+            String::from("pending"),
+            String::from("wasm-worker-wasm-context-1"),
+        )]
+    );
+
+    sidecar
+        .start_execution(StartExecutionRequest {
+            vm_id: String::from("vm-browser"),
+            context_id: context.context_id,
+            argv: vec![String::from("wasm"), String::from("/workspace/app.wasm")],
+            env: BTreeMap::new(),
+            cwd: String::from("/workspace"),
+        })
+        .expect("leaked pending process would exhaust the one-process limit");
+}

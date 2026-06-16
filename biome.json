@@ -1,23 +1,46 @@
 {
-	"$schema": "https://biomejs.dev/schemas/2.3.9/schema.json",
-	"assist": { "actions": { "source": { "organizeImports": "on" } } },
+	"$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
+	"files": {
+		"includes": [
+			"packages/**/*.ts",
+			"examples/**/*.ts",
+			"!packages/core/src/sidecar/generated-protocol.ts",
+			"!/**/node_modules"
+		],
+		"ignoreUnknown": true
+	},
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true,
+		"defaultBranch": "main"
+	},
+	"formatter": {
+		"enabled": true,
+		"useEditorconfig": true
+	},
 	"linter": {
 		"enabled": true,
 		"rules": {
 			"recommended": true,
+			"style": {
+				"noUselessElse": "off",
+				"useNodejsImportProtocol": "error"
+			},
+			"correctness": {
+				"noUnusedImports": "warn"
+			},
+			"suspicious": {
+				"noExplicitAny": "off",
+				"noControlCharactersInRegex": "off"
+			},
+			"performance": {
+				"useTopLevelRegex": "off"
+			},
 			"nursery": {
-				"noFloatingPromises": "error"
+				"noFloatingPromises": "error",
+				"noMisusedPromises": "error"
 			}
 		}
-	},
-	"files": {
-		"includes": [
-			"**/packages/**/*.ts",
-			"**/packages/**/*.tsx",
-			"!**/node_modules",
-			"!**/dist",
-			"!**/assets",
-			"!**/bridge"
-		]
 	}
 }

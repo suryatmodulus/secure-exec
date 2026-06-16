@@ -1,0 +1,87 @@
+---
+title: "Code Mode (MCP)"
+description: "Give AI agents a single code-execution tool instead of individual MCP tools. The LLM writes code that chains tool calls, executed safely in Secure Exec."
+---
+
+import { Aside, LinkCard } from '@astrojs/starlight/components';
+
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/code-mode" description="Full working example with SecureExecExecutor and tool dispatch." />
+
+Instead of calling MCP tools one at a time, Code Mode lets the LLM write JavaScript that orchestrates everything in one go — run safely in a V8 sandbox by Secure Exec.
+
+<Aside type="tip">
+  [MCP Toolkit](https://mcp-toolkit.nuxt.dev/advanced/code-mode) provides a premade Code Mode library powered by Secure Exec: `experimental_codeMode: true`. We recommend trying it first. The rest of this page covers how to implement Code Mode yourself.
+</Aside>
+
+## Why Code Mode
+
+- **[81% less token overhead](https://x.com/hugorcd/status/2034616192225407273)**: With 50 tools, replacing per-call tool descriptions with a single code-execution tool cuts tool description tokens by 81%
+- **Fewer round-trips**: Chain multiple tool calls, conditionals, and data transformations in a single execution
+- **Real control flow**: Loops, branching, `Promise.all` — not a chain of isolated tool calls
+- **Drop-in replacement**: Your existing tools don't change at all. Code Mode wraps them transparently.
+
+## How it works
+
+1. Define your tools (AI SDK `tool()`, MCP servers, or both)
+2. Create a `SecureExecExecutor` that runs LLM-generated code in a V8 isolate and proxies `codemode.*` calls back to your tool implementations
+3. Give the LLM one tool ("execute code") with typed API definitions for your tools
+4. The LLM writes JavaScript that calls your tools via `codemode.*` and chains the results
+
+```ts
+const tools = {
+  getWeather: tool({
+    description: "Get current weather for a city.",
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }) => fetchWeather(city),
+  }),
+  calculate: tool({
+    description: "Evaluate a math expression.",
+    inputSchema: z.object({ expression: z.string() }),
+    execute: async ({ expression }) => eval(expression),
+  }),
+};
+
+const executor = new SecureExecExecutor({ memoryLimit: 64 });
+
+// Give the LLM one tool instead of many
+tools: {
+  codemode: tool({
+    description: codeToolDescription, // includes typed API definitions
+    inputSchema: z.object({ code: z.string() }),
+    execute: async ({ code }) => executor.execute(code, fns),
+  }),
+}
+```
+
+The agent then generates code like this:
+
+```js
+async () => {
+  const [sf, tokyo] = await Promise.all([
+    codemode.getWeather({ city: "San Francisco" }),
+    codemode.getWeather({ city: "Tokyo" })
+  ]);
+
+  const diffF = Math.abs(sf.temp_f - tokyo.temp_f);
+  const diffC = await codemode.calculate({
+    expression: `${diffF} * 5 / 9`
+  });
+
+  return {
+    san_francisco: sf,
+    tokyo: tokyo,
+    difference: { fahrenheit: diffF, celsius: diffC.result },
+    warmer: sf.temp_f > tokyo.temp_f ? "San Francisco" : "Tokyo"
+  };
+}
+```
+
+Three tool calls, one sandbox execution, zero extra LLM round-trips.
+
+See the [full working example](https://github.com/rivet-dev/secure-exec/tree/main/examples/code-mode) for the complete implementation including the `SecureExecExecutor`.
+
+## Further reading
+
+- [Complete Code Mode implementation guide](https://mcp-toolkit.nuxt.dev/advanced/code-mode) — end-to-end Code Mode walkthrough using MCP Toolkit
+- [Cloudflare Code Mode blog post](https://blog.cloudflare.com/code-mode/)
+- [AI Agent Code Exec](/use-cases/ai-agent-code-exec) for simpler single-tool execution patterns

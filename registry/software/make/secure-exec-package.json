@@ -1,0 +1,8 @@
+{
+  "name": "@agent-os-pkgs/make",
+  "type": "wasm",
+  "description": "GNU make build tool (planned)",
+  "aptName": "make",
+  "source": "rust",
+  "status": "planned"
+}

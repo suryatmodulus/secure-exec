@@ -1,3 +1,0 @@
-// Re-exported from @secure-exec/node — canonical source is packages/secure-exec-node/src/execution-driver.ts
-export { NodeExecutionDriver } from "@secure-exec/node/internal/execution-driver";
-export type { NodeExecutionDriverOptions } from "@secure-exec/node/internal/isolate-bootstrap";

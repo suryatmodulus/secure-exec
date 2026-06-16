@@ -1,8 +1,0 @@
-{
-	"name": "hono-fetch-external-fixture",
-	"private": true,
-	"type": "commonjs",
-	"dependencies": {
-		"hono": "4.12.2"
-	}
-}

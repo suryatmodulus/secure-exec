@@ -1,0 +1,57 @@
+---
+title: "Secure Exec vs Sandbox"
+description: "When to use a container sandbox vs. Secure Exec for code execution"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Not every workload needs a full OS. And not every workload fits inside an isolate. Secure Exec and container sandboxes solve **different problems**, and the right choice depends on what you're running.
+
+**Secure Exec** runs code in a V8 isolate inside your Node.js process. No container, no network hop, no vendor dependency. It's built for fast, lightweight code execution like AI tool calls, user scripts, and plugins, where you need granular permissions and minimal overhead.
+
+**Container sandboxes** (e2b, Daytona, Modal, Cloudflare Containers) spin up a full OS with root access, system packages, and persistent disk. They're built for heavyweight workloads that need a complete environment: coding agents, long-lived dev sessions, or anything requiring arbitrary binaries.
+
+## Comparison
+
+| Dimension              | Secure Exec                    | Container Sandbox              |
+| ---------------------- | ------------------------------ | ------------------------------ |
+| Isolation              | V8 isolate                     | VM / container                 |
+| Performance            | Native V8                      | Native container               |
+| Cold start             | ~17 ms (p95)                   | ~950 ms (best provider)        |
+| Memory baseline        | ~3.4 MB                        | ~256 MB minimum                |
+| Permissions            | Granular, deny-by-default      | Coarse-grained                 |
+| Infrastructure         | `npm install`                  | Vendor account + API keys      |
+| Hardware               | Your choice                    | Vendor-locked                  |
+| Egress                 | None (in-process)              | Per-GB fees                    |
+| Cost                   | Compute only (your infra)      | Per-second + egress + storage  |
+| Language support        | Node.js, Python                | Any (full OS)                  |
+| Filesystem             | Virtual, scoped                | Full OS filesystem             |
+| Network access         | Configurable per-execution     | Full (or firewall rules)       |
+
+## When to Use Each
+
+### Use Secure Exec when:
+
+- You need **fast, lightweight** code execution (AI tool calls, user scripts, plugins)
+- You want **no vendor dependency** and full control over infrastructure
+- You need **granular permissions** (file, network, module-level)
+- Cost matters at scale, especially for high-concurrency lightweight workloads
+
+### Use a container sandbox when:
+
+- You need a **full OS environment** (install system packages, run arbitrary binaries)
+- You need languages beyond Node.js/Python with full OS-level access
+- You need **persistent, long-lived** environments (multi-hour dev sessions)
+- Workloads are heavyweight enough that the 256 MB minimum doesn't matter
+
+<Aside type="note">
+**Need a full sandboxed operating system?**
+
+If your workload needs full sandbox environments (for example, running coding agents like Claude Code, Codex, or Amp), the [Sandbox Agent SDK](https://sandboxagent.dev/) provides a unified interface for controlling agents inside sandboxes.
+
+It supports Claude Code, Codex, OpenCode, Amp, and Pi through one standardized API.
+</Aside>
+
+## Cost
+
+See [Cost Evaluation](/docs/cost-evaluation) for detailed per-second cost comparison across providers.

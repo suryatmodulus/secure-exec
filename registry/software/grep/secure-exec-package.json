@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/grep",
+  "type": "wasm",
+  "description": "GNU grep pattern matching (grep, egrep, fgrep)",
+  "aptName": "grep",
+  "source": "rust"
+}

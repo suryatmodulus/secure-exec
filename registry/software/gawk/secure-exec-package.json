@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/gawk",
+  "type": "wasm",
+  "description": "GNU awk text processing",
+  "aptName": "gawk",
+  "source": "rust"
+}

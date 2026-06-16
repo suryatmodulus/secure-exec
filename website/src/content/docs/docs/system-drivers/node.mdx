@@ -1,0 +1,235 @@
+---
+title: Node.js System Driver
+description: Server-side system driver with full host capabilities.
+---
+
+The Node system driver provides sandboxed code with access to the host filesystem, networking, child processes, and environment. All capabilities sit behind a permission layer.
+
+## Basic setup
+
+With no options, the driver grants no host capabilities: no filesystem, network, or child process access. Everything is deny-by-default.
+
+```ts
+import { createNodeDriver } from "secure-exec";
+
+const driver = createNodeDriver();
+```
+
+## Configuring capabilities
+
+Pass options to enable and configure specific host capabilities.
+
+```ts
+import {
+  createNodeDriver,
+  createDefaultNetworkAdapter,
+  allowAllFs,
+  allowAllNetwork,
+} from "secure-exec";
+
+const driver = createNodeDriver({
+  networkAdapter: createDefaultNetworkAdapter(),
+  permissions: {
+    fs: allowAllFs,
+    network: allowAllNetwork,
+  },
+  processConfig: {
+    cwd: "/app",
+    env: { NODE_ENV: "production" },
+  },
+});
+```
+
+### All options
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `filesystem` | `VirtualFileSystem` | Filesystem implementation. When omitted, the sandbox has no file access. |
+| `moduleAccess` | `ModuleAccessOptions` | Configure the host directory used to resolve `node_modules` (see [Module access](#module-access)). |
+| `networkAdapter` | `NetworkAdapter` | Network adapter. Pass `createDefaultNetworkAdapter()` for the built-in fetch/DNS/HTTP adapter. |
+| `commandExecutor` | `CommandExecutor` | Command executor for child processes (see [Child processes](#child-processes)). |
+| `permissions` | `Permissions` | Permission policies for fs, network, child process, process, and env access. |
+| `processConfig` | `ProcessConfig` | Values for `process.cwd()`, `process.env`, etc. inside the sandbox. |
+| `osConfig` | `OSConfig` | Values for `os.homedir()` and `os.tmpdir()` inside the sandbox. |
+
+## Permissions
+
+Permissions are deny-by-default. Each capability (`fs`, `network`, `childProcess`, `process`, `env`) is controlled by a policy. A policy is either the string `"allow"` or `"deny"`, or a rule object `{ default?, rules }` that matches requests by operation and path/pattern.
+
+### Policy rules
+
+Set a policy to `"allow"`/`"deny"`, or provide ordered `rules`. Later matching rules win, and `default` applies when no rule matches.
+
+```ts
+const driver = createNodeDriver({
+  permissions: {
+    // Only allow writes under /tmp; everything else denied.
+    fs: {
+      default: "deny",
+      rules: [{ mode: "allow", operations: ["write"], paths: ["/tmp/*"] }],
+    },
+    // Allow all network access.
+    network: "allow",
+    // Only allow spawning `ls`.
+    childProcess: {
+      default: "deny",
+      rules: [{ mode: "allow", patterns: ["ls"] }],
+    },
+    // Only allow reading NODE_ENV and PATH.
+    env: {
+      default: "deny",
+      rules: [{ mode: "allow", operations: ["read"], patterns: ["NODE_ENV", "PATH"] }],
+    },
+  },
+});
+```
+
+### Rule fields
+
+| Permission | Rule fields |
+| --- | --- |
+| `fs` | `mode` (`"allow"`/`"deny"`), `operations?`, `paths?` |
+| `network` | `mode`, `operations?`, `patterns?` |
+| `childProcess` | `mode`, `operations?`, `patterns?` |
+| `process` | `mode`, `operations?`, `patterns?` |
+| `env` | `mode`, `operations?`, `patterns?` |
+
+### Allow-all helpers
+
+For development or trusted environments, use the built-in helpers. Each is the string `"allow"`, and `allowAll` is an object covering every capability.
+
+```ts
+import { allowAllFs, allowAllNetwork, allowAllChildProcess, allowAllEnv, allowAll } from "secure-exec";
+
+const driver = createNodeDriver({
+  permissions: { fs: allowAllFs, network: allowAllNetwork },
+});
+
+// Or allow everything:
+const permissive = createNodeDriver({ permissions: allowAll });
+```
+
+## Filesystem
+
+By default, the driver has no filesystem, so sandboxed code has no file access. Supply a custom `VirtualFileSystem` implementation or use the built-in in-memory filesystem.
+
+```ts
+import { createNodeDriver, createInMemoryFileSystem } from "secure-exec";
+
+const fs = createInMemoryFileSystem();
+await fs.writeFile("/app/data.json", '{"key": "value"}');
+
+const driver = createNodeDriver({ filesystem: fs });
+```
+
+## Module access
+
+The `moduleAccess` option configures which host `node_modules` directory is projected into the sandbox as a read-only overlay. By default it uses `process.cwd()` to locate `node_modules`.
+
+```ts
+const driver = createNodeDriver({
+  moduleAccess: {
+    cwd: "/path/to/your/project",
+  },
+});
+```
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `cwd` | `string` | Absolute path used to resolve `node_modules`. Defaults to `process.cwd()`. |
+
+When the driver is backed by a host-rooted filesystem, a `node_modules` directory under that root is mounted into the sandbox at `/node_modules` as a read-only overlay, so write operations to it fail.
+
+## Child processes
+
+Provide a `CommandExecutor` to allow sandboxed code to spawn processes. This is gated behind the `childProcess` permission.
+
+### CommandExecutor interface
+
+```ts
+interface ManagedProcess {
+  pid: number;
+  writeStdin(data: Uint8Array | string): void;
+  closeStdin(): void;
+  kill(signal?: number): void;
+  wait(): Promise<number>;
+  readonly exitCode: number | null;
+}
+
+interface CommandExecutor {
+  spawn(
+    command: string,
+    args: string[],
+    options?: {
+      cwd?: string;
+      env?: Record<string, string>;
+      onStdout?: (data: Uint8Array) => void;
+      onStderr?: (data: Uint8Array) => void;
+    },
+  ): ManagedProcess;
+}
+```
+
+### Custom executor example
+
+```ts
+import { spawn } from "node:child_process";
+import type { CommandExecutor } from "secure-exec";
+
+const commandExecutor: CommandExecutor = {
+  spawn(command, args, options) {
+    const proc = spawn(command, args, {
+      cwd: options?.cwd,
+      env: options?.env,
+    });
+    proc.stdout?.on("data", (chunk) => options?.onStdout?.(chunk));
+    proc.stderr?.on("data", (chunk) => options?.onStderr?.(chunk));
+
+    let exitCode: number | null = null;
+    proc.on("close", (code) => {
+      exitCode = code ?? 1;
+    });
+
+    return {
+      pid: proc.pid ?? -1,
+      writeStdin: (data) => proc.stdin?.write(data),
+      closeStdin: () => proc.stdin?.end(),
+      kill: (signal) => proc.kill(signal),
+      wait: () =>
+        new Promise((resolve) =>
+          proc.on("close", (code) => resolve(code ?? 1)),
+        ),
+      get exitCode() {
+        return exitCode;
+      },
+    };
+  },
+};
+
+const driver = createNodeDriver({
+  commandExecutor,
+  permissions: {
+    childProcess: {
+      default: "deny",
+      rules: [{ mode: "allow", patterns: ["node"] }],
+    },
+  },
+});
+```
+
+## Process and OS configuration
+
+Use `processConfig` and `osConfig` to control what the sandbox sees for `process.cwd()`, `process.env`, `os.homedir()`, and `os.tmpdir()`.
+
+```ts
+const driver = createNodeDriver({
+  processConfig: {
+    cwd: "/app",
+    env: { NODE_ENV: "production", API_KEY: "sk-..." },
+  },
+  osConfig: {
+    homedir: "/root",
+    tmpdir: "/tmp",
+  },
+});
+```

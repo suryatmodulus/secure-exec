@@ -1,0 +1,18 @@
+import type { WasmCommandPackage } from "@secure-exec/registry-types";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const pkg = {
+	name: "tar",
+	aptName: "tar",
+	description: "GNU tar archiver",
+	source: "rust" as const,
+	commands: [{ name: "tar", permissionTier: "read-write" as const }],
+	get commandDir() {
+		return resolve(__dirname, "..", "wasm");
+	},
+} satisfies WasmCommandPackage;
+
+export default pkg;

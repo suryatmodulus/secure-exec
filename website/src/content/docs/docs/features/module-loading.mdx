@@ -1,0 +1,102 @@
+---
+title: "NPM & Module Loading"
+description: How sandboxed code resolves and loads modules.
+---
+import { LinkCard } from '@astrojs/starlight/components';
+
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/module-loading.ts" description="Runnable example for module resolution and loading." />
+
+Sandboxed code can `require()` and `import` modules through secure-exec's module resolution system.
+
+## Runnable example
+
+```ts
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	NodeRuntime,
+	allowAllFs,
+	createNodeDriver,
+	createNodeRuntimeDriverFactory,
+} from "../../../packages/secure-exec/src/index.ts";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+
+const runtime = new NodeRuntime({
+	systemDriver: createNodeDriver({
+		moduleAccess: { cwd: repoRoot },
+		permissions: { ...allowAllFs },
+	}),
+	runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+});
+
+try {
+	const result = await runtime.run<{ version: string }>(
+		`
+    const typescript = require("typescript");
+    module.exports = { version: typescript.version };
+  `,
+		"/root/example.js",
+	);
+
+	if (result.code !== 0 || typeof result.exports?.version !== "string") {
+		throw new Error(`Unexpected runtime result: ${JSON.stringify(result)}`);
+	}
+
+	console.log(
+		JSON.stringify({
+			ok: true,
+			version: result.exports.version,
+			summary: "sandbox resolved the host typescript package from the overlay",
+		}),
+	);
+} finally {
+	runtime.dispose();
+}
+```
+
+Source: [examples/features/src/module-loading.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/module-loading.ts)
+
+## node_modules overlay
+
+Node runtime executions expose a read-only dependency overlay at `/app/node_modules`, sourced from `<cwd>/node_modules` on the host (default `cwd` is `process.cwd()`).
+
+```ts
+// Inside the sandbox, this resolves from the host's node_modules
+const lodash = require("lodash");
+```
+
+Key constraints:
+
+- Overlay paths are **read-only**
+- Reads are constrained to canonical paths under `<cwd>/node_modules` (no symlink escapes)
+- Native addons (`.node` files) are rejected
+- Access outside overlay paths remains permission-gated
+
+## Configuring moduleAccess
+
+Override the host directory used for the overlay:
+
+```ts
+import { createNodeDriver } from "secure-exec";
+
+const driver = createNodeDriver({
+  moduleAccess: {
+    cwd: "/path/to/project",
+  },
+});
+```
+
+## Module support tiers
+
+Built-in modules fall into five support tiers:
+
+| Tier | Behavior | Examples |
+|---|---|---|
+| **Bridge** | Full implementation in secure-exec bridge | `fs`, `process`, `os`, `child_process`, `http`, `dns` |
+| **Polyfill** | Browser-compatible polyfill | `path`, `buffer`, `url`, `events`, `stream`, `util`, `assert` |
+| **Stub** | Minimal compatibility surface | `http2`, `crypto`, `v8` |
+| **Deferred** | `require()` succeeds, APIs throw unsupported errors | `net`, `tls`, `readline`, `perf_hooks`, `worker_threads` |
+| **Unsupported** | `require()` throws immediately | `dgram`, `cluster`, `wasi`, `inspector` |
+
+See the [Node Compatibility](/docs/nodejs-compatibility) page for the complete module matrix.

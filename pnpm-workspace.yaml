@@ -1,6 +1,23 @@
 packages:
-  - "packages/*"
-  - "packages/os/*"
-  - "packages/runtime/*"
-  - "examples/*"
-  - "examples/*/*"
+  - website
+  - packages/*
+  - examples/*
+  - registry/software/*
+  - registry/file-system/*
+  - registry/tool/*
+  - scripts/publish
+
+ignoredBuiltDependencies:
+  - '@clerk/shared'
+  - '@parcel/watcher'
+  - browser-tabs-lock
+  - core-js
+
+onlyBuiltDependencies:
+  - '@biomejs/biome'
+  - better-sqlite3
+  - bun
+  - cbor-extract
+  - esbuild
+  - lefthook
+  - sharp

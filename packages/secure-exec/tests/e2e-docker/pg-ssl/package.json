@@ -1,8 +1,0 @@
-{
-	"name": "e2e-docker-pg-ssl",
-	"private": true,
-	"type": "commonjs",
-	"dependencies": {
-		"pg": "8.13.1"
-	}
-}
