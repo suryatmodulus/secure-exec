@@ -1,0 +1,259 @@
+---
+title: SDK Overview
+description: Guided tour of the secure-exec API surface.
+---
+
+import { Tabs, TabItem, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## Install
+
+<Tabs>
+  <TabItem label="npm">
+  ```bash
+  npm install secure-exec
+  ```
+  </TabItem>
+  <TabItem label="bun">
+  ```bash
+  bun add secure-exec
+  ```
+  </TabItem>
+  <TabItem label="pnpm">
+  ```bash
+  pnpm add secure-exec
+  ```
+  </TabItem>
+  <TabItem label="yarn">
+  ```bash
+  yarn add secure-exec
+  ```
+  </TabItem>
+</Tabs>
+
+## Core concepts
+
+Every sandbox has two layers:
+
+- **System driver** provides host capabilities: filesystem, network, child processes, and permissions.
+- The execution environment runs code in a V8 isolate (Node) or Web Worker (browser).
+
+All host capabilities are deny-by-default. You opt in to what sandboxed code can access.
+
+## Create a runtime
+
+<Tabs>
+  <TabItem label="Node">
+    ```ts
+    import {
+      NodeRuntime,
+      createNodeDriver,
+      createNodeRuntimeDriverFactory,
+    } from "secure-exec";
+
+    const runtime = new NodeRuntime({
+      systemDriver: createNodeDriver(),
+      runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+    });
+    ```
+  </TabItem>
+  <TabItem label="Browser">
+    ```ts
+    import {
+      NodeRuntime,
+      createBrowserDriver,
+      createBrowserRuntimeDriverFactory,
+    } from "secure-exec/browser";
+
+    const runtime = new NodeRuntime({
+      systemDriver: await createBrowserDriver({ filesystem: "memory" }),
+      runtimeDriverFactory: createBrowserRuntimeDriverFactory(),
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+## Execute code
+
+Two methods for running sandboxed code:
+
+```ts
+// exec() runs code for side effects, returns an exit code
+const execResult = await runtime.exec("console.log('hello')");
+console.log(execResult.code); // 0
+
+// run() runs code and returns the default export
+const runResult = await runtime.run<{ default: number }>(
+  "export default 2 + 2"
+);
+console.log(runResult.exports?.default); // 4
+```
+
+## Capture output
+
+Console output is not buffered by default. Use the `onStdio` hook to capture it:
+
+```ts
+const logs: string[] = [];
+
+await runtime.exec("console.log('hello'); console.error('oops')", {
+  onStdio: (event) => logs.push(`[${event.channel}] ${event.message}`),
+});
+
+// logs: ["[stdout] hello", "[stderr] oops"]
+```
+
+You can also set a default hook on the runtime:
+
+```ts
+const runtime = new NodeRuntime({
+  systemDriver: createNodeDriver(),
+  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+  onStdio: (event) => console.log(event.message),
+});
+```
+
+See [Output Capture](/docs/features/output-capture) for more patterns.
+
+## TypeScript
+
+Optional companion package for sandboxed type checking and compilation:
+
+```bash
+pnpm add @secure-exec/typescript
+```
+
+```ts
+import { createTypeScriptTools } from "@secure-exec/typescript";
+
+const ts = createTypeScriptTools({
+  systemDriver: createNodeDriver(),
+  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+});
+```
+
+<Tabs>
+  <TabItem label="Type-check Source">
+    ```ts
+    const result = await ts.typecheckSource({
+      sourceText: "const x: number = 'hello';",
+    });
+
+    console.log(result.success); // false
+    console.log(result.diagnostics[0].message);
+    // "Type 'string' is not assignable to type 'number'."
+    ```
+  </TabItem>
+  <TabItem label="Type-check Project">
+    ```ts
+    const result = await ts.typecheckProject({
+      cwd: "/app",
+      configFilePath: "/app/tsconfig.json",
+    });
+
+    for (const d of result.diagnostics) {
+      console.log(`${d.filePath}:${d.line} ${d.message}`);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Compile Source">
+    ```ts
+    const result = await ts.compileSource({
+      sourceText: "const x: number = 42; export default x;",
+    });
+
+    console.log(result.outputText);
+    // "const x = 42; export default x;"
+    ```
+  </TabItem>
+  <TabItem label="Compile Project">
+    ```ts
+    const result = await ts.compileProject({
+      cwd: "/app",
+    });
+
+    console.log(result.emittedFiles); // ["/app/dist/index.js", ...]
+    console.log(result.success); // true
+    ```
+  </TabItem>
+</Tabs>
+
+See [TypeScript](/docs/features/typescript).
+
+## Permissions
+
+All capabilities are blocked unless you opt in:
+
+```ts
+import { createNodeDriver, allowAll, allowAllFs } from "secure-exec";
+
+// Allow everything
+const driver = createNodeDriver({ permissions: allowAll });
+
+// Allow only filesystem
+const fsOnly = createNodeDriver({ permissions: { fs: allowAllFs } });
+
+// Custom check
+const filtered = createNodeDriver({
+  permissions: {
+    network: (req) => ({ allow: req.host !== "internal.corp" }),
+  },
+});
+```
+
+See [Permissions](/docs/features/permissions) for the full API.
+
+## Resource limits
+
+Prevent runaway execution with CPU and memory bounds:
+
+```ts
+const runtime = new NodeRuntime({
+  systemDriver: createNodeDriver(),
+  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+  memoryLimit: 64, // MB
+  cpuTimeLimitMs: 5000,
+});
+```
+
+See [Resource Limits](/docs/features/resource-limits) for payload limits and per-execution overrides.
+
+## Filesystem
+
+```ts
+import { createNodeDriver, allowAllFs } from "secure-exec";
+
+const driver = createNodeDriver({
+  permissions: { fs: allowAllFs },
+});
+```
+
+Three filesystem backends are available: Node.js host fs, in-memory, and OPFS (browser). See [Filesystem](/docs/features/filesystem).
+
+## Networking
+
+```ts
+import { createNodeDriver, allowAllNetwork } from "secure-exec";
+
+const driver = createNodeDriver({
+  useDefaultNetwork: true,
+  permissions: { network: allowAllNetwork },
+});
+```
+
+See [Networking](/docs/features/networking).
+
+
+## Clean up
+
+```ts
+runtime.dispose();
+```
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Runtimes" href="/docs/runtimes/overview" description="Node runtime details." />
+  <LinkCard title="System Drivers" href="/docs/system-drivers/overview" description="Configure host capabilities per environment." />
+  <LinkCard title="Security Model" href="/docs/security-model" description="Trust boundaries, timing hardening, and isolation guarantees." />
+  <LinkCard title="API Reference" href="/docs/api-reference" description="Complete type and method reference." />
+</CardGrid>

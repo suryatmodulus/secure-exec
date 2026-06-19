@@ -1,0 +1,47 @@
+{
+  "name": "@agent-os-pkgs/everything",
+  "version": "0.0.260331072558",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "All available WASM command packages for secure-exec VMs in a single bundle",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@agent-os-pkgs/coreutils": "workspace:*",
+    "@agent-os-pkgs/sed": "workspace:*",
+    "@agent-os-pkgs/grep": "workspace:*",
+    "@agent-os-pkgs/gawk": "workspace:*",
+    "@agent-os-pkgs/findutils": "workspace:*",
+    "@agent-os-pkgs/diffutils": "workspace:*",
+    "@agent-os-pkgs/tar": "workspace:*",
+    "@agent-os-pkgs/gzip": "workspace:*",
+    "@agent-os-pkgs/curl": "workspace:*",
+    "@agent-os-pkgs/zip": "workspace:*",
+    "@agent-os-pkgs/unzip": "workspace:*",
+    "@agent-os-pkgs/jq": "workspace:*",
+    "@agent-os-pkgs/ripgrep": "workspace:*",
+    "@agent-os-pkgs/fd": "workspace:*",
+    "@agent-os-pkgs/tree": "workspace:*",
+    "@agent-os-pkgs/file": "workspace:*",
+    "@agent-os-pkgs/yq": "workspace:*",
+    "@agent-os-pkgs/codex": "workspace:*"
+  },
+  "devDependencies": {
+    "@secure-exec/registry-types": "workspace:*",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.2"
+  }
+}

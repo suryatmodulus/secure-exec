@@ -1,0 +1,25 @@
+{
+	"name": "secure-exec-registry",
+	"private": true,
+	"type": "module",
+	"license": "Apache-2.0",
+	"version": "0.0.0",
+	"packageManager": "pnpm@10.13.1",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"build": "pnpm -r run build",
+		"check-types": "pnpm -r run check-types",
+		"test": "node ./scripts/run-vitest.mjs"
+	},
+	"devDependencies": {
+		"@agent-os-pkgs/common": "link:software/common",
+		"@secure-exec/core": "link:../packages/core",
+		"@agent-os-pkgs/curl": "link:software/curl",
+		"@types/node": "^22.10.2",
+		"@xterm/headless": "^6.0.0",
+		"typescript": "^5.9.2",
+		"vitest": "^2.1.9"
+	}
+}

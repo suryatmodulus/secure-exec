@@ -1,0 +1,686 @@
+---
+title: Kernel API Reference
+description: Complete reference for all kernel types and methods.
+draft: true
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution">This page documents experimental functionality. APIs, behavior, and docs may change without notice.</Aside>
+
+## `createKernel(options)`
+
+Creates a new kernel instance.
+
+```ts
+import { createKernel } from "@secure-exec/kernel";
+
+const kernel = createKernel({
+  filesystem: vfs,
+  permissions: allowAll,
+  env: { HOME: "/root", PATH: "/bin:/usr/bin" },
+  cwd: "/root",
+});
+```
+
+**`KernelOptions`**
+
+| Option | Type | Description |
+|---|---|---|
+| `filesystem` | `VirtualFileSystem` | Backing filesystem. **Required.** |
+| `permissions` | `Permissions` | Access control. Default: allow all. |
+| `env` | `Record<string, string>` | Initial environment variables. |
+| `cwd` | `string` | Initial working directory. Default `"/"`. |
+
+---
+
+## `Kernel`
+
+The kernel instance returned by `createKernel()`.
+
+### `kernel.mount(driver)`
+
+Register a runtime driver. Commands from the driver become available to `exec()` and `spawn()`.
+
+```ts
+await kernel.mount(createWasmVmRuntime({ wasmBinaryPath: "..." }));
+await kernel.mount(createNodeRuntime());
+```
+
+Last-mounted driver wins when two drivers register the same command:
+
+```ts
+// WasmVM registers "node" as a stub
+await kernel.mount(createWasmVmRuntime({ wasmBinaryPath: "..." }));
+// Node driver overrides the "node" command
+await kernel.mount(createNodeRuntime());
+
+// "node" now routes to the Node driver
+const result = await kernel.exec('node -e "console.log(42)"');
+```
+
+| Param | Type | Description |
+|---|---|---|
+| `driver` | `RuntimeDriver` | Driver to mount. |
+| Returns | `Promise<void>` | Resolves when driver is initialized and commands registered. |
+
+### `kernel.exec(command, options?)`
+
+Execute a shell command string. Requires a shell driver (WasmVM) to be mounted.
+
+```ts
+const result = await kernel.exec("echo hello && ls /tmp", {
+  timeout: 10000,
+  env: { DEBUG: "true" },
+});
+
+console.log(result.exitCode); // 0
+console.log(result.stdout);   // "hello\n..."
+console.log(result.stderr);   // ""
+```
+
+**`ExecOptions`**
+
+| Option | Type | Description |
+|---|---|---|
+| `timeout` | `number` | Kill process after N ms. |
+| `env` | `Record<string, string>` | Environment variables (merged with kernel defaults). |
+| `cwd` | `string` | Working directory override. |
+| `stdin` | `string` | Data to write to stdin, then close. |
+
+**`ExecResult`**
+
+```ts
+{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+```
+
+### `kernel.spawn(command, args, options?)`
+
+Spawn a process directly. Returns a `ManagedProcess` handle for streaming I/O.
+
+```ts
+const proc = kernel.spawn("node", ["-e", "console.log('hi')"], {
+  onStdout: (data) => process.stdout.write(data),
+  onStderr: (data) => process.stderr.write(data),
+  env: { NODE_ENV: "production" },
+});
+
+console.log(proc.pid); // e.g. 42
+const exitCode = await proc.wait();
+```
+
+**`SpawnOptions`**
+
+| Option | Type | Description |
+|---|---|---|
+| `onStdout` | `(data: Uint8Array) => void` | Callback for stdout chunks. |
+| `onStderr` | `(data: Uint8Array) => void` | Callback for stderr chunks. |
+| `env` | `Record<string, string>` | Environment variables. |
+| `cwd` | `string` | Working directory. |
+| `ppid` | `number` | Parent PID (for cross-runtime spawns). |
+| `stdinFd` | `number` | Override stdin with this FD (for pipes). |
+| `stdoutFd` | `number` | Override stdout with this FD (for pipes). |
+| `stderrFd` | `number` | Override stderr with this FD (for pipes). |
+
+### `kernel.openShell(options?)`
+
+Open an interactive shell on a PTY. Wires PTY + process groups + termios for terminal use.
+
+```ts
+const shell = kernel.openShell({
+  command: "sh",
+  cols: 80,
+  rows: 24,
+  env: { TERM: "xterm-256color" },
+});
+
+shell.onData = (data) => process.stdout.write(data);
+shell.write("echo hello\n");
+shell.resize(120, 40); // SIGWINCH to foreground pgid
+
+const exitCode = await shell.wait();
+```
+
+**`OpenShellOptions`**
+
+| Option | Type | Description |
+|---|---|---|
+| `command` | `string` | Shell command. Default `"sh"`. |
+| `args` | `string[]` | Arguments to pass to the shell. |
+| `env` | `Record<string, string>` | Environment variables for the shell. |
+| `cwd` | `string` | Working directory. |
+| `cols` | `number` | Initial terminal columns. |
+| `rows` | `number` | Initial terminal rows. |
+
+| Returns | Type | Description |
+|---|---|---|
+| Returns | `ShellHandle` | Interactive shell handle. |
+
+### `kernel.connectTerminal(options?)`
+
+Wire `openShell()` to `process.stdin`/`process.stdout` for a CLI terminal session. Sets raw mode, forwards I/O, handles resize, restores terminal on exit.
+
+```ts
+// One-liner interactive shell
+const exitCode = await kernel.connectTerminal();
+process.exit(exitCode);
+```
+
+```ts
+// With options
+const exitCode = await kernel.connectTerminal({
+  command: "node",
+  args: ["--interactive"],
+  onData: (data) => myTerminal.write(data), // custom output handler
+});
+```
+
+**`ConnectTerminalOptions`** extends `OpenShellOptions`
+
+| Option | Type | Description |
+|---|---|---|
+| `onData` | `(data: Uint8Array) => void` | Custom output handler. Defaults to `process.stdout.write()`. |
+
+### `kernel.dispose()`
+
+Terminate all processes, clean up drivers, release resources.
+
+```ts
+await kernel.dispose();
+// All subsequent calls throw "disposed"
+```
+
+Sends SIGTERM to running processes, waits a short grace period, then disposes drivers in reverse mount order.
+
+### Filesystem convenience methods
+
+```ts
+await kernel.writeFile("/tmp/data.txt", "hello");
+const data = await kernel.readFile("/tmp/data.txt");     // Uint8Array
+await kernel.mkdir("/tmp/subdir");
+const entries = await kernel.readdir("/tmp");             // ["data.txt", "subdir"]
+const stat = await kernel.stat("/tmp/data.txt");          // { size, mode, ... }
+const exists = await kernel.exists("/tmp/data.txt");      // true
+```
+
+### Introspection
+
+```ts
+// Map of command name → driver name
+kernel.commands; // Map { "sh" => "wasmvm", "node" => "node", ... }
+
+// Map of PID → process info
+kernel.processes; // Map { 1 => { pid: 1, status: "running", ... }, ... }
+```
+
+---
+
+## `ManagedProcess`
+
+Returned by `kernel.spawn()`. Wraps a running process.
+
+```ts
+const proc = kernel.spawn("cat", []);
+
+proc.writeStdin(new TextEncoder().encode("hello\n"));
+proc.closeStdin();
+proc.kill(15); // SIGTERM
+
+const exitCode = await proc.wait();
+```
+
+| Property/Method | Type | Description |
+|---|---|---|
+| `pid` | `number` | Process ID in kernel process table. |
+| `writeStdin(data)` | `(data: Uint8Array \| string) => void` | Write to process stdin. |
+| `closeStdin()` | `() => void` | Close stdin (sends EOF). |
+| `kill(signal?)` | `(signal?: number) => void` | Send signal. Default SIGTERM (15). |
+| `wait()` | `() => Promise<number>` | Wait for exit, returns exit code. |
+
+---
+
+## `ShellHandle`
+
+Returned by `kernel.openShell()`. Provides interactive terminal I/O.
+
+```ts
+const shell = kernel.openShell();
+
+shell.onData = (data) => terminal.write(data);
+shell.write("ls -la\n");
+shell.resize(120, 40);
+shell.kill(15);
+
+const exitCode = await shell.wait();
+```
+
+| Property/Method | Type | Description |
+|---|---|---|
+| `pid` | `number` | PID of the shell process. |
+| `write(data)` | `(data: Uint8Array \| string) => void` | Write to shell (through PTY line discipline). |
+| `onData` | `((data: Uint8Array) => void) \| null` | Callback for shell output data. |
+| `resize(cols, rows)` | `(cols: number, rows: number) => void` | Notify resize — delivers SIGWINCH to foreground pgid. |
+| `kill(signal?)` | `(signal?: number) => void` | Kill the shell process. |
+| `wait()` | `() => Promise<number>` | Wait for exit, returns exit code. |
+
+---
+
+## `RuntimeDriver`
+
+Interface for pluggable execution engines. Implement this to add a new language runtime to the kernel.
+
+```ts
+interface RuntimeDriver {
+  name: string;
+  commands: string[];
+  init(kernel: KernelInterface): Promise<void>;
+  spawn(command: string, args: string[], ctx: ProcessContext): DriverProcess;
+  dispose(): Promise<void>;
+}
+```
+
+See [Writing a Custom RuntimeDriver](/docs/kernel/custom-runtime) for a full guide.
+
+### Built-in drivers
+
+| Factory | Package | Commands |
+|---|---|---|
+| `createWasmVmRuntime(options?)` | `@secure-exec/runtime-wasmvm` | `sh`, `bash`, `cat`, `grep`, `sed`, `awk`, `jq`, `ls`, `find`, and 80+ more |
+| `createNodeRuntime()` | `@secure-exec/runtime-node` | `node`, `npm`, `npx` |
+| `createPythonRuntime()` | `@secure-exec/runtime-python` | `python`, `python3` |
+
+---
+
+## `KernelInterface`
+
+Syscall surface exposed to runtime drivers during `init()`. Drivers use this to access the kernel's VFS, FD table, process table, and pipes.
+
+### File descriptor operations
+
+```ts
+// Open a file, returns FD number
+const fd = ki.fdOpen(pid, "/tmp/file.txt", O_RDONLY, 0o644);
+
+// Read up to 1024 bytes
+const data: Uint8Array = await ki.fdRead(pid, fd, 1024);
+
+// Write bytes, returns bytes written
+const written: number = ki.fdWrite(pid, fd, new TextEncoder().encode("hello"));
+
+// Seek (returns new cursor position as bigint)
+const pos: bigint = await ki.fdSeek(pid, fd, 0n, SEEK_SET);
+
+// Close
+ki.fdClose(pid, fd);
+
+// Duplicate
+const fd2 = ki.fdDup(pid, fd);
+ki.fdDup2(pid, oldFd, newFd);
+
+// Stat an open FD
+const stat = ki.fdStat(pid, fd);
+// { filetype, flags, rights }
+```
+
+### Positional I/O
+
+Read/write at a given offset without moving the FD cursor.
+
+```ts
+// Read 5 bytes at offset 0 — cursor stays where it was
+const data: Uint8Array = await ki.fdPread(pid, fd, 5, 0n);
+
+// Write at offset 10 — cursor stays where it was
+const written: number = await ki.fdPwrite(pid, fd, new TextEncoder().encode("world"), 10n);
+
+// Pipe FDs reject positional I/O with ESPIPE
+await ki.fdPread(pid, pipeFd, 10, 0n); // throws ESPIPE
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `fdPread` | `(pid, fd, length, offset) => Promise<Uint8Array>` | Read at offset without moving cursor. |
+| `fdPwrite` | `(pid, fd, data, offset) => Promise<number>` | Write at offset without moving cursor. Returns bytes written. |
+
+### Process operations
+
+```ts
+// Spawn a child process (cross-runtime dispatch)
+const child: ManagedProcess = ki.spawn(command, args, {
+  ppid: parentPid,
+  env: { ... },
+  cwd: "/app",
+  onStdout: (data) => { ... },
+  onStderr: (data) => { ... },
+});
+
+// Wait for child
+const { pid, status } = await ki.waitpid(childPid);
+
+// Send signal
+ki.kill(childPid, 15); // SIGTERM
+
+// Kill all processes in a process group (negative PID)
+ki.kill(-pgid, 15); // SIGTERM to all in group
+
+// Create a pipe
+const { readFd, writeFd } = ki.pipe(parentPid);
+```
+
+### Process groups and sessions
+
+POSIX job control: group processes for collective signal delivery and session management.
+
+```ts
+// Get/set process group ID
+const pgid = ki.getpgid(pid);
+ki.setpgid(pid, newPgid);
+
+// Create new session (pid becomes session leader)
+const sid = ki.setsid(pid); // returns new sid === pid
+
+// Get session ID
+const sid = ki.getsid(pid);
+
+// Kill all processes in a group
+ki.kill(-pgid, 2); // SIGINT to all in group
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `setpgid` | `(pid, pgid) => void` | Set process group. Process can create a new group or join an existing one. |
+| `getpgid` | `(pid) => number` | Get process group ID. |
+| `setsid` | `(pid) => number` | Create new session. Process becomes session leader (`sid=pid`, `pgid=pid`). Fails with EPERM if already a group leader. |
+| `getsid` | `(pid) => number` | Get session ID. |
+
+Child processes inherit their parent's `pgid` and `sid` at spawn time.
+
+### PTY operations
+
+Allocate pseudo-terminal device pairs for interactive terminal I/O. See [Interactive Shell](/docs/kernel/interactive-shell) for a full guide.
+
+```ts
+// Allocate a PTY master/slave pair
+const { masterFd, slaveFd, path } = ki.openpty(pid);
+// path: "/dev/pts/0"
+
+// Check if FD is a terminal
+ki.isatty(pid, slaveFd);  // true (slave FDs are terminals)
+ki.isatty(pid, masterFd); // false (master FDs are not)
+ki.isatty(pid, pipeFd);   // false
+
+// Set line discipline (low-level)
+ki.ptySetDiscipline(pid, slaveFd, {
+  canonical: true,  // buffer until newline
+  echo: true,       // echo input back
+  isig: true,       // ^C → SIGINT, ^Z → SIGTSTP
+});
+
+// Set foreground process group for signal delivery
+ki.ptySetForegroundPgid(pid, slaveFd, pgid);
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `openpty` | `(pid) => { masterFd, slaveFd, path }` | Allocate PTY pair. Installs FDs in process's table. Path is `/dev/pts/N`. |
+| `isatty` | `(pid, fd) => boolean` | `true` for PTY slave FDs, `false` for everything else. |
+| `ptySetDiscipline` | `(pid, fd, config) => void` | Set line discipline flags on the PTY. |
+| `ptySetForegroundPgid` | `(pid, fd, pgid) => void` | Set foreground process group for `^C`/`^Z`/`^\` signal delivery. |
+
+PTY data flow is bidirectional: writing to master delivers input to the slave (through line discipline); writing to slave delivers output readable from master.
+
+### Termios operations
+
+POSIX terminal attributes. Controls line discipline behavior (canonical mode, echo, signal generation, control characters).
+
+```ts
+// Get current terminal attributes (returns deep copy)
+const termios: Termios = ki.tcgetattr(pid, slaveFd);
+// { icanon: true, echo: true, isig: true, cc: { vintr: 0x03, ... } }
+
+// Switch to raw mode
+ki.tcsetattr(pid, slaveFd, { icanon: false, echo: false, isig: false });
+
+// Set foreground process group
+ki.tcsetpgrp(pid, slaveFd, pgid);
+
+// Get foreground process group
+const fgPgid: number = ki.tcgetpgrp(pid, slaveFd);
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `tcgetattr` | `(pid, fd) => Termios` | Get terminal attributes. Returns a deep copy. |
+| `tcsetattr` | `(pid, fd, Partial<Termios>) => void` | Set terminal attributes. Partial update — omitted fields keep current values. |
+| `tcsetpgrp` | `(pid, fd, pgid) => void` | Set foreground process group. `^C` delivers SIGINT to this group. |
+| `tcgetpgrp` | `(pid, fd) => number` | Get foreground process group. |
+
+### `/dev/fd` pseudo-directory
+
+Process-aware device paths for accessing open file descriptors by number.
+
+```ts
+// Open /dev/fd/N — equivalent to dup(N)
+const fd2 = ki.fdOpen(pid, "/dev/fd/5", O_RDONLY);
+// fd2 is a new FD sharing the same file description as FD 5
+
+// List open FDs for a process
+const fds: string[] = ki.devFdReadDir(pid);
+// ["0", "1", "2", "5", "6"]
+
+// Stat the underlying file for /dev/fd/N
+const stat = await ki.devFdStat(pid, 5);
+// Returns VirtualStat of the file behind FD 5
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `devFdReadDir` | `(pid) => string[]` | List open FD numbers for a process. |
+| `devFdStat` | `(pid, fd) => Promise<VirtualStat>` | Stat the underlying file for `/dev/fd/N`. Returns synthetic stat for pipe/PTY FDs. |
+
+<Aside type="note">
+VFS-level `readDir("/dev/fd")` returns an empty list because the VFS has no PID context.
+Use `ki.devFdReadDir(pid)` for PID-aware results.
+</Aside>
+
+### VFS access
+
+```ts
+ki.vfs.readFile(path);
+ki.vfs.writeFile(path, content);
+ki.vfs.readDir(path);
+ki.vfs.stat(path);
+ki.vfs.mkdir(path);
+ki.vfs.exists(path);
+ki.vfs.removeFile(path);
+ki.vfs.rename(oldPath, newPath);
+ki.vfs.symlink(target, linkPath);
+ki.vfs.readlink(path);
+// ... full POSIX VFS surface
+```
+
+---
+
+## `ProcessContext`
+
+Passed to `RuntimeDriver.spawn()`. Contains everything the driver needs to set up a process.
+
+```ts
+interface ProcessContext {
+  pid: number;
+  ppid: number;
+  env: Record<string, string>;
+  cwd: string;
+  fds: { stdin: number; stdout: number; stderr: number };
+  onStdout?: (data: Uint8Array) => void;
+  onStderr?: (data: Uint8Array) => void;
+}
+```
+
+---
+
+## `DriverProcess`
+
+Returned by `RuntimeDriver.spawn()`. The kernel wraps this into a `ManagedProcess`.
+
+```ts
+interface DriverProcess {
+  writeStdin(data: Uint8Array): void;
+  closeStdin(): void;
+  kill(signal: number): void;
+  wait(): Promise<number>;
+  onExit: ((code: number) => void) | null;
+  onStdout: ((data: Uint8Array) => void) | null;
+  onStderr: ((data: Uint8Array) => void) | null;
+}
+```
+
+---
+
+## `Termios`
+
+Terminal attributes controlling PTY line discipline behavior.
+
+```ts
+import { defaultTermios } from "@secure-exec/kernel";
+import type { Termios, TermiosCC } from "@secure-exec/kernel";
+
+const termios = defaultTermios();
+// {
+//   icanon: true,   // canonical mode (line buffering)
+//   echo: true,     // echo input back
+//   isig: true,     // signal generation from control chars
+//   cc: { vintr: 0x03, vquit: 0x1c, vsusp: 0x1a, veof: 0x04, verase: 0x7f }
+// }
+```
+
+**`Termios` fields**
+
+| Field | Type | Description |
+|---|---|---|
+| `icanon` | `boolean` | Canonical mode: buffer input until newline, handle backspace. |
+| `echo` | `boolean` | Echo input bytes back through master for display. |
+| `isig` | `boolean` | Enable signal generation from control characters. |
+| `cc` | `TermiosCC` | Control character definitions. |
+
+**`TermiosCC` control characters**
+
+| Field | Default | Description |
+|---|---|---|
+| `vintr` | `0x03` (^C) | Generates SIGINT. |
+| `vquit` | `0x1C` (^\\) | Generates SIGQUIT. |
+| `vsusp` | `0x1A` (^Z) | Generates SIGTSTP. |
+| `veof` | `0x04` (^D) | EOF on empty line. |
+| `verase` | `0x7F` (DEL) | Erase last character (canonical mode). |
+
+---
+
+## `KernelError`
+
+Structured error for kernel operations. Carries a machine-readable `code` for errno mapping without string matching.
+
+```ts
+import { KernelError } from "@secure-exec/kernel";
+import type { KernelErrorCode } from "@secure-exec/kernel";
+
+try {
+  ki.fdRead(pid, 999, 1024);
+} catch (err) {
+  if (err instanceof KernelError) {
+    console.log(err.code);    // "EBADF"
+    console.log(err.message); // "EBADF: bad file descriptor"
+  }
+}
+```
+
+**`KernelErrorCode` values**
+
+| Code | Description |
+|---|---|
+| `EACCES` | Permission denied. |
+| `EBADF` | Bad file descriptor. |
+| `EEXIST` | File or directory already exists. |
+| `EINVAL` | Invalid argument. |
+| `EIO` | I/O error. |
+| `EISDIR` | Is a directory. |
+| `ENOENT` | No such file or directory. |
+| `ENOSYS` | Function not implemented. |
+| `ENOTEMPTY` | Directory not empty. |
+| `ENOTDIR` | Not a directory. |
+| `EPERM` | Operation not permitted. |
+| `EPIPE` | Broken pipe. |
+| `ESPIPE` | Illegal seek (pipes, PTYs). |
+| `ESRCH` | No such process. |
+| `ETIMEDOUT` | Operation timed out. |
+
+---
+
+## Device layer
+
+The kernel provides pseudo-device files under `/dev/`. These are handled by the device layer, not the VFS.
+
+### Device nodes
+
+| Path | Description |
+|---|---|
+| `/dev/null` | Reads return EOF, writes are discarded. |
+| `/dev/zero` | Reads return zero bytes. |
+| `/dev/stdin` | Alias for FD 0 of the calling process. |
+| `/dev/stdout` | Alias for FD 1 of the calling process. |
+| `/dev/stderr` | Alias for FD 2 of the calling process. |
+
+### Pseudo-directories
+
+| Path | Description |
+|---|---|
+| `/dev/fd/` | Lists open FDs for the calling process. `/dev/fd/N` opens as `dup(N)`. Use `ki.devFdReadDir(pid)` for PID-aware listing. |
+| `/dev/pts/` | PTY slave devices. Created by `ki.openpty()`. `/dev/pts/0`, `/dev/pts/1`, etc. |
+
+<Aside type="note">
+VFS-level operations on `/dev/fd` and `/dev/pts` return directory-like stats but empty contents.
+Use KernelInterface methods (`devFdReadDir`, `devFdStat`, `openpty`) for PID-aware operations.
+</Aside>
+
+---
+
+## Signal constants
+
+```ts
+import { SIGTERM, SIGKILL, SIGINT, SIGQUIT, SIGTSTP, SIGWINCH } from "@secure-exec/kernel";
+```
+
+| Constant | Value | Description |
+|---|---|---|
+| `SIGINT` | `2` | Interrupt (^C). |
+| `SIGQUIT` | `3` | Quit (^\\). |
+| `SIGKILL` | `9` | Kill (cannot be caught). |
+| `SIGTERM` | `15` | Terminate. |
+| `SIGTSTP` | `20` | Terminal stop (^Z). |
+| `SIGWINCH` | `28` | Window size change (terminal resize). |
+
+---
+
+## Permission presets
+
+```ts
+import { allowAll, allowAllFs, allowAllNetwork, allowAllChildProcess, allowAllEnv } from "@secure-exec/kernel";
+
+const kernel = createKernel({
+  filesystem: vfs,
+  permissions: allowAll,        // everything allowed
+});
+
+const kernel = createKernel({
+  filesystem: vfs,
+  permissions: {
+    fs: allowAllFs,              // filesystem only
+    network: false,              // block network
+    childProcess: allowAllChildProcess,
+    env: (req) => ["HOME", "PATH"].includes(req.name),
+  },
+});
+```

@@ -1,0 +1,86 @@
+---
+title: Plugin Systems
+description: Run user-authored plugins with explicit resource limits and permissions.
+---
+
+import { LinkCard } from '@astrojs/starlight/components';
+
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/plugin-system" description="Full working example with sandboxed plugin execution." />
+
+Let users upload scripts or extensions without risking your host. The host controls what code is loaded, what capabilities are available, and how much CPU or memory each plugin can use.
+
+## Run a plugin from a virtual filesystem
+
+Store plugins in an in-memory filesystem and load them like regular modules. The plugin below gets filesystem access but no network or child-process permissions.
+
+```ts Plugin Runner
+import {
+  NodeRuntime,
+  allowAllFs,
+  createInMemoryFileSystem,
+  createNodeDriver,
+  createNodeRuntimeDriverFactory,
+} from "secure-exec";
+
+const filesystem = createInMemoryFileSystem();
+await filesystem.mkdir("/plugins");
+await filesystem.writeFile(
+  "/plugins/title-case.js",
+  `
+    module.exports = {
+      manifest: {
+        name: "title-case",
+        version: "1.0.0",
+      },
+      transform(input, options = {}) {
+        const words = String(input)
+          .split(/\\s+/)
+          .filter(Boolean)
+          .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase());
+
+        return (options.prefix ?? "") + words.join(" ");
+      },
+    };
+  `
+);
+
+const runtime = new NodeRuntime({
+  systemDriver: createNodeDriver({
+    filesystem,
+    permissions: { fs: allowAllFs },
+  }),
+  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+  memoryLimit: 64,
+  cpuTimeLimitMs: 1000,
+});
+
+const input = "hello from plugin land";
+const options = { prefix: "Plugin says: " };
+
+const result = await runtime.run<{
+  manifest: { name: string; version: string };
+  output: string;
+}>(`
+  const plugin = require("/plugins/title-case.js");
+
+  module.exports = {
+    manifest: plugin.manifest,
+    output: plugin.transform(
+      ${JSON.stringify(input)},
+      ${JSON.stringify(options)}
+    ),
+  };
+`, "/root/run-plugin.js");
+
+console.log(result.exports?.manifest.name); // "title-case"
+console.log(result.exports?.output); // "Plugin says: Hello From Plugin Land"
+```
+
+This gives you a clean host/plugin boundary:
+
+- The host decides which plugin source is mounted
+- The isolate loads the plugin like a normal module
+- Only explicitly granted capabilities are available
+- The host gets back structured data, not direct access to plugin internals
+
+You can combine this with [TypeScript](/features/typescript) to type-check uploaded plugin code before enabling it.

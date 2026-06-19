@@ -1,0 +1,10 @@
+[package]
+name = "secure-exec-sidecar-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Browser-side Secure Exec sidecar scaffold"
+
+[dependencies]
+secure-exec-bridge = { path = "../bridge" }
+secure-exec-kernel = { path = "../kernel" }

@@ -1,0 +1,148 @@
+---
+title: Child Processes
+description: Spawn child processes from sandboxed code.
+---
+import { Aside, LinkCard } from '@astrojs/starlight/components';
+
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/child-processes.ts" description="Runnable example for child process spawning." />
+
+Sandboxed code can spawn child processes through the `CommandExecutor` interface, gated by the `childProcess` permission.
+
+## Runnable example
+
+```ts
+import {
+  NodeRuntime,
+  allowAllChildProcess,
+  createNodeDriver,
+  createNodeRuntimeDriverFactory,
+  type CommandExecutor,
+} from "../../../packages/secure-exec/src/index.ts";
+import { spawn } from "node:child_process";
+
+const commandExecutor: CommandExecutor = {
+  spawn(command, args, options) {
+    const resolvedCommand = command === "node" ? process.execPath : command;
+    const resolvedCwd = options.cwd === "/root" ? process.cwd() : options.cwd;
+    const child = spawn(resolvedCommand, args, {
+      cwd: resolvedCwd,
+      env: options.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    child.stdout.on("data", (chunk) => {
+      options.onStdout?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk) => {
+      options.onStderr?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+
+    return {
+      writeStdin(data) {
+        child.stdin.write(data);
+      },
+      closeStdin() {
+        child.stdin.end();
+      },
+      kill(signal) {
+        child.kill(signal);
+      },
+      wait() {
+        return new Promise<number>((resolve) => {
+          child.once("close", (code) => resolve(code ?? 1));
+        });
+      },
+    };
+  },
+};
+
+const runtime = new NodeRuntime({
+  systemDriver: createNodeDriver({
+    commandExecutor,
+    permissions: { ...allowAllChildProcess },
+  }),
+  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+});
+
+try {
+  const result = await runtime.exec(`
+    const { spawnSync } = require("node:child_process");
+
+    const child = spawnSync("node", ["--version"], {
+      encoding: "utf8",
+    });
+    const output =
+      typeof child.stdout === "string"
+        ? child.stdout
+        : Buffer.from(child.stdout || []).toString("utf8");
+
+    if (child.status !== 0 || !output.startsWith("v")) {
+      throw new Error("Unexpected child process exit code: " + child.status);
+    }
+  `);
+
+  if (result.code !== 0) {
+    throw new Error(`Unexpected execution result: ${JSON.stringify(result)}`);
+  }
+
+  console.log(
+    JSON.stringify({
+      ok: true,
+      summary: "sandbox spawned node --version successfully",
+    }),
+  );
+} finally {
+  runtime.dispose();
+}
+```
+
+Source: [examples/features/src/child-processes.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/child-processes.ts)
+
+## Permission gating
+
+Restrict which commands sandboxed code can spawn:
+
+```ts
+const driver = createNodeDriver({
+  permissions: {
+    childProcess: (req) => {
+      const allowed = ["node", "python3", "echo"];
+      return { allow: allowed.includes(req.command) };
+    },
+  },
+});
+```
+
+## Custom CommandExecutor
+
+Provide your own executor for full control over process spawning:
+
+```ts
+const driver = createNodeDriver({
+  commandExecutor: {
+    spawn(command, args, options) {
+      // Custom spawn logic
+      // Returns a ManagedProcess
+    },
+  },
+  permissions: {
+    childProcess: () => ({ allow: true }),
+  },
+});
+```
+
+## Process configuration
+
+Configure the process environment visible to sandboxed code:
+
+```ts
+const driver = createNodeDriver({
+  processConfig: {
+    cwd: "/app",
+    env: { NODE_ENV: "production" },
+    argv: ["node", "script.js"],
+  },
+});
+```
+
+<Aside type="note">Child processes are only available with the Node system driver. The browser driver does not support process spawning.</Aside>

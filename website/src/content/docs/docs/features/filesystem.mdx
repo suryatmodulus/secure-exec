@@ -1,0 +1,101 @@
+---
+title: Filesystem
+description: Filesystem backends for sandboxed code.
+---
+import { Aside, LinkCard } from '@astrojs/starlight/components';
+
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/filesystem.ts" description="Runnable example for filesystem backends." />
+
+secure-exec supports three filesystem backends. The system driver controls which backend sandboxed code uses.
+
+## Runnable example
+
+```ts
+import {
+  NodeRuntime,
+  allowAllFs,
+  createInMemoryFileSystem,
+  createNodeDriver,
+  createNodeRuntimeDriverFactory,
+} from "../../../packages/secure-exec/src/index.ts";
+
+const filesystem = createInMemoryFileSystem();
+const runtime = new NodeRuntime({
+  systemDriver: createNodeDriver({
+    filesystem,
+    permissions: { fs: allowAllFs },
+  }),
+  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+});
+
+try {
+  const result = await runtime.exec(`
+    const fs = require("node:fs");
+    fs.mkdirSync("/workspace", { recursive: true });
+    fs.writeFileSync("/workspace/hello.txt", "hello from the sandbox");
+  `);
+
+  if (result.code !== 0) {
+    throw new Error(`Unexpected execution result: ${JSON.stringify(result)}`);
+  }
+
+  const message = await filesystem.readTextFile("/workspace/hello.txt");
+
+  console.log(
+    JSON.stringify({
+      ok: message === "hello from the sandbox",
+      message,
+      summary: "sandbox wrote to the in-memory filesystem",
+    }),
+  );
+} finally {
+  runtime.dispose();
+}
+```
+
+Source: [examples/features/src/filesystem.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/filesystem.ts)
+
+## OPFS (browser)
+
+Persistent filesystem using the Origin Private File System API. This is the default for `createBrowserDriver()`.
+
+```ts
+import { createBrowserDriver } from "secure-exec/browser";
+
+// OPFS (default)
+const driver = await createBrowserDriver({ filesystem: "opfs" });
+
+// In-memory fallback
+const memDriver = await createBrowserDriver({ filesystem: "memory" });
+```
+
+<Aside type="note">OPFS does not support atomic rename operations.</Aside>
+
+## Node filesystem
+
+Thin wrapper around Node.js `fs/promises`. Provides real host filesystem access (gated by permissions).
+
+```ts
+import { NodeFileSystem } from "secure-exec";
+
+const fs = new NodeFileSystem({ root: "/path/to/sandbox-root" });
+```
+
+## VirtualFileSystem interface
+
+All backends implement this interface:
+
+| Method | Returns | Description |
+|---|---|---|
+| `readFile(path)` | `Promise<Uint8Array>` | Read file as bytes |
+| `readTextFile(path)` | `Promise<string>` | Read file as text |
+| `readDir(path)` | `Promise<string[]>` | List directory entries |
+| `readDirWithTypes(path)` | `Promise<DirEntry[]>` | List entries with type info |
+| `writeFile(path, content)` | `Promise<void>` | Write file |
+| `createDir(path)` | `Promise<void>` | Create directory |
+| `mkdir(path)` | `Promise<void>` | Create directory (alias) |
+| `exists(path)` | `Promise<boolean>` | Check if path exists |
+| `stat(path)` | `Promise<StatInfo>` | Get file metadata |
+| `removeFile(path)` | `Promise<void>` | Delete a file |
+| `removeDir(path)` | `Promise<void>` | Delete a directory |
+| `rename(old, new)` | `Promise<void>` | Rename a file or directory |

@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/jq",
+  "type": "wasm",
+  "description": "jq JSON processor",
+  "aptName": "jq",
+  "source": "rust"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/codex",
+  "type": "wasm",
+  "description": "OpenAI Codex command package (codex, codex-exec)",
+  "aptName": "codex",
+  "source": "rust"
+}

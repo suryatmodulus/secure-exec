@@ -147,7 +147,6 @@ jobs:
       - name: Build TypeScript packages
         run: |
           npx turbo build \
-            --filter='!./registry/software/*' \
             --filter='!./examples/*'
       - name: Finalize package versions for publish
         run: |

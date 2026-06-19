@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/curl",
+  "type": "wasm",
+  "description": "curl HTTP client",
+  "aptName": "curl",
+  "source": "c"
+}

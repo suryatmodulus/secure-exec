@@ -1,37 +1,30 @@
 {
-  "$schema": "https://turbo.build/schema.json",
-  "tasks": {
-    "build:bridge": {
-      "dependsOn": ["^build"],
-      "outputs": ["dist/bridge.js"]
-    },
-    "build:polyfills": {},
-    "build:isolate-runtime": {},
-    "build:generated": {
-      "dependsOn": ["build:bridge", "build:polyfills", "build:isolate-runtime"]
-    },
-    "build:wasm": {
-      "dependsOn": [],
-      "inputs": ["native/wasmvm/**/*.rs", "native/wasmvm/Cargo.toml", "native/wasmvm/patches/**"],
-      "outputs": ["native/wasmvm/target/wasm32-wasip1/release/multicall.opt.wasm"]
-    },
-    "build": {
-      "dependsOn": ["^build", "build:generated"],
-      "outputs": ["dist/**"]
-    },
-    "check-types": {
-      "dependsOn": ["^build", "build:generated"]
-    },
-    "test": {
-      "dependsOn": ["^build", "build:generated"]
-    },
-    "test:watch": {
-      "cache": false,
-      "persistent": true
-    },
-    "dev": {
-      "cache": false,
-      "persistent": true
-    }
-  }
+	"$schema": "https://turbo.build/schema.json",
+	"tasks": {
+		"//#fmt": {
+			"cache": false
+		},
+		"build": {
+			"dependsOn": ["^build"],
+			"inputs": [
+				"src/**",
+				"tsconfig.json",
+				"package.json"
+			],
+			"outputs": ["dist/**"]
+		},
+		"check-types": {
+			"inputs": [
+				"src/**",
+				"tests/**",
+				"tsconfig.json",
+				"package.json"
+			],
+			"dependsOn": ["^build"]
+		},
+		"test": {
+			"inputs": ["src/**", "tests/**", "package.json"],
+			"dependsOn": ["^build", "check-types"]
+		}
+	}
 }

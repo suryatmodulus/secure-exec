@@ -1,116 +1,194 @@
 {
-  "name": "@secure-exec/core",
-  "version": "0.2.1",
-  "type": "module",
-  "license": "Apache-2.0",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist",
-    "README.md"
-  ],
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
-    },
-    "./internal/bridge-setup": {
-      "types": "./dist/bridge-setup.d.ts",
-      "import": "./dist/bridge-setup.js",
-      "default": "./dist/bridge-setup.js"
-    },
-    "./internal/esm-compiler": {
-      "types": "./dist/esm-compiler.d.ts",
-      "import": "./dist/esm-compiler.js",
-      "default": "./dist/esm-compiler.js"
-    },
-    "./internal/fs-helpers": {
-      "types": "./dist/fs-helpers.d.ts",
-      "import": "./dist/fs-helpers.js",
-      "default": "./dist/fs-helpers.js"
-    },
-    "./internal/module-resolver": {
-      "types": "./dist/module-resolver.d.ts",
-      "import": "./dist/module-resolver.js",
-      "default": "./dist/module-resolver.js"
-    },
-    "./internal/package-bundler": {
-      "types": "./dist/package-bundler.d.ts",
-      "import": "./dist/package-bundler.js",
-      "default": "./dist/package-bundler.js"
-    },
-    "./internal/runtime": {
-      "types": "./dist/runtime.d.ts",
-      "import": "./dist/runtime.js",
-      "default": "./dist/runtime.js"
-    },
-    "./internal/python-runtime": {
-      "types": "./dist/python-runtime.d.ts",
-      "import": "./dist/python-runtime.js",
-      "default": "./dist/python-runtime.js"
-    },
-    "./internal/runtime-driver": {
-      "types": "./dist/runtime-driver.d.ts",
-      "import": "./dist/runtime-driver.js",
-      "default": "./dist/runtime-driver.js"
-    },
-    "./internal/types": {
-      "types": "./dist/types.d.ts",
-      "import": "./dist/types.js",
-      "default": "./dist/types.js"
-    },
-    "./internal/kernel": {
-      "types": "./dist/kernel/index.d.ts",
-      "import": "./dist/kernel/index.js",
-      "default": "./dist/kernel/index.js"
-    },
-    "./internal/generated/isolate-runtime": {
-      "types": "./dist/generated/isolate-runtime.d.ts",
-      "import": "./dist/generated/isolate-runtime.js",
-      "default": "./dist/generated/isolate-runtime.js"
-    },
-    "./internal/generated/polyfills": {
-      "types": "./dist/generated/polyfills.d.ts",
-      "import": "./dist/generated/polyfills.js",
-      "default": "./dist/generated/polyfills.js"
-    },
-    "./internal/shared/*": {
-      "types": "./dist/shared/*.d.ts",
-      "import": "./dist/shared/*.js",
-      "default": "./dist/shared/*.js"
-    },
-    "./test/vfs-conformance": {
-      "types": "./dist/test/vfs-conformance.d.ts",
-      "import": "./dist/test/vfs-conformance.js",
-      "default": "./dist/test/vfs-conformance.js"
-    },
-    "./test/block-store-conformance": {
-      "types": "./dist/test/block-store-conformance.d.ts",
-      "import": "./dist/test/block-store-conformance.js",
-      "default": "./dist/test/block-store-conformance.js"
-    },
-    "./test/metadata-store-conformance": {
-      "types": "./dist/test/metadata-store-conformance.d.ts",
-      "import": "./dist/test/metadata-store-conformance.js",
-      "default": "./dist/test/metadata-store-conformance.js"
-    }
-  },
-  "scripts": {
-    "check-types:src": "tsc --noEmit",
-    "check-types:isolate-runtime": "tsc -p tsconfig.isolate-runtime.json --noEmit",
-    "check-types": "pnpm run check-types:src && pnpm run check-types:isolate-runtime",
-    "build": "tsc",
-    "test": "vitest run"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^22.10.2",
-    "@xterm/headless": "^6.0.0",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
-  },
-  "dependencies": {
-    "better-sqlite3": "^12.8.0"
-  }
+	"name": "@secure-exec/core",
+	"version": "0.2.1",
+	"type": "module",
+	"license": "Apache-2.0",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist",
+		"fixtures",
+		"README.md"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./protocol": {
+			"types": "./dist/generated-protocol.d.ts",
+			"import": "./dist/generated-protocol.js",
+			"default": "./dist/generated-protocol.js"
+		},
+		"./vm-config": {
+			"types": "./dist/vm-config.d.ts",
+			"import": "./dist/vm-config.js",
+			"default": "./dist/vm-config.js"
+		},
+		"./binary": {
+			"types": "./dist/binary.d.ts",
+			"import": "./dist/binary.js",
+			"default": "./dist/binary.js"
+		},
+		"./bytes": {
+			"types": "./dist/bytes.d.ts",
+			"import": "./dist/bytes.js",
+			"default": "./dist/bytes.js"
+		},
+		"./callbacks": {
+			"types": "./dist/callbacks.d.ts",
+			"import": "./dist/callbacks.js",
+			"default": "./dist/callbacks.js"
+		},
+		"./cargo": {
+			"types": "./dist/cargo.d.ts",
+			"import": "./dist/cargo.js",
+			"default": "./dist/cargo.js"
+		},
+		"./descriptors": {
+			"types": "./dist/descriptors.d.ts",
+			"import": "./dist/descriptors.js",
+			"default": "./dist/descriptors.js"
+		},
+		"./ext": {
+			"types": "./dist/ext.d.ts",
+			"import": "./dist/ext.js",
+			"default": "./dist/ext.js"
+		},
+		"./event-buffer": {
+			"types": "./dist/event-buffer.d.ts",
+			"import": "./dist/event-buffer.js",
+			"default": "./dist/event-buffer.js"
+		},
+		"./process": {
+			"types": "./dist/process.d.ts",
+			"import": "./dist/process.js",
+			"default": "./dist/process.js"
+		},
+		"./sidecar-client": {
+			"types": "./dist/sidecar-client.d.ts",
+			"import": "./dist/sidecar-client.js",
+			"default": "./dist/sidecar-client.js"
+		},
+		"./test-runtime": {
+			"types": "./dist/test-runtime.d.ts",
+			"import": "./dist/test-runtime.js",
+			"default": "./dist/test-runtime.js"
+		},
+		"./native-client": {
+			"types": "./dist/native-client.d.ts",
+			"import": "./dist/native-client.js",
+			"default": "./dist/native-client.js"
+		},
+		"./response-payloads": {
+			"types": "./dist/response-payloads.d.ts",
+			"import": "./dist/response-payloads.js",
+			"default": "./dist/response-payloads.js"
+		},
+		"./request-payloads": {
+			"types": "./dist/request-payloads.d.ts",
+			"import": "./dist/request-payloads.js",
+			"default": "./dist/request-payloads.js"
+		},
+		"./state": {
+			"types": "./dist/state.d.ts",
+			"import": "./dist/state.js",
+			"default": "./dist/state.js"
+		},
+		"./ownership": {
+			"types": "./dist/ownership.d.ts",
+			"import": "./dist/ownership.js",
+			"default": "./dist/ownership.js"
+		},
+		"./permissions": {
+			"types": "./dist/permissions.d.ts",
+			"import": "./dist/permissions.js",
+			"default": "./dist/permissions.js"
+		},
+		"./protocol-schema": {
+			"types": "./dist/protocol-schema.d.ts",
+			"import": "./dist/protocol-schema.js",
+			"default": "./dist/protocol-schema.js"
+		},
+		"./protocol-maps": {
+			"types": "./dist/protocol-maps.d.ts",
+			"import": "./dist/protocol-maps.js",
+			"default": "./dist/protocol-maps.js"
+		},
+		"./protocol-frames": {
+			"types": "./dist/protocol-frames.d.ts",
+			"import": "./dist/protocol-frames.js",
+			"default": "./dist/protocol-frames.js"
+		},
+		"./protocol-client": {
+			"types": "./dist/protocol-client.d.ts",
+			"import": "./dist/protocol-client.js",
+			"default": "./dist/protocol-client.js"
+		},
+		"./framing": {
+			"types": "./dist/framing.d.ts",
+			"import": "./dist/framing.js",
+			"default": "./dist/framing.js"
+		},
+		"./frame-stream": {
+			"types": "./dist/frame-stream.d.ts",
+			"import": "./dist/frame-stream.js",
+			"default": "./dist/frame-stream.js"
+		},
+		"./frame-rpc": {
+			"types": "./dist/frame-rpc.d.ts",
+			"import": "./dist/frame-rpc.js",
+			"default": "./dist/frame-rpc.js"
+		},
+		"./frame-payload-codec": {
+			"types": "./dist/frame-payload-codec.d.ts",
+			"import": "./dist/frame-payload-codec.js",
+			"default": "./dist/frame-payload-codec.js"
+		},
+		"./filesystem": {
+			"types": "./dist/filesystem.d.ts",
+			"import": "./dist/filesystem.js",
+			"default": "./dist/filesystem.js"
+		},
+		"./json": {
+			"types": "./dist/json.d.ts",
+			"import": "./dist/json.js",
+			"default": "./dist/json.js"
+		},
+		"./kernel-proxy": {
+			"types": "./dist/kernel-proxy.d.ts",
+			"import": "./dist/kernel-proxy.js",
+			"default": "./dist/kernel-proxy.js"
+		},
+		"./numbers": {
+			"types": "./dist/numbers.d.ts",
+			"import": "./dist/numbers.js",
+			"default": "./dist/numbers.js"
+		},
+		"./correlation": {
+			"types": "./dist/correlation.d.ts",
+			"import": "./dist/correlation.js",
+			"default": "./dist/correlation.js"
+		},
+		"./fixtures/base-filesystem.json": {
+			"default": "./fixtures/base-filesystem.json"
+		}
+	},
+	"scripts": {
+		"build:protocol": "pnpm --dir ../build-tools build:protocol",
+		"build:vm-config": "cargo test -p secure-exec-vm-config --quiet",
+		"check-types": "pnpm run build:protocol && pnpm run build:vm-config && tsc --noEmit",
+		"build": "pnpm run build:protocol && pnpm run build:vm-config && tsc",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"@secure-exec/sidecar": "workspace:*",
+		"@rivetkit/bare-ts": "^0.6.2"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.2",
+		"typescript": "^5.7.2",
+		"vitest": "^2.1.8"
+	}
 }

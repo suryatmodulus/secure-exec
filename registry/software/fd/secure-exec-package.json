@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/fd",
+  "type": "wasm",
+  "description": "fd fast file finder",
+  "aptName": "fd-find",
+  "source": "rust"
+}

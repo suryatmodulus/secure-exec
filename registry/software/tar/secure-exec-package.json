@@ -1,0 +1,7 @@
+{
+  "name": "@agent-os-pkgs/tar",
+  "type": "wasm",
+  "description": "GNU tar archiver",
+  "aptName": "tar",
+  "source": "rust"
+}
