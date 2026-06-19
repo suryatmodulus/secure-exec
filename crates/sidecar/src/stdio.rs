@@ -33,7 +33,13 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc::{channel, unbounded_channel, Receiver};
 use tokio::time;
 
-const EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(5);
+// Guest sync fs/module RPCs are serviced by `pump_process_events` on this timer,
+// so a blocked guest call waits up to one interval before the host even sees it.
+// At 5ms this dominated per-call latency (~5ms/stat); 250us cuts it ~11x (stat
+// 7.5s -> ~0.65s over 1500 ops) and the sub-ms tokio timer is honored. Idle
+// pumps are cheap no-ops (try_recv + zero-timeout poll), so the higher cadence
+// costs negligible CPU when no guest is issuing RPCs.
+const EVENT_PUMP_INTERVAL: Duration = Duration::from_micros(250);
 const MAX_STDIN_FRAME_QUEUE: usize = 128;
 const MAX_EVENT_READY_QUEUE: usize = 1;
 const MAX_STDOUT_FRAME_QUEUE: usize = 128;
@@ -623,10 +629,13 @@ fn send_output_frame(
 }
 
 fn default_compile_cache_root() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "secure-exec-sidecar-compile-cache-{}",
-        std::process::id()
-    ))
+    // Stable across sidecar processes so V8 compile-cache (cachedData) survives a
+    // fresh sidecar/VM and benefits cold starts. Previously keyed by PID, which
+    // gave every process an empty cache — cold module imports never reused
+    // compiled bytecode. Entries are namespaced+validated downstream by
+    // `stable_compile_cache_namespace_hash` + V8's source/version checks, so a
+    // shared root is safe; stale or mismatched entries are simply ignored.
+    std::env::temp_dir().join("secure-exec-sidecar-compile-cache")
 }
 
 #[cfg(test)]
