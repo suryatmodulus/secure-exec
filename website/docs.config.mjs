@@ -77,29 +77,29 @@ export const siteConfig = {
 				// { slug: "docs/process-isolation", attrs: { "data-icon": "box" } },
 			],
 		},
-		{
-			label: "Reference",
-			items: [
-				// { slug: "docs/api-reference", attrs: { "data-icon": "book" } },
-				// { slug: "docs/nodejs-compatibility", attrs: { "data-icon": "check" } },
-				{ slug: "docs/benchmarks" },
-				// {
-				// 	label: "Comparison",
-				// 	items: [
-				// 		{ slug: "docs/comparison/sandbox", attrs: { "data-icon": "gitCompare" } },
-				// 		{ slug: "docs/comparison/cloudflare-workers", attrs: { "data-icon": "gitCompare" } },
-				// 	],
-				// },
-				// {
-				// 	label: "Advanced",
-				// 	items: [
-				// 		{ slug: "docs/cost-evaluation", attrs: { "data-icon": "dollar" } },
-				// 		{ slug: "docs/architecture", attrs: { "data-icon": "blocks" } },
-				// 		{ slug: "docs/security-model", attrs: { "data-icon": "lock" } },
-				// 	],
-				// },
-			],
-		},
+		// {
+		// 	label: "Reference",
+		// 	items: [
+		// 		{ slug: "docs/api-reference", attrs: { "data-icon": "book" } },
+		// 		{ slug: "docs/nodejs-compatibility", attrs: { "data-icon": "check" } },
+		// 		{ slug: "docs/benchmarks" },
+		// 		{
+		// 			label: "Comparison",
+		// 			items: [
+		// 				{ slug: "docs/comparison/sandbox", attrs: { "data-icon": "gitCompare" } },
+		// 				{ slug: "docs/comparison/cloudflare-workers", attrs: { "data-icon": "gitCompare" } },
+		// 			],
+		// 		},
+		// 		{
+		// 			label: "Advanced",
+		// 			items: [
+		// 				{ slug: "docs/cost-evaluation", attrs: { "data-icon": "dollar" } },
+		// 				{ slug: "docs/architecture", attrs: { "data-icon": "blocks" } },
+		// 				{ slug: "docs/security-model", attrs: { "data-icon": "lock" } },
+		// 			],
+		// 		},
+		// 	],
+		// },
 	],
 };
 

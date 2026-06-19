@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/media/secure-exec-logo.png" alt="Secure Exec" height="200" />
+  <img src="https://secureexec.dev/secure-exec-logo.png" alt="Secure Exec" height="200" />
 </p>
 
 <h3 align="center">Secure Node.js Execution Without a Sandbox</h3>
@@ -11,67 +11,11 @@
 </p>
 
 <p align="center">
-  <a href="https://secureexec.dev/docs">Documentation</a> — <a href="https://secureexec.dev/docs/api-reference">API Reference</a> — <a href="https://rivet.dev/discord">Discord</a>
+  <a href="https://secureexec.dev/docs">Documentation</a> — <a href="https://secureexec.dev/docs/sdk-overview">SDK Overview</a> — <a href="https://rivet.dev/discord">Discord</a>
 </p>
 
 ```
 npm install secure-exec
-```
-
-## Example: Kernel-first code execution
-
-Create a kernel, mount a Node runtime, and execute code in an isolated V8 sandbox.
-
-```typescript
-import { createKernel, createInMemoryFileSystem, createNodeRuntime } from "secure-exec";
-
-const kernel = createKernel({
-  filesystem: createInMemoryFileSystem(),
-});
-await kernel.mount(createNodeRuntime());
-
-const result = await kernel.exec("node -e \"console.log('hello from secure-exec')\"");
-console.log(result.stdout); // "hello from secure-exec\n"
-
-await kernel.dispose();
-```
-
-## Example: AI agent with secure code execution
-
-Give your agent the ability to write and run code safely. This example uses the Vercel AI SDK, but secure-exec works with any tool-use framework.
-
-```typescript
-import { generateText, stepCountIs, tool } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
-import { NodeRuntime, createNodeDriver, createNodeRuntimeDriverFactory } from "secure-exec";
-import { z } from "zod";
-
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    permissions: {
-      fs: () => ({ allow: true }),
-      network: () => ({ allow: true }),
-    },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  memoryLimit: 64,
-  cpuTimeLimitMs: 5000,
-});
-
-const { text } = await generateText({
-  model: anthropic("claude-sonnet-4-6"),
-  prompt: "Calculate the first 20 fibonacci numbers",
-  stopWhen: stepCountIs(5),
-  tools: {
-    execute: tool({
-      description: "Run JavaScript in a secure sandbox. Use export to return data.",
-      inputSchema: z.object({ code: z.string() }),
-      execute: async ({ code }) => runtime.run(code, "/entry.mjs"),
-    }),
-  },
-});
-
-console.log(text);
 ```
 
 ## Why Secure Exec
@@ -79,12 +23,95 @@ console.log(text);
 Give your AI agent the ability to write and run code safely.
 
 - **No infrastructure required** — No Docker daemon, no hypervisor, no orchestrator. Runs anywhere Node.js, Bun, or an HTML5 browser runs. Deploy to Lambda, a VPS, or a static site — your existing deployment works.
-- **Node.js & npm compatibility** — fs, child_process, http, dns, process, os — bridged to real host capabilities, not stubbed. Run Express, Hono, Next.js, and any npm package. [Compatibility matrix →](https://secureexec.dev/docs/nodejs-compatibility)
+- **Node.js & npm compatibility** — fs, child_process, http, dns, process, os — bridged to real host capabilities, not stubbed. Run Express, Hono, Next.js, and any npm package.
 - **Built for AI agents** — Give your AI agent the ability to write and run code safely. Works with the Vercel AI SDK, LangChain, and any tool-use framework.
 - **Deny-by-default permissions** — Filesystem, network, child processes, and env vars are all blocked unless explicitly allowed. Permissions are composable functions — grant read but not write, allow fetch but block spawn.
-- **Configurable resource limits** — CPU time budgets and memory caps. Runaway code is terminated deterministically with exit code 124 — no OOM crashes, no infinite loops, no host exhaustion.
+- **Configurable resource limits** — CPU time budgets and memory caps. Runaway code is terminated deterministically — no OOM crashes, no infinite loops, no host exhaustion.
 - **Powered by V8 isolates** — The same isolation primitive behind Cloudflare Workers for Platforms and every browser tab. Battle-tested at scale by the infrastructure you already trust.
 
+## Features
+
+- **[TypeScript](https://secureexec.dev/docs/features/typescript)** — Compile and type-check TypeScript inside the sandbox.
+- **[Permissions](https://secureexec.dev/docs/features/permissions)** — Control what sandboxed code can access on the host.
+- **[Filesystem & Mounts](https://secureexec.dev/docs/features/filesystem)** — Filesystem backends for sandboxed code.
+- **[Virtual Filesystem](https://secureexec.dev/docs/features/virtual-filesystem)** — A fully virtual filesystem inside the kernel, isolated from the host disk.
+- **[Networking](https://secureexec.dev/docs/features/networking)** — Network access for sandboxed code.
+- **[NPM & Module Loading](https://secureexec.dev/docs/features/module-loading)** — How sandboxed code resolves and loads modules.
+- **[Runtime & Platform](https://secureexec.dev/docs/features/runtime-platform)** — The host environment guest code sees, plus the platform ladder.
+- **[Output Capture](https://secureexec.dev/docs/features/output-capture)** — Capture console output from sandboxed code.
+- **[Resource Limits](https://secureexec.dev/docs/features/resource-limits)** — Bound and cancel guest execution with timeouts, memory, and CPU-time limits.
+- **[Child Processes](https://secureexec.dev/docs/features/child-processes)** — Spawn child processes from sandboxed code.
+
+## Quickstart
+
+**1. Install**
+
+```bash
+npm install secure-exec
+```
+
+**2. Create a runtime**
+
+`NodeRuntime.create()` boots a fully virtualized VM behind the native sidecar. Guest code runs inside the kernel isolation boundary with no host escapes. All options are optional: `cwd` defaults to `/home/user`, and permissions default to a secure policy that denies network access (see step 4).
+
+```ts
+import { NodeRuntime } from "secure-exec";
+
+const runtime = await NodeRuntime.create();
+```
+
+**3. Run code**
+
+Use `run()` when you want a JSON value back; the guest calls `globalThis.__return(value)` to set it. Use `exec()` when you care about side effects and want to capture `stdout`/`stderr`/`exitCode`. Guest code runs as an ES module, so `import` and top-level `await` both work.
+
+```ts
+import { NodeRuntime } from "secure-exec";
+
+// Boot a fully virtualized runtime. Guest code runs inside the kernel
+// isolation boundary - no host escapes.
+const runtime = await NodeRuntime.create();
+
+try {
+  // run() executes guest JavaScript as an ES module and returns the value the
+  // guest passes to globalThis.__return(). stdout/stderr are captured too.
+  const result = await runtime.run<{ message: string; sum: number }>(`
+    console.log("hello from secure-exec");
+    __return({ message: "hello from secure-exec", sum: 1 + 2 });
+  `);
+
+  console.log("stdout:", JSON.stringify(result.stdout.trim()));
+  console.log("value:", result.value);
+  console.log("exitCode:", result.exitCode);
+} finally {
+  // Tear down the VM and release the sidecar.
+  await runtime.dispose();
+}
+```
+
+**4. Configure permissions (optional)**
+
+Guest code is **deny-by-default**: the sandbox has no network access until you opt in (the filesystem and processes are fully virtualized and never touch the host). Pass a `permissions` policy to `NodeRuntime.create()` to open up capabilities. It merges over the secure default, so you only specify what you want to change.
+
+```ts
+const runtime = await NodeRuntime.create({
+  permissions: {
+    // Virtualized and enabled by default (these never touch the host):
+    fs: "allow",           // the in-VM filesystem
+    childProcess: "allow", // spawning processes inside the VM
+    process: "allow",      // process info (pid, cwd, ...)
+    env: "allow",          // environment variables
+    // Denied by default - opt in explicitly:
+    network: "allow",      // outbound network access
+    tool: "allow",         // host callbacks
+  },
+});
+```
+
+Set any scope to `"deny"` to lock it down. See [Permissions](https://secureexec.dev/docs/features/permissions) to learn more.
+
+*[See the full quickstart →](https://secureexec.dev/docs/quickstart)*
+
+<!--
 ## Benchmarks
 
 V8 isolates vs. sandboxes.
@@ -156,6 +183,7 @@ V8 isolates vs. sandboxes.
 
 [Our benchmarks →](https://secureexec.dev/docs/benchmarks) · [Full cost breakdown →](https://secureexec.dev/docs/cost-evaluation)
 </details>
+-->
 
 ## Secure Exec vs. Sandboxes
 
@@ -236,7 +264,7 @@ Yes. For orchestrating stateful, long-running tasks, we recommend pairing Secure
 <details>
 <summary>Does this have Node.js compatibility?</summary>
 
-Yes. Most Node.js core modules work — including fs, child_process, http, dns, process, and os. These are bridged to real host capabilities, not stubbed. [Compatibility matrix →](https://secureexec.dev/docs/nodejs-compatibility)
+Yes. Most Node.js core modules work — including fs, child_process, http, dns, process, and os. These are bridged to real host capabilities, not stubbed.
 </details>
 
 <details>
