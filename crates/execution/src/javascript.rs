@@ -62,15 +62,15 @@ const NODE_SYNC_RPC_DATA_BYTES_ENV: &str = "AGENT_OS_NODE_SYNC_RPC_DATA_BYTES";
 const NODE_SYNC_RPC_WAIT_TIMEOUT_MS_ENV: &str = "AGENT_OS_NODE_SYNC_RPC_WAIT_TIMEOUT_MS";
 static NEXT_V8_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const V8_HEAP_LIMIT_MB_ENV: &str = "AGENT_OS_V8_HEAP_LIMIT_MB";
-const V8_CPU_TIME_LIMIT_MS_ENV: &str = "AGENT_OS_V8_CPU_TIME_LIMIT_MS";
-/// Default per-execution CPU/wall-clock watchdog budget for guest JavaScript.
+/// Opt-in TRUE CPU-time budget (ms) for guest JavaScript. Unset/`0` => no limit.
 ///
 /// Guest inline code (e.g. `while (true) {}`) runs on the shared, slot-bounded V8
-/// runtime; without a watchdog it pins a CPU core and never releases its slot,
-/// starving peers. Arm a generous-but-finite default so a runaway guest is
-/// terminated instead of hanging the shared runtime. Operators can override (or
-/// disable, via `0`) with `AGENT_OS_V8_CPU_TIME_LIMIT_MS`.
-const V8_DEFAULT_CPU_TIME_LIMIT_MS: u32 = 30_000;
+/// runtime; with this set, a runaway burning CPU is terminated by the CPU-budget
+/// watchdog (which counts active JS CPU only, excluding idle/await). There is NO
+/// default: with this unset the guest runs CPU-uncapped by design — the
+/// platform/operator MUST set it to cap a guest. A wall-clock backstop is
+/// intentionally NOT part of this knob (deferred to a follow-up).
+const V8_CPU_TIME_LIMIT_MS_ENV: &str = "AGENT_OS_V8_CPU_TIME_LIMIT_MS";
 const NODE_SYNC_RPC_DEFAULT_DATA_BYTES: usize = 4 * 1024 * 1024;
 const NODE_SYNC_RPC_DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 const NODE_SYNC_RPC_RESPONSE_QUEUE_CAPACITY: usize = 1;
@@ -1879,17 +1879,18 @@ fn javascript_heap_limit_mb(request: &StartJavascriptExecutionRequest) -> u32 {
         .unwrap_or(0)
 }
 
-/// Resolve the CPU-time watchdog budget (ms) for a JavaScript execution.
+/// Resolve the opt-in TRUE CPU-time budget (ms) for a JavaScript execution.
 ///
-/// Defaults to [`V8_DEFAULT_CPU_TIME_LIMIT_MS`] so a CPU-bound guest is always
-/// terminated; operators may override via `AGENT_OS_V8_CPU_TIME_LIMIT_MS`. A
-/// value of `0` disables the watchdog (normalized to `None` by the V8 session).
+/// Opt-in with NO default: read from `AGENT_OS_V8_CPU_TIME_LIMIT_MS`, falling
+/// back to `0` (no limit) when unset/unparsable. `0` is normalized to `None` by
+/// the V8 session, so the CPU-budget watchdog is NOT armed and the guest runs
+/// CPU-uncapped. The platform/operator must set this to cap a guest.
 fn javascript_cpu_time_limit_ms(request: &StartJavascriptExecutionRequest) -> u32 {
     request
         .env
         .get(V8_CPU_TIME_LIMIT_MS_ENV)
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(V8_DEFAULT_CPU_TIME_LIMIT_MS)
+        .unwrap_or(0)
 }
 
 fn spawn_javascript_sync_rpc_timeout(
