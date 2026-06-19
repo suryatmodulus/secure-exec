@@ -1,86 +1,94 @@
 ---
 title: Plugin Systems
-description: Run user-authored plugins with explicit resource limits and permissions.
+description: Run user-authored plugins in isolation with explicit permissions.
 ---
 
-import { LinkCard } from '@astrojs/starlight/components';
+Let users upload scripts or extensions without risking your host. The host controls what plugin code runs, what capabilities are available, and what structured data comes back.
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/plugin-system" description="Full working example with sandboxed plugin execution." />
+## Run a plugin in isolation
 
-Let users upload scripts or extensions without risking your host. The host controls what code is loaded, what capabilities are available, and how much CPU or memory each plugin can use.
+The host owns the plugin source and the input. Run the plugin with `run()` inside a sandboxed VM and get a structured value back: the guest calls `globalThis.__return(value)` with any JSON-serializable value, and that value is decoded on the host as `result.value`.
 
-## Run a plugin from a virtual filesystem
-
-Store plugins in an in-memory filesystem and load them like regular modules. The plugin below gets filesystem access but no network or child-process permissions.
+The plugin below gets filesystem access but no network access. The guest proves it cannot reach the network, then transforms the host-supplied input.
 
 ```ts Plugin Runner
-import {
-  NodeRuntime,
-  allowAllFs,
-  createInMemoryFileSystem,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "secure-exec";
+import { NodeRuntime } from "secure-exec";
 
-const filesystem = createInMemoryFileSystem();
-await filesystem.mkdir("/plugins");
-await filesystem.writeFile(
-  "/plugins/title-case.js",
-  `
-    module.exports = {
-      manifest: {
-        name: "title-case",
-        version: "1.0.0",
-      },
-      transform(input, options = {}) {
-        const words = String(input)
-          .split(/\\s+/)
-          .filter(Boolean)
-          .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase());
-
-        return (options.prefix ?? "") + words.join(" ");
-      },
-    };
-  `
-);
-
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    filesystem,
-    permissions: { fs: allowAllFs },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  memoryLimit: 64,
-  cpuTimeLimitMs: 1000,
+// Boot a sandboxed VM for running untrusted plugin code. The plugin can use
+// the filesystem, but network access is denied. (childProcess/process stay
+// allowed because the kernel spawns the guest `node` process to run the
+// plugin - denying it would block the runtime itself.)
+const runtime = await NodeRuntime.create({
+  permissions: {
+    fs: "allow",
+    network: "deny",
+    childProcess: "allow",
+    process: "allow",
+    env: "allow",
+  },
 });
 
-const input = "hello from plugin land";
-const options = { prefix: "Plugin says: " };
+try {
+  // The host owns the plugin source and the input. Here the plugin is a
+  // title-case transformer; in a real system it would be uploaded by a user.
+  const pluginSource = `
+    function transform(input, options = {}) {
+      const words = String(input)
+        .split(/\\s+/)
+        .filter(Boolean)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+      return (options.prefix ?? "") + words.join(" ");
+    }
+    const manifest = { name: "title-case", version: "1.0.0" };
+  `;
 
-const result = await runtime.run<{
-  manifest: { name: string; version: string };
-  output: string;
-}>(`
-  const plugin = require("/plugins/title-case.js");
+  const input = "hello from plugin land";
+  const options = { prefix: "Plugin says: " };
 
-  module.exports = {
-    manifest: plugin.manifest,
-    output: plugin.transform(
-      ${JSON.stringify(input)},
-      ${JSON.stringify(options)}
-    ),
-  };
-`, "/root/run-plugin.js");
+  // Run the plugin in isolation and get a structured value back via run().
+  // The guest calls __return() with a JSON-serializable value, decoded on the
+  // host as result.value. The plugin also proves it cannot reach the network.
+  const { value, stdout, exitCode } = await runtime.run<{
+    manifest: { name: string; version: string };
+    output: string;
+    networkBlocked: boolean;
+  }>(`
+    ${pluginSource}
 
-console.log(result.exports?.manifest.name); // "title-case"
-console.log(result.exports?.output); // "Plugin says: Hello From Plugin Land"
+    console.log("running plugin:", manifest.name);
+
+    let networkBlocked = false;
+    try {
+      await fetch("http://example.com");
+    } catch {
+      networkBlocked = true;
+    }
+
+    __return({
+      manifest,
+      output: transform(${JSON.stringify(input)}, ${JSON.stringify(options)}),
+      networkBlocked,
+    });
+  `);
+
+  console.log("guest stdout:", stdout.trim());
+  console.log("exit code:", exitCode);
+  console.log("plugin name:", value?.manifest.name);
+  console.log("plugin version:", value?.manifest.version);
+  console.log("plugin output:", value?.output);
+  console.log("network blocked:", value?.networkBlocked);
+} finally {
+  await runtime.dispose();
+}
 ```
+
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-plugin-systems)*
 
 This gives you a clean host/plugin boundary:
 
-- The host decides which plugin source is mounted
-- The isolate loads the plugin like a normal module
-- Only explicitly granted capabilities are available
-- The host gets back structured data, not direct access to plugin internals
+- The host decides which plugin source runs
+- The plugin executes inside the kernel isolation boundary
+- Only explicitly granted capabilities are available; here, network access is denied
+- The host gets back structured data via `__return()`, not direct access to plugin internals
 
-You can combine this with [TypeScript](/features/typescript) to type-check uploaded plugin code before enabling it.
+You can combine this with [TypeScript](/docs/features/typescript) to type-check uploaded plugin code before enabling it.

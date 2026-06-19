@@ -1,0 +1,951 @@
+/**
+ * NodeRuntime — ergonomic façade for running guest JavaScript end-to-end.
+ *
+ * Boots a fully virtualized VM (via the native sidecar) and runs guest Node
+ * programs with minimal boilerplate. All of the sidecar spawn, session
+ * handshake, VM creation, root filesystem bootstrap, runtime-driver mounting,
+ * and lifecycle waiting are hidden behind `NodeRuntime.create()`.
+ *
+ * ```ts
+ * const rt = await NodeRuntime.create();
+ * const { stdout, exitCode } = await rt.exec("console.log('hi', 1 + 1)");
+ * await rt.dispose();
+ * ```
+ *
+ * Guest code is written to an ESM module inside the VM and executed as
+ * `node <file>` through the kernel, so all execution stays inside the kernel
+ * isolation boundary — no host escapes, no real Node.js builtins for guest
+ * work.
+ */
+
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type {
+	ExecResult,
+	HostToolDefinition,
+	Kernel,
+	Permissions,
+} from "./test-runtime.js";
+import {
+	createInMemoryFileSystem,
+	createKernel,
+	createNodeRuntime,
+	createWasmVmRuntime,
+	NodeFileSystem,
+} from "./test-runtime.js";
+
+export type { HostToolDefinition, HostToolExample } from "./test-runtime.js";
+
+/** Repository root, used to locate the bundled WASM command binaries. */
+const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+
+/**
+ * Directory containing the WASM coreutils/shell command binaries that provide
+ * the guest `sh` the kernel needs to drive `exec()`. Built from the in-repo
+ * Rust command sources.
+ */
+const DEFAULT_COMMANDS_DIR = path.join(
+	REPO_ROOT,
+	"registry/native/target/wasm32-wasip1/release/commands",
+);
+
+/**
+ * Secure-by-default permission policy applied when the caller passes no
+ * `permissions`. Outward-facing capabilities are denied: there is **no network
+ * access** (and no host callbacks) by default — guest code cannot reach the
+ * network until you opt in. The filesystem, child-process, process, and env
+ * scopes are allowed because they are fully virtualized (the guest only ever
+ * sees the VM's in-memory filesystem and kernel-managed processes, never the
+ * real host) and are required for the runtime to execute a guest program at
+ * all. Tighten or widen any scope by passing your own `permissions`.
+ */
+const DEFAULT_PERMISSIONS: Permissions = {
+	fs: "allow",
+	childProcess: "allow",
+	process: "allow",
+	env: "allow",
+	network: "deny",
+};
+
+/** Options for {@link NodeRuntime.create}. */
+export interface NodeRuntimeCreateOptions {
+	/** Environment variables visible to guest processes. */
+	env?: Record<string, string>;
+	/** Initial working directory for guest processes. Defaults to `/home/user`. */
+	cwd?: string;
+	/**
+	 * Permission policy for the VM. Merged over a secure default that **denies
+	 * network access** (guest code cannot reach the network until you opt in);
+	 * the virtualized filesystem and processes stay enabled so programs run.
+	 * Because it merges, a partial policy works: `{ network: "allow" }` grants
+	 * the network while keeping the execution essentials. Pass a fuller policy
+	 * (rule sets) to further sandbox individual scopes.
+	 */
+	permissions?: Permissions;
+	/**
+	 * Override the directory containing the WASM command binaries (the source of
+	 * the guest `sh`). Defaults to the in-repo build output, or the
+	 * `SECURE_EXEC_WASM_COMMANDS_DIR` environment variable when set.
+	 */
+	commandsDir?: string;
+	/**
+	 * Files to seed into the VM's virtual filesystem before the guest runs,
+	 * keyed by absolute guest path. Parent directories are created as needed.
+	 * Use this to project host assets, npm packages, or fixtures into the
+	 * sandbox so guest code can `import`/`require`/read them. The bytes are
+	 * copied into the VM's in-memory filesystem; the host filesystem is never
+	 * exposed to the guest.
+	 *
+	 * ```ts
+	 * const rt = await NodeRuntime.create({
+	 *   files: { "/root/data.json": '{"ok":true}' },
+	 * });
+	 * ```
+	 */
+	files?: Record<string, string | Uint8Array>;
+	/**
+	 * Host directories to project into the VM's virtual filesystem, Docker-style.
+	 * Each mount makes a host directory readable at a guest path. Files are read
+	 * lazily from the host as the guest accesses them, so large trees (for
+	 * example a `node_modules` package such as the TypeScript compiler) are
+	 * projected without copying their bytes up front. The guest sees only the
+	 * mounted subtree, never the wider host filesystem.
+	 *
+	 * ```ts
+	 * const rt = await NodeRuntime.create({
+	 *   mounts: [
+	 *     {
+	 *       guestPath: "/root/node_modules/typescript",
+	 *       hostPath: "/abs/path/to/node_modules/typescript",
+	 *       readOnly: true,
+	 *     },
+	 *   ],
+	 * });
+	 * ```
+	 */
+	mounts?: HostDirectoryMount[];
+	/**
+	 * Host-side tools the guest can invoke as shell commands. Each entry is
+	 * registered as a named guest command; when the guest runs it, the
+	 * invocation round-trips back to the host and runs the tool's `handler`,
+	 * whose return value is delivered back to the guest. This is how you give
+	 * sandboxed guest code controlled, named host capabilities (the kind an AI
+	 * agent calls as tools) without granting it the underlying access directly.
+	 *
+	 * The guest invokes a tool by name with JSON input:
+	 *
+	 * ```ts
+	 * const rt = await NodeRuntime.create({
+	 *   tools: {
+	 *     add: {
+	 *       description: "Add two numbers",
+	 *       inputSchema: {
+	 *         type: "object",
+	 *         properties: { a: { type: "number" }, b: { type: "number" } },
+	 *         required: ["a", "b"],
+	 *       },
+	 *       handler: ({ a, b }: { a: number; b: number }) => ({ sum: a + b }),
+	 *     },
+	 *   },
+	 * });
+	 * await rt.exec(`
+	 *   import { execFileSync } from "node:child_process";
+	 *   const out = execFileSync("add", ["add", "--json", JSON.stringify({ a: 2, b: 3 })]);
+	 *   console.log(out.toString());
+	 * `);
+	 * ```
+	 *
+	 * When `tools` is provided and no `tool` permission scope is set, the `tool`
+	 * scope is granted so the registered tools are invocable; pass your own
+	 * `permissions.tool` policy to gate individual tools.
+	 */
+	tools?: Record<string, HostToolDefinition>;
+	/**
+	 * Guest-bound ports that may accept non-loopback connections. By default a
+	 * guest server is reachable only over loopback inside the VM; listing a port
+	 * here lifts that restriction for that port, letting connections from outside
+	 * the loopback interface reach it. Use this for guests that run servers which
+	 * must accept external connections (for example a dev server you expose
+	 * beyond loopback).
+	 *
+	 * ```ts
+	 * const rt = await NodeRuntime.create({
+	 *   permissions: { network: "allow" },
+	 *   loopbackExemptPorts: [3000],
+	 * });
+	 * ```
+	 */
+	loopbackExemptPorts?: number[];
+}
+
+/** A host directory projected into the VM's virtual filesystem. */
+export interface HostDirectoryMount {
+	/** Absolute guest path the directory appears at inside the VM. */
+	guestPath: string;
+	/** Absolute host directory to project (read through the VFS, lazily). */
+	hostPath: string;
+	/** Mount read-only (the default). Pass `false` to allow guest writes. */
+	readOnly?: boolean;
+}
+
+/** Result of {@link NodeRuntime.exec}. */
+export interface NodeRuntimeExecResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+
+/** Options for a single {@link NodeRuntime.exec} call. */
+export interface NodeRuntimeExecOptions {
+	/** Extra environment variables for this run, merged over the VM env. */
+	env?: Record<string, string>;
+	/** Working directory for this run. */
+	cwd?: string;
+	/** Data piped to the guest program's stdin. */
+	stdin?: string | Uint8Array;
+	/** Abort the run after this many milliseconds. */
+	timeout?: number;
+	/**
+	 * Cancel the run when this signal aborts. On abort the guest process is
+	 * killed inside the VM (the kernel delivers `SIGTERM`) and the call rejects
+	 * with the signal's abort reason. Use this to cancel an in-flight run from
+	 * the outside, for example to enforce your own deadline or stop work when a
+	 * request is canceled.
+	 *
+	 * ```ts
+	 * const controller = new AbortController();
+	 * const pending = rt.exec("while (true) {}", { signal: controller.signal });
+	 * controller.abort();
+	 * await pending.catch((err) => console.log(err.name)); // "AbortError"
+	 * ```
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Called with each chunk the guest writes to stdout as it is produced,
+	 * letting you observe output incrementally instead of waiting for the run to
+	 * finish. Chunks arrive as raw bytes; decode with a `TextDecoder` for text.
+	 * The complete output is still returned as `result.stdout` when the run ends.
+	 */
+	onStdout?: (chunk: Uint8Array) => void;
+	/**
+	 * Called with each chunk the guest writes to stderr as it is produced,
+	 * letting you observe output incrementally instead of waiting for the run to
+	 * finish. Chunks arrive as raw bytes; decode with a `TextDecoder` for text.
+	 * The complete output is still returned as `result.stderr` when the run ends.
+	 */
+	onStderr?: (chunk: Uint8Array) => void;
+}
+
+/** The HTTP request {@link NodeRuntime.fetch} drives into the VM. */
+export interface NodeRuntimeFetchInput {
+	/** HTTP method. Defaults to `GET`. */
+	method?: string;
+	/** Request path (and query), e.g. `/api/users?limit=10`. */
+	path: string;
+	/** Request headers. */
+	headers?: Record<string, string>;
+	/** Request body. */
+	body?: string | Uint8Array;
+}
+
+/** The HTTP response {@link NodeRuntime.fetch} returns from the VM. */
+export interface NodeRuntimeFetchResponse {
+	/** HTTP status code, e.g. `200`. */
+	status: number;
+	/** HTTP status text, e.g. `OK`. */
+	statusText: string;
+	/** Response headers, lower-cased by name. */
+	headers: Record<string, string>;
+	/** Response body decoded as UTF-8 text. */
+	body: string;
+}
+
+/**
+ * Options for {@link NodeRuntime.spawn}. Inherits the streaming `onStdout` /
+ * `onStderr` hooks from {@link NodeRuntimeExecOptions}.
+ */
+export interface NodeRuntimeSpawnOptions extends NodeRuntimeExecOptions {}
+
+/**
+ * Describes the guest TCP listener to wait for with
+ * {@link NodeRuntime.waitForListener} or look up with
+ * {@link NodeRuntime.findListener}. A listener matches when a guest process is
+ * accepting connections on the given `port` (and `host`/`path` when supplied).
+ */
+export interface NodeRuntimeListenerQuery {
+	/** TCP port the guest listener is bound to, e.g. `3000`. */
+	port: number;
+	/** Bind host to match, e.g. `127.0.0.1`. Omit to match any host. */
+	host?: string;
+	/** Unix socket path to match, for path-bound listeners. */
+	path?: string;
+}
+
+/**
+ * A matched guest listener returned by {@link NodeRuntime.waitForListener} and
+ * {@link NodeRuntime.findListener}. `processId` identifies the guest process
+ * that owns the listening socket; the `host`/`port`/`path` it is bound to are
+ * reported when known.
+ */
+export interface NodeRuntimeListener {
+	/** The guest process id that owns the listening socket. */
+	processId: string;
+	/** The host the listener is bound to, when reported. */
+	host?: string;
+	/** The port the listener is bound to, when reported. */
+	port?: number;
+	/** The unix socket path the listener is bound to, when reported. */
+	path?: string;
+}
+
+/** Options for {@link NodeRuntime.waitForListener}. */
+export interface NodeRuntimeWaitForListenerOptions {
+	/**
+	 * Give up after this many milliseconds and reject. Defaults to 10000. The
+	 * wait also rejects if the bound `signal` aborts first.
+	 */
+	timeoutMs?: number;
+	/** Abort the wait early; the returned promise rejects when it fires. */
+	signal?: AbortSignal;
+	/**
+	 * How long to wait between listener lookups while polling, in milliseconds.
+	 * Defaults to 50.
+	 */
+	pollIntervalMs?: number;
+}
+
+/**
+ * A live handle to a guest process started with {@link NodeRuntime.spawn}.
+ *
+ * Unlike {@link NodeRuntime.exec}, which runs a program to completion and
+ * returns its captured output, a handle is returned immediately while the
+ * process keeps running. Use it to stream stdout/stderr, feed stdin, signal or
+ * kill the process, and await its exit. This is the building block for
+ * long-running guests such as dev servers: start one here, then drive requests
+ * into it with {@link NodeRuntime.fetch}.
+ */
+export interface NodeRuntimeProcess {
+	/** The guest process id. */
+	readonly pid: number;
+	/** Write data to the guest process's stdin. */
+	writeStdin(data: string | Uint8Array): void;
+	/** Close the guest process's stdin, signalling end-of-input. */
+	closeStdin(): void;
+	/**
+	 * Send a signal to the guest process. Defaults to `SIGTERM`. Accepts a
+	 * signal name (e.g. `"SIGKILL"`) or a raw signal number.
+	 */
+	kill(signal?: NodeJS.Signals | number): void;
+	/** Resolve with the guest process's exit code once it terminates. */
+	wait(): Promise<number>;
+	/** The exit code once the process has exited, or `null` while it runs. */
+	readonly exitCode: number | null;
+}
+
+/** Result of {@link NodeRuntime.run}. */
+export interface NodeRuntimeRunResult<T = unknown> {
+	/** The JSON-decoded value the guest produced, when the run succeeded. */
+	value?: T;
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+
+let nextProgramId = 0;
+
+/**
+ * Ergonomic, batteries-included runtime for executing guest JavaScript.
+ *
+ * Construct one with {@link NodeRuntime.create}, run programs with
+ * {@link NodeRuntime.exec} / {@link NodeRuntime.run}, and release the VM with
+ * {@link NodeRuntime.dispose}. A single instance can run many programs; each
+ * call executes a fresh guest process.
+ */
+export class NodeRuntime {
+	private constructor(private readonly kernel: Kernel) {}
+
+	/**
+	 * Boot a VM and return a ready-to-use runtime. Spawns the sidecar, opens a
+	 * session, creates the VM with a bootstrapped root filesystem, mounts the
+	 * shell and Node runtimes, and waits for the VM to report ready.
+	 */
+	static async create(
+		options: NodeRuntimeCreateOptions = {},
+	): Promise<NodeRuntime> {
+		const commandsDir =
+			options.commandsDir ??
+			process.env.SECURE_EXEC_WASM_COMMANDS_DIR ??
+			DEFAULT_COMMANDS_DIR;
+
+		// Seed caller-provided files into the VM's in-memory filesystem before
+		// boot so they are part of the root filesystem snapshot the guest sees
+		// (e.g. projected npm packages or fixtures). The host filesystem is
+		// never exposed; only these bytes are copied in.
+		const filesystem = createInMemoryFileSystem();
+		if (options.files) {
+			for (const [filePath, content] of Object.entries(options.files)) {
+				await filesystem.writeFile(filePath, content);
+			}
+		}
+
+		// Project host directories into the VM, Docker-style. NodeFileSystem
+		// reads lazily through the VFS so large trees never traverse the
+		// protocol frame as a single blob.
+		const mounts = (options.mounts ?? []).map((mount) => ({
+			path: mount.guestPath,
+			fs: new NodeFileSystem({ root: mount.hostPath }),
+			readOnly: mount.readOnly ?? true,
+		}));
+
+		// Grant the `tool` scope when the caller registers tools but does not set
+		// their own tool policy, so the registered tools are actually invocable.
+		const toolDefaults =
+			options.tools &&
+			Object.keys(options.tools).length > 0 &&
+			options.permissions?.tool === undefined
+				? { tool: "allow" as const }
+				: {};
+
+		const kernel = createKernel({
+			filesystem,
+			mounts: mounts.length > 0 ? mounts : undefined,
+			// Merge the caller's policy over the secure default so partial
+			// opt-ins work: `{ network: "allow" }` enables the network while the
+			// execution essentials (fs/childProcess/process/env) stay granted.
+			permissions: {
+				...DEFAULT_PERMISSIONS,
+				...toolDefaults,
+				...options.permissions,
+			},
+			env: options.env,
+			cwd: options.cwd,
+			loopbackExemptPorts: options.loopbackExemptPorts,
+		});
+
+		try {
+			// The shell runtime provides `sh` plus coreutils; the Node runtime
+			// provides the real V8-backed `node`. `sh` is REQUIRED to spawn any
+			// process: the kernel runs every command through a shell, so without
+			// `sh` nothing can be spawned, including the guest `node` program we
+			// run here and any child the guest spawns via node:child_process.
+			await kernel.mount(createWasmVmRuntime({ commandDirs: [commandsDir] }));
+			await kernel.mount(createNodeRuntime());
+
+			// Register host tools after the runtimes are mounted so they are
+			// installed as guest commands the moment the VM is ready.
+			if (options.tools && Object.keys(options.tools).length > 0) {
+				await kernel.registerHostTools(options.tools);
+			}
+		} catch (error) {
+			await kernel.dispose().catch(() => {});
+			throw error;
+		}
+
+		return new NodeRuntime(kernel);
+	}
+
+	/**
+	 * Run `code` as a guest Node program and capture its output.
+	 *
+	 * The source is written to an ES module inside the VM and executed with
+	 * `node <file>`; it runs as standard ESM (top-level `await`, `import`).
+	 */
+	async exec(
+		code: string,
+		options: NodeRuntimeExecOptions = {},
+	): Promise<NodeRuntimeExecResult> {
+		const programPath = `/tmp/secure-exec-program-${nextProgramId++}.mjs`;
+		await this.kernel.writeFile(programPath, code);
+		return this.runProgram(programPath, options);
+	}
+
+	/**
+	 * Run an already-written guest program file to completion and capture its
+	 * output, honoring a caller-supplied `signal` for cancellation.
+	 *
+	 * Without a `signal`, this runs the program through the shell (`node <file>`)
+	 * exactly as before. With a `signal`, it starts the program as a guest
+	 * process so the run can be cancelled: when the signal aborts, the process is
+	 * killed inside the VM (the kernel delivers `SIGTERM`) and the call rejects
+	 * with the signal's abort reason.
+	 */
+	private async runProgram(
+		programPath: string,
+		options: NodeRuntimeExecOptions,
+	): Promise<NodeRuntimeExecResult> {
+		const signal = options.signal;
+		if (!signal) {
+			const result = await this.kernel.exec(`node ${programPath}`, {
+				env: options.env,
+				cwd: options.cwd,
+				stdin: options.stdin,
+				timeout: options.timeout,
+				onStdout: options.onStdout,
+				onStderr: options.onStderr,
+			});
+			return toExecResult(result);
+		}
+
+		if (signal.aborted) {
+			throw toAbortError(signal);
+		}
+
+		// A signal was supplied, so run the program as a guest process we can
+		// kill: aborting the signal maps to a kernel kill of the underlying
+		// process. Aggregate the streamed output ourselves to reproduce the
+		// run-to-completion result that the shell path returns.
+		const stdoutChunks: Uint8Array[] = [];
+		const stderrChunks: Uint8Array[] = [];
+		const proc = this.kernel.spawn("node", [programPath], {
+			env: options.env,
+			cwd: options.cwd,
+			onStdout: (chunk) => {
+				stdoutChunks.push(chunk);
+				options.onStdout?.(chunk);
+			},
+			onStderr: (chunk) => {
+				stderrChunks.push(chunk);
+				options.onStderr?.(chunk);
+			},
+			streamStdin: options.stdin !== undefined,
+		});
+
+		if (options.stdin !== undefined) {
+			proc.writeStdin(options.stdin);
+			proc.closeStdin();
+		}
+
+		const onAbort = () => {
+			// Deliver SIGTERM to cancel the in-flight run inside the VM.
+			proc.kill(toSignalNumber("SIGTERM"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		if (options.timeout !== undefined) {
+			timer = setTimeout(() => {
+				proc.kill(toSignalNumber("SIGKILL"));
+			}, options.timeout);
+		}
+
+		try {
+			const exitCode = await proc.wait();
+			if (signal.aborted) {
+				throw toAbortError(signal);
+			}
+			return {
+				stdout: decodeChunks(stdoutChunks),
+				stderr: decodeChunks(stderrChunks),
+				exitCode,
+			};
+		} finally {
+			if (timer !== undefined) {
+				clearTimeout(timer);
+			}
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	/**
+	 * Start `code` as a long-running guest Node program and return a live handle
+	 * to it, without waiting for it to finish.
+	 *
+	 * The source is written to an ES module inside the VM and started with
+	 * `node <file>`; it runs as standard ESM (top-level `await`, `import`). The
+	 * returned {@link NodeRuntimeProcess} lets you stream output, write to stdin,
+	 * signal or kill the process, and await its exit. Pass `onStdout`/`onStderr`
+	 * to receive output chunks as they are produced.
+	 *
+	 * Use this for guests that do not run to completion, such as a dev server you
+	 * later drive with {@link NodeRuntime.fetch}:
+	 *
+	 * ```ts
+	 * const server = await rt.spawn(`
+	 *   import http from "node:http";
+	 *   http.createServer((_, res) => res.end("ok")).listen(3000);
+	 * `);
+	 * const res = await rt.fetch(3000, { path: "/" });
+	 * server.kill();
+	 * await server.wait();
+	 * ```
+	 */
+	async spawn(
+		code: string,
+		options: NodeRuntimeSpawnOptions = {},
+	): Promise<NodeRuntimeProcess> {
+		const programPath = `/tmp/secure-exec-program-${nextProgramId++}.mjs`;
+		await this.kernel.writeFile(programPath, code);
+		const proc = this.kernel.spawn("node", [programPath], {
+			env: options.env,
+			cwd: options.cwd,
+			onStdout: options.onStdout,
+			onStderr: options.onStderr,
+			// Keep stdin open so callers can stream input via writeStdin and signal
+			// end-of-input with closeStdin.
+			streamStdin: true,
+		});
+		return {
+			pid: proc.pid,
+			writeStdin(data) {
+				proc.writeStdin(data);
+			},
+			closeStdin() {
+				proc.closeStdin();
+			},
+			kill(signal) {
+				proc.kill(toSignalNumber(signal));
+			},
+			wait() {
+				return proc.wait();
+			},
+			get exitCode() {
+				return proc.exitCode;
+			},
+		};
+	}
+
+	/**
+	 * Run `code` and return the JSON-serializable value it produces.
+	 *
+	 * The guest exposes a `__return(value)` function; call it with a
+	 * JSON-serializable value and that value is decoded on the host as
+	 * `result.value`. If `__return` is never called the value is `undefined`.
+	 * stdout/stderr/exitCode are still captured.
+	 */
+	async run<T = unknown>(
+		code: string,
+		options: NodeRuntimeExecOptions = {},
+	): Promise<NodeRuntimeRunResult<T>> {
+		const id = nextProgramId++;
+		const resultPath = `/tmp/secure-exec-result-${id}.json`;
+		const programPath = `/tmp/secure-exec-program-${id}.mjs`;
+		// Inject the __return helper as a module-level preamble, then the user
+		// code at module top level. Import declarations (preamble's and the
+		// user's) are hoisted, so __return is defined before the user's
+		// executable code runs — and the user keeps full ESM semantics
+		// (top-level `import` and top-level `await` both work). Do NOT wrap the
+		// user code in an IIFE: that would push their top-level `import`
+		// statements inside a function and make them a SyntaxError.
+		const wrapped = [
+			`import { writeFileSync as __writeFileSync } from "node:fs";`,
+			`globalThis.__return = (value) => {`,
+			`  __writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(value === undefined ? null : value));`,
+			`};`,
+			code,
+		].join("\n");
+		await this.kernel.writeFile(programPath, wrapped);
+		const exec = await this.runProgram(programPath, options);
+
+		let value: T | undefined;
+		if (exec.exitCode === 0) {
+			try {
+				const bytes = await this.kernel.readFile(resultPath);
+				value = JSON.parse(new TextDecoder().decode(bytes)) as T;
+			} catch {
+				// No __return() call (or unreadable result): leave value undefined.
+			}
+		}
+
+		return { ...exec, value };
+	}
+
+	/**
+	 * Drive an HTTP request to a guest HTTP server listening inside the VM and
+	 * read the response back on the host.
+	 *
+	 * Point this at a port a guest program is serving, for example a dev server
+	 * started with {@link NodeRuntime.exec}. The
+	 * request and response never leave the VM: the connection is made to the
+	 * guest's loopback listener through the kernel socket table, so this works
+	 * even when guest network egress is denied.
+	 *
+	 * ```ts
+	 * const res = await rt.fetch(3000, { path: "/health" });
+	 * console.log(res.status, res.body);
+	 * ```
+	 */
+	async fetch(
+		port: number,
+		input: NodeRuntimeFetchInput,
+	): Promise<NodeRuntimeFetchResponse> {
+		const body =
+			input.body === undefined
+				? undefined
+				: typeof input.body === "string"
+					? input.body
+					: new TextDecoder().decode(input.body);
+		const responseJson = await this.kernel.vmFetch({
+			port,
+			method: input.method ?? "GET",
+			path: input.path,
+			headersJson: JSON.stringify(input.headers ?? {}),
+			body,
+		});
+		return parseFetchResponse(responseJson);
+	}
+
+	/**
+	 * Look up a guest TCP listener once and return it, or `null` when nothing is
+	 * listening yet.
+	 *
+	 * This is the immediate, non-blocking check behind
+	 * {@link NodeRuntime.waitForListener}: it asks the kernel socket table
+	 * whether a guest process is accepting connections on the requested `port`
+	 * (optionally narrowed by `host`/`path`) and returns the match, or `null` if
+	 * none is up. Use {@link NodeRuntime.waitForListener} when you want to block
+	 * until one appears.
+	 *
+	 * ```ts
+	 * const listener = rt.findListener({ port: 3000 });
+	 * if (listener) console.log("up on pid", listener.processId);
+	 * ```
+	 */
+	findListener(query: NodeRuntimeListenerQuery): NodeRuntimeListener | null {
+		const match = this.kernel.socketTable.findListener({
+			port: query.port,
+			...(query.host !== undefined ? { host: query.host } : {}),
+			...(query.path !== undefined ? { path: query.path } : {}),
+		}) as NodeRuntimeListener | null;
+		return match ?? null;
+	}
+
+	/**
+	 * Block until a guest TCP listener is accepting connections on the requested
+	 * `port` (optionally narrowed by `host`/`path`), then resolve with it.
+	 *
+	 * This is the companion to {@link NodeRuntime.spawn} and
+	 * {@link NodeRuntime.fetch} for dev-server scenarios: start a server, wait
+	 * until it is actually listening, then drive requests into it. The kernel
+	 * socket table is polled until a matching listener appears or the wait is
+	 * cut short. If `timeoutMs` elapses (default 10000) or the supplied `signal`
+	 * aborts first, the returned promise rejects.
+	 *
+	 * ```ts
+	 * const server = await rt.spawn(`
+	 *   import http from "node:http";
+	 *   http.createServer((_, res) => res.end("ok")).listen(3000);
+	 * `);
+	 * const listener = await rt.waitForListener({ port: 3000 });
+	 * const res = await rt.fetch(listener.port ?? 3000, { path: "/" });
+	 * server.kill();
+	 * await server.wait();
+	 * ```
+	 */
+	async waitForListener(
+		query: NodeRuntimeListenerQuery,
+		options: NodeRuntimeWaitForListenerOptions = {},
+	): Promise<NodeRuntimeListener> {
+		const timeoutMs = options.timeoutMs ?? 10_000;
+		const pollIntervalMs = options.pollIntervalMs ?? 50;
+		const signal = options.signal;
+		const deadline = Date.now() + timeoutMs;
+
+		for (;;) {
+			if (signal?.aborted) {
+				throw toAbortError(signal);
+			}
+
+			const match = this.findListener(query);
+			if (match) {
+				return match;
+			}
+
+			if (Date.now() >= deadline) {
+				throw new Error(
+					`Timed out after ${timeoutMs}ms waiting for a listener on port ${query.port}`,
+				);
+			}
+
+			await delayUntil(
+				Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())),
+				signal,
+			);
+		}
+	}
+
+	/**
+	 * Register host-side tools the guest can invoke as shell commands, after the
+	 * VM is already running. Each entry becomes a named guest command; when the
+	 * guest runs it, the invocation round-trips back to the host and runs the
+	 * tool's `handler`, whose return value is delivered back to the guest. This
+	 * is the same capability as the `tools` create option, exposed for adding
+	 * tools to a live runtime. See `tools` on {@link NodeRuntime.create} for the
+	 * invocation shape and permission behavior.
+	 *
+	 * When registering tools this way, make sure the `tool` permission scope is
+	 * granted (for example `permissions: { tool: "allow" }` on
+	 * {@link NodeRuntime.create}) so the tools are invocable.
+	 */
+	async registerTools(
+		tools: Record<string, HostToolDefinition>,
+	): Promise<void> {
+		await this.kernel.registerHostTools(tools);
+	}
+
+	/**
+	 * Write a file into the VM's virtual filesystem, creating parent
+	 * directories as needed. Use this to project assets or npm packages into
+	 * the sandbox after boot; the host filesystem is never touched.
+	 */
+	async writeFile(
+		filePath: string,
+		content: string | Uint8Array,
+	): Promise<void> {
+		await this.kernel.writeFile(filePath, content);
+	}
+
+	/** Read a file from the VM's virtual filesystem as raw bytes. */
+	async readFile(filePath: string): Promise<Uint8Array> {
+		return this.kernel.readFile(filePath);
+	}
+
+	/** Tear down the VM and release the sidecar. */
+	async dispose(): Promise<void> {
+		await this.kernel.dispose();
+	}
+}
+
+/**
+ * Common POSIX signal numbers, used to translate a signal name passed to
+ * {@link NodeRuntimeProcess.kill} into the numeric signal the kernel expects.
+ */
+const SIGNAL_NUMBERS: Record<string, number> = {
+	SIGHUP: 1,
+	SIGINT: 2,
+	SIGQUIT: 3,
+	SIGKILL: 9,
+	SIGUSR1: 10,
+	SIGUSR2: 12,
+	SIGTERM: 15,
+	SIGSTOP: 19,
+	SIGCONT: 18,
+};
+
+/**
+ * Normalize a signal passed to {@link NodeRuntimeProcess.kill} into the numeric
+ * signal the kernel expects. Accepts a signal name (e.g. `"SIGKILL"`) or a raw
+ * number; defaults to `SIGTERM` when omitted.
+ */
+function toSignalNumber(signal?: NodeJS.Signals | number): number {
+	if (signal === undefined) {
+		return SIGNAL_NUMBERS.SIGTERM;
+	}
+	if (typeof signal === "number") {
+		return signal;
+	}
+	const resolved = SIGNAL_NUMBERS[signal];
+	if (resolved === undefined) {
+		throw new Error(`Unknown signal: ${signal}`);
+	}
+	return resolved;
+}
+
+/**
+ * Build the error a {@link NodeRuntime.waitForListener} wait rejects with when
+ * its abort signal fires, preferring the signal's own `reason` when present.
+ */
+function toAbortError(signal: AbortSignal): Error {
+	const reason = (signal as { reason?: unknown }).reason;
+	if (reason instanceof Error) {
+		return reason;
+	}
+	const error = new Error("The listener wait was aborted");
+	error.name = "AbortError";
+	return error;
+}
+
+/**
+ * Resolve after `ms` milliseconds, or reject early if `signal` aborts. Used to
+ * pace the polling loop in {@link NodeRuntime.waitForListener} without blocking
+ * past an abort.
+ */
+function delayUntil(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(toAbortError(signal));
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(toAbortError(signal as AbortSignal));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/**
+ * Concatenate streamed stdout/stderr chunks and decode them as UTF-8 text,
+ * reproducing the aggregated `stdout`/`stderr` strings the shell-backed
+ * {@link NodeRuntime.exec} path returns when a run is driven as a process for
+ * cancellation support.
+ */
+function decodeChunks(chunks: Uint8Array[]): string {
+	if (chunks.length === 0) {
+		return "";
+	}
+	let total = 0;
+	for (const chunk of chunks) {
+		total += chunk.length;
+	}
+	const merged = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		merged.set(chunk, offset);
+		offset += chunk.length;
+	}
+	return new TextDecoder().decode(merged);
+}
+
+function toExecResult(result: ExecResult): NodeRuntimeExecResult {
+	return {
+		stdout: result.stdout,
+		stderr: result.stderr,
+		exitCode: result.exitCode,
+	};
+}
+
+/**
+ * Decode the raw JSON the kernel returns for a VM HTTP request into a
+ * structured response. The wire shape carries `status`, an optional
+ * `statusText`, `headers` (either an array of `[name, value]` pairs or an
+ * object), and a `body` that is base64-encoded when `bodyEncoding` is
+ * `"base64"`.
+ */
+function parseFetchResponse(responseJson: string): NodeRuntimeFetchResponse {
+	const parsed = JSON.parse(responseJson) as {
+		status?: number;
+		statusText?: string;
+		headers?: Array<[string, string]> | Record<string, string>;
+		body?: string;
+		bodyEncoding?: string;
+	};
+
+	const headers: Record<string, string> = {};
+	if (Array.isArray(parsed.headers)) {
+		for (const [name, value] of parsed.headers) {
+			headers[name.toLowerCase()] = value;
+		}
+	} else if (parsed.headers) {
+		for (const [name, value] of Object.entries(parsed.headers)) {
+			headers[name.toLowerCase()] = value;
+		}
+	}
+
+	let body = parsed.body ?? "";
+	if (parsed.bodyEncoding === "base64" && body.length > 0) {
+		body = new TextDecoder().decode(
+			Uint8Array.from(globalThis.atob(body), (char) => char.charCodeAt(0)),
+		);
+	}
+
+	return {
+		status: parsed.status ?? 0,
+		statusText: parsed.statusText ?? "",
+		headers,
+		body,
+	};
+}

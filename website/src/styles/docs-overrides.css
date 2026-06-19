@@ -1,0 +1,45 @@
+/*
+ * Local docs-theme overrides — appended after @rivet-dev/docs-theme's theme.css
+ * via siteConfig.css (see docs.config.mjs). Keep this minimal; prefer fixing the
+ * shared theme upstream. Only Secure-Exec-specific touch-ups belong here.
+ */
+
+/* Code-group <Tabs> with a code block as the panel stacked two borders between
+ * the tab bar and the code: the tablist's own `border-bottom` plus the
+ * Expressive Code frame's `border-top`. Drop the frame's top border inside a tab
+ * panel so the tablist divider is the single, flush separation line. */
+.sl-markdown-content starlight-tabs [role="tabpanel"] .expressive-code .frame {
+	border-top: none;
+}
+
+/* Same code-group case, bottom edge: the frame's `border` and the inner `pre`'s
+ * own `border` (Expressive Code draws both) each contribute a `border-bottom`,
+ * stacking into a doubled line under the code. The frame's top border is already
+ * dropped above; drop its bottom border too so the pre's bottom border is the
+ * single, flush edge. Scoped to the tab-panel code group; standalone code blocks
+ * keep their frame border. */
+.sl-markdown-content starlight-tabs [role="tabpanel"] .expressive-code .frame {
+	border-bottom: none;
+}
+
+/* Aside (note/tip/caution/danger/etc.) callout: align the icon's top with the
+ * top of the first body-text line across all variants.
+ *
+ * Root cause: the icon is an inline <svg> inside `.starlight-aside__title`,
+ * which the theme collapses with `line-height: 0`. As an inline box on a
+ * zero-height line box, the SVG is baseline-positioned and ends up centered on
+ * the row top, so roughly half the icon floats above the first text line. The
+ * theme's `margin-top` (and the prior 0.3rem override) only shifts that
+ * mis-centered box; it can't make the icon top meet the text top, so the
+ * alignment stayed visibly off.
+ *
+ * Fix: take the icon out of inline/baseline flow with `display: block` so its
+ * box top coincides with the grid cell (row) top, the same edge the content
+ * column starts from. Then offset by the content's first-line top leading:
+ * `.starlight-aside__content` is `line-height: 1.6` at `font-size: 1rem`, so the
+ * 25.6px line box has (25.6 - 16)/2 = 4.8px of leading above the 16px glyph box,
+ * i.e. ~0.3rem to the em-box top plus a hair more to the visible cap height. */
+.sl-markdown-content .starlight-aside__icon {
+	display: block;
+	margin-top: 0.35rem;
+}

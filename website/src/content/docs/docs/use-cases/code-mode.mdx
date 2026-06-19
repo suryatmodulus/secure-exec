@@ -5,9 +5,9 @@ description: "Give AI agents a single code-execution tool instead of individual 
 
 import { Aside, LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/code-mode" description="Full working example with SecureExecExecutor and tool dispatch." />
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-code-mode" description="Full working example: the LLM chains tool calls in one sandboxed run and returns a structured result." />
 
-Instead of calling MCP tools one at a time, Code Mode lets the LLM write JavaScript that orchestrates everything in one go — run safely in a V8 sandbox by Secure Exec.
+Instead of calling MCP tools one at a time, Code Mode lets the LLM write JavaScript that orchestrates everything in one go, run safely in a V8 sandbox by Secure Exec.
 
 <Aside type="tip">
   [MCP Toolkit](https://mcp-toolkit.nuxt.dev/advanced/code-mode) provides a premade Code Mode library powered by Secure Exec: `experimental_codeMode: true`. We recommend trying it first. The rest of this page covers how to implement Code Mode yourself.
@@ -17,71 +17,100 @@ Instead of calling MCP tools one at a time, Code Mode lets the LLM write JavaScr
 
 - **[81% less token overhead](https://x.com/hugorcd/status/2034616192225407273)**: With 50 tools, replacing per-call tool descriptions with a single code-execution tool cuts tool description tokens by 81%
 - **Fewer round-trips**: Chain multiple tool calls, conditionals, and data transformations in a single execution
-- **Real control flow**: Loops, branching, `Promise.all` — not a chain of isolated tool calls
-- **Drop-in replacement**: Your existing tools don't change at all. Code Mode wraps them transparently.
+- **Real control flow**: Loops, branching, and `Promise.all`, not a chain of isolated tool calls
+- **One structured result**: The LLM returns a single JSON value via `globalThis.__return()`, decoded on the host as `result.value`
 
 ## How it works
 
-1. Define your tools (AI SDK `tool()`, MCP servers, or both)
-2. Create a `SecureExecExecutor` that runs LLM-generated code in a V8 isolate and proxies `codemode.*` calls back to your tool implementations
-3. Give the LLM one tool ("execute code") with typed API definitions for your tools
-4. The LLM writes JavaScript that calls your tools via `codemode.*` and chains the results
+1. Boot a sandbox with `NodeRuntime.create()`
+2. Provide your tool implementations to the guest as in-sandbox helpers (e.g. a `codemode.*` object in the program preamble)
+3. Give the LLM one tool ("execute code") and feed its generated JavaScript to `rt.run()`
+4. The generated code chains your tools via `codemode.*` and hands a single structured result back to the host with `globalThis.__return(value)`, which `rt.run()` decodes as `result.value`
+
+<Aside type="caution">
+  `NodeRuntime` runs guest JavaScript and returns a JSON-serializable value via `globalThis.__return()`. Calling host-side functions from the guest is a real secure-exec capability: the wire protocol carries host callbacks (`@secure-exec/core` exposes `registerHostCallbacks`), which proxy guest calls back out to host implementations through the kernel. That capability is **not yet surfaced** as a `NodeRuntime.create()` option, so the ergonomic API does not wire `codemode.*` calls back to the host for you. Until it does, provide the tool implementations to the guest as in-sandbox helpers (as below), or register host callbacks yourself on top of the lower-level protocol client.
+</Aside>
 
 ```ts
-const tools = {
-  getWeather: tool({
-    description: "Get current weather for a city.",
-    inputSchema: z.object({ city: z.string() }),
-    execute: async ({ city }) => fetchWeather(city),
-  }),
-  calculate: tool({
-    description: "Evaluate a math expression.",
-    inputSchema: z.object({ expression: z.string() }),
-    execute: async ({ expression }) => eval(expression),
-  }),
+import { NodeRuntime } from "secure-exec";
+
+// The tool implementations, provided to the guest as `codemode.*`. Everything
+// here runs inside the sandbox, never on the host.
+const toolsPreamble = `
+const codemode = {
+  async getWeather({ city }) {
+    const table = {
+      "San Francisco": { temp_f: 61 },
+      "Tokyo": { temp_f: 75 },
+    };
+    return table[city] ?? { temp_f: null };
+  },
+  async calculate({ expression }) {
+    // A real tool would call out to a service; we keep it simple and safe.
+    return { result: Number(eval(expression)) };
+  },
 };
-
-const executor = new SecureExecExecutor({ memoryLimit: 64 });
-
-// Give the LLM one tool instead of many
-tools: {
-  codemode: tool({
-    description: codeToolDescription, // includes typed API definitions
-    inputSchema: z.object({ code: z.string() }),
-    execute: async ({ code }) => executor.execute(code, fns),
-  }),
-}
+`;
 ```
 
-The agent then generates code like this:
+The agent then generates code like this (call it `llmGeneratedCode`). It chains three tool calls with real control flow (`Promise.all`, arithmetic, branching) in one execution, then returns a single structured result:
 
 ```js
-async () => {
-  const [sf, tokyo] = await Promise.all([
-    codemode.getWeather({ city: "San Francisco" }),
-    codemode.getWeather({ city: "Tokyo" })
-  ]);
+const [sf, tokyo] = await Promise.all([
+  codemode.getWeather({ city: "San Francisco" }),
+  codemode.getWeather({ city: "Tokyo" }),
+]);
 
-  const diffF = Math.abs(sf.temp_f - tokyo.temp_f);
-  const diffC = await codemode.calculate({
-    expression: `${diffF} * 5 / 9`
-  });
+const diffF = Math.abs(sf.temp_f - tokyo.temp_f);
+const diffC = await codemode.calculate({ expression: `${diffF} * 5 / 9` });
 
-  return {
-    san_francisco: sf,
-    tokyo: tokyo,
-    difference: { fahrenheit: diffF, celsius: diffC.result },
-    warmer: sf.temp_f > tokyo.temp_f ? "San Francisco" : "Tokyo"
-  };
+console.log("chained 3 tool calls in one sandbox execution");
+
+globalThis.__return({
+  san_francisco: sf,
+  tokyo: tokyo,
+  difference: { fahrenheit: diffF, celsius: diffC.result },
+  warmer: sf.temp_f > tokyo.temp_f ? "San Francisco" : "Tokyo",
+});
+```
+
+Run the LLM's code in one sandboxed pass and read back the structured result:
+
+```ts
+const rt = await NodeRuntime.create();
+try {
+  // rt.run() executes the guest code and decodes whatever it passes to
+  // globalThis.__return(), while still capturing stdout/stderr/exitCode.
+  const result = await rt.run(
+    toolsPreamble + llmGeneratedCode,
+    { timeout: 5000 },
+  );
+
+  console.log("exitCode:", result.exitCode);
+  console.log("stdout:", result.stdout.trim());
+  console.log("structured result:", JSON.stringify(result.value, null, 2));
+} finally {
+  await rt.dispose();
 }
 ```
 
-Three tool calls, one sandbox execution, zero extra LLM round-trips.
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-code-mode)*
 
-See the [full working example](https://github.com/rivet-dev/secure-exec/tree/main/examples/code-mode) for the complete implementation including the `SecureExecExecutor`.
+Three tool calls, one sandbox execution, zero extra LLM round-trips. Running it prints:
+
+```text
+exitCode: 0
+stdout: chained 3 tool calls in one sandbox execution
+structured result: {
+  "san_francisco": { "temp_f": 61 },
+  "tokyo": { "temp_f": 75 },
+  "difference": { "fahrenheit": 14, "celsius": 7.777777777777778 },
+  "warmer": "Tokyo"
+}
+```
 
 ## Further reading
 
-- [Complete Code Mode implementation guide](https://mcp-toolkit.nuxt.dev/advanced/code-mode) — end-to-end Code Mode walkthrough using MCP Toolkit
+- [Complete Code Mode implementation guide](https://mcp-toolkit.nuxt.dev/advanced/code-mode): end-to-end Code Mode walkthrough using MCP Toolkit
 - [Cloudflare Code Mode blog post](https://blog.cloudflare.com/code-mode/)
 - [AI Agent Code Exec](/use-cases/ai-agent-code-exec) for simpler single-tool execution patterns

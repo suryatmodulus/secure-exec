@@ -1,158 +1,96 @@
 ---
 title: AI Agent Code Exec
-description: Give AI agents a secure code-execution tool with CPU and memory limits.
+description: Give AI agents a secure code-execution tool that runs untrusted code in a sandbox and returns structured results.
 ---
 
 import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/ai-agent-type-check" description="Full working example with type-checked TypeScript execution." />
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-ai-agent-code-exec" description="Full working example that runs untrusted code and captures its result." />
 
-Give your agent a code-execution tool with explicit CPU and memory limits. The agent writes code, runs it in an isolate, and gets back structured results.
+Give your agent a code-execution tool that runs untrusted, model-generated code in a fully virtualized VM. The agent writes code, it runs inside the kernel isolation boundary with no access to the host, and you get back its stdout and a structured return value.
 
-## Run generated JavaScript
+## Run untrusted JavaScript and capture a result
 
-The agent writes JavaScript, assigns a return value to `module.exports`, and gets it back.
+`NodeRuntime.create()` boots a sandboxed VM. `rt.run()` executes the guest code and decodes whatever it passes to `globalThis.__return()`, while still capturing `stdout`, `stderr`, and `exitCode`. Use `rt.exec()` when you only need the captured output streams.
 
-```ts JavaScript Execution
-import { generateText, stepCountIs, tool } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
-import { NodeRuntime, createNodeDriver, createNodeRuntimeDriverFactory } from "secure-exec";
-import { z } from "zod";
+The guest code runs as a standard ES module (top-level `await` and `import` work), but it can only see the virtual filesystem and kernel-mediated syscalls, and it cannot reach the host machine.
 
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    permissions: {
-      fs: () => ({ allow: true }),
-      network: () => ({ allow: true }),
-    },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  memoryLimit: 64,
-  cpuTimeLimitMs: 5000,
-});
+```ts AI Agent Code Exec
+import { NodeRuntime } from "secure-exec";
 
-const { text } = await generateText({
-  model: anthropic("claude-sonnet-4-5"),
-  prompt: "Calculate the first 20 fibonacci numbers",
-  stopWhen: stepCountIs(5),
-  tools: {
-    execute: tool({
-      description: "Run JavaScript in a secure sandbox. Assign the result to module.exports to return data.",
-      inputSchema: z.object({ code: z.string() }),
-      execute: async ({ code }) => runtime.run(code),
-    }),
-  },
-});
+// Imagine this string came from an AI agent. We never trust it: it runs fully
+// sandboxed inside the secure-exec VM, with no access to the host machine.
+const untrustedCode = `
+const fib = [0, 1];
+while (fib.length < 20) {
+  fib.push(fib[fib.length - 1] + fib[fib.length - 2]);
+}
+console.log("computed", fib.length, "fibonacci numbers");
+// Hand a JSON-serializable value back to the host.
+globalThis.__return({ fibonacci: fib, sum: fib.reduce((a, b) => a + b, 0) });
+`;
 
-console.log(text);
+const rt = await NodeRuntime.create();
+try {
+  // rt.run() executes the guest code and decodes whatever it passes to
+  // globalThis.__return(), while still capturing stdout/stderr/exitCode.
+  const result = await rt.run<{ fibonacci: number[]; sum: number }>(
+    untrustedCode,
+    { timeout: 5000 },
+  );
+
+  console.log("exitCode:", result.exitCode);
+  console.log("stdout:", result.stdout.trim());
+  console.log("returned value:", JSON.stringify(result.value));
+
+  // The sandbox presents normal Node semantics, but the code cannot touch the
+  // host: it only ever sees the virtual filesystem and kernel-mediated syscalls.
+  const escapeAttempt = await rt.exec(
+    `import os from "node:os";\nconsole.log("guest hostname:", os.hostname());`,
+    { timeout: 5000 },
+  );
+  console.log("\nescape attempt exitCode:", escapeAttempt.exitCode);
+  console.log("escape attempt stdout:", escapeAttempt.stdout.trim());
+} finally {
+  await rt.dispose();
+}
 ```
 
-## Type-check generated TypeScript before execution
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-ai-agent-code-exec)*
 
-If the agent writes TypeScript, type-check it first. Failed diagnostics go back to the agent for repair; passing code gets compiled and executed.
+Running this prints the captured stdout and the decoded return value, and shows that the guest only ever sees the sandbox:
 
-```ts Type-Checked Execution
-import { generateText, stepCountIs, tool } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
-import {
-  NodeRuntime,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "secure-exec";
-import { createTypeScriptTools } from "@secure-exec/typescript";
-import { z } from "zod";
+```
+exitCode: 0
+stdout: computed 20 fibonacci numbers
+returned value: {"fibonacci":[0,1,1,2,3,5,8,13,21,34,55,89,144,233,377,610,987,1597,2584,4181],"sum":10945}
 
-const systemDriver = createNodeDriver({
+escape attempt exitCode: 0
+escape attempt stdout: guest hostname: sandbox
+```
+
+## Wiring it into an agent tool
+
+A single `NodeRuntime` instance can run many programs. Each `run()` / `exec()` call executes a fresh guest process. To expose this as a tool to your agent framework, hold one runtime for the session and call `rt.run(code)` from the tool's handler, returning `{ stdout, value, exitCode }` to the model. Pass a `timeout` (in milliseconds) per call to bound runaway code, and call `rt.dispose()` when the session ends.
+
+## Sandboxing untrusted code
+
+By default `NodeRuntime.create()` runs with an allow-all policy so guest programs work without extra setup. To restrict what untrusted code can do, pass a `permissions` policy. Each capability (`fs`, `network`, `childProcess`, `process`, `env`) accepts either `"allow"` / `"deny"` or a rule set. For example, to run untrusted code with no network access:
+
+```ts
+import { NodeRuntime } from "secure-exec";
+
+const rt = await NodeRuntime.create({
   permissions: {
-    fs: () => ({ allow: true }),
-    network: () => ({ allow: true }),
+    fs: "allow",
+    network: "deny",
+    childProcess: "allow",
+    process: "allow",
+    env: "allow",
   },
 });
-const runtimeDriverFactory = createNodeRuntimeDriverFactory();
-
-const runtime = new NodeRuntime({
-  systemDriver,
-  runtimeDriverFactory,
-  memoryLimit: 64,
-  cpuTimeLimitMs: 5000,
-});
-const ts = createTypeScriptTools({
-  systemDriver,
-  runtimeDriverFactory,
-  memoryLimit: 256,
-  cpuTimeLimitMs: 5000,
-});
-
-const { text } = await generateText({
-  model: anthropic("claude-sonnet-4-5"),
-  prompt:
-    "Write TypeScript that calculates the first 20 fibonacci numbers. Assign the result to module.exports.",
-  stopWhen: stepCountIs(5),
-  tools: {
-    execute_typescript: tool({
-      description:
-        "Type-check TypeScript in a sandbox, compile it, then run the emitted JavaScript in a sandbox. Return diagnostics when validation fails.",
-      inputSchema: z.object({ code: z.string() }),
-      execute: async ({ code }) => {
-        const typecheck = await ts.typecheckSource({
-          sourceText: code,
-          filePath: "/root/generated.ts",
-          compilerOptions: {
-            module: "commonjs",
-            target: "es2022",
-          },
-        });
-
-        if (!typecheck.success) {
-          return {
-            ok: false,
-            stage: "typecheck",
-            diagnostics: typecheck.diagnostics,
-          };
-        }
-
-        const compiled = await ts.compileSource({
-          sourceText: code,
-          filePath: "/root/generated.ts",
-          compilerOptions: {
-            module: "commonjs",
-            target: "es2022",
-          },
-        });
-
-        if (!compiled.success || !compiled.outputText) {
-          return {
-            ok: false,
-            stage: "compile",
-            diagnostics: compiled.diagnostics,
-          };
-        }
-
-        const execution = await runtime.run<Record<string, unknown>>(
-          compiled.outputText,
-          "/root/generated.js"
-        );
-
-        if (execution.code !== 0) {
-          return {
-            ok: false,
-            stage: "run",
-            errorMessage:
-              execution.errorMessage ?? `Sandbox exited with code ${execution.code}`,
-          };
-        }
-
-        return {
-          ok: true,
-          stage: "run",
-          exports: execution.exports,
-        };
-      },
-    }),
-  },
-});
-
-console.log(text);
 ```
 
-See [TypeScript](/docs/features/typescript) for the lower-level compile and type-check APIs.
+When you pass a `permissions` object, any capability you omit defaults to `"deny"`. `NodeRuntime` executes the guest with `node` as a child process inside the VM, so keep `childProcess` allowed (denying it blocks the runtime itself) and tighten `fs`, `network`, and `env` to sandbox the untrusted code.
+
+You can also constrain the run with `env` and `cwd` on `NodeRuntime.create()`, and `env`, `cwd`, `stdin`, and `timeout` on each `run()` / `exec()` call.

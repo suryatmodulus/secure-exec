@@ -1,211 +1,103 @@
 ---
-title: Custom Virtual Filesystem
-description: Implement your own VirtualFileSystem to control how sandboxed code reads and writes files.
+title: Virtual Filesystem
+description: Sandboxed code reads and writes a fully virtual filesystem that lives inside the kernel, isolated from the host disk.
 ---
-import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-You can create a custom `VirtualFileSystem` to back the sandbox with any storage layer — a database, S3, a zip archive, or anything else. Sandboxed code uses `fs`, `require`, and other Node APIs as normal, and your implementation handles the actual I/O.
+Every VM boots with a **virtual filesystem** that lives entirely inside the kernel. Guest code creates directories, writes files, and lists them with the normal Node `fs` APIs, but none of that I/O ever touches the host disk. The guest sees an ordinary POSIX filesystem; the host sees nothing.
 
-## The interface
+For basic filesystem usage (reading, writing, and listing files from guest code), see [Filesystem & Mounts](/docs/features/filesystem). This page focuses on the VFS model itself: how it isolates the guest, and the mount and storage backends behind it.
 
-Your class must implement `VirtualFileSystem` from `secure-exec-core`:
+## Isolation from the host
+
+The defining property of the virtual filesystem is isolation. A file the guest writes lives only in the kernel's virtual filesystem. When the host checks that same path, it finds nothing: the guest's writes never escape to the host disk. Each VM gets its own filesystem, and disposing the runtime with `rt.dispose()` tears it down.
+
+The example below seeds a file into the VM at boot with `files`, writes another from the host with `rt.writeFile`, has the guest read both, reads one back on the host with `rt.readFile`, and then proves the guest path does not exist on the real host:
 
 ```ts
-import type { VirtualFileSystem, VirtualStat, VirtualDirEntry } from "secure-exec";
+import { NodeRuntime } from "secure-exec";
 
-class MyFileSystem implements VirtualFileSystem {
-  async readFile(path: string): Promise<Uint8Array> { /* ... */ }
-  async readTextFile(path: string): Promise<string> { /* ... */ }
-  async writeFile(path: string, content: string | Uint8Array): Promise<void> { /* ... */ }
-  async readDir(path: string): Promise<string[]> { /* ... */ }
-  async readDirWithTypes(path: string): Promise<VirtualDirEntry[]> { /* ... */ }
-  async createDir(path: string): Promise<void> { /* ... */ }
-  async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> { /* ... */ }
-  async exists(path: string): Promise<boolean> { /* ... */ }
-  async stat(path: string): Promise<VirtualStat> { /* ... */ }
-  async removeFile(path: string): Promise<void> { /* ... */ }
-  async removeDir(path: string): Promise<void> { /* ... */ }
-  async rename(oldPath: string, newPath: string): Promise<void> { /* ... */ }
-  async realpath(path: string): Promise<string> { /* ... */ }
-  async symlink(target: string, linkPath: string): Promise<void> { /* ... */ }
-  async readlink(path: string): Promise<string> { /* ... */ }
-  async lstat(path: string): Promise<VirtualStat> { /* ... */ }
-  async link(oldPath: string, newPath: string): Promise<void> { /* ... */ }
-  async chmod(path: string, mode: number): Promise<void> { /* ... */ }
-  async chown(path: string, uid: number, gid: number): Promise<void> { /* ... */ }
-  async utimes(path: string, atime: number, mtime: number): Promise<void> { /* ... */ }
-  async truncate(path: string, length: number): Promise<void> { /* ... */ }
-  async pread(path: string, offset: number, length: number): Promise<Uint8Array> { /* ... */ }
-  async pwrite(path: string, offset: number, data: Uint8Array): Promise<void> { /* ... */ }
+// Boot a VM and seed a file into its virtual filesystem at boot with `files`.
+// The bytes are copied into the kernel's in-memory filesystem; the host
+// filesystem is never exposed to the guest.
+const rt = await NodeRuntime.create({
+	files: { "/home/user/seed.json": JSON.stringify({ ok: true }) },
+});
+
+try {
+	// Write another file from the host with rt.writeFile, then have the guest
+	// read both back. The guest only ever sees the virtual filesystem.
+	await rt.writeFile("/home/user/note.txt", "written from the host\n");
+
+	const result = await rt.run(`
+		const { readFileSync } = await import("node:fs");
+		const seed = JSON.parse(readFileSync("/home/user/seed.json", "utf8"));
+		const note = readFileSync("/home/user/note.txt", "utf8").trim();
+		console.log("guest read seed:", JSON.stringify(seed));
+		console.log("guest read note:", note);
+		globalThis.__return({ seed, note });
+	`);
+
+	console.log("guest stdout:", result.stdout.trim());
+	console.log("guest exit code:", result.exitCode);
+	console.log("value returned to host:", result.value);
+
+	// Read a guest-written file back on the host with rt.readFile.
+	const bytes = await rt.readFile("/home/user/seed.json");
+	console.log("host rt.readFile:", new TextDecoder().decode(bytes));
+
+	// The virtual filesystem is isolated from the host disk. The guest path does
+	// not exist on the real host - prove it by checking the same path here.
+	const { existsSync } = await import("node:fs");
+	const guestPath = "/home/user/seed.json";
+	console.log(
+		`host sees ${guestPath}?`,
+		existsSync(guestPath) ? "YES (unexpected!)" : "NO - isolated from host",
+	);
+} finally {
+	await rt.dispose();
 }
 ```
 
-## Example: read-only Map filesystem
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-virtual-filesystem)*
 
-A minimal filesystem backed by a `Map<string, string>`. Useful when you have a fixed set of files (e.g. loaded from a database) and want to make them available to sandboxed code.
+Running this prints:
 
-```ts
-import type { VirtualFileSystem, VirtualStat, VirtualDirEntry } from "secure-exec";
-import {
-  NodeRuntime,
-  allowAllFs,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "secure-exec";
-
-class ReadOnlyMapFS implements VirtualFileSystem {
-  private files: Map<string, string>;
-
-  constructor(files: Record<string, string>) {
-    this.files = new Map(Object.entries(files));
-  }
-
-  async readFile(path: string) {
-    const content = this.files.get(path);
-    if (content === undefined) throw new Error(`ENOENT: ${path}`);
-    return new TextEncoder().encode(content);
-  }
-
-  async readTextFile(path: string) {
-    const content = this.files.get(path);
-    if (content === undefined) throw new Error(`ENOENT: ${path}`);
-    return content;
-  }
-
-  async exists(path: string) {
-    return this.files.has(path) || this.#isDir(path);
-  }
-
-  async stat(path: string): Promise<VirtualStat> {
-    const now = Date.now();
-    if (this.files.has(path)) {
-      return {
-        mode: 0o444,
-        size: new TextEncoder().encode(this.files.get(path)!).byteLength,
-        blocks: 0, dev: 1, rdev: 0,
-        isDirectory: false, isSymbolicLink: false,
-        atimeMs: now, mtimeMs: now, ctimeMs: now, birthtimeMs: now,
-        ino: 0, nlink: 1, uid: 0, gid: 0,
-      };
-    }
-    if (this.#isDir(path)) {
-      return {
-        mode: 0o555,
-        size: 0,
-        blocks: 0, dev: 1, rdev: 0,
-        isDirectory: true, isSymbolicLink: false,
-        atimeMs: now, mtimeMs: now, ctimeMs: now, birthtimeMs: now,
-        ino: 0, nlink: 1, uid: 0, gid: 0,
-      };
-    }
-    throw new Error(`ENOENT: ${path}`);
-  }
-
-  async lstat(path: string) { return this.stat(path); }
-
-  async readDir(path: string) {
-    const prefix = path === "/" ? "/" : path + "/";
-    const entries = new Set<string>();
-    for (const key of this.files.keys()) {
-      if (key.startsWith(prefix)) {
-        const rest = key.slice(prefix.length);
-        entries.add(rest.split("/")[0]);
-      }
-    }
-    if (entries.size === 0) throw new Error(`ENOENT: ${path}`);
-    return [...entries];
-  }
-
-  async readDirWithTypes(path: string): Promise<VirtualDirEntry[]> {
-    const names = await this.readDir(path);
-    const prefix = path === "/" ? "/" : path + "/";
-    return names.map((name) => ({
-      name,
-      isDirectory: this.#isDir(prefix + name),
-    }));
-  }
-
-  // Write operations throw — this filesystem is read-only
-  async writeFile() { throw new Error("EROFS: read-only filesystem"); }
-  async createDir() { throw new Error("EROFS: read-only filesystem"); }
-  async mkdir() { throw new Error("EROFS: read-only filesystem"); }
-  async removeFile() { throw new Error("EROFS: read-only filesystem"); }
-  async removeDir() { throw new Error("EROFS: read-only filesystem"); }
-  async rename() { throw new Error("EROFS: read-only filesystem"); }
-  async symlink() { throw new Error("EROFS: read-only filesystem"); }
-  async readlink() { throw new Error("ENOSYS: no symlinks"); }
-  async link() { throw new Error("EROFS: read-only filesystem"); }
-  async chmod() { throw new Error("EROFS: read-only filesystem"); }
-  async chown() { throw new Error("EROFS: read-only filesystem"); }
-  async utimes() { throw new Error("EROFS: read-only filesystem"); }
-  async truncate() { throw new Error("EROFS: read-only filesystem"); }
-  async pwrite() { throw new Error("EROFS: read-only filesystem"); }
-
-  // No symlinks, so realpath is the identity function
-  async realpath(path: string) { return path; }
-
-  async pread(path: string, offset: number, length: number) {
-    const data = await this.readFile(path);
-    return data.subarray(offset, offset + length);
-  }
-
-  #isDir(path: string) {
-    const prefix = path === "/" ? "/" : path + "/";
-    for (const key of this.files.keys()) {
-      if (key.startsWith(prefix)) return true;
-    }
-    return false;
-  }
-}
+```text
+guest stdout: guest read seed: {"ok":true}
+guest read note: written from the host
+guest exit code: 0
+value returned to host: { seed: { ok: true }, note: 'written from the host' }
+host rt.readFile: {"ok":true}
+host sees /home/user/seed.json? NO - isolated from host
 ```
 
-### Using it
+This is the core guarantee of the virtual filesystem: guest code runs against a faithful POSIX filesystem, but every read and write is mediated by the kernel and stays inside the isolation boundary.
 
-```ts
-const fs = new ReadOnlyMapFS({
-  "/config.json": JSON.stringify({ greeting: "hello" }),
-  "/src/index.js": `
-    const config = JSON.parse(require("fs").readFileSync("/config.json", "utf8"));
-    console.log(config.greeting);
-  `,
-});
+## Seeding and exchanging files
 
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    filesystem: fs,
-    permissions: { ...allowAllFs },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-});
+`NodeRuntime` gives you three ways to move data across the isolation boundary without exposing the host disk:
 
-const result = await runtime.exec(`
-  const config = JSON.parse(require("fs").readFileSync("/config.json", "utf8"));
-  console.log(config.greeting);
-`);
+- **`create({ files })`** seeds files into the virtual filesystem before the guest runs, keyed by absolute guest path. Parent directories are created as needed. Use it to project fixtures, config, or npm packages into the sandbox. The bytes are copied into the VM's in-memory filesystem.
+- **`rt.writeFile(path, data)`** writes a file into the VM after boot, creating parent directories as needed.
+- **`rt.readFile(path)`** reads a file from the VM back to the host as raw bytes.
 
-// Output captured via onStdio callback — see Output Capture docs
-runtime.dispose();
-```
+All three operate on the virtual filesystem only; the host filesystem is never touched.
 
-## More examples
+## Custom and host-backed filesystems
 
-Full, tested implementations for common storage backends:
+The default `NodeRuntime.create()` filesystem is purely in-memory: it starts empty (apart from the bootstrapped root) and lives only for the life of the VM. That is not the only backing the kernel supports. Secure Exec mounts are pluggable, and several backends are real today.
 
-<CardGrid>
-  <LinkCard title="S3 / MinIO" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/virtual-file-system-s3" description="Store sandbox files as S3 objects. Works with any S3-compatible store (AWS, MinIO, R2). Includes Docker Compose for local testing with MinIO." />
-  <LinkCard title="SQLite" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/virtual-file-system-sqlite" description="Store sandbox files as rows in a SQLite database (via sql.js / WASM). Snapshot and restore entire filesystems. No external services needed." />
-</CardGrid>
+- **Host directory mounts.** Project a real host directory into the VM with `NodeRuntime.create({ mounts })`. This is a first-class `NodeRuntime` option: see [Mounting host directories](/docs/features/filesystem#mounting-host-directories) for a runnable example. The mount is read-only by default and exposes only the chosen subtree to the guest.
+- **Overlay filesystems.** The kernel can layer a writable filesystem over a read-only base, so guest writes land in the overlay and the base is never mutated. Overlays are configured at the mount/protocol layer rather than through a `NodeRuntime.create()` option.
+- **Pluggable storage backends.** Remote and cloud-backed filesystems ship as separate packages that build a native mount plugin descriptor:
+  - **`@secure-exec/s3`** (`createS3Backend`) backs a mount with an Amazon S3 bucket, so guest code reads and writes the bucket as an ordinary POSIX directory.
+  - **`@secure-exec/google-drive`** (`createGoogleDriveBackend`) backs a mount with Google Drive, exposing Drive files to the guest as a POSIX directory.
+  - **`@secure-exec/sandbox`** (`createSandboxFs`) backs a mount with a remote sandbox-agent host, scoping all guest filesystem operations under a base path on that host.
 
-Other use cases you can build with `VirtualFileSystem`:
+Host directory mounts are available directly through `NodeRuntime.create({ mounts })`. The overlay and remote storage backends are wired at the lower-level mount and descriptor layer: each storage package returns a mount plugin descriptor that is attached through the VM configuration (`configureVm` mounts) rather than through a one-line `create()` flag. They are real Secure Exec capabilities, driven through the protocol-level mount plumbing.
 
-- **Git-backed storage** — store files in a bare Git repo, with each sandbox session as a commit
-- **Encrypted filesystem** — wrap another VFS and encrypt/decrypt content transparently
-- **Union / overlay filesystem** — layer a writable VFS on top of a read-only base (e.g. template files + user modifications)
-- **Remote filesystem** — proxy file operations to a remote server via HTTP or gRPC
+## Notes
 
-## Tips
-
-- **Throw Node-style errors.** Sandboxed code expects errors like `ENOENT`, `EACCES`, and `EISDIR`. Match the error message prefix so `fs` error handling works naturally.
-- **Normalize paths.** All paths are absolute POSIX paths (forward slashes, rooted at `/`). Normalize before lookup to avoid mismatches.
-- **No-op what you don't need.** Operations like `chmod`, `chown`, and `utimes` can be no-ops if your storage layer doesn't support them. Throw `ENOSYS` for operations that genuinely can't work (like symlinks on a flat key-value store).
-- **Use `createInMemoryFileSystem()` as a reference.** The built-in in-memory filesystem is a complete implementation you can study or extend.
+- Guest code runs as an ES module. When you pass code to `rt.run(...)`, it is wrapped so that `globalThis.__return(...)` can hand a value back to the host. Because of that wrapping, use dynamic `await import("node:fs")` inside `run` code rather than a top-level `import` statement. (`rt.exec(...)`, which only captures stdout/stderr, runs your code as a plain module and accepts top-level `import`.)
+- The default working directory is `/home/user`. Pass `cwd` to `NodeRuntime.create({ cwd })` to change it.
+- File access is governed by the VM permission policy. By default the runtime allows the filesystem scope; tighten it by passing `permissions` to `NodeRuntime.create(...)`.

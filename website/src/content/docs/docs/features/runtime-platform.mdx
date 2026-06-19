@@ -1,136 +1,162 @@
 ---
 title: Runtime & Platform
-description: Configure which JavaScript host environment guest code sees — node, browser, neutral, or bare — plus module resolution and the Node builtin allow-list.
+description: The host environment guest code sees (the full Node.js surface today), plus the platform ladder (node, browser, neutral, bare) the kernel models.
 ---
 
 By default, guest JavaScript runs with the full Node.js emulation surface: the
-`process` and `Buffer` globals, `require`, the `node:*` builtin modules, npm
-module resolution, and a virtualized Node process identity.
+`process` and `Buffer` globals, the `node:*` builtin modules, npm module
+resolution, and a virtualized Node process identity. This is the environment
+`NodeRuntime` boots, and today it is the only one secure-exec exposes.
 
-The `jsRuntime` option on `CreateVmConfig` lets you choose a **different host
-environment** for guest JS — the same idea as esbuild's `platform`. You can run
-code as a browser-like runtime, a minimal universal runtime, or pure
-ECMAScript with nothing host-provided. This only changes *which globals,
-builtins, and module resolution are exposed*; guest code still runs inside the
-same kernel-backed V8 isolate with zero host escapes.
+Guest code runs inside a kernel-backed V8 isolate with zero host escapes. Even
+with the full Node surface available, every syscall (filesystem, network,
+child process) goes through the kernel, not the real host.
 
 ```ts
-await client.createVm(session, {
-  runtime: "java_script",
-  config: {
-    jsRuntime: {
-      platform: "browser",          // node | browser | neutral | bare
-      moduleResolution: "node",     // node | relative | none
-      // allowedBuiltins: ["path"], // node platform only
-    },
-  },
-});
+import { NodeRuntime } from "secure-exec";
+
+const rt = await NodeRuntime.create();
+
+try {
+	const probe = await rt.run<{
+		platform: string;
+		hasProcess: boolean;
+		hasBuffer: boolean;
+		nodeVersion: string;
+		sha256: string;
+		joinedPath: string;
+	}>(`
+		const { createHash } = await import("node:crypto");
+		const { join } = await import("node:path");
+
+		const sha256 = createHash("sha256").update("secure-exec").digest("hex");
+
+		globalThis.__return({
+			platform: typeof process !== "undefined" ? process.platform : "(no process)",
+			hasProcess: typeof process !== "undefined",
+			hasBuffer: typeof Buffer !== "undefined",
+			nodeVersion: typeof process !== "undefined" ? process.versions.node : "(none)",
+			sha256,
+			joinedPath: join("/home/user", "report.txt"),
+		});
+	`);
+
+	console.log(probe.value);
+} finally {
+	await rt.dispose();
+}
 ```
 
-Omitting `jsRuntime` entirely is identical to the previous behavior
-(`platform: "node"`, full Node resolution).
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-runtime-platform)*
 
-## `platform` — the host environment
+Running this prints the guest's host environment as seen from inside the
+isolate. `process` and `Buffer` are present, `process.platform` is `linux`,
+and `node:crypto` / `node:path` resolve and run:
 
-The four platforms form a ladder from "full Node" down to "language only".
-Values match esbuild (`node` / `browser` / `neutral`), plus `bare` for the
-language-only tier esbuild has no name for.
+```text
+{
+  platform: 'linux',
+  hasProcess: true,
+  hasBuffer: true,
+  nodeVersion: '22.0.0',
+  sha256: 'fa7ce60dac0cc1bfe7424a68e47ad3d712345cf936431bb147cd5f5de0371a4a',
+  joinedPath: '/home/user/report.txt'
+}
+```
+
+:::note[Guest `run()` code is wrapped in an async function]
+Code passed to `rt.run()` executes inside an `async` wrapper so it can use
+top-level `await`, but that also means it is not a module body, so use dynamic
+`await import("node:…")` rather than a top-level `import` statement. Code passed
+to `rt.exec()` runs as a real ES module, where static `import` is fine.
+:::
+
+## The platform ladder
+
+Internally the kernel models the guest host environment as a ladder, using
+esbuild's vocabulary: `node` / `browser` / `neutral`, plus `bare` for the
+language-only tier esbuild has no name for. `NodeRuntime` always runs
+the top rung (`node`); the lower rungs are described here for context and are
+**not currently selectable in secure-exec** (see the note below).
 
 | Capability | `node` | `browser` | `neutral` | `bare` |
 |---|:---:|:---:|:---:|:---:|
-| Node globals | ✅ | — | — | — |
-| `node:*` builtins | ✅ | — | — | — |
-| Node identity | ✅ | — | — | — |
-| Web platform | ✅ | ✅ | — | — |
-| Universal primitives | ✅ | ✅ | ✅ | — |
+| Node globals | ✅ | No | No | No |
+| `node:*` builtins | ✅ | No | No | No |
+| Node identity | ✅ | No | No | No |
+| Web platform | ✅ | ✅ | No | No |
+| Universal primitives | ✅ | ✅ | ✅ | No |
 | Language + Wasm | ✅ | ✅ | ✅ | ✅ |
 
 Where each row means:
 
-- **Node globals** — `process`, `Buffer`, `require`, `module`, `__dirname`, `__filename`.
-- **`node:*` builtins** — the Node builtin modules (`fs`, `path`, `crypto`, …).
-- **Node identity** — virtualized `process.versions`, `execPath`, pid/ppid/uid/gid.
-- **Web platform** — `fetch`, `URL`, `TextEncoder`, WebCrypto, `structuredClone`, `Blob`, `AbortController`, …
-- **Universal primitives** — `console`, timers (`setTimeout`/`setInterval`/…), `queueMicrotask`.
-- **Language + Wasm** — the ECMAScript spec globals plus `WebAssembly`.
+- **Node globals**: `process`, `Buffer`, `require`, `module`, `__dirname`, `__filename`.
+- **`node:*` builtins**: the Node builtin modules (`fs`, `path`, `crypto`, …).
+- **Node identity**: virtualized `process.versions`, `execPath`, pid/ppid/uid/gid.
+- **Web platform**: `fetch`, `URL`, `TextEncoder`, WebCrypto, `structuredClone`, `Blob`, `AbortController`, …
+- **Universal primitives**: `console`, timers (`setTimeout`/`setInterval`/…), `queueMicrotask`.
+- **Language + Wasm**: the ECMAScript spec globals plus `WebAssembly`.
 
-- **`node`** (default) — full Node.js compatibility. Nothing is removed.
-- **`browser`** — a browser/Deno-like runtime. The Node surface is gone;
+- **`node`** (the secure-exec default): full Node.js compatibility. Nothing is removed.
+- **`browser`**: a browser/Deno-like runtime. The Node surface is gone;
   web-standard globals remain. `crypto` is the WebCrypto object (`crypto.subtle`,
-  `crypto.getRandomValues`) — *not* the `node:crypto` module, so
+  `crypto.getRandomValues`), *not* the `node:crypto` module, so
   `crypto.randomBytes` / `crypto.createHash` are absent.
-- **`neutral`** — universal primitives only (`console`, timers,
+- **`neutral`**: universal primitives only (`console`, timers,
   `queueMicrotask`) plus the language. No `fetch`/`URL`/WebCrypto, no Node.
-- **`bare`** — language only: the ECMAScript spec globals plus `WebAssembly`.
+- **`bare`**: language only: the ECMAScript spec globals plus `WebAssembly`.
   No `console`, no timers, no `fetch`. The caller is expected to provide any host
   functionality the guest needs.
 
-`WebAssembly` stays available on every platform — compilation happens inside the
+`WebAssembly` stays available on every tier; compilation happens inside the
 isolate and is not a host escape.
 
-## `moduleResolution` — how imports resolve
+:::caution[Platform selection is not configurable in secure-exec yet]
+The kernel's wire protocol carries a `jsRuntime` configuration
+(`@secure-exec/core` exports the `JsRuntimeConfig` / `JsRuntimePlatform` types
+from `@secure-exec/core/vm-config`) with `platform`, `moduleResolution`, and
+`allowedBuiltins` fields. These tiers are real in the kernel, but
+`NodeRuntime.create()` does **not** plumb those fields through yet; it always
+boots the VM on the `node` platform with full Node module resolution. There is
+no ergonomic way to select `browser` / `neutral` / `bare`, change module
+resolution, or restrict the builtin allow-list from `NodeRuntime` today. The
+sections below document the intended model for those fields, not a
+`NodeRuntime.create()` option you can pass.
+:::
 
-An independent axis (any combination with `platform` is valid). Like esbuild,
-the default is full Node resolution even for non-`node` platforms.
+## `moduleResolution`: how imports resolve
+
+An independent axis of the wire config (any combination with `platform` is
+valid). Like esbuild, the default is full Node resolution even for non-`node`
+platforms, which is exactly what `NodeRuntime` uses.
 
 | `moduleResolution` | `import "pkg"` | `import "./x.js"` | `node:*` |
 |---|:---:|:---:|:---:|
 | `node` (default) | ✅ | ✅ | ✅ |
-| `relative` | — | ✅ | — |
-| `none` | — | — | — |
+| `relative` | No | ✅ | No |
+| `none` | No | No | No |
 
 (`import "pkg"` = bare/`node_modules` specifier; `import "./x.js"` = relative or
 absolute path; `node:*` follows the platform / `allowedBuiltins`.)
 
-- **`node`** — standard Node resolution: the `node_modules` ancestor walk,
+- **`node`**: standard Node resolution: the `node_modules` ancestor walk,
   `exports`/`imports`/conditions, and `realpath`/symlink following.
-- **`relative`** — only relative and absolute paths resolve from the VFS; bare
+- **`relative`**: only relative and absolute paths resolve from the VFS; bare
   package specifiers and `node:*` builtins do not.
-- **`none`** — nothing resolves. Any `import` or `require` (including relative)
-  fails. Produces a single self-contained entrypoint module — useful for
+- **`none`**: nothing resolves. Any `import` or `require` (including relative)
+  fails. Produces a single self-contained entrypoint module, useful for
   locked-down evaluation of one script.
 
-## `allowedBuiltins` — restrict Node builtins (node platform only)
+## `allowedBuiltins`: restrict Node builtins (node platform only)
 
-When `platform` is `node`, you can narrow which `node:*` builtin modules guest
-code may import:
+In the wire config, when `platform` is `node`, you can narrow which `node:*`
+builtin modules guest code may import:
 
-- **omitted** — the engine default allow-list (current behavior).
-- **`[]`** — deny **all** builtins.
-- **`["path", "fs"]`** — allow exactly these (a root name like `fs` also covers
+- **omitted**: the engine default allow-list (the behavior `NodeRuntime` uses).
+- **`[]`**: deny **all** builtins.
+- **`["path", "fs"]`**: allow exactly these (a root name like `fs` also covers
   `node:fs/promises`).
 
-`allowedBuiltins` is only meaningful under `platform: "node"` — the other
-platforms deny all `node:*` builtins regardless. Supplying it under any other
-platform is a configuration error (rejected at VM creation). Unknown builtin
-names are rejected too.
-
-## Worked examples
-
-**Deno / browser-like sandbox** — web APIs, still resolves npm packages:
-
-```ts
-config: { jsRuntime: { platform: "browser" } }
-// fetch/URL/crypto.subtle available; no process/Buffer/require;
-// `import "some-pkg"` still resolves from node_modules.
-```
-
-**Locked-down single-script eval** — nothing host-provided, no imports at all:
-
-```ts
-config: { jsRuntime: { platform: "bare", moduleResolution: "none" } }
-// Only ECMAScript + WebAssembly; every import/require throws.
-```
-
-**Node, but only a few builtins**:
-
-```ts
-config: { jsRuntime: { platform: "node", allowedBuiltins: ["path", "url"] } }
-// `import "node:path"` works; `import "node:fs"` is denied.
-```
-
-## Notes
-
-- `jsRuntime` is fixed at VM creation; it cannot be changed via reconfigure.
-- The setting applies to every JavaScript execution in the VM, including nested
-  `child_process` JavaScript launches, which inherit the same platform.
+`allowedBuiltins` is only meaningful under `platform: "node"`; the other
+platforms deny all `node:*` builtins regardless. Unknown builtin names are
+rejected.

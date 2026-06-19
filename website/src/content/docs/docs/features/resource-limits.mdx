@@ -1,133 +1,121 @@
 ---
 title: Resource Limits
-description: CPU time, memory, and payload size controls.
+description: Terminating runaway guest code with execution timeouts, plus the memory, payload, CPU-time, and timing limits the VM enforces.
 ---
 import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/resource-limits.ts" description="Runnable example for CPU and memory limits." />
+Resource limits prevent sandboxed code from running forever or exhausting the
+host. Each `exec()` call accepts a `timeout`, and when the budget elapses the
+guest process is killed so a runaway program can never hang the host. The
+timeout is the limit you reach for through the ergonomic `NodeRuntime` API
+today; secure-exec enforces several more resource limits at the VM level, and
+those are described at the end of this page.
 
-Resource limits prevent sandboxed code from running forever or exhausting host memory.
-
-## Runnable example
+## Limiting Execution Time
 
 ```ts
-import {
-  NodeRuntime,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "../../../packages/secure-exec/src/index.ts";
+import { NodeRuntime } from "secure-exec";
 
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  memoryLimit: 64,
-  cpuTimeLimitMs: 100,
-});
+const rt = await NodeRuntime.create();
 
 try {
-  const safeRun = await runtime.exec(`
-    console.log("resource-limits-ok");
-  `);
+	// A normal program finishes well within the timeout budget.
+	const ok = await rt.exec(`console.log("finished work");`, {
+		timeout: 5000,
+	});
+	console.log("normal run:");
+	console.log("  exitCode:", ok.exitCode);
+	console.log("  stdout:", JSON.stringify(ok.stdout.trim()));
 
-  const timedOut = await runtime.exec("while (true) {}");
+	// A runaway program (infinite loop) never returns on its own. The exec
+	// timeout terminates the guest process after the budget elapses.
+	const start = Date.now();
+	const runaway = await rt.exec(`while (true) {}`, {
+		timeout: 1000,
+	});
+	const elapsed = Date.now() - start;
 
-  const success =
-    safeRun.code === 0 &&
-    timedOut.code === 124 &&
-    (timedOut.errorMessage?.includes("CPU time limit exceeded") ?? false);
+	console.log("runaway run (timeout: 1000ms):");
+	console.log("  exitCode:", runaway.exitCode);
+	console.log("  elapsedMs:", elapsed);
 
-  console.log(
-    JSON.stringify({
-      ok: success,
-      safeCode: safeRun.code,
-      timeoutCode: timedOut.code,
-      errorMessage: timedOut.errorMessage,
-      summary: "normal code completed and an infinite loop hit the CPU limit",
-    }),
-  );
+	// A killed process exits non-zero; a clean exit would be 0.
+	const terminated = runaway.exitCode !== 0;
+	console.log(
+		terminated
+			? "runaway guest was terminated by the timeout"
+			: "ERROR: runaway guest was NOT terminated",
+	);
+
+	if (!terminated) {
+		process.exitCode = 1;
+	}
 } finally {
-  runtime.dispose();
+	await rt.dispose();
 }
 ```
 
-Source: [examples/features/src/resource-limits.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/resource-limits.ts)
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-resource-limits)*
 
-## CPU time limit
+Running it prints:
 
-Set a CPU time budget in milliseconds. When exceeded, the execution exits with code `124`.
-
-```ts
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  cpuTimeLimitMs: 5000, // 5 seconds
-});
-
-const result = await runtime.exec("while (true) {}");
-console.log(result.code); // 124
-console.log(result.errorMessage); // "CPU time limit exceeded"
+```text
+normal run:
+  exitCode: 0
+  stdout: "finished work"
+runaway run (timeout: 1000ms):
+  exitCode: 137
+  elapsedMs: 2506
+runaway guest was terminated by the timeout
 ```
 
-You can also override per execution:
+## Execution timeout
+
+Pass `timeout` (in milliseconds) to `exec()` to bound how long a single guest
+program may run. When the budget elapses, the guest process is killed and `exec()`
+returns with a non-zero `exitCode` (`137`, i.e. `128 + SIGKILL`).
 
 ```ts
-await runtime.exec("while (true) {}", {
-  cpuTimeLimitMs: 1000, // tighter limit for this call
+const runaway = await rt.exec(`while (true) {}`, {
+	timeout: 1000,
 });
+
+console.log(runaway.exitCode); // 137 (terminated)
 ```
 
-## Memory limit
-
-Cap isolate memory in MB. When unset, the isolate uses V8's default heap size.
+A program that finishes before the timeout returns its real exit code:
 
 ```ts
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  memoryLimit: 64, // 64 MB
+const ok = await rt.exec(`console.log("finished work");`, {
+	timeout: 5000,
 });
+
+console.log(ok.exitCode); // 0
 ```
 
-## Payload limits
+The same `timeout` option is available on `run()`.
 
-The bridge enforces size limits on data crossing the isolate boundary. Oversized payloads are rejected with `ERR_SANDBOX_PAYLOAD_TOO_LARGE` instead of exhausting host memory.
+## Other limits enforced by the VM
 
-```ts
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  payloadLimits: {
-    base64TransferBytes: 10 * 1024 * 1024, // 10 MB for file transfers
-    jsonPayloadBytes: 5 * 1024 * 1024, // 5 MB for JSON payloads
-  },
-});
-```
+The execution `timeout` is the only resource limit exposed as a
+`NodeRuntime.exec()` / `NodeRuntime.run()` option today, but it is not the only
+limit secure-exec enforces. The VM applies a broader set of resource limits
+configured at VM creation through the protocol's `VmLimits`
+(`CreateVmConfig.limits`), including:
 
-Hosts can tune these limits within bounded safe ranges but cannot disable enforcement.
+- **Memory**: a V8 heap limit (`jsRuntime.v8HeapLimitMb`) caps how much memory
+  guest JavaScript may allocate, plus filesystem byte and inode caps for the
+  virtual filesystem.
+- **Payload and transfer limits**: caps on captured output, stdin buffering,
+  event payload size, and `fetch()` response size bound how much data moves
+  between the guest and the host.
+- **CPU-time budget**: secure-exec can bound CPU usage (cores and blocking
+  read time) independently of the wall-clock execution `timeout`.
+- **Timing mitigation**: secure-exec can freeze timers to blunt timing side
+  channels.
 
-## Timing mitigation
-
-High-resolution timers are frozen by default to mitigate timing side-channel attacks.
-
-```ts
-// Default: frozen timers
-const secure = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  timingMitigation: "freeze", // default
-});
-
-// Opt out for Node-compatible advancing clocks
-const compatible = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  timingMitigation: "off",
-});
-```
-
-In `"freeze"` mode:
-- `Date.now()` and `performance.now()` return frozen values within an execution
-- `process.hrtime()` and `process.uptime()` follow the hardened path
-- `SharedArrayBuffer` is unavailable
-
-See the [Security Model](/docs/security-model) for more on timing hardening and trust boundaries.
+These limits are real and enforced by secure-exec, but they are not yet
+surfaced as `NodeRuntime.create()` options. The ergonomic `NodeRuntime` API
+boots the VM with secure-exec's defaults for them; only the execution
+`timeout` is configurable per call today. To tune the other limits you set
+`CreateVmConfig.limits` when driving the VM through the lower-level protocol.

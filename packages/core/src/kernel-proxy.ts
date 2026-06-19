@@ -1318,6 +1318,21 @@ export class NativeSidecarKernelProxy {
 		return this.boundUdpLookups.get(key)?.value ?? null;
 	}
 
+	/**
+	 * Drive an HTTP request to a guest-bound TCP port inside the VM and return
+	 * the raw JSON response payload from the sidecar. The caller decodes the
+	 * JSON into a structured response.
+	 */
+	async vmFetch(request: {
+		port: number;
+		method: string;
+		path: string;
+		headersJson: string;
+		body?: string;
+	}): Promise<string> {
+		return this.client.vmFetch(this.session, this.vm, request);
+	}
+
 	getSignalState(pid: number): KernelSignalState {
 		const entry = this.trackedProcesses.get(pid);
 		if (entry && !this.signalRefreshes.has(pid)) {
@@ -2259,6 +2274,7 @@ export type {
 	SidecarPermissionsPolicy,
 	SidecarRegisteredHostCallbackDefinition,
 	SidecarRequestFrame,
+	SidecarRequestHandler,
 	SidecarResponsePayload,
 	SidecarSessionState,
 	SidecarSignalHandlerRegistration,

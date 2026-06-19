@@ -1,130 +1,143 @@
 ---
 title: Dev Servers
-description: Run user-provided dev servers (Hono, Express, Next.js) inside a secure isolate.
+description: Run user-provided server-style code (HTTP servers, request handlers) inside a secure isolate.
 ---
 
 import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/hono-dev-server" description="Full working example with a sandboxed Hono dev server." />
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-dev-servers" description="Full working example that boots an HTTP server inside a sandboxed isolate and drives requests against it." />
 
-Let users run their own dev servers inside a sandboxed isolate. Secure Exec can host long-lived Node servers from untrusted code, not just one-shot scripts. The host starts the user's server inside the isolate, verifies it's ready, proxies requests to it, and tears it down when done.
+Let users run their own server-style code inside a sandboxed isolate. A guest program can boot a real `node:http` server, bind a loopback port owned by the kernel, and serve requests, all without touching the host machine.
 
-## Run a user's Hono server
+secure-exec can boot a guest server and forward host requests into it: the wire protocol exposes a `vmFetch` capability that addresses a running guest server by port and proxies a host request through the kernel socket table into the guest. The example below boots a guest server and drives requests against it from inside the same run, then exits, getting a `200` back.
 
-Start a user-provided Hono server inside the isolate, wait for its health endpoint, fetch a response from the host, then terminate.
+The ergonomic `NodeRuntime` API (`exec()` / `run()`) is run-to-completion: `exec()` writes the guest code to a module inside the VM and runs it as `node <file>`, then returns once that process exits. The host-side proxy into a running guest server is real in secure-exec via `vmFetch`, but it is not yet surfaced as a simple `NodeRuntime` option, so the example exercises the server from **inside** the same guest run.
 
-```ts Hono Dev Server
-import { createServer } from "node:net";
-import {
-  NodeRuntime,
-  allowAllNetwork,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "secure-exec";
+## Boot a server and drive requests inside the isolate
 
-const host = "127.0.0.1";
-const port = await findOpenPort();
-const logs: string[] = [];
+The guest starts an HTTP server on loopback, waits for its health endpoint, fetches a response, tears the server down, and prints a structured result line. The host runs the program with `exec()` and parses that result.
 
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    useDefaultNetwork: true,
-    permissions: { ...allowAllNetwork },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  memoryLimit: 128,
-  cpuTimeLimitMs: 60_000,
+```ts
+import { NodeRuntime } from "secure-exec";
+
+// A user's "dev server": untrusted server-style code. It boots a real
+// node:http server, then we drive requests against it - all inside the
+// secure-exec VM, with no access to the host machine.
+const devServer = `
+import http from "node:http";
+
+// 1. Start the user's server, exactly as they wrote it.
+const app = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("hello from the sandboxed dev server");
 });
 
-const execPromise = runtime.exec(`
-  (async () => {
-    const { Hono } = require("hono");
-    const { serve } = require("@hono/node-server");
+// Listen on loopback inside the VM. The kernel owns this socket; it never
+// touches a real host port.
+await new Promise((resolve) => app.listen(3000, "127.0.0.1", resolve));
+const { port } = app.address();
+console.log("server listening on 127.0.0.1:" + port);
 
-    const app = new Hono();
-    app.get("/", (c) => c.text("hello from sandboxed hono"));
-    app.get("/health", (c) => c.json({ ok: true }));
+// 2. Wait for readiness by polling the health endpoint from inside the VM.
+async function waitForReady(url) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (res.status === 200) return;
+    } catch {
+      // Not ready yet; retry.
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("Timed out waiting for " + url);
+}
+await waitForReady("http://127.0.0.1:" + port + "/health");
+console.log("health check passed");
 
-    serve({
-      fetch: app.fetch,
-      port: ${port},
-      hostname: "${host}",
-    });
+// 3. Drive a request against the running server and capture the response.
+const res = await fetch("http://127.0.0.1:" + port + "/");
+const body = await res.text();
+console.log("GET / ->", res.status, JSON.stringify(body));
 
-    console.log("server:listening:${port}");
-    await new Promise(() => {});
-  })().catch((error) => {
-    console.error(error);
-    process.exitCode = 1;
-  });
-`, {
-  onStdio: (event) => logs.push(`[${event.channel}] ${event.message}`),
-});
+// 4. Tear the server down so the program can exit cleanly.
+await new Promise((resolve) => app.close(resolve));
+console.log("server closed");
+
+// Emit a machine-readable result line the host can parse from stdout.
+console.log("RESULT " + JSON.stringify({ status: res.status, body }));
+
+// The fetch client keeps a connection pool alive, so exit explicitly once the
+// work is done rather than waiting for the event loop to drain.
+process.exit(0);
+`;
+
+// The guest binds a loopback port and drives requests against it with fetch(),
+// so opt in to networking. NodeRuntime.create() denies network by default;
+// permissions merge over that secure default.
+const runtime = await NodeRuntime.create({ permissions: { network: "allow" } });
 
 try {
-  await waitForServer(runtime, `http://${host}:${port}/health`);
+	// exec() runs the guest program (an ES module, so top-level `import` and
+	// `await` work) to completion. The server is long-lived for the duration of
+	// the run, but exec()/run() are run-to-completion: the guest must finish
+	// (here, by closing the server) for the call to return.
+	const result = await runtime.exec(devServer, { timeout: 30_000 });
 
-  const response = await runtime.network.fetch(`http://${host}:${port}/`, {
-    method: "GET",
-  });
+	console.log("--- host side ---");
+	console.log("exitCode:", result.exitCode);
+	console.log("guest stdout:\n" + result.stdout.trim());
+	if (result.stderr.trim()) {
+		console.log("guest stderr:\n" + result.stderr.trim());
+	}
 
-  console.log(response.status); // 200
-  console.log(response.body); // "hello from sandboxed hono"
+	// Recover the structured result the guest printed on its final stdout line.
+	const resultLine = result.stdout
+		.split("\n")
+		.find((line) => line.startsWith("RESULT "));
+	if (resultLine) {
+		const payload = JSON.parse(resultLine.slice("RESULT ".length));
+		console.log("parsed response:", JSON.stringify(payload));
+	}
 } finally {
-  await runtime.terminate();
-  await execPromise.catch(() => undefined);
-}
-
-async function findOpenPort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-
-    server.once("error", reject);
-    server.listen(0, host, () => {
-      const address = server.address();
-      if (!address || typeof address !== "object") {
-        reject(new Error("Failed to allocate a port"));
-        server.close();
-        return;
-      }
-
-      const allocatedPort = address.port;
-      server.close((error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve(allocatedPort);
-      });
-    });
-  });
-}
-
-async function waitForServer(runtime: NodeRuntime, url: string): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      const response = await runtime.network.fetch(url, { method: "GET" });
-      if (response.status === 200) {
-        return;
-      }
-    } catch {
-      // Retry until the server is ready.
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-
-  throw new Error(`Timed out waiting for ${url}`);
+	// Tear down the VM and release the sidecar.
+	await runtime.dispose();
 }
 ```
 
-Your platform stays in control of the lifecycle while the user's code runs isolated:
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/uc-dev-servers)*
 
-- The isolate owns the user's server process and application code
-- The host verifies readiness through the network adapter
-- The host proxies traffic to the sandboxed server
-- The host terminates the runtime when the session ends
+Running it prints the guest's progress and the parsed response:
+
+```
+--- host side ---
+exitCode: 0
+guest stdout:
+server listening on 127.0.0.1:3000
+health check passed
+GET / -> 200 "hello from the sandboxed dev server"
+server closed
+RESULT {"status":200,"body":"hello from the sandboxed dev server"}
+parsed response: {"status":200,"body":"hello from the sandboxed dev server"}
+```
+
+## What the isolate gives you
+
+- The guest owns the server process, the application code, and the loopback socket. The kernel mediates the socket, so it never binds a real host port.
+- `fetch()` inside the guest runs through the kernel socket table, so even the readiness checks and requests stay inside the isolation boundary.
+- The host stays in control of the lifecycle: it starts the run, enforces the `timeout`, captures stdout/stderr/exitCode, and disposes the VM.
 
 This is useful for platforms that let users write and preview server-side code (live coding environments, serverless playgrounds, educational tools) without giving them access to the host machine.
 
-For a simpler request-only model without a bound TCP port, Hono also works with direct `app.fetch(...)` handlers. See [Quickstart](/docs/quickstart).
+## Run-to-completion on the ergonomic API
+
+The ergonomic `NodeRuntime` API runs each program to completion: `exec()` and `run()` boot the guest program, wait for it to finish, and return its output. They do not keep a guest server running between calls or hand you a host-side handle to proxy traffic into it.
+
+The underlying capability does exist in secure-exec: the wire protocol's `vmFetch` addresses a running guest server by port and forwards a host request into it through the kernel socket table. It is just not yet surfaced as a simple `NodeRuntime` option, so to drive a server from the ergonomic API today you keep the request loop inside a single run. If you want to serve many requests that way, either:
+
+- batch the requests you want to handle into one guest run, like the example above, or
+- model each request as its own short guest run that boots the handler, processes the request, and returns. This is the request-only pattern from the [Quickstart](/docs/quickstart).

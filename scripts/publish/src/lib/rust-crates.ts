@@ -7,6 +7,7 @@ export const RUST_CRATE_ORDER = [
 	"secure-exec-kernel",
 	"secure-exec-v8-runtime",
 	"secure-exec-execution",
+	"secure-exec-vm-config",
 	"secure-exec-sidecar",
 	"secure-exec-client",
 ] as const;

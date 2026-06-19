@@ -2,6 +2,7 @@ packages:
   - website
   - packages/*
   - examples/*
+  - examples/docs/*
   - registry/software/*
   - registry/file-system/*
   - registry/tool/*

@@ -13,6 +13,9 @@ import {
 	NativeSidecarKernelProxy,
 	NativeSidecarProcessClient,
 	type RootFilesystemEntry,
+	type SidecarRegisteredHostCallbackDefinition,
+	type SidecarRequestFrame,
+	type SidecarResponsePayload,
 	serializeMountConfigForSidecar,
 } from "./kernel-proxy.js";
 import { resolvePublishedSidecarBinary } from "./binary.js";
@@ -275,6 +278,43 @@ export interface Permissions {
 	tool?: ToolPermissions;
 }
 
+/** A worked example shown alongside a registered host tool. */
+export interface HostToolExample {
+	/** What this example demonstrates. */
+	description: string;
+	/** Example input matching the tool's input schema. */
+	input: unknown;
+}
+
+/**
+ * A host-side tool that guest code can invoke as a shell command. The guest
+ * runs the tool by name and the invocation round-trips back to the host JS
+ * `handler`, whose return value is passed back to the guest. Tools never run
+ * inside the guest: they execute on the host, so they are the bridge for giving
+ * sandboxed guest code controlled, named capabilities (the kind AI agents call
+ * as tools).
+ */
+export interface HostToolDefinition {
+	/** Human-readable description of what the tool does. */
+	description: string;
+	/** JSON Schema describing the tool's input. */
+	inputSchema: object;
+	/** Abort the invocation after this many milliseconds. */
+	timeoutMs?: number;
+	/** Worked examples shown alongside the tool. */
+	examples?: HostToolExample[];
+	/**
+	 * Extra command names the guest can use to invoke this tool, in addition to
+	 * the key it is registered under.
+	 */
+	commandAliases?: string[];
+	/**
+	 * Host handler invoked when guest code runs the tool. Receives the parsed
+	 * input and returns a JSON-serializable result delivered back to the guest.
+	 */
+	handler: (input: unknown) => unknown | Promise<unknown>;
+}
+
 export interface ResourceBudgets {
 	maxOutputBytes?: number;
 	maxBridgeCalls?: number;
@@ -417,6 +457,14 @@ export interface Kernel extends KernelInterface {
 	removeFile(path: string): Promise<void>;
 	removeDir(path: string): Promise<void>;
 	rename(oldPath: string, newPath: string): Promise<void>;
+	vmFetch(request: {
+		port: number;
+		method: string;
+		path: string;
+		headersJson: string;
+		body?: string;
+	}): Promise<string>;
+	registerHostTools(tools: Record<string, HostToolDefinition>): Promise<void>;
 	readonly commands: ReadonlyMap<string, string>;
 	readonly processes: ReadonlyMap<number, ProcessInfo>;
 	readonly env: Record<string, string>;
@@ -2446,6 +2494,14 @@ class NativeKernel implements Kernel {
 		number
 	>();
 	private readonly loopbackExemptPorts: number[];
+	// Host tools registered with the VM, keyed by the callback key the sidecar
+	// sends back on a host_callback request (the tool name). Installed lazily on
+	// the first registerHostTools call.
+	private readonly hostToolHandlers = new Map<
+		string,
+		(input: unknown) => unknown | Promise<unknown>
+	>();
+	private hostToolRequestHandlerInstalled = false;
 
 	constructor(
 		private readonly options: {
@@ -2705,6 +2761,110 @@ class NativeKernel implements Kernel {
 	async readFile(targetPath: string): Promise<Uint8Array> {
 		await this.ensureReady();
 		return this.proxy!.readFile(targetPath);
+	}
+
+	async vmFetch(request: {
+		port: number;
+		method: string;
+		path: string;
+		headersJson: string;
+		body?: string;
+	}): Promise<string> {
+		await this.ensureReady();
+		return this.proxy!.vmFetch(request);
+	}
+
+	async registerHostTools(
+		tools: Record<string, HostToolDefinition>,
+	): Promise<void> {
+		await this.ensureReady();
+		if (!this.client || !this.session || !this.vm) {
+			throw new Error("kernel is not ready");
+		}
+
+		// Install the dispatcher once. It routes every host_callback request the
+		// sidecar emits to the matching registered handler and replies with a
+		// host_callback_result frame.
+		if (!this.hostToolRequestHandlerInstalled) {
+			this.client.setSidecarRequestHandler((request: SidecarRequestFrame) =>
+				this.dispatchHostToolRequest(request),
+			);
+			this.hostToolRequestHandlerInstalled = true;
+		}
+
+		for (const [name, tool] of Object.entries(tools)) {
+			this.hostToolHandlers.set(name, tool.handler);
+			const definition: SidecarRegisteredHostCallbackDefinition = {
+				description: tool.description,
+				inputSchema: tool.inputSchema,
+				...(tool.timeoutMs !== undefined ? { timeoutMs: tool.timeoutMs } : {}),
+				...(tool.examples && tool.examples.length > 0
+					? {
+							examples: tool.examples.map((example) => ({
+								description: example.description,
+								input: example.input,
+							})),
+						}
+					: {}),
+			};
+			// Register each tool as its own single-tool toolkit so the guest can
+			// invoke it directly by name (or by any caller-provided alias). The
+			// sidecar exposes the toolkit name as a guest command; the single
+			// callback carries the tool's schema and gates the `tool` permission.
+			await this.client.registerHostCallbacks(this.session, this.vm, {
+				name,
+				description: tool.description,
+				commandAliases: [name, ...(tool.commandAliases ?? [])],
+				callbacks: { [name]: definition },
+			});
+			this.commands.set(name, "wasmvm");
+			for (const alias of tool.commandAliases ?? []) {
+				this.commands.set(alias, "wasmvm");
+			}
+		}
+	}
+
+	private async dispatchHostToolRequest(
+		request: SidecarRequestFrame,
+	): Promise<SidecarResponsePayload> {
+		const { payload } = request;
+		if (payload.type !== "host_callback") {
+			throw new Error(
+				`unsupported sidecar request for host tools: ${payload.type}`,
+			);
+		}
+		// Callback keys arrive as `${toolkit}:${tool}` for toolkit invocations and
+		// as the bare command name otherwise. The toolkit name and tool name are
+		// the same here, so the registered tool name is the segment after the last
+		// colon (or the whole key when no colon is present).
+		const callbackKey = payload.callback_key;
+		const toolName = callbackKey.includes(":")
+			? callbackKey.slice(callbackKey.lastIndexOf(":") + 1)
+			: callbackKey;
+		const handler =
+			this.hostToolHandlers.get(toolName) ??
+			this.hostToolHandlers.get(callbackKey);
+		if (!handler) {
+			return {
+				type: "host_callback_result",
+				invocation_id: payload.invocation_id,
+				error: `no host tool registered for ${callbackKey}`,
+			};
+		}
+		try {
+			const result = await handler(payload.input);
+			return {
+				type: "host_callback_result",
+				invocation_id: payload.invocation_id,
+				result: result === undefined ? null : result,
+			};
+		} catch (error) {
+			return {
+				type: "host_callback_result",
+				invocation_id: payload.invocation_id,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
 	}
 
 	async writeFile(

@@ -1,180 +1,125 @@
 ---
 title: TypeScript
-description: Sandboxed type checking and compilation.
+description: Compiling and type-checking TypeScript inside the sandbox.
 ---
-import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/typescript.ts" description="Runnable example for sandboxed TypeScript compilation." />
+`@secure-exec/typescript` runs the TypeScript compiler **inside the sandbox**. The compiler is projected into the VM and every compile and type-check happens in the guest, so untrusted TypeScript never executes (or compiles) on the host.
 
-The `@secure-exec/typescript` companion package runs the TypeScript compiler inside a sandbox for safe type checking and compilation of untrusted code.
+Running the compiler in the sandbox protects you from **CPU and memory amplification attacks**. Type-checking attacker-controlled source is itself a risk: a small, malicious type can make `tsc` spin for seconds or balloon its heap (recursive conditional types, deeply nested generics, and similar pathologies). Because the compiler runs in a disposable VM you control rather than in your host process, that blow-up is contained by the sandbox boundary, and you can bound each run with a `timeout`, instead of hanging or OOM-ing the host.
 
-## Runnable example
-
-```ts
-import {
-  NodeRuntime,
-  allowAllFs,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "../../../packages/secure-exec/src/index.ts";
-import { createTypeScriptTools } from "../../../packages/typescript/src/index.ts";
-
-const sourceText = `
-  export const message: string = "hello from typescript";
-`;
-
-const systemDriver = createNodeDriver();
-const runtimeDriverFactory = createNodeRuntimeDriverFactory();
-const compilerSystemDriver = createNodeDriver({
-  moduleAccess: {
-    cwd: process.cwd(),
-  },
-  permissions: { ...allowAllFs },
-});
-
-const runtime = new NodeRuntime({
-  systemDriver,
-  runtimeDriverFactory,
-});
-
-const ts = createTypeScriptTools({
-  systemDriver: compilerSystemDriver,
-  runtimeDriverFactory,
-  compilerSpecifier: "/root/node_modules/typescript/lib/typescript.js",
-});
-
-try {
-  const typecheck = await ts.typecheckSource({
-    sourceText,
-    filePath: "/root/example.ts",
-    compilerOptions: {
-      module: "commonjs",
-      target: "es2022",
-    },
-  });
-
-  if (!typecheck.success) {
-    throw new Error(typecheck.diagnostics.map((diagnostic) => diagnostic.message).join("\n"));
-  }
-
-  const compiled = await ts.compileSource({
-    sourceText,
-    filePath: "/root/example.ts",
-    compilerOptions: {
-      module: "commonjs",
-      target: "es2022",
-    },
-  });
-
-  if (!compiled.success || !compiled.outputText) {
-    throw new Error(compiled.diagnostics.map((diagnostic) => diagnostic.message).join("\n"));
-  }
-
-  const result = await runtime.run<{ message: string }>(compiled.outputText, "/root/example.js");
-  const message = result.exports?.message;
-
-  if (result.code !== 0 || message !== "hello from typescript") {
-    throw new Error(`Unexpected runtime result: ${JSON.stringify(result)}`);
-  }
-
-  console.log(
-    JSON.stringify({
-      ok: true,
-      message,
-      summary: "sandbox typechecked, compiled, and ran a TypeScript snippet",
-    }),
-  );
-} finally {
-  runtime.dispose();
-}
-```
-
-Source: [examples/features/src/typescript.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/typescript.ts)
+You compile typed source to JavaScript, run the emitted code in the sandbox, and get structured diagnostics back, all without the compiler ever touching the host.
 
 ## Install
 
 ```bash
-pnpm add @secure-exec/typescript
+npm install @secure-exec/typescript secure-exec
 ```
 
-## Setup
+## Compiling and type-checking
 
 ```ts
-import { createNodeDriver, createNodeRuntimeDriverFactory } from "secure-exec";
 import { createTypeScriptTools } from "@secure-exec/typescript";
+import { NodeRuntime } from "secure-exec";
 
-const ts = createTypeScriptTools({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-});
-```
+const tools = createTypeScriptTools();
 
-**Options:**
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `systemDriver` | `SystemDriver` | required | Compiler runtime capabilities and filesystem view |
-| `runtimeDriverFactory` | `NodeRuntimeDriverFactory` | required | Creates the compiler sandbox |
-| `memoryLimit` | `number` | `512` | Compiler isolate memory cap in MB |
-| `cpuTimeLimitMs` | `number` | | Compiler CPU time budget in ms |
-| `compilerSpecifier` | `string` | `"/root/node_modules/typescript/lib/typescript.js"` | Module specifier for the TypeScript compiler |
-
-## Type-check a source string
-
-```ts
-const result = await ts.typecheckSource({
-  sourceText: "const x: number = 'hello';",
-});
-
-console.log(result.success); // false
-console.log(result.diagnostics[0].message);
-// "Type 'string' is not assignable to type 'number'."
-```
-
-## Type-check a project
-
-```ts
-const result = await ts.typecheckProject({
-  cwd: "/app",
-  configFilePath: "/app/tsconfig.json",
-});
-
-for (const d of result.diagnostics) {
-  console.log(`${d.filePath}:${d.line} ${d.message}`);
+// A typed snippet we want to compile and run inside the sandbox.
+const typeScriptSource = `
+interface Greeting {
+  name: string;
+  count: number;
 }
-```
 
-## Compile a source string
+const greeting: Greeting = { name: "secure-exec", count: 3 };
+const lines: string[] = Array.from(
+  { length: greeting.count },
+  (_unused, index) => \`hello \${greeting.name} #\${index + 1}\`,
+);
 
-```ts
-const result = await ts.compileSource({
-  sourceText: "const x: number = 42; export default x;",
+for (const line of lines) {
+  console.log(line);
+}
+`;
+
+// Step 1: compile TypeScript to JavaScript inside the sandbox.
+const compiled = await tools.compileSource({
+  sourceText: typeScriptSource,
+  compilerOptions: { module: "ESNext", target: "ES2022" },
 });
 
-console.log(result.outputText);
-// "const x = 42; export default x;"
-```
+if (!compiled.success) {
+  const messages = compiled.diagnostics.map((d) => d.message);
+  throw new Error(`TypeScript compile failed:\n${messages.join("\n")}`);
+}
 
-## Compile a project
+console.log("Compiled TypeScript to JavaScript inside the sandbox.");
 
-```ts
-const result = await ts.compileProject({
-  cwd: "/app",
+// Step 2: run the emitted JavaScript inside the sandbox.
+const rt = await NodeRuntime.create();
+try {
+  const result = await rt.exec(compiled.outputText ?? "");
+  console.log("exitCode:", result.exitCode);
+  console.log("guest stdout:\n" + result.stdout.trimEnd());
+} finally {
+  await rt.dispose();
+}
+
+// Step 3: type-check a snippet that has a type error inside the sandbox.
+const typeCheck = await tools.typecheckSource({
+  sourceText: `const total: number = "not a number";`,
 });
 
-console.log(result.emittedFiles); // ["/app/dist/index.js", ...]
-console.log(result.success); // true
+console.log("type check success:", typeCheck.success);
+for (const diagnostic of typeCheck.diagnostics) {
+  console.log(
+    `  ${diagnostic.category} TS${diagnostic.code} (line ${diagnostic.line}): ${diagnostic.message}`,
+  );
+}
+
+if (typeCheck.success) {
+  throw new Error("Expected the ill-typed snippet to fail type checking.");
+}
+
+console.log("OK: TypeScript compiled and type-checked inside the sandbox.");
 ```
 
-## Diagnostic shape
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-typescript)*
+
+Running the example prints:
+
+```
+Compiled TypeScript to JavaScript inside the sandbox.
+exitCode: 0
+guest stdout:
+hello secure-exec #1
+hello secure-exec #2
+hello secure-exec #3
+type check success: false
+  error TS2322 (line 1): Type 'string' is not assignable to type 'number'.
+OK: TypeScript compiled and type-checked inside the sandbox.
+```
+
+## How it works
+
+`createTypeScriptTools()` reads the `typescript` package on the host and projects it into the VM's virtual filesystem, then runs the compiler program in the guest through `secure-exec`. The compiler bundle is mounted (read lazily) rather than copied, so the multi-megabyte compiler is available in the sandbox without shipping its bytes up front. Each call boots a VM, runs the compiler inside it, and returns the result:
+
+- **`compileSource({ sourceText, compilerOptions? })`** compiles a single TypeScript string and returns `{ success, diagnostics, outputText, sourceMapText }`. `outputText` is the emitted JavaScript, ready to run with `NodeRuntime`.
+- **`typecheckSource({ sourceText })`** type-checks a single TypeScript string without emitting and returns `{ success, diagnostics }`.
+- **`compileProject({ cwd?, configFilePath? })`** compiles a `tsconfig.json` project inside the VM and emits the output into the VM filesystem, returning `{ success, diagnostics, emitSkipped, emittedFiles }`.
+- **`typecheckProject({ cwd?, configFilePath? })`** type-checks a `tsconfig.json` project inside the VM and returns `{ success, diagnostics }`.
+
+Each diagnostic is `{ code, category, message, filePath?, line?, column? }`, so type errors come back as structured data you can inspect or report. To compile a project or point the tools at your own sources, seed files into the VM with the `files` option, or project a host directory with the `mounts` option:
 
 ```ts
-type TypeScriptDiagnostic = {
-  code: number;
-  category: "error" | "warning" | "suggestion" | "message";
-  message: string;
-  filePath?: string;
-  line?: number;
-  column?: number;
-};
+const tools = createTypeScriptTools({
+  files: {
+    "/root/tsconfig.json": JSON.stringify({
+      compilerOptions: { strict: true, target: "ES2022", module: "ESNext" },
+      include: ["src"],
+    }),
+    "/root/src/index.ts": "export const answer: number = 42;\n",
+  },
+});
+
+const result = await tools.compileProject({ cwd: "/root" });
 ```

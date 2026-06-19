@@ -17,10 +17,10 @@ export const siteConfig = {
 	repo: "rivet-dev/secure-exec",
 	editPath: "website/",
 
-	topNav: [
-		{ label: "Documentation", href: "/docs", match: "/docs" },
-		{ label: "Changelog", href: "https://github.com/rivet-dev/secure-exec/releases" },
-	],
+	// Local CSS appended after the shared theme stylesheet (so it overrides it).
+	css: ["./src/styles/docs-overrides.css"],
+
+	topNav: [],
 	cta: { label: "Get Started", href: "/docs/quickstart" },
 	social: { discord: "https://rivet.dev/discord" },
 
@@ -29,14 +29,12 @@ export const siteConfig = {
 	landing: {
 		title: "Documentation",
 		subtitle:
-			"Secure Exec is a fully virtualized runtime for executing untrusted code — a POSIX-like VM with a virtual filesystem, process table, sockets, and managed language runtimes, with zero host escapes.",
+			"A lightweight library for secure Node.js execution. No containers, no VMs — just npm-compatible sandboxing out of the box.",
 		cards: [
 			{ title: "Quickstart", href: "/docs/quickstart", icon: "rocket", description: "Install and run your first sandboxed execution in a few minutes." },
 			{ title: "SDK Overview", href: "/docs/sdk-overview", icon: "terminal", description: "The programmatic API for driving the runtime from Node or the browser." },
 			{ title: "Features", href: "/docs/features/typescript", icon: "layers", description: "TypeScript, permissions, filesystem, networking, child processes, and more." },
-			{ title: "System Drivers", href: "/docs/system-drivers/overview", icon: "cpu", description: "Run on Node or in the browser through one kernel-owned syscall surface." },
-			{ title: "Benchmarks", href: "/docs/benchmarks", icon: "gauge", description: "Performance and cost characteristics versus other approaches." },
-			{ title: "API Reference", href: "/docs/api-reference", icon: "book", description: "Full reference for the runtime API." },
+			// { title: "API Reference", href: "/docs/api-reference", icon: "book", description: "Full reference for the runtime API." },
 		],
 	},
 
@@ -64,14 +62,6 @@ export const siteConfig = {
 			],
 		},
 		{
-			label: "System Drivers",
-			items: [
-				{ slug: "docs/system-drivers/overview", attrs: { "data-icon": "layers" } },
-				{ slug: "docs/system-drivers/node", attrs: { "data-icon": "hexagon" } },
-				{ slug: "docs/system-drivers/browser", attrs: { "data-icon": "globe" } },
-			],
-		},
-		{
 			label: "Features",
 			items: [
 				{ slug: "docs/features/typescript", attrs: { "data-icon": "fileCode" } },
@@ -84,30 +74,30 @@ export const siteConfig = {
 				{ slug: "docs/features/output-capture", attrs: { "data-icon": "scroll" } },
 				{ slug: "docs/features/resource-limits", attrs: { "data-icon": "gauge" } },
 				{ slug: "docs/features/child-processes", attrs: { "data-icon": "split" } },
-				{ slug: "docs/process-isolation", attrs: { "data-icon": "box" } },
+				// { slug: "docs/process-isolation", attrs: { "data-icon": "box" } },
 			],
 		},
 		{
 			label: "Reference",
 			items: [
-				{ slug: "docs/api-reference", attrs: { "data-icon": "book" } },
-				{ slug: "docs/nodejs-compatibility", attrs: { "data-icon": "check" } },
-				{ slug: "docs/benchmarks", attrs: { "data-icon": "gauge" } },
-				{
-					label: "Comparison",
-					items: [
-						{ slug: "docs/comparison/sandbox", attrs: { "data-icon": "gitCompare" } },
-						{ slug: "docs/comparison/cloudflare-workers", attrs: { "data-icon": "gitCompare" } },
-					],
-				},
-				{
-					label: "Advanced",
-					items: [
-						{ slug: "docs/cost-evaluation", attrs: { "data-icon": "dollar" } },
-						{ slug: "docs/architecture", attrs: { "data-icon": "blocks" } },
-						{ slug: "docs/security-model", attrs: { "data-icon": "lock" } },
-					],
-				},
+				// { slug: "docs/api-reference", attrs: { "data-icon": "book" } },
+				// { slug: "docs/nodejs-compatibility", attrs: { "data-icon": "check" } },
+				{ slug: "docs/benchmarks" },
+				// {
+				// 	label: "Comparison",
+				// 	items: [
+				// 		{ slug: "docs/comparison/sandbox", attrs: { "data-icon": "gitCompare" } },
+				// 		{ slug: "docs/comparison/cloudflare-workers", attrs: { "data-icon": "gitCompare" } },
+				// 	],
+				// },
+				// {
+				// 	label: "Advanced",
+				// 	items: [
+				// 		{ slug: "docs/cost-evaluation", attrs: { "data-icon": "dollar" } },
+				// 		{ slug: "docs/architecture", attrs: { "data-icon": "blocks" } },
+				// 		{ slug: "docs/security-model", attrs: { "data-icon": "lock" } },
+				// 	],
+				// },
 			],
 		},
 	],

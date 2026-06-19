@@ -24,6 +24,281 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.19.15)
 
+  examples/docs/feat-child-processes:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-filesystem:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-module-loading:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-networking:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-output-capture:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-permissions:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-resource-limits:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-runtime-platform:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/feat-typescript:
+    dependencies:
+      '@secure-exec/typescript':
+        specifier: workspace:*
+        version: link:../../../packages/typescript
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+
+  examples/docs/feat-virtual-filesystem:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/process-isolation:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/quickstart:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/sdk-overview:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/uc-ai-agent-code-exec:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/uc-code-mode:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/uc-dev-servers:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  examples/docs/uc-plugin-systems:
+    dependencies:
+      secure-exec:
+        specifier: workspace:*
+        version: link:../../../packages/secure-exec
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      tsx:
+        specifier: ^4.19.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
   examples/native-client:
     dependencies:
       '@secure-exec/core':
@@ -102,7 +377,36 @@ importers:
         specifier: ^5.7.2
         version: 5.9.3
 
+  packages/secure-exec:
+    dependencies:
+      '@secure-exec/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
   packages/sidecar: {}
+
+  packages/typescript:
+    dependencies:
+      '@secure-exec/core':
+        specifier: workspace:*
+        version: link:../core
+      secure-exec:
+        specifier: workspace:*
+        version: link:../secure-exec
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.15
 
   registry/file-system/google-drive:
     dependencies:

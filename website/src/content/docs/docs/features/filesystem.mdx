@@ -1,101 +1,138 @@
 ---
-title: Filesystem
+title: Filesystem & Mounts
 description: Filesystem backends for sandboxed code.
 ---
-import { Aside, LinkCard } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/filesystem.ts" description="Runnable example for filesystem backends." />
+Secure Exec gives each VM a virtual filesystem that lives entirely inside the kernel. Guest code reads and writes it through the standard Node `fs` module, and by default none of it touches the host disk. A VM booted with `NodeRuntime.create()` uses an isolated in-memory filesystem, so it is isolated by default.
 
-secure-exec supports three filesystem backends. The system driver controls which backend sandboxed code uses.
+## Reading and Writing Files
 
-## Runnable example
+Boot a runtime with `NodeRuntime.create()`, then run guest code that writes and reads files with `node:fs`. The guest source runs as a standard ES module (top-level `import` and `await` work).
 
 ```ts
-import {
-  NodeRuntime,
-  allowAllFs,
-  createInMemoryFileSystem,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "../../../packages/secure-exec/src/index.ts";
+import { NodeRuntime } from "secure-exec";
 
-const filesystem = createInMemoryFileSystem();
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    filesystem,
-    permissions: { fs: allowAllFs },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-});
+// Boot a fully virtualized VM. With the default NodeRuntime, the guest
+// filesystem lives entirely inside the kernel and writes never touch the host
+// disk.
+const rt = await NodeRuntime.create();
 
 try {
-  const result = await runtime.exec(`
-    const fs = require("node:fs");
-    fs.mkdirSync("/workspace", { recursive: true });
-    fs.writeFileSync("/workspace/hello.txt", "hello from the sandbox");
+  // Guest code runs as an ES module inside the VM. It writes and reads files
+  // using the standard node `fs` module, backed by the kernel's virtual
+  // filesystem.
+  const { stdout, stderr, exitCode } = await rt.exec(`
+    import { mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+
+    mkdirSync("/workspace", { recursive: true });
+    writeFileSync("/workspace/hello.txt", "hello from the sandbox");
+
+    const message = readFileSync("/workspace/hello.txt", "utf8");
+    const entries = readdirSync("/workspace");
+
+    console.log("read back from VM:", message);
+    console.log("/workspace contents:", JSON.stringify(entries));
   `);
 
-  if (result.code !== 0) {
-    throw new Error(`Unexpected execution result: ${JSON.stringify(result)}`);
-  }
-
-  const message = await filesystem.readTextFile("/workspace/hello.txt");
-
-  console.log(
-    JSON.stringify({
-      ok: message === "hello from the sandbox",
-      message,
-      summary: "sandbox wrote to the in-memory filesystem",
-    }),
-  );
+  console.log("exitCode:", exitCode);
+  if (stderr.trim()) console.log("guest stderr:", stderr.trim());
+  console.log("guest stdout:");
+  console.log(stdout.trim());
 } finally {
-  runtime.dispose();
+  await rt.dispose();
 }
 ```
 
-Source: [examples/features/src/filesystem.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/filesystem.ts)
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-filesystem)*
 
-## OPFS (browser)
+Running this prints the file contents the guest read back from inside the VM:
 
-Persistent filesystem using the Origin Private File System API. This is the default for `createBrowserDriver()`.
-
-```ts
-import { createBrowserDriver } from "secure-exec/browser";
-
-// OPFS (default)
-const driver = await createBrowserDriver({ filesystem: "opfs" });
-
-// In-memory fallback
-const memDriver = await createBrowserDriver({ filesystem: "memory" });
+```
+exitCode: 0
+guest stdout:
+read back from VM: hello from the sandbox
+/workspace contents: ["hello.txt"]
 ```
 
-<Aside type="note">OPFS does not support atomic rename operations.</Aside>
+<Aside type="note">By default, the virtual filesystem is isolated from the host. With a VM booted by `NodeRuntime.create()`, a file the guest writes to `/workspace` exists only inside the VM, and the host filesystem never sees it.</Aside>
 
-## Node filesystem
+## Mounting host directories
 
-Thin wrapper around Node.js `fs/promises`. Provides real host filesystem access (gated by permissions).
+Isolation is the default, but it is not the only option. Pass `mounts` to `NodeRuntime.create()` to project a real host directory into the VM, Docker-style. Each mount makes a host directory readable at a guest path; the guest sees only the mounted subtree, never the wider host filesystem. Files are read lazily through the VFS, so large trees (for example a `node_modules` package) are projected without copying their bytes up front. Mounts are read-only by default; pass `readOnly: false` to allow guest writes.
 
 ```ts
-import { NodeFileSystem } from "secure-exec";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { NodeRuntime } from "secure-exec";
 
-const fs = new NodeFileSystem({ root: "/path/to/sandbox-root" });
+// A real directory on the host containing greeting.txt ("value-from-host").
+const hostDir = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "host-data",
+);
+
+const mounted = await NodeRuntime.create({
+  mounts: [
+    {
+      guestPath: "/mnt/host-data",
+      hostPath: hostDir,
+      readOnly: true,
+    },
+  ],
+});
+
+try {
+  // The guest reads a file that lives on the real host, exposed read-only at
+  // the mount point. Nothing else on the host is visible.
+  const { stdout, stderr, exitCode } = await mounted.exec(`
+    import { readFileSync, readdirSync } from "node:fs";
+
+    const entries = readdirSync("/mnt/host-data");
+    const greeting = readFileSync("/mnt/host-data/greeting.txt", "utf8");
+
+    console.log("mounted contents:", JSON.stringify(entries));
+    console.log("guest read host file:", greeting.trim());
+  `);
+
+  console.log("[mount] exitCode:", exitCode);
+  if (stderr.trim()) console.log("[mount] guest stderr:", stderr.trim());
+  console.log("[mount] guest stdout:");
+  console.log(stdout.trim());
+} finally {
+  await mounted.dispose();
+}
 ```
 
-## VirtualFileSystem interface
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-filesystem)*
 
-All backends implement this interface:
+The guest lists the mounted directory and reads the real host file through the mount point:
 
-| Method | Returns | Description |
-|---|---|---|
-| `readFile(path)` | `Promise<Uint8Array>` | Read file as bytes |
-| `readTextFile(path)` | `Promise<string>` | Read file as text |
-| `readDir(path)` | `Promise<string[]>` | List directory entries |
-| `readDirWithTypes(path)` | `Promise<DirEntry[]>` | List entries with type info |
-| `writeFile(path, content)` | `Promise<void>` | Write file |
-| `createDir(path)` | `Promise<void>` | Create directory |
-| `mkdir(path)` | `Promise<void>` | Create directory (alias) |
-| `exists(path)` | `Promise<boolean>` | Check if path exists |
-| `stat(path)` | `Promise<StatInfo>` | Get file metadata |
-| `removeFile(path)` | `Promise<void>` | Delete a file |
-| `removeDir(path)` | `Promise<void>` | Delete a directory |
-| `rename(old, new)` | `Promise<void>` | Rename a file or directory |
+```
+[mount] exitCode: 0
+[mount] guest stdout:
+mounted contents: ["greeting.txt"]
+guest read host file: value-from-host
+```
+
+Host directory mounts are one of several filesystem backends. For overlay filesystems and remote storage backends (such as Amazon S3 and Google Drive), see [Custom and host-backed filesystems](/docs/features/virtual-filesystem#custom-and-host-backed-filesystems).
+
+## Standard Node `fs` API
+
+Guest code uses Node's built-in `node:fs` module, and the kernel backs it with the virtual filesystem, so common operations work as you would expect:
+
+| Operation | API |
+|---|---|
+| Read a file as text | `readFileSync(path, "utf8")` |
+| Read a file as bytes | `readFileSync(path)` |
+| List a directory | `readdirSync(path)` |
+| List with entry types | `readdirSync(path, { withFileTypes: true })` |
+| Write a file | `writeFileSync(path, content)` |
+| Create a directory | `mkdirSync(path, { recursive: true })` |
+| Check a path exists | `existsSync(path)` |
+| Get file metadata | `statSync(path)` |
+| Delete a file | `rmSync(path)` |
+| Rename a file or directory | `renameSync(oldPath, newPath)` |
+
+The async `node:fs/promises` variants are available too. Present normal Linux filesystem semantics to your tools and run them unmodified.

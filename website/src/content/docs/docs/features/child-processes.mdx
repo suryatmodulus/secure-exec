@@ -4,145 +4,75 @@ description: Spawn child processes from sandboxed code.
 ---
 import { Aside, LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/child-processes.ts" description="Runnable example for child process spawning." />
+Sandboxed code can spawn child processes with the standard `node:child_process` module. Each child runs as a kernel-managed process inside the VM. It never spawns a real host process or escapes the isolation boundary.
 
-Sandboxed code can spawn child processes through the `CommandExecutor` interface, gated by the `childProcess` permission.
+## Spawning Child Processes
 
-## Runnable example
+The guest spawns commands available in the VM (`sh` and `node`) and reads their output:
 
 ```ts
-import {
-  NodeRuntime,
-  allowAllChildProcess,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-  type CommandExecutor,
-} from "../../../packages/secure-exec/src/index.ts";
-import { spawn } from "node:child_process";
+import { NodeRuntime } from "secure-exec";
 
-const commandExecutor: CommandExecutor = {
-  spawn(command, args, options) {
-    const resolvedCommand = command === "node" ? process.execPath : command;
-    const resolvedCwd = options.cwd === "/root" ? process.cwd() : options.cwd;
-    const child = spawn(resolvedCommand, args, {
-      cwd: resolvedCwd,
-      env: options.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    child.stdout.on("data", (chunk) => {
-      options.onStdout?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    child.stderr.on("data", (chunk) => {
-      options.onStderr?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-
-    return {
-      writeStdin(data) {
-        child.stdin.write(data);
-      },
-      closeStdin() {
-        child.stdin.end();
-      },
-      kill(signal) {
-        child.kill(signal);
-      },
-      wait() {
-        return new Promise<number>((resolve) => {
-          child.once("close", (code) => resolve(code ?? 1));
-        });
-      },
-    };
-  },
-};
-
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver({
-    commandExecutor,
-    permissions: { ...allowAllChildProcess },
-  }),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-});
+// Boot a fully virtualized VM. The guest runs inside the kernel isolation
+// boundary, and any child processes it spawns are themselves kernel-managed
+// processes - they never spawn real host processes.
+const rt = await NodeRuntime.create();
 
 try {
-  const result = await runtime.exec(`
-    const { spawnSync } = require("node:child_process");
+  // Guest code runs as an ES module inside the VM. It uses the standard
+  // node:child_process module to spawn a command available in the VM and read
+  // its output. Here we spawn `sh -c` to echo a message, and `node` to report
+  // its own version - both run as kernel-managed child processes.
+  const { stdout, stderr, exitCode } = await rt.exec(`
+    import { execFileSync } from "node:child_process";
 
-    const child = spawnSync("node", ["--version"], {
+    // Spawn a shell command and capture its stdout.
+    const shellOut = execFileSync("sh", ["-c", "echo hello from a child process"], {
       encoding: "utf8",
     });
-    const output =
-      typeof child.stdout === "string"
-        ? child.stdout
-        : Buffer.from(child.stdout || []).toString("utf8");
+    console.log("sh output:", shellOut.trim());
 
-    if (child.status !== 0 || !output.startsWith("v")) {
-      throw new Error("Unexpected child process exit code: " + child.status);
-    }
+    // Spawn node as a child process and read its version.
+    const nodeVersion = execFileSync("node", ["--version"], {
+      encoding: "utf8",
+    });
+    console.log("child node version:", nodeVersion.trim());
   `);
 
-  if (result.code !== 0) {
-    throw new Error(`Unexpected execution result: ${JSON.stringify(result)}`);
-  }
-
-  console.log(
-    JSON.stringify({
-      ok: true,
-      summary: "sandbox spawned node --version successfully",
-    }),
-  );
+  console.log("exitCode:", exitCode);
+  if (stderr.trim()) console.log("guest stderr:", stderr.trim());
+  console.log("guest stdout:");
+  console.log(stdout.trim());
 } finally {
-  runtime.dispose();
+  await rt.dispose();
 }
 ```
 
-Source: [examples/features/src/child-processes.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/child-processes.ts)
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-child-processes)*
 
-## Permission gating
+Running this prints the output captured from each child process:
 
-Restrict which commands sandboxed code can spawn:
+```
+exitCode: 0
+guest stdout:
+sh output: hello from a child process
+child node version: v22.0.0
+```
+
+## Available commands
+
+Children can run any command provided by the runtimes mounted in the VM. By default the VM ships a WASM-backed `sh` and coreutils plus a V8-backed `node`, so `execFileSync("node", ["--version"])` and `execFileSync("sh", ["-c", "…"])` both work out of the box.
+
+You can point the VM at a different set of WASM command binaries by passing `commandsDir` to `NodeRuntime.create()`:
 
 ```ts
-const driver = createNodeDriver({
-  permissions: {
-    childProcess: (req) => {
-      const allowed = ["node", "python3", "echo"];
-      return { allow: allowed.includes(req.command) };
-    },
-  },
+const rt = await NodeRuntime.create({
+  commandsDir: "/path/to/wasm/commands",
 });
 ```
 
-## Custom CommandExecutor
+## Other child_process APIs
 
-Provide your own executor for full control over process spawning:
+The example uses `execFileSync` for brevity, but the asynchronous and streaming `node:child_process` APIs (`spawn`, `exec`, `execFile`) also work. Use them when you need to stream stdout/stderr incrementally or write to a child's stdin while it runs.
 
-```ts
-const driver = createNodeDriver({
-  commandExecutor: {
-    spawn(command, args, options) {
-      // Custom spawn logic
-      // Returns a ManagedProcess
-    },
-  },
-  permissions: {
-    childProcess: () => ({ allow: true }),
-  },
-});
-```
-
-## Process configuration
-
-Configure the process environment visible to sandboxed code:
-
-```ts
-const driver = createNodeDriver({
-  processConfig: {
-    cwd: "/app",
-    env: { NODE_ENV: "production" },
-    argv: ["node", "script.js"],
-  },
-});
-```
-
-<Aside type="note">Child processes are only available with the Node system driver. The browser driver does not support process spawning.</Aside>
+<Aside type="note">Child processes always run inside the kernel. There is no way for guest code to reach a real host process or host binary, since `node:child_process` only sees the commands provided by the VM's mounted runtimes.</Aside>

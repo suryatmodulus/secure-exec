@@ -2,177 +2,109 @@
 title: Networking
 description: Network access for sandboxed code.
 ---
-import { LinkCard, Tabs, TabItem } from '@astrojs/starlight/components';
+import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/networking.ts" description="Runnable example for network access control." />
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-networking" description="Runnable example for network access control." />
 
-Network access is deny-by-default. Enable it by setting `useDefaultNetwork: true` on the system driver and granting the `network` permission.
+Network access is governed by the VM permission policy. Set `network` to
+`"allow"` to let guest code open sockets and make outbound requests, or
+`"deny"` to block them. Guest `fetch()`, `node:http`, and socket operations all
+flow through the kernel socket table. Guest code never touches the real host
+network.
 
-## Runnable example
+## Making Network Requests
+
+The guest below starts a loopback HTTP server inside the VM and fetches it. With
+`network: "allow"` the request succeeds; with the default (network denied) the
+same code is blocked by the permission policy.
+
+Permissions merge over a secure default, so to opt into the network you only
+name the scope you are changing: `{ network: "allow" }`. The default already
+grants the fs/child_process/process/env scopes the runtime needs to launch guest
+programs, so there is no need to restate them. Denying the network is the
+default, so a plain `create()` blocks it.
 
 ```ts
-import {
-	NodeRuntime,
-	allowAllNetwork,
-	createNodeDriver,
-	createNodeRuntimeDriverFactory,
-} from "../../../packages/secure-exec/src/index.ts";
+import { NodeRuntime } from "secure-exec";
 
-const logs: string[] = [];
+// Guest program: start a loopback HTTP server, then fetch it. Both the listen
+// and the fetch go through the kernel socket table.
+const GUEST = `
+import http from "node:http";
 
-const runtime = new NodeRuntime({
-	systemDriver: createNodeDriver({
-		useDefaultNetwork: true,
-		permissions: { ...allowAllNetwork },
-	}),
-	runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+const server = http.createServer((_req, res) => {
+	res.writeHead(200, { "content-type": "text/plain" });
+	res.end("network-ok");
 });
 
+await new Promise((resolve, reject) => {
+	server.once("error", reject);
+	server.listen(0, "127.0.0.1", resolve);
+});
+
+const { port } = server.address();
+const response = await fetch("http://127.0.0.1:" + port + "/");
+const body = await response.text();
+console.log("status:", response.status);
+console.log("body:", body);
+
+await new Promise((resolve) => server.close(resolve));
+`;
+
+// 1. Network allowed: opt in with a partial policy. Permissions merge over the
+// secure default, so you only name the scope you are changing.
+const allowed = await NodeRuntime.create({
+	permissions: { network: "allow" },
+});
 try {
-	const result = await runtime.exec(
-		`
-			(async () => {
-				const http = require("node:http");
-
-				const server = http.createServer((_req, res) => {
-					res.writeHead(200, { "content-type": "text/plain" });
-					res.end("network-ok");
-				});
-
-				await new Promise((resolve, reject) => {
-					server.once("error", reject);
-					server.listen(0, "127.0.0.1", resolve);
-				});
-
-				const address = server.address();
-				if (!address || typeof address === "string") {
-					throw new Error("missing loopback address");
-				}
-
-				const response = await fetch("http://127.0.0.1:" + address.port + "/");
-				const body = await response.text();
-
-				if (!response.ok || response.status !== 200 || body !== "network-ok") {
-					throw new Error(
-						"unexpected response: " + response.status + " " + body,
-					);
-				}
-
-				console.log(JSON.stringify({ status: response.status, body }));
-
-				await new Promise((resolve) => server.close(resolve));
-			})().catch((error) => {
-				console.error(error instanceof Error ? error.message : String(error));
-				process.exitCode = 1;
-			});
-		`,
-		{
-			onStdio: (event) => {
-				logs.push(`[${event.channel}] ${event.message}`);
-			},
-		},
-	);
-
-	if (result.code !== 0) {
-		throw new Error(`Unexpected execution result: ${JSON.stringify(result)}`);
-	}
-
-	const payload = logs
-		.filter((line) => line.startsWith("[stdout] "))
-		.map((line) => line.slice("[stdout] ".length))
-		.map((line) => JSON.parse(line))
-		.at(-1);
-
-	if (payload?.status !== 200 || payload?.body !== "network-ok") {
-		throw new Error(`Unexpected captured output: ${JSON.stringify(logs)}`);
-	}
-
-	console.log(
-		JSON.stringify({
-			ok: true,
-			status: payload.status,
-			body: payload.body,
-			summary: "sandbox started a loopback HTTP server and fetched it",
-		}),
-	);
+	const result = await allowed.exec(GUEST);
+	console.log("[network allowed] exitCode:", result.exitCode);
+	console.log("[network allowed] stdout:", JSON.stringify(result.stdout.trim()));
+	console.log("[network allowed] stderr:", JSON.stringify(result.stderr.trim()));
 } finally {
-	runtime.dispose();
+	await allowed.dispose();
+}
+
+// 2. Network denied: this is the default, so plain create() blocks the network.
+const denied = await NodeRuntime.create();
+try {
+	const result = await denied.exec(GUEST);
+	console.log("[network denied] exitCode:", result.exitCode);
+	console.log("[network denied] stderr:", JSON.stringify(result.stderr.trim()));
+} finally {
+	await denied.dispose();
 }
 ```
 
-Source: [examples/features/src/networking.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/networking.ts)
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-networking)*
 
-## Quick setup
+Running it prints:
 
-<Tabs>
-  <TabItem label="Node">
-    ```ts
-    import { createNodeDriver, allowAllNetwork } from "secure-exec";
-
-    const driver = createNodeDriver({
-      useDefaultNetwork: true,
-      permissions: { ...allowAllNetwork },
-    });
-    ```
-
-    The Node adapter supports `fetch`, DNS lookups, and low-level HTTP requests.
-  </TabItem>
-  <TabItem label="Browser">
-    ```ts
-    import { createBrowserDriver } from "secure-exec/browser";
-
-    const driver = await createBrowserDriver({
-      useDefaultNetwork: true,
-    });
-    ```
-
-    The browser adapter supports `fetch` only. DNS and low-level HTTP are not available.
-  </TabItem>
-</Tabs>
-
-## Network adapters
-
-You can provide a custom adapter instead of using `useDefaultNetwork`:
-
-```ts
-import { createNodeDriver, createDefaultNetworkAdapter, allowAllNetwork } from "secure-exec";
-
-const driver = createNodeDriver({
-  networkAdapter: createDefaultNetworkAdapter(),
-  permissions: { ...allowAllNetwork },
-});
 ```
-
-| Factory | Environment | Capabilities |
-|---|---|---|
-| `createDefaultNetworkAdapter()` | Node | fetch, DNS, HTTP |
-| `createBrowserNetworkAdapter()` | Browser | fetch only |
-
-## NetworkAdapter interface
-
-| Method | Returns | Description |
-|---|---|---|
-| `fetch(url, options?)` | `Promise<FetchResponse>` | HTTP fetch |
-| `dnsLookup(hostname)` | `Promise<DnsResult>` | DNS resolution |
-| `httpRequest(url, options?)` | `Promise<HttpResponse>` | Low-level HTTP request |
+[network allowed] exitCode: 0
+[network allowed] stdout: "status: 200\nbody: network-ok"
+[network allowed] stderr: ""
+[network denied] exitCode: 1
+[network denied] stderr: "Error: EACCES: EACCES: permission denied, tcp://127.0.0.1:0: blocked by network.listen policy"
+```
 
 ## Permission gating
 
-Use a function to filter requests:
+The `network` permission accepts `"allow"`, `"deny"`, or a rule set that matches
+request patterns. A rule set has a `default` mode plus a list of `rules`, each
+with a `mode` and `patterns`:
 
 ```ts
-const driver = createNodeDriver({
-  useDefaultNetwork: true,
-  permissions: {
-    network: (req) => {
-      if (req.hostname?.endsWith(".internal")) {
-        return { allow: false };
-      }
-      if (req.hostname === "169.254.169.254") {
-        return { allow: false };
-      }
-      return { allow: true };
-    },
-  },
+const rt = await NodeRuntime.create({
+	permissions: {
+		network: {
+			default: "deny",
+			rules: [{ mode: "allow", patterns: ["api.example.com"] }],
+		},
+	},
 });
 ```
+
+When a request is denied, the guest operation fails with an `EACCES` error
+describing which policy blocked it (for example `blocked by network.listen
+policy` or `blocked by network.connect policy`).

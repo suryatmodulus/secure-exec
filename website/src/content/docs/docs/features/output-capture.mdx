@@ -4,122 +4,72 @@ description: Capture console output from sandboxed code.
 ---
 import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/output-capture.ts" description="Runnable example for capturing console output." />
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-output-capture" description="Runnable example for capturing stdout, stderr, and the exit code." />
 
-Console output from sandboxed code is **not buffered** into result fields. `exec()` and `run()` do not return `stdout` or `stderr`. Use the `onStdio` hook to capture output.
+`exec()` runs guest code and returns its captured output. The `stdout` and `stderr` streams are buffered separately into strings, and the guest process's `exitCode` is returned alongside them. Buffering into strings bounds host memory: `exec()` holds each channel as a single string rather than retaining an unbounded backlog of live stream chunks.
 
-## Runnable example
+## Capturing Output
 
 ```ts
-import {
-  NodeRuntime,
-  createNodeDriver,
-  createNodeRuntimeDriverFactory,
-} from "../../../packages/secure-exec/src/index.ts";
+import { NodeRuntime } from "secure-exec";
 
-const events: string[] = [];
-
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-});
+const rt = await NodeRuntime.create();
 
 try {
-  const result = await runtime.exec(
-    `
-      console.log("hello from the sandbox");
-      console.error("oops from the sandbox");
-    `,
-    {
-      onStdio: (event) => {
-        events.push(`[${event.channel}] ${event.message}`);
-      },
-    }
-  );
+	const { stdout, stderr, exitCode } = await rt.exec(`
+		console.log("hello from the sandbox");
+		console.error("oops from the sandbox");
+		process.exit(3);
+	`);
 
-  if (result.code !== 0) {
-    throw new Error(`Unexpected execution result: ${JSON.stringify(result)}`);
-  }
-
-  const expected = [
-    "[stdout] hello from the sandbox",
-    "[stderr] oops from the sandbox",
-  ];
-
-  if (JSON.stringify(events) !== JSON.stringify(expected)) {
-    throw new Error(`Unexpected stdio events: ${JSON.stringify(events)}`);
-  }
-
-  console.log(
-    JSON.stringify({
-      ok: true,
-      events,
-      summary: "captured stdout and stderr with onStdio",
-    }),
-  );
+	console.log("exitCode:", exitCode);
+	console.log("stdout:", JSON.stringify(stdout));
+	console.log("stderr:", JSON.stringify(stderr));
 } finally {
-  runtime.dispose();
+	await rt.dispose();
 }
 ```
 
-Source: [examples/features/src/output-capture.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/output-capture.ts)
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-output-capture)*
 
-## Default hook
+Running it prints:
 
-Set a runtime-level hook that applies to all executions:
-
-```ts
-const runtime = new NodeRuntime({
-  systemDriver: createNodeDriver(),
-  runtimeDriverFactory: createNodeRuntimeDriverFactory(),
-  onStdio: (event) => console.log(event.message),
-});
+```
+exitCode: 3
+stdout: "hello from the sandbox\n"
+stderr: "oops from the sandbox\n"
 ```
 
-Per-execution hooks override the default.
+`stdout` and `stderr` are independent strings, so output written to one channel never bleeds into the other. The `exitCode` is the guest process's exit status. Here the program called `process.exit(3)`, so `exitCode` is `3`.
 
-## StdioHook type
+## Result shape
 
-```ts
-type StdioHook = (event: {
-  channel: "stdout" | "stderr";
-  message: string;
-}) => void;
-```
-
-## Patterns
-
-**Collect to array:**
+`exec()` resolves to an object with three fields:
 
 ```ts
-const output: string[] = [];
-await runtime.exec(code, {
-  onStdio: (e) => output.push(e.message),
-});
+interface NodeRuntimeExecResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
 ```
 
-**Stream to logger:**
+:::note[Streaming output is not on `NodeRuntime` yet]
+`NodeRuntime.exec()` returns the full `stdout` and `stderr` strings once the
+guest process finishes. Secure Exec supports incremental streaming underneath
+(the kernel's exec protocol carries live stdout/stderr stream events), but
+`NodeRuntime` does not surface per-chunk callbacks yet, so the buffered strings
+are what you get today.
+:::
+
+## Common patterns
+
+Use `exitCode` to detect failure, and `run()` when you also need a value back (it returns the same `stdout`/`stderr`/`exitCode` plus a decoded `value`):
 
 ```ts
-await runtime.exec(code, {
-  onStdio: (e) => {
-    if (e.channel === "stderr") logger.warn(e.message);
-    else logger.info(e.message);
-  },
-});
+const { stderr, exitCode } = await rt.exec(code);
+if (exitCode !== 0) throw new Error(`guest exited ${exitCode}: ${stderr}`);
+
+const { value } = await rt.run(`globalThis.__return({ answer: 42 });`);
+// value === { answer: 42 }
 ```
-
-**Filter by channel:**
-
-```ts
-const errors: string[] = [];
-await runtime.exec(code, {
-  onStdio: (e) => {
-    if (e.channel === "stderr") errors.push(e.message);
-  },
-});
-```
-
-## Why no buffering?
-
-Buffering console output by default would let untrusted code grow host memory without bound by logging at high volume. The explicit `onStdio` hook puts you in control of how output is stored and when to stop collecting.

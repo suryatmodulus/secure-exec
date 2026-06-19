@@ -4,132 +4,156 @@ description: Control what sandboxed code can access on the host.
 ---
 import { LinkCard } from '@astrojs/starlight/components';
 
-<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/permissions.ts" description="Runnable example for permission configuration." />
+<LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-permissions" description="Runnable example for permission configuration." />
 
-All host capabilities are **deny-by-default**. Sandboxed code cannot access the filesystem, network, child processes, or environment variables unless you explicitly allow it.
+Every guest syscall is checked against a per-domain permission policy. You pass a
+`permissions` object to `NodeRuntime.create()` and configure each capability
+domain (`fs`, `network`, `childProcess`, `process`, and `env`) independently.
+When no `permissions` option is given, the runtime defaults to allow-all so guest
+programs run without extra setup; tighten it to sandbox guest capabilities.
 
-## Runnable example
+A domain is set to `"allow"`, `"deny"`, or a rule set. When a guest operation is
+denied, the kernel rejects it with `EACCES` before any host resource is touched.
+
+## Configuring Permissions
+
+The example below allows filesystem access but denies the network. The guest
+writes and reads a file successfully, while an outbound `fetch()` is blocked by
+the kernel.
 
 ```ts
-import {
-	NodeRuntime,
-	createInMemoryFileSystem,
-	createNodeDriver,
-	createNodeRuntimeDriverFactory,
-} from "../../../packages/secure-exec/src/index.ts";
+import { NodeRuntime } from "secure-exec";
 
-const filesystem = createInMemoryFileSystem();
-await filesystem.writeFile("/secret.txt", "top secret");
-const runtime = new NodeRuntime({
-	systemDriver: createNodeDriver({
-		filesystem,
-		permissions: {
-			fs: (request) => ({ allow: request.path.startsWith("/workspace") }),
-		},
-	}),
-	runtimeDriverFactory: createNodeRuntimeDriverFactory(),
+// Permissions are a per-domain policy evaluated against every guest syscall.
+// Each domain (fs, network, childProcess, process, env) is configured
+// independently as "allow", "deny", or a rule set. Here the guest may use the
+// filesystem, but the network is fully denied - so an outbound fetch is blocked
+// by the kernel before any socket is opened.
+const rt = await NodeRuntime.create({
+  permissions: {
+    fs: "allow",
+    network: "deny",
+    childProcess: "allow",
+    process: "allow",
+    env: "allow",
+  },
 });
 
-const result = await runtime.run<{
-	message: string;
-	blocked: boolean;
-}>(
-	`
-  const fs = require("node:fs");
+try {
+  // Guest code runs as an ES module inside the VM. The filesystem write/read
+  // succeeds because fs is allowed; the fetch() throws because the kernel
+  // rejects the connection with EACCES from the network policy.
+  const { value, stdout, stderr, exitCode } = await rt.run<{
+    fileContents: string;
+    networkBlocked: boolean;
+    networkError: string | null;
+  }>(`
+    const { mkdirSync, writeFileSync, readFileSync } = await import("node:fs");
 
-  fs.mkdirSync("/workspace", { recursive: true });
-  fs.writeFileSync("/workspace/message.txt", "hello from permissions");
+    // Allowed: filesystem access is permitted.
+    mkdirSync("/workspace", { recursive: true });
+    writeFileSync("/workspace/note.txt", "written inside the sandbox");
+    const fileContents = readFileSync("/workspace/note.txt", "utf8");
+    console.log("filesystem allowed:", fileContents);
 
-  let blocked = false;
-  try {
-    fs.readFileSync("/secret.txt", "utf8");
-  } catch (error) {
-    blocked = error && error.code === "EACCES";
+    // Denied: the network domain is set to "deny", so fetch() is blocked.
+    let networkBlocked = false;
+    let networkError = null;
+    try {
+      await fetch("http://example.com");
+      console.log("UNEXPECTED: fetch succeeded");
+    } catch (error) {
+      networkBlocked = true;
+      networkError = (error.cause && error.cause.message) || error.message;
+      console.log("network denied:", networkError);
+    }
+
+    __return({ fileContents, networkBlocked, networkError });
+  `);
+
+  console.log("---");
+  console.log("exitCode:", exitCode);
+  if (stderr.trim()) console.log("guest stderr:", stderr.trim());
+  console.log("guest stdout:\n" + stdout.trim());
+  console.log("file contents:", value?.fileContents);
+  console.log("network blocked:", value?.networkBlocked);
+  console.log("network error:", value?.networkError);
+
+  if (value?.fileContents !== "written inside the sandbox") {
+    throw new Error("expected allowed filesystem write/read to succeed");
   }
-
-  module.exports = {
-    message: fs.readFileSync("/workspace/message.txt", "utf8"),
-    blocked,
-  };
-`,
-);
-
-console.log(
-	JSON.stringify({
-		ok:
-			result.code === 0 &&
-			result.exports?.message === "hello from permissions" &&
-			result.exports?.blocked === true,
-		message: result.exports?.message,
-		blocked: result.exports?.blocked,
-		summary: "filesystem access was allowed for /workspace and denied for /secret.txt",
-	}),
-);
+  if (!value?.networkBlocked) {
+    throw new Error("expected denied network fetch to be blocked");
+  }
+  console.log("OK: filesystem allowed, network denied");
+} finally {
+  await rt.dispose();
+}
 ```
 
-Source: [examples/features/src/permissions.ts](https://github.com/rivet-dev/secure-exec/blob/main/examples/features/src/permissions.ts)
+*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-permissions)*
 
-## Permission helpers
+Running it prints:
 
-Quick presets for common configurations:
-
-```ts
-import {
-  createNodeDriver,
-  allowAll,
-  allowAllFs,
-  allowAllNetwork,
-} from "secure-exec";
-
-// Allow everything
-const driver = createNodeDriver({ permissions: allowAll });
-
-// Allow only filesystem and network
-const selective = createNodeDriver({
-  permissions: {
-    fs: allowAllFs,
-    network: allowAllNetwork,
-  },
-});
+```
+---
+exitCode: 0
+guest stdout:
+filesystem allowed: written inside the sandbox
+network denied: EACCES: EACCES: permission denied, tcp://example.com:80: blocked by network.http policy
+file contents: written inside the sandbox
+network blocked: true
+network error: EACCES: EACCES: permission denied, tcp://example.com:80: blocked by network.http policy
+OK: filesystem allowed, network denied
 ```
 
-| Export | Allows |
+## Permission domains
+
+Each field of the `permissions` object configures one capability domain:
+
+| Domain | Controls |
 |---|---|
-| `allowAll` | All operations across all domains |
-| `allowAllFs` | All filesystem reads and writes |
-| `allowAllNetwork` | All network requests and DNS lookups |
-| `allowAllChildProcess` | All child process spawning |
-| `allowAllEnv` | All environment variable access |
+| `fs` | Filesystem reads, writes, and metadata operations |
+| `network` | Outbound connections, `fetch`, HTTP, and DNS |
+| `childProcess` | Spawning child processes |
+| `process` | Process-control operations |
+| `env` | Environment variable access |
 
-## Function-based checks
+A domain that is omitted is denied, so when you supply a `permissions` object you
+must explicitly set every domain the guest needs.
 
-Each permission field accepts a function that inspects the request and returns a decision:
+## Allow, deny, and rule sets
+
+The simplest value for a domain is `"allow"` or `"deny"`:
 
 ```ts
-const driver = createNodeDriver({
+const rt = await NodeRuntime.create({
   permissions: {
-    fs: (req) => ({ allow: req.operation === "read" }),
-    network: (req) => ({ allow: !req.host?.endsWith(".internal") }),
-    childProcess: (req) => ({ allow: ["node", "python3"].includes(req.command) }),
-    env: (req) => ({ allow: ["PATH", "HOME"].includes(req.name) }),
+    fs: "allow",
+    network: "deny",
+    childProcess: "allow",
+    process: "allow",
+    env: "allow",
   },
 });
 ```
 
-## Permissions type
+For finer control, a domain can be a rule set with a `default` mode and an
+ordered list of `rules`. Filesystem rules match on `operations` and `paths`
+(glob patterns); the other domains match on `operations` and `patterns`. Use
+`["*"]` for a wildcard:
 
 ```ts
-type PermissionDecision =
-  | boolean
-  | { allowed: boolean; reason?: string }
-  | { allow: boolean; reason?: string };
-
-type PermissionCheck<T> = (request: T) => PermissionDecision;
-
-type Permissions = {
-  fs?: PermissionCheck<{ path: string; operation: string }>;
-  network?: PermissionCheck<{ url?: string; host?: string; port?: number }>;
-  childProcess?: PermissionCheck<{ command: string; args: string[] }>;
-  env?: PermissionCheck<{ name: string; value: string }>;
-};
+const rt = await NodeRuntime.create({
+  permissions: {
+    fs: {
+      default: "allow",
+      rules: [{ mode: "deny", operations: ["*"], paths: ["/vault/**"] }],
+    },
+    network: "deny",
+    childProcess: "allow",
+    process: "allow",
+    env: "allow",
+  },
+});
 ```
