@@ -1,13 +1,13 @@
 
 export default new Map([
-["src/content/docs/docs/benchmarks.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Fbenchmarks.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/index.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Findex.mdx&astroContentModuleFlag=true")],
-["src/content/docs/docs/sdk-overview.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Fsdk-overview.mdx&astroContentModuleFlag=true")],
+["src/content/docs/docs/benchmarks.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Fbenchmarks.mdx&astroContentModuleFlag=true")],
+["src/content/docs/docs/quickstart.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Fquickstart.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/child-processes.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Fchild-processes.mdx&astroContentModuleFlag=true")],
+["src/content/docs/docs/sdk-overview.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Fsdk-overview.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/filesystem.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Ffilesystem.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/module-loading.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Fmodule-loading.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/networking.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Fnetworking.mdx&astroContentModuleFlag=true")],
-["src/content/docs/docs/quickstart.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Fquickstart.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/output-capture.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Foutput-capture.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/permissions.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Fpermissions.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/docs/features/resource-limits.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fdocs%2Ffeatures%2Fresource-limits.mdx&astroContentModuleFlag=true")],
