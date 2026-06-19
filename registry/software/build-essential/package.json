@@ -1,33 +1,33 @@
 {
-  "name": "@agent-os-pkgs/build-essential",
-  "version": "0.0.260331072558",
-  "type": "module",
-  "license": "Apache-2.0",
-  "description": "Build-essential WASM command set for secure-exec VMs (common + make + git)",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist"
-  ],
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
-  },
-  "scripts": {
-    "build": "tsc",
-    "check-types": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@agent-os-pkgs/common": "workspace:*",
-    "@agent-os-pkgs/curl": "workspace:*",
-    "@agent-os-pkgs/make": "workspace:*",
-    "@agent-os-pkgs/git": "workspace:*"
-  },
-  "devDependencies": {
-    "@secure-exec/registry-types": "workspace:*",
-    "@types/node": "^22.10.2",
-    "typescript": "^5.9.2"
-  }
+	"name": "@agent-os-pkgs/build-essential",
+	"version": "0.3.0-rc.1",
+	"type": "module",
+	"license": "Apache-2.0",
+	"description": "Build-essential WASM command set for secure-exec VMs (common + make + git)",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"scripts": {
+		"build": "tsc",
+		"check-types": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@agent-os-pkgs/common": "workspace:*",
+		"@agent-os-pkgs/curl": "workspace:*",
+		"@agent-os-pkgs/make": "workspace:*",
+		"@agent-os-pkgs/git": "workspace:*"
+	},
+	"devDependencies": {
+		"@secure-exec/registry-types": "workspace:*",
+		"@types/node": "^22.10.2",
+		"typescript": "^5.9.2"
+	}
 }

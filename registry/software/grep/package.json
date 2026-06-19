@@ -1,28 +1,28 @@
 {
-  "name": "@agent-os-pkgs/grep",
-  "version": "0.0.260331072558",
-  "type": "module",
-  "license": "Apache-2.0",
-  "description": "GNU grep pattern matching for secure-exec VMs (grep, egrep, fgrep)",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist",
-    "wasm"
-  ],
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
-  },
-  "scripts": {
-    "build": "tsc",
-    "check-types": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@secure-exec/registry-types": "workspace:*",
-    "@types/node": "^22.10.2",
-    "typescript": "^5.9.2"
-  }
+	"name": "@agent-os-pkgs/grep",
+	"version": "0.3.0-rc.1",
+	"type": "module",
+	"license": "Apache-2.0",
+	"description": "GNU grep pattern matching for secure-exec VMs (grep, egrep, fgrep)",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist",
+		"wasm"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"scripts": {
+		"build": "tsc",
+		"check-types": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@secure-exec/registry-types": "workspace:*",
+		"@types/node": "^22.10.2",
+		"typescript": "^5.9.2"
+	}
 }

@@ -1,6 +1,6 @@
 {
 	"name": "@secure-exec/registry-types",
-	"version": "0.1.2-rc.1",
+	"version": "0.3.0-rc.1",
 	"type": "module",
 	"license": "Apache-2.0",
 	"main": "./dist/index.js",
