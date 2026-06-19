@@ -24,3 +24,11 @@ Sidecar: /home/nathan/secure-exec/target/release/secure-exec-sidecar
   warm: mean=499.37ms p50=475.53ms p95=709.2ms
 
 --- batch=50, mode=sequential ---
+  cold: mean=876.98ms p50=796.45ms p95=1447.84ms
+  warm: mean=481.52ms p50=456.71ms p95=641.87ms
+
+--- batch=50, mode=concurrent ---
+  cold: mean=1907.44ms p50=1540.5ms p95=4991.96ms
+  warm: mean=542.93ms p50=523.24ms p95=741.14ms
+
+--- batch=100, mode=sequential ---

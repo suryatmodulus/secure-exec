@@ -223,6 +223,9 @@ pub struct PythonExecutionResult {
 pub enum PythonExecutionError {
     MissingContext(String),
     VmMismatch { expected: String, found: String },
+    /// Guest Python is unavailable because this build was compiled without the
+    /// bundled Pyodide runtime assets (the published crate excludes them).
+    RuntimeUnavailable,
     PrepareRuntime(std::io::Error),
     PrepareWarmPath(std::io::Error),
     WarmupFailed { exit_code: i32, stderr: String },
@@ -249,6 +252,11 @@ impl fmt::Display for PythonExecutionError {
                     "guest Python context belongs to vm {expected}, not {found}"
                 )
             }
+            Self::RuntimeUnavailable => write!(
+                f,
+                "guest Python execution is unavailable: this build of secure-exec-execution \
+                 was compiled without the bundled Pyodide runtime assets"
+            ),
             Self::PrepareRuntime(err) => {
                 write!(f, "failed to prepare guest Python runtime assets: {err}")
             }
@@ -301,6 +309,20 @@ impl fmt::Display for PythonExecutionError {
 }
 
 impl std::error::Error for PythonExecutionError {}
+
+/// Returns an error when this build was compiled without the bundled Pyodide
+/// runtime assets (the published crate excludes them; see `build.rs`). In the
+/// workspace build the in-tree assets are present and this is a no-op.
+fn ensure_pyodide_available() -> Result<(), PythonExecutionError> {
+    #[cfg(secure_exec_pyodide_unavailable)]
+    {
+        return Err(PythonExecutionError::RuntimeUnavailable);
+    }
+    #[cfg(not(secure_exec_pyodide_unavailable))]
+    {
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct PythonExecution {
@@ -702,6 +724,7 @@ impl PythonExecutionEngine {
         &mut self,
         vm_id: &str,
     ) -> Result<PathBuf, PythonExecutionError> {
+        ensure_pyodide_available()?;
         let import_cache = self.import_caches.entry(vm_id.to_owned()).or_default();
         import_cache
             .ensure_materialized()
@@ -736,6 +759,7 @@ impl PythonExecutionEngine {
         &mut self,
         request: StartPythonExecutionRequest,
     ) -> Result<PythonExecution, PythonExecutionError> {
+        ensure_pyodide_available()?;
         let context = self
             .contexts
             .get(&request.context_id)

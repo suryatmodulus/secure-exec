@@ -75,6 +75,11 @@ packages/browser/.cache/
 crates/execution/assets/generated/
 crates/v8-runtime/assets/generated/
 
+# WASM command binaries vendored into @secure-exec/core at build/prepack time
+# (whitelisted in package.json `files`, so they still ship in the npm tarball).
+# Derived from registry/native build output; never committed to git.
+packages/core/commands/
+
 # Transient repro scratch files and Vite/Vitest config timestamp artifacts
 .tmp-*
 *.timestamp-*.mjs

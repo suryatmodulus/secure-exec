@@ -18,6 +18,7 @@
  * work.
  */
 
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -36,18 +37,57 @@ import {
 
 export type { HostToolDefinition, HostToolExample } from "./test-runtime.js";
 
-/** Repository root, used to locate the bundled WASM command binaries. */
+/** Repository root, used to locate the in-repo WASM command build output. */
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
 /**
- * Directory containing the WASM coreutils/shell command binaries that provide
- * the guest `sh` the kernel needs to drive `exec()`. Built from the in-repo
- * Rust command sources.
+ * In-repo build output for the WASM coreutils/shell command binaries, produced
+ * by the Rust command build (`make -C registry/native wasm`). Only present in a
+ * developer checkout; preferred when it exists so local edits are picked up
+ * without re-vendoring.
  */
-const DEFAULT_COMMANDS_DIR = path.join(
+const REPO_COMMANDS_DIR = path.join(
 	REPO_ROOT,
 	"registry/native/target/wasm32-wasip1/release/commands",
 );
+
+/**
+ * Commands vendored into the published `@secure-exec/core` package by
+ * `scripts/copy-wasm-commands.mjs` (listed in `files` as `commands`). This is
+ * the directory a real `npm install secure-exec` resolves: from the compiled
+ * `dist/node-runtime.js` it sits at `<package>/commands`. This is the analogue
+ * of how the sidecar binary ships inside `@secure-exec/sidecar`.
+ */
+const BUNDLED_COMMANDS_DIR = fileURLToPath(
+	new URL("../commands", import.meta.url),
+);
+
+/**
+ * Resolve the directory holding the WASM command binaries (the source of the
+ * guest `sh` the kernel needs to spawn any process). Precedence:
+ *
+ *   1. explicit `commandsDir` option,
+ *   2. `SECURE_EXEC_WASM_COMMANDS_DIR` env var,
+ *   3. the in-repo build output (developer checkout), when present,
+ *   4. the commands vendored into the installed package (published installs).
+ *
+ * The in-repo path wins over the bundled copy so local development picks up
+ * freshly built commands without re-vendoring. A fresh `npm install` has no
+ * in-repo path, so it falls through to the bundled copy.
+ */
+function resolveCommandsDir(explicit?: string): string {
+	if (explicit !== undefined) {
+		return explicit;
+	}
+	const fromEnv = process.env.SECURE_EXEC_WASM_COMMANDS_DIR;
+	if (fromEnv) {
+		return fromEnv;
+	}
+	if (existsSync(REPO_COMMANDS_DIR)) {
+		return REPO_COMMANDS_DIR;
+	}
+	return BUNDLED_COMMANDS_DIR;
+}
 
 /**
  * Secure-by-default permission policy applied when the caller passes no
@@ -84,8 +124,10 @@ export interface NodeRuntimeCreateOptions {
 	permissions?: Permissions;
 	/**
 	 * Override the directory containing the WASM command binaries (the source of
-	 * the guest `sh`). Defaults to the in-repo build output, or the
-	 * `SECURE_EXEC_WASM_COMMANDS_DIR` environment variable when set.
+	 * the guest `sh`). When unset, resolution falls back through the
+	 * `SECURE_EXEC_WASM_COMMANDS_DIR` environment variable, the in-repo build
+	 * output (developer checkouts), then the commands vendored into the installed
+	 * `@secure-exec/core` package (published installs).
 	 */
 	commandsDir?: string;
 	/**
@@ -423,10 +465,7 @@ export class NodeRuntime {
 	static async create(
 		options: NodeRuntimeCreateOptions = {},
 	): Promise<NodeRuntime> {
-		const commandsDir =
-			options.commandsDir ??
-			process.env.SECURE_EXEC_WASM_COMMANDS_DIR ??
-			DEFAULT_COMMANDS_DIR;
+		const commandsDir = resolveCommandsDir(options.commandsDir);
 
 		// Seed caller-provided files into the VM's in-memory filesystem before
 		// boot so they are part of the root filesystem snapshot the guest sees

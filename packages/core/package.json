@@ -8,6 +8,7 @@
 	"files": [
 		"dist",
 		"fixtures",
+		"commands",
 		"README.md"
 	],
 	"exports": {
@@ -178,12 +179,14 @@
 	"scripts": {
 		"build:protocol": "pnpm --dir ../build-tools build:protocol",
 		"build:vm-config": "cargo test -p secure-exec-vm-config --quiet",
+		"copy-commands": "node scripts/copy-wasm-commands.mjs",
 		"check-types": "pnpm run build:protocol && pnpm run build:vm-config && tsc --noEmit",
-		"build": "pnpm run build:protocol && pnpm run build:vm-config && tsc",
+		"build": "pnpm run build:protocol && pnpm run build:vm-config && tsc && pnpm run copy-commands",
+		"prepack": "node scripts/copy-wasm-commands.mjs --require",
 		"test": "vitest run"
 	},
 	"dependencies": {
-		"@secure-exec/sidecar": "workspace:*",
+		"@secure-exec/sidecar": "^0.3.0-rc.2",
 		"@rivetkit/bare-ts": "^0.6.2"
 	},
 	"devDependencies": {

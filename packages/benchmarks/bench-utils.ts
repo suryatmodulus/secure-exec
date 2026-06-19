@@ -19,10 +19,32 @@
 import os from "node:os";
 import { NodeRuntime } from "secure-exec";
 
-export const BATCH_SIZES = [1, 10, 50, 100, 200];
-export const ITERATIONS = 5;
-export const WARMUP_ITERATIONS = 1;
-export const MEMORY_ITERATIONS = 5;
+/**
+ * The full matrix matches the original harness: batch sizes 1/10/50/100/200,
+ * 5 recorded iterations, 1 warmup discarded. All four are overridable via env so
+ * a quick smoke run is possible without editing the file, e.g.:
+ *
+ *   BENCH_BATCH_SIZES=1,5 BENCH_ITERATIONS=2 BENCH_WARMUP=0 tsx coldstart.bench.ts
+ */
+function numList(envVar: string, fallback: number[]): number[] {
+	const raw = process.env[envVar];
+	if (!raw) return fallback;
+	return raw
+		.split(",")
+		.map((s) => Number(s.trim()))
+		.filter((n) => Number.isFinite(n) && n > 0);
+}
+function num(envVar: string, fallback: number): number {
+	const raw = process.env[envVar];
+	if (raw === undefined) return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+export const BATCH_SIZES = numList("BENCH_BATCH_SIZES", [1, 10, 50, 100, 200]);
+export const ITERATIONS = num("BENCH_ITERATIONS", 5);
+export const WARMUP_ITERATIONS = num("BENCH_WARMUP", 1);
+export const MEMORY_ITERATIONS = num("BENCH_MEMORY_ITERATIONS", 5);
 
 /**
  * A trivial guest program: just enough to confirm the runtime is live and the

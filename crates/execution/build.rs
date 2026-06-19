@@ -1,20 +1,22 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[path = "build_support.rs"]
 mod v8_bridge_build;
 
-#[path = "pyodide_release.rs"]
-mod pyodide_release;
-
 /// Large Pyodide runtime assets are excluded from the published crate (see the
 /// `exclude` list in Cargo.toml) to keep it under the registry size limit.
-/// During in-tree builds they are copied from `assets/pyodide/`; when building
-/// the published crate (where they are absent) they are downloaded from the
-/// release CDN at the crate version. `SECURE_EXEC_RELEASE_CDN` may override the
-/// default GitHub release URL during and after the secure-exec repo split.
+/// During in-tree (workspace) builds they are copied from `assets/pyodide/`.
+///
+/// When building the published crate (the unpacked tarball, where these assets
+/// are absent) Python support is built WITHOUT the externalized Pyodide assets:
+/// each missing asset is staged as an empty placeholder so the `include_bytes!`
+/// of the OUT_DIR copy still compiles, and the `secure_exec_pyodide_unavailable`
+/// cfg is set so the runtime reports Python as unavailable instead of trying to
+/// boot an incomplete Pyodide. This keeps `cargo publish` verification free of
+/// any CDN/network dependency. Python support remains fully functional in the
+/// workspace build where the in-tree assets exist.
 const EXTERNALIZED_PYODIDE_ASSETS: &[&str] = &[
     "pyodide.asm.wasm",
     "pyodide.asm.js",
@@ -29,11 +31,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=pyodide_release.rs");
-    println!(
-        "cargo:rerun-if-env-changed={}",
-        pyodide_release::SECURE_EXEC_RELEASE_CDN_ENV
-    );
+    // Declare the cfg used to gate Python availability so `cargo` does not warn
+    // about an unexpected cfg name.
+    println!("cargo:rustc-check-cfg=cfg(secure_exec_pyodide_unavailable)");
     v8_bridge_build::build_v8_bridge(&manifest_dir, &out_dir);
     stage_pyodide_assets(&manifest_dir, &out_dir);
 }
@@ -48,19 +48,14 @@ fn stage_pyodide_assets(manifest_dir: &Path, out_dir: &Path) {
         )
     });
 
-    // Externalized assets are published as GitHub Release assets for the
-    // matching tag, so building the published crate only needs public HTTP
-    // access (no registry credentials).
-    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION must be set");
-    let configured_cdn = env::var(pyodide_release::SECURE_EXEC_RELEASE_CDN_ENV).ok();
-    let base_url = pyodide_release::pyodide_release_base_url(&version, configured_cdn.as_deref());
+    let mut pyodide_unavailable = false;
 
     for asset in EXTERNALIZED_PYODIDE_ASSETS {
         let in_tree = manifest_dir.join("assets/pyodide").join(asset);
         let dest = pyodide_out.join(asset);
         println!("cargo:rerun-if-changed={}", in_tree.display());
 
-        if dest.exists() {
+        if dest.exists() && !is_placeholder(&dest) {
             continue;
         }
 
@@ -74,29 +69,32 @@ fn stage_pyodide_assets(manifest_dir: &Path, out_dir: &Path) {
                 )
             });
         } else {
-            let url = pyodide_release::pyodide_release_asset_url(&base_url, asset);
-            download_asset(&url, &dest);
+            // Published-crate build: the externalized asset is absent and there
+            // is no CDN dependency. Stage an empty placeholder so `include_bytes!`
+            // compiles, and mark Python as unavailable for this build.
+            pyodide_unavailable = true;
+            fs::write(&dest, b"").unwrap_or_else(|error| {
+                panic!(
+                    "failed to write pyodide placeholder {}: {}",
+                    dest.display(),
+                    error
+                )
+            });
         }
+    }
+
+    if pyodide_unavailable {
+        println!("cargo:rustc-cfg=secure_exec_pyodide_unavailable");
+        println!(
+            "cargo:warning=secure-exec-execution: building without bundled Pyodide assets; \
+             guest Python execution will be unavailable in this build."
+        );
     }
 }
 
-fn download_asset(url: &str, dest: &Path) {
-    let status = Command::new("curl")
-        .args(["--fail", "--location", "--silent", "--show-error", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to spawn curl to download externalized pyodide asset {url}: {error}. \
-                 curl is required to build the published secure-exec-execution crate."
-            )
-        });
-
-    if !status.success() {
-        panic!(
-            "failed to download externalized pyodide asset from {url} (curl exited with {status}). \
-             The release CDN must serve this asset before the crate is published."
-        );
-    }
+/// A zero-byte staged asset is a placeholder written by a prior published-crate
+/// build; treat it as missing so a later workspace build can replace it with the
+/// real in-tree asset.
+fn is_placeholder(path: &Path) -> bool {
+    fs::metadata(path).map(|meta| meta.len() == 0).unwrap_or(false)
 }

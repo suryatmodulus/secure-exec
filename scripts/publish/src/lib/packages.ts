@@ -124,11 +124,9 @@ export function discoverPackages(
 	}> = JSON.parse(pnpmList);
 	for (const p of workspacePkgs) {
 		if (!p.name) continue;
-		// The renamed third-party software packages (registry/software/*) publish
-		// under the @agent-os-pkgs/* scope so downstream (agent-os) can pin them.
-		const isAgentOsPkg = p.name.startsWith("@agent-os-pkgs/");
-		if (!isAgentOsPkg && !SECURE_EXEC_WORKSPACE_PACKAGES.has(p.name)) continue;
-		if (!isAgentOsPkg && p.path.includes("/registry/software/")) continue;
+		// Only the curated secure-exec workspace packages are published; the
+		// @agent-os-pkgs/* software packages (registry/software/*) are not.
+		if (!SECURE_EXEC_WORKSPACE_PACKAGES.has(p.name)) continue;
 		add(p.path);
 	}
 
