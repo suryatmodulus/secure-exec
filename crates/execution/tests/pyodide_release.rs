@@ -1,4 +1,4 @@
-#[path = "../../build-support/pyodide_release.rs"]
+#[path = "../pyodide_release.rs"]
 mod pyodide_release;
 
 #[test]

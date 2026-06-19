@@ -6,9 +6,13 @@ import { LinkCard } from '@astrojs/starlight/components';
 
 <LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-output-capture" description="Runnable example for capturing stdout, stderr, and the exit code." />
 
-`exec()` runs guest code and returns its captured output. The `stdout` and `stderr` streams are buffered separately into strings, and the guest process's `exitCode` is returned alongside them. Buffering into strings bounds host memory: `exec()` holds each channel as a single string rather than retaining an unbounded backlog of live stream chunks.
+`exec()` runs guest code and resolves with its captured output once the guest process exits.
 
-## Capturing Output
+- `stdout` and `stderr` are buffered as separate strings, so output on one channel never bleeds into the other.
+- `exitCode` is the guest process's exit status.
+- Buffering into strings bounds host memory: each channel is held as one string, not an unbounded backlog of live chunks.
+
+## Capturing output
 
 ```ts
 import { NodeRuntime } from "secure-exec";
@@ -32,7 +36,7 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-output-capture)*
 
-Running it prints:
+Prints:
 
 ```
 exitCode: 3
@@ -40,11 +44,11 @@ stdout: "hello from the sandbox\n"
 stderr: "oops from the sandbox\n"
 ```
 
-`stdout` and `stderr` are independent strings, so output written to one channel never bleeds into the other. The `exitCode` is the guest process's exit status. Here the program called `process.exit(3)`, so `exitCode` is `3`.
+`process.exit(3)` is why `exitCode` is `3`.
 
 ## Result shape
 
-`exec()` resolves to an object with three fields:
+`exec()` resolves to `NodeRuntimeExecResult`:
 
 ```ts
 interface NodeRuntimeExecResult {
@@ -54,17 +58,79 @@ interface NodeRuntimeExecResult {
 }
 ```
 
-:::note[Streaming output is not on `NodeRuntime` yet]
-`NodeRuntime.exec()` returns the full `stdout` and `stderr` strings once the
-guest process finishes. Secure Exec supports incremental streaming underneath
-(the kernel's exec protocol carries live stdout/stderr stream events), but
-`NodeRuntime` does not surface per-chunk callbacks yet, so the buffered strings
-are what you get today.
-:::
+`run()` resolves to `NodeRuntimeRunResult<T>`: the same three fields plus a decoded `value`:
+
+```ts
+interface NodeRuntimeRunResult<T = unknown> {
+	value?: T;       // JSON-decoded value the guest passed to __return()
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+```
+
+`value` is only populated when `exitCode === 0` and the guest called `globalThis.__return(value)`; otherwise it is `undefined`.
+
+## Streaming output
+
+Pass `onStdout` / `onStderr` to observe output incrementally as it is produced. The full strings are still returned when the run ends.
+
+- Each callback receives a `Uint8Array` chunk. Decode text with a `TextDecoder`.
+- Available on both `exec()` and `run()`, and on `spawn()` via `NodeRuntimeSpawnOptions`.
+
+```ts
+const decoder = new TextDecoder();
+
+const { stdout, exitCode } = await rt.exec(
+	`
+		for (let i = 0; i < 3; i++) console.log("tick", i);
+	`,
+	{
+		onStdout: (chunk) => process.stdout.write(decoder.decode(chunk)),
+		onStderr: (chunk) => process.stderr.write(decoder.decode(chunk)),
+	},
+);
+// stdout still holds the complete buffered output after the run.
+```
+
+## Exec options
+
+`exec()`, `run()`, and `spawn()` accept `NodeRuntimeExecOptions`:
+
+```ts
+interface NodeRuntimeExecOptions {
+	env?: Record<string, string>;          // merged over the VM env
+	cwd?: string;                          // working directory for this run
+	stdin?: string | Uint8Array;           // piped to the guest's stdin
+	timeout?: number;                      // abort after N milliseconds
+	signal?: AbortSignal;                  // cancel from the outside (SIGTERM)
+	onStdout?: (chunk: Uint8Array) => void;
+	onStderr?: (chunk: Uint8Array) => void;
+}
+```
+
+Feed input and read everything back as buffered strings:
+
+```ts
+const { stdout } = await rt.exec(
+	`process.stdin.pipe(process.stdout);`,
+	{ stdin: "echo me back\n" },
+);
+// stdout === "echo me back\n"
+```
+
+Cancel an in-flight run with `signal`; the guest process is killed inside the VM and the call rejects with the abort reason:
+
+```ts
+const controller = new AbortController();
+const pending = rt.exec("while (true) {}", { signal: controller.signal });
+controller.abort();
+await pending.catch((err) => console.log(err.name)); // "AbortError"
+```
 
 ## Common patterns
 
-Use `exitCode` to detect failure, and `run()` when you also need a value back (it returns the same `stdout`/`stderr`/`exitCode` plus a decoded `value`):
+Use `exitCode` to detect failure; use `run()` when you also need a value back:
 
 ```ts
 const { stderr, exitCode } = await rt.exec(code);
@@ -73,3 +139,5 @@ if (exitCode !== 0) throw new Error(`guest exited ${exitCode}: ${stderr}`);
 const { value } = await rt.run(`globalThis.__return({ answer: 42 });`);
 // value === { answer: 42 }
 ```
+
+For long-running guests that never exit (dev servers), use `spawn()` instead: it returns a live `NodeRuntimeProcess` handle with the same `onStdout`/`onStderr` streaming, plus `writeStdin`, `kill`, and `wait()`.

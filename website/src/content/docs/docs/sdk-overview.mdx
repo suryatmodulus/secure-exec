@@ -5,6 +5,9 @@ description: Guided tour of the secure-exec API surface.
 
 import { Tabs, TabItem, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
+A tour of the `NodeRuntime` class, the entry point for booting a VM and running
+guest JavaScript end-to-end.
+
 ## Install
 
 <Tabs>
@@ -32,15 +35,12 @@ import { Tabs, TabItem, CardGrid, LinkCard } from '@astrojs/starlight/components
 
 ## Create a runtime
 
-`NodeRuntime.create(options?)` returns a ready-to-use runtime. All options are
-optional; `cwd` defaults to `/home/user`, and permissions default to a secure
-policy that denies network access.
+`NodeRuntime.create(options?)` boots a VM and returns a ready-to-use runtime.
+All options are optional.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
-// Boot a VM. Every option here is optional; these are the defaults made
-// explicit. `cwd` defaults to "/home/user", and network is denied by default.
 const rt = await NodeRuntime.create({
   env: { GREETING: "hello from the VM env" },
   cwd: "/home/user",
@@ -48,6 +48,35 @@ const rt = await NodeRuntime.create({
 ```
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/sdk-overview)*
+
+Every `create()` option:
+
+- `env`: environment variables visible to guest processes.
+- `cwd`: initial working directory for guests. Defaults to `/home/user`.
+- `permissions`: capability policy, merged over a secure default that denies
+  network access. See [Permissions](#permissions).
+- `files`: seed files into the VM filesystem before boot, keyed by absolute
+  guest path. Values are `string | Uint8Array`. Parent dirs are created as needed.
+- `mounts`: project host directories into the VM, Docker-style and read lazily.
+- `tools`: register host-side tools the guest can invoke as shell commands.
+- `commandsDir`: override the directory of WASM command binaries (the guest
+  `sh`). Defaults to the in-repo build or `SECURE_EXEC_WASM_COMMANDS_DIR`.
+- `loopbackExemptPorts`: guest ports allowed to accept non-loopback connections.
+
+```ts
+const rt = await NodeRuntime.create({
+  // Seed bytes into the in-memory VFS.
+  files: { "/home/user/data.json": '{"ok":true}' },
+  // Mount a host dir, lazily and read-only by default.
+  mounts: [
+    {
+      guestPath: "/home/user/node_modules/typescript",
+      hostPath: "/abs/path/node_modules/typescript",
+      readOnly: true,
+    },
+  ],
+});
+```
 
 ## Execute code
 
@@ -57,70 +86,153 @@ and top-level `await` both work.
 `exec()` runs code and captures `stdout`, `stderr`, and `exitCode`:
 
 ```ts
-// exec() runs guest code for its output. Guest code is an ES module, so
-// `import` and top-level `await` both work.
-const execResult = await rt.exec(
-  `
+const execResult = await rt.exec(`
   import os from "node:os";
-  console.log("stdout:", 1 + 1);
-  console.error("stderr:", process.env.GREETING);
   console.log("platform:", os.platform());
-  `,
-);
-console.log("exec.stdout:  ", JSON.stringify(execResult.stdout));
-console.log("exec.stderr:  ", JSON.stringify(execResult.stderr));
-console.log("exec.exitCode:", execResult.exitCode);
+  console.error("greeting:", process.env.GREETING);
+`);
+// { stdout: string, stderr: string, exitCode: number }
 ```
 
-`run()` additionally returns a JSON-serializable `value`. The guest calls
-`globalThis.__return(value)` and that value is decoded on the host:
+`run<T>()` additionally decodes a JSON-serializable `value`. The guest calls
+`globalThis.__return(value)`; if it never does, `value` is `undefined`:
 
 ```ts
-// run() returns a JSON-serializable value: the guest calls
-// globalThis.__return(value) and that value is decoded on the host.
-const runResult = await rt.run<{ sum: number; cwd: string }>(
-  `
-  globalThis.__return({ sum: 2 + 40, cwd: process.cwd() });
-  console.log("computed in the VM");
-  `,
-);
-console.log("run.value:    ", JSON.stringify(runResult.value));
-console.log("run.stdout:   ", JSON.stringify(runResult.stdout));
-console.log("run.exitCode: ", runResult.exitCode);
+const runResult = await rt.run<{ sum: number }>(`
+  globalThis.__return({ sum: 2 + 40 });
+`);
+console.log(runResult.value?.sum); // 42
+// { value?: T, stdout, stderr, exitCode }
 ```
 
 ## Per-run options
 
-`exec()` and `run()` accept per-call options: extra `env`, a `cwd`, `stdin` data
-(`string` or `Uint8Array`), and a `timeout` in milliseconds.
+`exec()` and `run()` accept the same per-call options:
+
+- `env`: extra env merged over the VM env.
+- `cwd`: working directory for this run.
+- `stdin`: `string | Uint8Array` piped to the guest's stdin.
+- `timeout`: abort the run after N milliseconds.
+- `signal`: an `AbortSignal`; on abort the guest process is killed (kernel
+  delivers `SIGTERM`) and the call rejects with the abort reason.
+- `onStdout` / `onStderr`: `(chunk: Uint8Array) => void`, called per chunk as
+  output is produced. The full output is still returned in the result.
 
 ```ts
-// Per-run options: extra env, stdin, cwd, and a timeout (ms).
-const stdinResult = await rt.run<string>(
+const result = await rt.run<string>(
   `
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
   globalThis.__return(input.trim().toUpperCase());
   `,
-  { stdin: "piped through stdin", timeout: 10_000 },
+  {
+    stdin: "piped through stdin",
+    timeout: 10_000,
+    onStdout: (chunk) => process.stdout.write(new TextDecoder().decode(chunk)),
+  },
 );
-console.log("run.value (stdin):", JSON.stringify(stdinResult.value));
+```
+
+```ts
+// Cancel an in-flight run from the outside.
+const controller = new AbortController();
+const pending = rt.exec("while (true) {}", { signal: controller.signal });
+controller.abort();
+await pending.catch((err) => err.name); // "AbortError"
+```
+
+## Spawn a long-running process
+
+`spawn()` starts a guest program and returns a live `NodeRuntimeProcess` handle
+immediately, without waiting for it to exit. Use it for dev servers and other
+guests that do not run to completion. It takes the same per-run options.
+
+```ts
+const server = await rt.spawn(`
+  import http from "node:http";
+  http.createServer((_, res) => res.end("ok")).listen(3000);
+`);
+
+server.pid;                       // guest process id
+server.exitCode;                  // number once exited, else null
+server.writeStdin("data");        // feed stdin
+server.closeStdin();              // signal end-of-input
+server.kill("SIGTERM");           // signal name or number; defaults to SIGTERM
+await server.wait();              // resolves with the exit code
+```
+
+## Drive HTTP into the VM (host to guest)
+
+`fetch(port, input)` sends an HTTP request to a guest server listening inside
+the VM and reads the response back on the host. The request never leaves the VM,
+so it works even when guest network egress is denied.
+
+```ts
+const res = await rt.fetch(3000, {
+  method: "POST",                 // defaults to "GET"
+  path: "/api/users?limit=10",
+  headers: { "content-type": "application/json" },
+  body: '{"name":"ada"}',         // string | Uint8Array
+});
+// { status, statusText, headers, body }; headers lower-cased, body UTF-8 text
+console.log(res.status, res.body);
+```
+
+## Host tools
+
+Register host-side tools the guest invokes as named shell commands. The guest
+invocation round-trips back to the host `handler`, whose return value is
+delivered to the guest. Provide tools at `create()`, or add them to a live
+runtime with `registerTools()`.
+
+```ts
+await rt.registerTools({
+  add: {
+    description: "Add two numbers",
+    inputSchema: {
+      type: "object",
+      properties: { a: { type: "number" }, b: { type: "number" } },
+      required: ["a", "b"],
+    },
+    handler: ({ a, b }: { a: number; b: number }) => ({ sum: a + b }),
+  },
+});
+
+await rt.exec(`
+  import { execFileSync } from "node:child_process";
+  const out = execFileSync("add", ["add", "--json", JSON.stringify({ a: 2, b: 3 })]);
+  console.log(out.toString());
+`);
+```
+
+- Tools passed to `create({ tools })` auto-grant the `tool` permission scope when
+  you set no `tool` policy of your own.
+- When registering on a live runtime, ensure the `tool` scope is granted (e.g.
+  `permissions: { tool: "allow" }` on `create()`).
+
+## Read and write VM files
+
+Move bytes in and out of the VM's virtual filesystem after boot. The host
+filesystem is never touched.
+
+```ts
+await rt.writeFile("/home/user/out.txt", "hello");  // string | Uint8Array
+const bytes = await rt.readFile("/home/user/out.txt"); // Uint8Array
+console.log(new TextDecoder().decode(bytes));
 ```
 
 ## Permissions
 
-The `permissions` option to `NodeRuntime.create()` controls what guest code can
-access. It defaults to a secure policy that denies network access while leaving
-the `fs`, `childProcess`, `process`, and `env` scopes enabled. Your policy is
-merged over that secure default, so a partial policy works: `{ network: "allow" }`
-grants the network while keeping the execution essentials in place. The policy
-covers `fs`, `network`, `childProcess`, `process`, `env`, and `tool` scopes, each
-set to `"allow"`, `"deny"`, or a rule set.
+The `permissions` option controls what guest code can access. It defaults to a
+secure policy that denies network access while leaving the `fs`, `childProcess`,
+`process`, and `env` scopes enabled. Your policy is merged over that default, so
+a partial policy works: `{ network: "allow" }` grants the network while keeping
+the execution essentials in place. Scopes are `fs`, `network`, `childProcess`,
+`process`, `env`, and `tool`, each set to `"allow"`, `"deny"`, or a rule set.
 
-Because secure-exec runs each program as a guest `node` process, `childProcess`
-must remain allowed for `exec()` / `run()` to work. Since the default already
-denies network access, the snippet below is equivalent to the default and shown
-to make the secure baseline explicit:
+Because Secure Exec runs each program as a guest `node` process, `childProcess`
+must stay allowed for `exec()` / `run()` to work. The snippet below restates the
+secure baseline explicitly:
 
 ```ts
 const rt = await NodeRuntime.create({
@@ -136,11 +248,8 @@ See [Permissions](/docs/features/permissions) for the full policy shape.
 
 ## Clean up
 
-Always release the VM and the underlying sidecar when you are done:
+Always release the VM and underlying sidecar when done:
 
 ```ts
-// Always release the VM and the underlying sidecar.
 await rt.dispose();
-console.log("disposed");
 ```
-

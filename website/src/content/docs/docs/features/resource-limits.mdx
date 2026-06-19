@@ -1,17 +1,17 @@
 ---
 title: Resource Limits
-description: Terminating runaway guest code with execution timeouts, plus the memory, payload, CPU-time, and timing limits the VM enforces.
+description: Bound and cancel guest execution with exec/run timeouts and AbortSignal, plus the memory, payload, CPU-time, and timing limits the VM enforces.
 ---
 import { LinkCard } from '@astrojs/starlight/components';
 
-Resource limits prevent sandboxed code from running forever or exhausting the
-host. Each `exec()` call accepts a `timeout`, and when the budget elapses the
-guest process is killed so a runaway program can never hang the host. The
-timeout is the limit you reach for through the ergonomic `NodeRuntime` API
-today; secure-exec enforces several more resource limits at the VM level, and
-those are described at the end of this page.
+Bound and cancel guest execution so runaway code can never hang the host:
 
-## Limiting Execution Time
+- `timeout` (ms) on `exec()` / `run()`: kill the guest after a wall-clock budget.
+- `signal` (`AbortSignal`) on `exec()` / `run()`: cancel an in-flight run from the outside.
+
+Memory, payload, CPU-time, and timing limits are also enforced by the VM, but are not yet `NodeRuntime` options (see [Other limits](#other-limits-enforced-by-the-vm)).
+
+## Limiting execution time
 
 ```ts
 import { NodeRuntime } from "secure-exec";
@@ -69,53 +69,101 @@ runaway run (timeout: 1000ms):
 runaway guest was terminated by the timeout
 ```
 
-## Execution timeout
+## `timeout`
 
-Pass `timeout` (in milliseconds) to `exec()` to bound how long a single guest
-program may run. When the budget elapses, the guest process is killed and `exec()`
-returns with a non-zero `exitCode` (`137`, i.e. `128 + SIGKILL`).
+- Pass `timeout` in milliseconds to bound how long a single guest program may run.
+- When the budget elapses the guest process is killed; the call **resolves** with a non-zero `exitCode` (`137`, i.e. `128 + SIGKILL`).
+- A program that finishes first resolves with its real exit code.
 
 ```ts
-const runaway = await rt.exec(`while (true) {}`, {
-	timeout: 1000,
-});
-
+const runaway = await rt.exec(`while (true) {}`, { timeout: 1000 });
 console.log(runaway.exitCode); // 137 (terminated)
-```
 
-A program that finishes before the timeout returns its real exit code:
-
-```ts
-const ok = await rt.exec(`console.log("finished work");`, {
-	timeout: 5000,
-});
-
+const ok = await rt.exec(`console.log("done");`, { timeout: 5000 });
 console.log(ok.exitCode); // 0
 ```
 
-The same `timeout` option is available on `run()`.
+`timeout` is available on both `exec()` and `run()`.
+
+## `signal` (AbortSignal)
+
+- Pass an `AbortSignal` to cancel an in-flight run from the outside.
+- On abort the guest process is killed inside the VM (the kernel delivers `SIGTERM`) and the call **rejects** with the signal's abort reason (an `AbortError` by default).
+- Aborting an already-finished run has no effect; passing an already-aborted signal rejects immediately.
+
+```ts
+const controller = new AbortController();
+const pending = rt.exec(`while (true) {}`, { signal: controller.signal });
+
+controller.abort();
+
+await pending.catch((err) => console.log(err.name)); // "AbortError"
+```
+
+Wire a signal to your own deadline, or cancel work when an upstream request is canceled:
+
+```ts
+// Cancel after 2s, surfacing your own reason on the rejection.
+const result = await rt.exec(code, {
+	signal: AbortSignal.timeout(2000),
+});
+```
+
+`timeout` and `signal` can be combined: whichever fires first ends the run (the `timeout` kills and resolves non-zero, the `signal` kills and rejects).
+
+## Result shape
+
+`exec()` resolves with:
+
+```ts
+interface NodeRuntimeExecResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+```
+
+`run()` resolves with the same fields plus `value`, the JSON value the guest returned via `__return(...)` (only when `exitCode === 0`):
+
+```ts
+interface NodeRuntimeRunResult<T> {
+	value?: T;
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+```
+
+## Full option set for `exec()` / `run()`
+
+Both take the same options:
+
+- `timeout?: number`: kill the run after this many milliseconds (resolves non-zero).
+- `signal?: AbortSignal`: cancel the run; rejects with the abort reason.
+- `stdin?: string | Uint8Array`: data piped to the guest's stdin.
+- `env?: Record<string, string>`: extra env merged over the VM env for this run.
+- `cwd?: string`: working directory for this run.
+- `onStdout?: (chunk: Uint8Array) => void`: stream stdout chunks as produced.
+- `onStderr?: (chunk: Uint8Array) => void`: stream stderr chunks as produced.
+
+```ts
+const out = await rt.exec(code, {
+	timeout: 5000,
+	stdin: "hello\n",
+	env: { LOG: "1" },
+	onStdout: (chunk) => process.stdout.write(chunk),
+});
+```
+
+For long-running guests that should not run to completion (dev servers, watchers), use `rt.spawn(code, options)` instead, which returns a live `NodeRuntimeProcess` you `kill()` and `wait()` on directly.
 
 ## Other limits enforced by the VM
 
-The execution `timeout` is the only resource limit exposed as a
-`NodeRuntime.exec()` / `NodeRuntime.run()` option today, but it is not the only
-limit secure-exec enforces. The VM applies a broader set of resource limits
-configured at VM creation through the protocol's `VmLimits`
-(`CreateVmConfig.limits`), including:
+`timeout` and `signal` are the only execution-bounding controls exposed as `NodeRuntime` options today. The VM enforces a broader set of limits, configured at VM creation through the protocol's `VmLimits` (`CreateVmConfig.limits`):
 
-- **Memory**: a V8 heap limit (`jsRuntime.v8HeapLimitMb`) caps how much memory
-  guest JavaScript may allocate, plus filesystem byte and inode caps for the
-  virtual filesystem.
-- **Payload and transfer limits**: caps on captured output, stdin buffering,
-  event payload size, and `fetch()` response size bound how much data moves
-  between the guest and the host.
-- **CPU-time budget**: secure-exec can bound CPU usage (cores and blocking
-  read time) independently of the wall-clock execution `timeout`.
-- **Timing mitigation**: secure-exec can freeze timers to blunt timing side
-  channels.
+- **Memory**: a V8 heap limit (`jsRuntime.v8HeapLimitMb`) caps guest JavaScript allocation, plus filesystem byte and inode caps for the virtual filesystem.
+- **Payload and transfer**: caps on captured output, stdin buffering, event payload size, and `fetch()` response size bound how much data moves between guest and host.
+- **CPU-time budget**: bounds CPU usage (cores and blocking read time) independently of the wall-clock `timeout`.
+- **Timing mitigation**: timers can be frozen to blunt timing side channels.
 
-These limits are real and enforced by secure-exec, but they are not yet
-surfaced as `NodeRuntime.create()` options. The ergonomic `NodeRuntime` API
-boots the VM with secure-exec's defaults for them; only the execution
-`timeout` is configurable per call today. To tune the other limits you set
-`CreateVmConfig.limits` when driving the VM through the lower-level protocol.
+These limits are real and enforced, but not yet surfaced as `NodeRuntime.create()` options. The ergonomic API boots the VM with Secure Exec's defaults for them; only `timeout`/`signal` are configurable per call. To tune the rest, set `CreateVmConfig.limits` when driving the VM through the lower-level protocol.

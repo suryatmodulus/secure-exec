@@ -6,26 +6,45 @@ import { LinkCard } from '@astrojs/starlight/components';
 
 <LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-permissions" description="Runnable example for permission configuration." />
 
-Every guest syscall is checked against a per-domain permission policy. You pass a
-`permissions` object to `NodeRuntime.create()` and configure each capability
-domain (`fs`, `network`, `childProcess`, `process`, and `env`) independently.
-When no `permissions` option is given, the runtime defaults to allow-all so guest
-programs run without extra setup; tighten it to sandbox guest capabilities.
+Every guest syscall is checked against a per-scope permission policy passed as `permissions` to `NodeRuntime.create()`.
 
-A domain is set to `"allow"`, `"deny"`, or a rule set. When a guest operation is
-denied, the kernel rejects it with `EACCES` before any host resource is touched.
+- Six scopes, configured independently: `fs`, `network`, `childProcess`, `process`, `env`, `tool`.
+- Each scope is `"allow"`, `"deny"`, or a rule set.
+- A denied operation is rejected with `EACCES` before any host resource is touched.
+- The policy you pass is **merged over a secure default**, so partial policies work.
+
+## Defaults and merge semantics
+
+Secure Exec is deny-by-default for outward-facing capabilities. When you pass no `permissions`, this baseline applies:
+
+```ts
+{
+  fs: "allow",          // virtualized in-memory filesystem only
+  childProcess: "allow",
+  process: "allow",
+  env: "allow",
+  network: "deny",      // no network egress until you opt in
+}
+```
+
+- `fs`/`childProcess`/`process`/`env` are allowed because they are fully virtualized (the guest sees only the VM, never the host) and are required to run a program at all.
+- `network` is denied: guest code cannot reach the network until you opt in.
+- Your `permissions` are merged **over** this baseline. Omitted scopes keep their default; they are **not** denied. So `{ network: "allow" }` grants the network while keeping the execution essentials.
+
+```ts
+// Grant the network, leave everything else at the secure default.
+const rt = await NodeRuntime.create({ permissions: { network: "allow" } });
+```
 
 ## Configuring Permissions
 
-The example below allows filesystem access but denies the network. The guest
-writes and reads a file successfully, while an outbound `fetch()` is blocked by
-the kernel.
+The example below allows the filesystem but denies the network. The guest writes and reads a file successfully, while an outbound `fetch()` is blocked by the kernel.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
-// Permissions are a per-domain policy evaluated against every guest syscall.
-// Each domain (fs, network, childProcess, process, env) is configured
+// Permissions are a per-scope policy evaluated against every guest syscall.
+// Each scope (fs, network, childProcess, process, env, tool) is configured
 // independently as "allow", "deny", or a rule set. Here the guest may use the
 // filesystem, but the network is fully denied - so an outbound fetch is blocked
 // by the kernel before any socket is opened.
@@ -56,7 +75,7 @@ try {
     const fileContents = readFileSync("/workspace/note.txt", "utf8");
     console.log("filesystem allowed:", fileContents);
 
-    // Denied: the network domain is set to "deny", so fetch() is blocked.
+    // Denied: the network scope is set to "deny", so fetch() is blocked.
     let networkBlocked = false;
     let networkError = null;
     try {
@@ -107,53 +126,84 @@ network error: EACCES: EACCES: permission denied, tcp://example.com:80: blocked 
 OK: filesystem allowed, network denied
 ```
 
-## Permission domains
+## Permission scopes
 
-Each field of the `permissions` object configures one capability domain:
+| Scope | Controls | Default |
+|---|---|---|
+| `fs` | Filesystem reads, writes, and metadata operations | `allow` |
+| `network` | Outbound connections, `fetch`, HTTP, and DNS | `deny` |
+| `childProcess` | Spawning child processes | `allow` |
+| `process` | Process-control operations | `allow` |
+| `env` | Environment variable access | `allow` |
+| `tool` | Invoking host tools registered via `tools` / `rt.registerTools` | `deny`* |
 
-| Domain | Controls |
-|---|---|
-| `fs` | Filesystem reads, writes, and metadata operations |
-| `network` | Outbound connections, `fetch`, HTTP, and DNS |
-| `childProcess` | Spawning child processes |
-| `process` | Process-control operations |
-| `env` | Environment variable access |
-
-A domain that is omitted is denied, so when you supply a `permissions` object you
-must explicitly set every domain the guest needs.
+\* The `tool` scope is auto-granted to `allow` when you pass `tools` to `create()` and set no `tool` policy of your own. Pass `permissions.tool` to gate individual tools.
 
 ## Allow, deny, and rule sets
 
-The simplest value for a domain is `"allow"` or `"deny"`:
+The simplest value for a scope is `"allow"` or `"deny"`:
 
 ```ts
 const rt = await NodeRuntime.create({
-  permissions: {
-    fs: "allow",
-    network: "deny",
-    childProcess: "allow",
-    process: "allow",
-    env: "allow",
-  },
+  permissions: { fs: "allow", network: "deny" },
 });
 ```
 
-For finer control, a domain can be a rule set with a `default` mode and an
-ordered list of `rules`. Filesystem rules match on `operations` and `paths`
-(glob patterns); the other domains match on `operations` and `patterns`. Use
-`["*"]` for a wildcard:
+For finer control, a scope can be a rule set: a `default` mode plus an ordered list of `rules` evaluated in order.
+
+- `default`: `"allow"` or `"deny"`, applied when no rule matches.
+- Each rule has a `mode` (`"allow"` or `"deny"`) and matchers.
+- `fs` rules match on `operations` and `paths` (path/glob patterns).
+- All other scopes match on `operations` and `patterns`.
+- Use `["*"]` as a wildcard for any operation or pattern.
 
 ```ts
+// fs: allow by default, but deny anything under /vault.
 const rt = await NodeRuntime.create({
   permissions: {
     fs: {
       default: "allow",
       rules: [{ mode: "deny", operations: ["*"], paths: ["/vault/**"] }],
     },
-    network: "deny",
-    childProcess: "allow",
-    process: "allow",
-    env: "allow",
+  },
+});
+```
+
+```ts
+// network: deny by default, allow only api.example.com.
+const rt = await NodeRuntime.create({
+  permissions: {
+    network: {
+      default: "deny",
+      rules: [{ mode: "allow", operations: ["*"], patterns: ["api.example.com"] }],
+    },
+  },
+});
+```
+
+## Tools and the `tool` scope
+
+Host tools registered with `tools` (at `create`) or `rt.registerTools` (after boot) are gated by the `tool` scope. The `create` option auto-grants `tool: "allow"` when you set no policy; `rt.registerTools` does not, so grant it yourself:
+
+```ts
+const rt = await NodeRuntime.create({
+  permissions: { tool: "allow" },
+});
+await rt.registerTools({
+  add: {
+    description: "Add two numbers",
+    handler: ({ a, b }: { a: number; b: number }) => ({ sum: a + b }),
+  },
+});
+```
+
+Restrict which tools the guest may call with a rule set over their command names:
+
+```ts
+const rt = await NodeRuntime.create({
+  tools: { add: { /* ... */ }, deleteFile: { /* ... */ } },
+  permissions: {
+    tool: { default: "deny", rules: [{ mode: "allow", patterns: ["add"] }] },
   },
 });
 ```

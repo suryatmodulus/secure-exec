@@ -4,25 +4,20 @@ description: How sandboxed code resolves and loads modules.
 ---
 import { Aside } from '@astrojs/starlight/components';
 
-Guest code resolves and loads modules through secure-exec's module loader, which runs entirely inside the kernel. Both ESM `import` and CommonJS `require` resolve against the guest's virtual filesystem rather than reaching out to the host. What appears on that virtual filesystem is up to you: by default a `NodeRuntime` boots with an empty `node_modules`, but secure-exec can also project host `node_modules` into the VM so real npm packages (including the TypeScript compiler) run inside the sandbox.
+Guest `import` and `require` resolve against the VM's virtual filesystem, never the host module loader. Resolution runs entirely inside the kernel. By default the guest sees an empty `node_modules`; project host packages in with `mounts` to run real npm packages (including the TypeScript compiler) in-sandbox.
 
 ## Loading Modules
 
-Boot a runtime with `NodeRuntime.create()`, then run guest code that loads Node builtins. The guest source runs as a standard ES module, so it can `import` builtins directly and also build a CommonJS `require` with `createRequire`.
+- Guest source runs as a standard ES module: `import`, `import.meta.url`, and top-level `await` all work.
+- Build a CommonJS `require` with `createRequire(import.meta.url)`.
+- Both paths resolve through the kernel's module loader.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
-// Boot a fully virtualized VM. Module resolution runs entirely inside the
-// kernel - `import` and `require` resolve against the guest's virtual
-// filesystem, not by reaching out to the host module loader.
 const rt = await NodeRuntime.create();
 
 try {
-  // Guest code runs as an ES module inside the VM, so it can `import` Node
-  // builtins directly. It can also build a CommonJS `require` with
-  // `createRequire` to load builtins the classic way. Both resolve through the
-  // kernel's module loader.
   const { stdout, stderr, exitCode } = await rt.exec(`
     // ESM import of a Node builtin.
     import { basename, join } from "node:path";
@@ -54,8 +49,6 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-module-loading)*
 
-Running this resolves `node:path` through `import` and `node:os` through a `createRequire` `require`, then prints what each loaded:
-
 ```
 exitCode: 0
 guest stdout:
@@ -64,47 +57,42 @@ resolved node:os via require -> linux
 {"basename":"report.txt","joined":"/workspace/data/report.txt","platform":"linux"}
 ```
 
-<Aside type="note">Module resolution runs inside the kernel against the guest's virtual filesystem, not the host module loader. The guest only sees what is present on its virtual filesystem; when you project host `node_modules` into the VM (see below), those packages become part of that filesystem and resolve like any other guest module.</Aside>
-
-## ESM and CommonJS
-
-Guest source runs as a standard ES module, so:
-
-- `import` statements resolve Node builtins (`node:path`, `node:fs`, `node:os`, …) and any modules present on the guest filesystem.
-- `import.meta.url` is available, and `createRequire(import.meta.url)` produces a working CommonJS `require` for code that prefers `require(...)`.
-- Top-level `await` works.
+<Aside type="note">Resolution runs inside the kernel against the guest's virtual filesystem. The guest only sees what is present there; mounting host `node_modules` (below) makes those packages part of that filesystem so they resolve like any other guest module.</Aside>
 
 ## node_modules resolution
 
-When a guest filesystem contains `node_modules`, the resolver matches naive Node.js resolution over that filesystem, Docker-style:
+When a guest filesystem contains `node_modules`, the resolver matches naive Node.js resolution over it, Docker-style:
 
-- the ancestor `node_modules` walk from the importing module up to the root,
+- ancestor `node_modules` walk from the importing module up to the root,
 - `package.json` `exports`/`imports` and conditions,
-- and `realpath`/symlink following.
+- `realpath`/symlink following.
 
-There are no package-manager-specific heuristics: pnpm/yarn layouts resolve because the virtual filesystem exposes their symlinks, not because the resolver special-cases them.
+No package-manager-specific heuristics: pnpm/yarn layouts resolve because the VFS exposes their symlinks, not because the resolver special-cases them.
 
 ## Loading real npm packages
 
-By default a `NodeRuntime` boots with an empty `node_modules`, so the guest sees no third-party packages. To run real npm packages inside the sandbox, project a host directory into the VM with the `mounts` option on `NodeRuntime.create()`. Each mount makes a host directory readable at a guest path, Docker-style, and the bytes are read lazily as the guest accesses them, so even a large tree such as the TypeScript compiler is projected without copying it up front. This is exactly how a host-installed toolchain runs against guest code: the packages are mounted, and the in-kernel resolver then walks them like any other guest `node_modules`. Resolution still runs entirely inside the kernel; mounting host packages changes what is present on the guest filesystem, not where resolution happens. The guest sees only the mounted subtree, never the wider host filesystem.
+Put package bytes on the guest filesystem, then let the in-kernel resolver walk them. Two ways to project them:
 
-Mount the package into a `node_modules` directory that sits on the importing module's resolution path. Resolution follows the importing module up its ancestor `node_modules` chain (it is driven by the module's location, not the cwd), and `exec()` runs each program from `/tmp`, so mounting the package at `/tmp/node_modules/<name>` is where that walk finds it.
+- `create({ mounts })`: project a host directory, Docker-style. Read lazily as the guest accesses files, so a large tree (e.g. the TypeScript compiler) is projected without copying it up front. Preferred for real `node_modules` trees. Each mount:
+  - `guestPath`: absolute guest path the directory appears at.
+  - `hostPath`: absolute host directory to project.
+  - `readOnly`: read-only mount (default `true`; pass `false` to allow guest writes).
+- `create({ files })` or `rt.writeFile` / `rt.readFile`: write bytes directly into the VM when you want to seed files instead of projecting a host tree.
+
+Either way the host filesystem is never exposed; the guest sees only the mounted subtree or the bytes you write.
+
+Mount the package under a `node_modules` directory on the importing module's resolution path. The walk follows the module's location (not the cwd), and `exec()` runs each program from `/tmp`, so `/tmp/node_modules/<name>` is where that walk finds it.
 
 ```ts
 import { createRequire } from "node:module";
 import { NodeRuntime } from "secure-exec";
 
-// Resolve a real, host-installed npm package directory. `is-number` is a tiny
-// dependency-free CommonJS package already present in this repo's node_modules.
-// `require.resolve` returns the package's entry file; its parent directory is
-// the package root we project into the VM.
+// `is-number` is a tiny dependency-free CommonJS package in this repo's
+// node_modules. require.resolve returns its entry file; the parent dir is the
+// package root we project into the VM.
 const require = createRequire(import.meta.url);
 const isNumberDir = require.resolve("is-number").replace(/[/\\]index\.js$/, "");
 
-// Boot a VM and mount the host package directory into a guest `node_modules`.
-// Resolution follows the importing module up its ancestor `node_modules` chain
-// (not the cwd), and `exec()` runs each program from `/tmp`, so the package is
-// mounted at `/tmp/node_modules/is-number` where that walk will find it.
 const mounted = await NodeRuntime.create({
   mounts: [
     {
@@ -116,8 +104,6 @@ const mounted = await NodeRuntime.create({
 });
 
 try {
-  // The guest resolves `is-number` from the mounted host directory the same way
-  // Node would over a real filesystem, then uses the real package's code.
   const { stdout, stderr, exitCode } = await mounted.exec(`
     // ESM import of the real, host-mounted npm package.
     import isNumber from "is-number";
@@ -150,8 +136,6 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-module-loading)*
 
-Running this resolves `is-number` from the mounted host directory through both `import` and `require`, then calls the real package's code. The reported resolution path points at the mounted location, and the ESM default export and the CommonJS export are the same module:
-
 ```
 exitCode: 0
 guest stdout:
@@ -159,8 +143,17 @@ loaded real npm package -> /tmp/node_modules/is-number/index.js
 {"from":"/tmp/node_modules/is-number/index.js","isNumber(42)":true,"isNumber(\"3.14\")":true,"isNumber(\"nope\")":false,"sameModule":true}
 ```
 
-You can also seed package files directly with the `files` option or `rt.writeFile`/`rt.readFile` when you want to write bytes into the VM instead of projecting a host directory. Mounting is preferred for real `node_modules` trees because it is lazy and never copies the whole tree.
+### Seeding files directly
 
-## Built-in module support
+When you don't have a host directory to mount, write bytes into the VM:
 
-Node builtins are served either by a full kernel-backed implementation (for modules such as `fs`, `net`, `child_process`, `dns`, `http`, `os`, and `crypto`) or by a pure-JS polyfill (for modules such as `path`, `buffer`, `url`, `events`, `stream`, `util`, and `assert`).
+```ts
+// At boot.
+const rt = await NodeRuntime.create({
+  files: { "/tmp/node_modules/greet/index.js": "module.exports = () => 'hi';" },
+});
+
+// Or after boot.
+await rt.writeFile("/tmp/node_modules/greet/package.json", '{"main":"index.js"}');
+const bytes = await rt.readFile("/tmp/node_modules/greet/index.js");
+```

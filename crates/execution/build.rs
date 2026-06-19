@@ -6,7 +6,7 @@ use std::process::Command;
 #[path = "build_support.rs"]
 mod v8_bridge_build;
 
-#[path = "../build-support/pyodide_release.rs"]
+#[path = "pyodide_release.rs"]
 mod pyodide_release;
 
 /// Large Pyodide runtime assets are excluded from the published crate (see the
@@ -29,6 +29,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=pyodide_release.rs");
     println!(
         "cargo:rerun-if-env-changed={}",
         pyodide_release::SECURE_EXEC_RELEASE_CDN_ENV

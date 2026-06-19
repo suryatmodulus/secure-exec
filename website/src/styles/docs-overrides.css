@@ -43,3 +43,10 @@
 	display: block;
 	margin-top: 0.35rem;
 }
+
+/* Benchmarks sidebar item: no icon at all. The theme renders an icon for every
+ * leaf, falling back to `ICONS.dot` when a page has no `data-icon`. Hide that
+ * fallback dot for the Benchmarks link so it shows no icon. */
+a[href*="/docs/benchmarks"] .se-sidebar-icon {
+	display: none;
+}

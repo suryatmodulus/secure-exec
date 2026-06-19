@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { NodeRuntime } from "secure-exec";
 
 // Boot a fully virtualized VM. Module resolution runs entirely inside the
@@ -39,33 +39,23 @@ try {
   await rt.dispose();
 }
 
-// --- Loading a real npm package from the host -----------------------------
+// --- Loading real npm packages from the host ------------------------------
 
-// Resolve a real, host-installed npm package directory. `is-number` is a tiny
-// dependency-free CommonJS package already present in this repo's node_modules.
-// `require.resolve` returns the package's entry file; its parent directory is
-// the package root we project into the VM.
-const require = createRequire(import.meta.url);
-const isNumberDir = require.resolve("is-number").replace(/[/\\]index\.js$/, "");
+// Point `nodeModules` at a host `node_modules` directory and the whole tree is
+// projected into the VM in one call. Any package inside resolves the way Node
+// would over a real filesystem, symlinks and all. Here we mount this repo's
+// root node_modules, which includes the tiny `is-number` package.
+const hostNodeModules = fileURLToPath(
+  new URL("../../../../node_modules", import.meta.url),
+);
 
-// Boot a second VM and mount the host package directory into a guest
-// `node_modules`. Resolution follows the importing module up its ancestor
-// `node_modules` chain (not the cwd), and `exec()` runs each program from
-// `/tmp`, so the package is mounted at `/tmp/node_modules/is-number` where that
-// walk will find it.
 const mounted = await NodeRuntime.create({
-  mounts: [
-    {
-      guestPath: "/tmp/node_modules/is-number",
-      hostPath: isNumberDir,
-      readOnly: true,
-    },
-  ],
+  nodeModules: hostNodeModules,
 });
 
 try {
-  // The guest resolves `is-number` from the mounted host directory the same way
-  // Node would over a real filesystem, then uses the real package's code.
+  // The guest resolves `is-number` from the mounted host node_modules the same
+  // way Node would over a real filesystem, then uses the real package's code.
   const { stdout, stderr, exitCode } = await mounted.exec(`
     // ESM import of the real, host-mounted npm package.
     import isNumber from "is-number";
@@ -76,14 +66,13 @@ try {
     const isNumberCjs = require("is-number");
 
     const result = {
-      from: require.resolve("is-number"),
       "isNumber(42)": isNumber(42),
       'isNumber("3.14")': isNumber("3.14"),
       'isNumber("nope")': isNumber("nope"),
       sameModule: isNumber === isNumberCjs,
     };
 
-    console.log("loaded real npm package ->", result.from);
+    console.log("loaded real npm package is-number");
     console.log(JSON.stringify(result));
   `);
 

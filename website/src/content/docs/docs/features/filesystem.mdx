@@ -4,24 +4,25 @@ description: Filesystem backends for sandboxed code.
 ---
 import { Aside } from '@astrojs/starlight/components';
 
-Secure Exec gives each VM a virtual filesystem that lives entirely inside the kernel. Guest code reads and writes it through the standard Node `fs` module, and by default none of it touches the host disk. A VM booted with `NodeRuntime.create()` uses an isolated in-memory filesystem, so it is isolated by default.
+Every VM gets a virtual filesystem that lives entirely inside the kernel. Guest code reads and writes it through the standard Node `fs` module.
+
+- `NodeRuntime.create()` boots an isolated in-memory filesystem. Guest writes never touch the host disk.
+- Seed initial bytes with `create({ files })`.
+- Project real host directories with `create({ mounts })`, Docker-style.
+- Read and write the VFS from the host with `rt.writeFile` / `rt.readFile`.
 
 ## Reading and Writing Files
 
-Boot a runtime with `NodeRuntime.create()`, then run guest code that writes and reads files with `node:fs`. The guest source runs as a standard ES module (top-level `import` and `await` work).
+Boot a runtime, then run guest code that uses `node:fs`. Guest source runs as a standard ES module (top-level `import` and `await` work).
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
-// Boot a fully virtualized VM. With the default NodeRuntime, the guest
-// filesystem lives entirely inside the kernel and writes never touch the host
-// disk.
+// Boot a fully virtualized VM. The guest filesystem lives entirely inside the
+// kernel and writes never touch the host disk.
 const rt = await NodeRuntime.create();
 
 try {
-  // Guest code runs as an ES module inside the VM. It writes and reads files
-  // using the standard node `fs` module, backed by the kernel's virtual
-  // filesystem.
   const { stdout, stderr, exitCode } = await rt.exec(`
     import { mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 
@@ -46,7 +47,7 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-filesystem)*
 
-Running this prints the file contents the guest read back from inside the VM:
+Output:
 
 ```
 exitCode: 0
@@ -55,11 +56,57 @@ read back from VM: hello from the sandbox
 /workspace contents: ["hello.txt"]
 ```
 
-<Aside type="note">By default, the virtual filesystem is isolated from the host. With a VM booted by `NodeRuntime.create()`, a file the guest writes to `/workspace` exists only inside the VM, and the host filesystem never sees it.</Aside>
+<Aside type="note">The virtual filesystem is isolated from the host by default. A file the guest writes to `/workspace` exists only inside the VM; the host filesystem never sees it.</Aside>
 
-## Mounting host directories
+## Host filesystem access (`rt.writeFile` / `rt.readFile`)
 
-Isolation is the default, but it is not the only option. Pass `mounts` to `NodeRuntime.create()` to project a real host directory into the VM, Docker-style. Each mount makes a host directory readable at a guest path; the guest sees only the mounted subtree, never the wider host filesystem. Files are read lazily through the VFS, so large trees (for example a `node_modules` package) are projected without copying their bytes up front. Mounts are read-only by default; pass `readOnly: false` to allow guest writes.
+Read and write the VFS directly from the host, without running guest code. Both operate on the VM's in-memory filesystem; the host filesystem is never touched.
+
+- `rt.writeFile(path, content)`: write a file, creating parent directories as needed. `content` is `string | Uint8Array`.
+- `rt.readFile(path)`: read a file as raw bytes. Returns `Promise<Uint8Array>`.
+
+```ts
+const rt = await NodeRuntime.create();
+
+// Project an asset into the VM after boot.
+await rt.writeFile("/workspace/config.json", JSON.stringify({ ok: true }));
+
+// Read back whatever the guest produced.
+const bytes = await rt.readFile("/workspace/out.txt");
+console.log(new TextDecoder().decode(bytes));
+```
+
+## Seeding files at boot (`create({ files })`)
+
+Seed bytes into the VFS before the guest runs, keyed by absolute guest path. Parent directories are created automatically. Use this to project host assets, npm packages, or fixtures so guest code can `import`/`require`/read them. Values are `string | Uint8Array`.
+
+```ts
+import { readFileSync } from "node:fs";
+
+const rt = await NodeRuntime.create({
+  files: {
+    "/root/data.json": '{"ok":true}',
+    "/root/logo.png": readFileSync("./logo.png"), // Uint8Array
+  },
+});
+
+await rt.exec(`
+  import { readFileSync } from "node:fs";
+  console.log(readFileSync("/root/data.json", "utf8"));
+`);
+```
+
+The bytes are copied into the VM's in-memory filesystem; the host filesystem is never exposed to the guest.
+
+## Mounting host directories (`create({ mounts })`)
+
+Project a real host directory into the VM, Docker-style. Each mount makes a host directory readable at a guest path.
+
+- `guestPath`: absolute guest path the directory appears at.
+- `hostPath`: absolute host directory to project.
+- `readOnly`: mount read-only. Defaults to `true`; pass `false` to allow guest writes.
+
+The guest sees only the mounted subtree, never the wider host filesystem. Files are read lazily through the VFS, so large trees (for example a `node_modules` package such as the TypeScript compiler) are projected without copying their bytes up front.
 
 ```ts
 import path from "node:path";
@@ -84,8 +131,6 @@ const mounted = await NodeRuntime.create({
 });
 
 try {
-  // The guest reads a file that lives on the real host, exposed read-only at
-  // the mount point. Nothing else on the host is visible.
   const { stdout, stderr, exitCode } = await mounted.exec(`
     import { readFileSync, readdirSync } from "node:fs";
 
@@ -107,7 +152,7 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-filesystem)*
 
-The guest lists the mounted directory and reads the real host file through the mount point:
+Output:
 
 ```
 [mount] exitCode: 0
@@ -118,9 +163,18 @@ guest read host file: value-from-host
 
 Host directory mounts are one of several filesystem backends. For overlay filesystems and remote storage backends (such as Amazon S3 and Google Drive), see [Custom and host-backed filesystems](/docs/features/virtual-filesystem#custom-and-host-backed-filesystems).
 
+## When to use each
+
+| Need | Use |
+|---|---|
+| Isolated scratch space | `NodeRuntime.create()` (default) |
+| Inject fixed bytes before boot | `create({ files })` |
+| Expose a real host directory | `create({ mounts })` |
+| Write/read the VFS from the host | `rt.writeFile` / `rt.readFile` |
+
 ## Standard Node `fs` API
 
-Guest code uses Node's built-in `node:fs` module, and the kernel backs it with the virtual filesystem, so common operations work as you would expect:
+Guest code uses Node's built-in `node:fs` module, backed by the virtual filesystem:
 
 | Operation | API |
 |---|---|

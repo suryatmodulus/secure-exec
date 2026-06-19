@@ -125,6 +125,38 @@ export interface NodeRuntimeCreateOptions {
 	 */
 	mounts?: HostDirectoryMount[];
 	/**
+	 * Mount a host `node_modules` directory into the VM in one call so guest
+	 * `import`/`require` resolve real, host-installed npm packages.
+	 *
+	 * Pass the absolute host path to a `node_modules` directory (or an object
+	 * with that path and an explicit guest location). The whole directory is
+	 * projected lazily, Docker-style, at a guest `node_modules` on the resolution
+	 * path, so any package inside it resolves the way Node would over a real
+	 * filesystem (ancestor `node_modules` walk, `exports`/conditions, symlinks).
+	 * This is the ergonomic alternative to wiring up individual `mounts` entries
+	 * per package.
+	 *
+	 * By default the directory is mounted at `/tmp/node_modules`, which is where
+	 * the resolution walk for a program run by {@link NodeRuntime.exec} /
+	 * {@link NodeRuntime.run} begins (each program is written under `/tmp`). Pass
+	 * the object form with `guestPath` to mount it elsewhere on a different
+	 * module's resolution path.
+	 *
+	 * ```ts
+	 * const rt = await NodeRuntime.create({
+	 *   nodeModules: "/abs/path/to/project/node_modules",
+	 * });
+	 * await rt.exec(`
+	 *   import isNumber from "is-number";
+	 *   console.log(isNumber(42));
+	 * `);
+	 * ```
+	 *
+	 * The host filesystem is never exposed beyond the mounted `node_modules`
+	 * subtree. The mount is read-only.
+	 */
+	nodeModules?: string | NodeModulesMount;
+	/**
 	 * Host-side tools the guest can invoke as shell commands. Each entry is
 	 * registered as a named guest command; when the guest runs it, the
 	 * invocation round-trips back to the host and runs the tool's `handler`,
@@ -186,6 +218,25 @@ export interface HostDirectoryMount {
 	hostPath: string;
 	/** Mount read-only (the default). Pass `false` to allow guest writes. */
 	readOnly?: boolean;
+}
+
+/** Guest path a `nodeModules` mount is projected at by default. */
+const DEFAULT_NODE_MODULES_GUEST_PATH = "/tmp/node_modules";
+
+/**
+ * Object form of the `nodeModules` create option: a host `node_modules`
+ * directory to project, optionally at an explicit guest path. The string form
+ * (`nodeModules: "/abs/node_modules"`) is shorthand for `{ hostPath }`.
+ */
+export interface NodeModulesMount {
+	/** Absolute host `node_modules` directory to project (read lazily). */
+	hostPath: string;
+	/**
+	 * Absolute guest path to mount it at. Defaults to `/tmp/node_modules`, where
+	 * the resolution walk for {@link NodeRuntime.exec} / {@link NodeRuntime.run}
+	 * programs begins. Override to put it on a different module's resolution path.
+	 */
+	guestPath?: string;
 }
 
 /** Result of {@link NodeRuntime.exec}. */
@@ -391,7 +442,24 @@ export class NodeRuntime {
 		// Project host directories into the VM, Docker-style. NodeFileSystem
 		// reads lazily through the VFS so large trees never traverse the
 		// protocol frame as a single blob.
-		const mounts = (options.mounts ?? []).map((mount) => ({
+		const hostMounts: HostDirectoryMount[] = [...(options.mounts ?? [])];
+
+		// The `nodeModules` helper is sugar over a single host directory mount:
+		// project the whole host `node_modules` at a guest `node_modules` on the
+		// resolution path so any package inside resolves like real Node would.
+		if (options.nodeModules !== undefined) {
+			const nodeModules =
+				typeof options.nodeModules === "string"
+					? { hostPath: options.nodeModules }
+					: options.nodeModules;
+			hostMounts.push({
+				guestPath: nodeModules.guestPath ?? DEFAULT_NODE_MODULES_GUEST_PATH,
+				hostPath: nodeModules.hostPath,
+				readOnly: true,
+			});
+		}
+
+		const mounts = hostMounts.map((mount) => ({
 			path: mount.guestPath,
 			fs: new NodeFileSystem({ root: mount.hostPath }),
 			readOnly: mount.readOnly ?? true,

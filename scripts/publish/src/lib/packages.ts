@@ -19,8 +19,6 @@ export interface DiscoverPackagesOptions {
 }
 
 export const EXCLUDED = new Set<string>([
-	"secure-exec",
-	"@secure-exec/typescript",
 	"publish",
 ]);
 
@@ -41,6 +39,7 @@ export const META_PACKAGES: readonly MetaPackageSpec[] = [
 const SIDECAR_BINARY_PACKAGE_DIRS = ["packages/sidecar/npm"] as const;
 
 export const SECURE_EXEC_WORKSPACE_PACKAGES = new Set([
+	"secure-exec",
 	"@secure-exec/browser",
 	"@secure-exec/core",
 	"@secure-exec/google-drive",
@@ -48,6 +47,7 @@ export const SECURE_EXEC_WORKSPACE_PACKAGES = new Set([
 	"@secure-exec/s3",
 	"@secure-exec/sandbox",
 	"@secure-exec/sidecar",
+	"@secure-exec/typescript",
 ]);
 
 export const DEFAULT_SIDECAR_PLATFORMS = ["linux-x64-gnu"] as const;

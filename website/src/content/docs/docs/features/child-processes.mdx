@@ -4,25 +4,21 @@ description: Spawn child processes from sandboxed code.
 ---
 import { Aside, LinkCard } from '@astrojs/starlight/components';
 
-Sandboxed code can spawn child processes with the standard `node:child_process` module. Each child runs as a kernel-managed process inside the VM. It never spawns a real host process or escapes the isolation boundary.
+Two ways to run processes in Secure Exec:
 
-## Spawning Child Processes
+- **Guest `node:child_process`**: guest code spawns commands inside the VM. Every child is a kernel-managed process, never a real host process.
+- **`rt.spawn(code)`**: the host starts a long-running guest program and gets a live handle (`pid`, `writeStdin`, `kill`, `wait`, `exitCode`).
 
-The guest spawns commands available in the VM (`sh` and `node`) and reads their output:
+## Guest child_process
+
+Guest code uses the standard `node:child_process` module to spawn commands available in the VM (`sh`, `node`, and the mounted coreutils):
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
-// Boot a fully virtualized VM. The guest runs inside the kernel isolation
-// boundary, and any child processes it spawns are themselves kernel-managed
-// processes - they never spawn real host processes.
 const rt = await NodeRuntime.create();
 
 try {
-  // Guest code runs as an ES module inside the VM. It uses the standard
-  // node:child_process module to spawn a command available in the VM and read
-  // its output. Here we spawn `sh -c` to echo a message, and `node` to report
-  // its own version - both run as kernel-managed child processes.
   const { stdout, stderr, exitCode } = await rt.exec(`
     import { execFileSync } from "node:child_process";
 
@@ -50,7 +46,7 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-child-processes)*
 
-Running this prints the output captured from each child process:
+Output:
 
 ```
 exitCode: 0
@@ -59,11 +55,9 @@ sh output: hello from a child process
 child node version: v22.0.0
 ```
 
-## Available commands
-
-Children can run any command provided by the runtimes mounted in the VM. By default the VM ships a WASM-backed `sh` and coreutils plus a V8-backed `node`, so `execFileSync("node", ["--version"])` and `execFileSync("sh", ["-c", "…"])` both work out of the box.
-
-You can point the VM at a different set of WASM command binaries by passing `commandsDir` to `NodeRuntime.create()`:
+- `execFileSync` is used for brevity; the async/streaming APIs (`spawn`, `exec`, `execFile`) also work for incremental stdout/stderr or writing to a child's stdin.
+- Children run any command provided by the mounted runtimes. By default that is WASM-backed `sh` + coreutils and V8-backed `node`.
+- Point at a different set of WASM command binaries with `commandsDir`:
 
 ```ts
 const rt = await NodeRuntime.create({
@@ -71,8 +65,60 @@ const rt = await NodeRuntime.create({
 });
 ```
 
-## Other child_process APIs
+<Aside type="note">Child processes always run inside the kernel. Guest code cannot reach a real host process or host binary; `node:child_process` only sees the commands the VM mounts.</Aside>
 
-The example uses `execFileSync` for brevity, but the asynchronous and streaming `node:child_process` APIs (`spawn`, `exec`, `execFile`) also work. Use them when you need to stream stdout/stderr incrementally or write to a child's stdin while it runs.
+## Long-running guests with rt.spawn
 
-<Aside type="note">Child processes always run inside the kernel. There is no way for guest code to reach a real host process or host binary, since `node:child_process` only sees the commands provided by the VM's mounted runtimes.</Aside>
+`rt.exec` runs to completion and returns captured output. `rt.spawn(code)` returns a live handle immediately while the guest keeps running. It is the building block for dev servers and other long-lived guests.
+
+```ts
+const proc = await rt.spawn(`
+  process.stdin.on("data", (chunk) => {
+    process.stdout.write("got: " + chunk.toString());
+  });
+`);
+
+proc.writeStdin("hello\n");   // feed stdin
+proc.closeStdin();            // signal end-of-input
+
+const exitCode = await proc.wait();
+console.log(proc.pid, exitCode);
+```
+
+`rt.spawn(code, options?)` returns a `NodeRuntimeProcess`:
+
+- `pid: number`: the guest process id.
+- `writeStdin(data: string | Uint8Array): void`: write to the guest's stdin.
+- `closeStdin(): void`: close stdin, signalling end-of-input.
+- `kill(signal?): void`: send a signal. Defaults to `SIGTERM`; accepts a name (`"SIGKILL"`) or a raw number.
+- `wait(): Promise<number>`: resolve with the exit code once the process terminates.
+- `exitCode: number | null`: the exit code, or `null` while running.
+
+`NodeRuntimeSpawnOptions` matches the exec options: `env`, `cwd`, `stdin`, `timeout`, `signal`, `onStdout`, `onStderr`. Stream output by passing `onStdout` / `onStderr`, which receive raw `Uint8Array` chunks:
+
+```ts
+const proc = await rt.spawn("setInterval(() => console.log('tick'), 100)", {
+  onStdout: (chunk) => process.stdout.write(new TextDecoder().decode(chunk)),
+});
+// ... later
+proc.kill();              // SIGTERM
+await proc.wait();
+```
+
+### Driving a guest server
+
+Spawn a server, wait for it to listen, then drive requests into it with `rt.fetch`, entirely inside the VM, even when guest network egress is denied:
+
+```ts
+const server = await rt.spawn(`
+  import http from "node:http";
+  http.createServer((_, res) => res.end("ok")).listen(3000);
+`);
+
+const listener = await rt.waitForListener({ port: 3000 });
+const res = await rt.fetch(listener.port ?? 3000, { path: "/" });
+console.log(res.status, res.body); // 200 ok
+
+server.kill();
+await server.wait();
+```

@@ -1,3 +1,11 @@
+// Pyodide release-asset URL helpers.
+//
+// This file lives inside the `secure-exec-execution` crate so it is included in
+// the published crate tarball; `build.rs` and `tests/pyodide_release.rs`
+// `#[path]`-include it. It must not reference files outside the crate
+// directory, or `cargo publish` verification fails (the tarball only contains
+// in-crate files).
+
 pub const SECURE_EXEC_RELEASE_CDN_ENV: &str = "SECURE_EXEC_RELEASE_CDN";
 
 pub fn pyodide_release_base_url(version: &str, configured_cdn: Option<&str>) -> String {

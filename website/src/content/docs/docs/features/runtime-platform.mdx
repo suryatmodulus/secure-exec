@@ -3,14 +3,14 @@ title: Runtime & Platform
 description: The host environment guest code sees (the full Node.js surface today), plus the platform ladder (node, browser, neutral, bare) the kernel models.
 ---
 
-By default, guest JavaScript runs with the full Node.js emulation surface: the
-`process` and `Buffer` globals, the `node:*` builtin modules, npm module
-resolution, and a virtualized Node process identity. This is the environment
-`NodeRuntime` boots, and today it is the only one secure-exec exposes.
+Guest JavaScript runs with the **full Node.js emulation surface**: the `process`
+and `Buffer` globals, the `node:*` builtin modules, npm module resolution, and a
+virtualized Node process identity. This is what `NodeRuntime` boots, and today it
+is the only platform Secure Exec exposes.
 
 Guest code runs inside a kernel-backed V8 isolate with zero host escapes. Even
-with the full Node surface available, every syscall (filesystem, network,
-child process) goes through the kernel, not the real host.
+with the full Node surface available, every syscall (filesystem, network, child
+process) goes through the kernel, never the real host.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
@@ -49,9 +49,7 @@ try {
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-runtime-platform)*
 
-Running this prints the guest's host environment as seen from inside the
-isolate. `process` and `Buffer` are present, `process.platform` is `linux`,
-and `node:crypto` / `node:path` resolve and run:
+Output, the guest host environment as seen from inside the isolate:
 
 ```text
 {
@@ -65,19 +63,108 @@ and `node:crypto` / `node:path` resolve and run:
 ```
 
 :::note[Guest `run()` code is wrapped in an async function]
-Code passed to `rt.run()` executes inside an `async` wrapper so it can use
-top-level `await`, but that also means it is not a module body, so use dynamic
-`await import("node:…")` rather than a top-level `import` statement. Code passed
-to `rt.exec()` runs as a real ES module, where static `import` is fine.
+Code passed to `rt.run()` executes inside an `async` wrapper, so it can use
+top-level `await` but is not a module body: use dynamic `await import("node:…")`,
+not a top-level `import`. Code passed to `rt.exec()` runs as a real ES module,
+where static `import` is fine.
 :::
+
+## Host environment (the `node` surface)
+
+Available to guest code on the default platform:
+
+- **Node globals**: `process`, `Buffer`, `require`, `module`, `__dirname`, `__filename`.
+- **`node:*` builtins**: `fs`, `path`, `crypto`, `http`, `net`, `os`, `child_process`, `dns`, and the rest of the Node standard library.
+- **Node identity**: virtualized `process.versions` (Node `22.0.0`), `process.platform` (`linux`), `execPath`, and `pid`/`ppid`/`uid`/`gid`.
+- **Web platform**: `fetch`, `URL`, `TextEncoder`/`TextDecoder`, WebCrypto, `structuredClone`, `Blob`, `AbortController`.
+- **Universal primitives**: `console`, timers (`setTimeout`/`setInterval`/…), `queueMicrotask`.
+- **Language + Wasm**: the ECMAScript spec globals plus `WebAssembly`.
+
+Every one of these is kernel-backed. `fetch` and `node:net`/`node:http` route
+through the kernel socket table (and are denied by default until you grant
+`network`); `node:fs` sees only the VM's virtual filesystem; `node:child_process`
+spawns kernel-managed processes.
+
+### Seeding the host environment
+
+`NodeRuntime.create()` shapes what the guest sees before and after boot:
+
+```ts
+const rt = await NodeRuntime.create({
+	env: { API_BASE: "https://example.test" },   // guest process env
+	cwd: "/home/user",                            // default working dir
+	files: { "/root/data.json": '{"ok":true}' },  // seed VFS bytes
+	mounts: [                                      // project host dirs, Docker-style, lazy
+		{ guestPath: "/root/node_modules/typescript", hostPath: "/abs/typescript", readOnly: true },
+	],
+	permissions: { network: "allow" },            // merged over secure default (network denied)
+	tools: {                                       // host capabilities the guest calls as commands
+		add: {
+			description: "Add two numbers",
+			inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] },
+			handler: ({ a, b }: { a: number; b: number }) => ({ sum: a + b }),
+		},
+	},
+	loopbackExemptPorts: [3000],                   // let non-loopback connections reach this port
+	commandsDir: "/abs/wasm/commands",             // override the WASM `sh`/coreutils dir
+});
+```
+
+- `files` copies bytes into the VFS up front; `mounts` reads host trees lazily through the VFS, so large `node_modules` are not copied as a blob.
+- `permissions` merges over a secure default (`fs`/`childProcess`/`process`/`env` allowed, `network` denied), so `{ network: "allow" }` is enough to opt in.
+- `tools` auto-grants the `tool` scope when you set no `tool` policy; the guest invokes a tool by name with `--json` input over `node:child_process`.
+
+After boot, the same surface is reachable on the live runtime:
+
+```ts
+await rt.writeFile("/root/late.json", '{"added":"after boot"}');
+const bytes = await rt.readFile("/root/late.json"); // Uint8Array
+await rt.registerTools({ now: { description: "epoch ms", handler: () => Date.now() } });
+```
+
+### Running and driving guest programs
+
+- `rt.exec(code, options)` runs an ESM program to completion, returns `{ stdout, stderr, exitCode }`.
+- `rt.run<T>(code, options)` runs a program that calls `globalThis.__return(value)` and decodes it as `result.value` (plus `stdout`/`stderr`/`exitCode`).
+- `rt.spawn(code, options)` starts a long-running guest and returns a live `NodeRuntimeProcess` (`pid`, `writeStdin`, `closeStdin`, `kill`, `wait`, `exitCode`).
+- `rt.fetch(port, input)` drives an HTTP request from the host into a guest listener and returns `{ status, statusText, headers, body }`, even with egress denied.
+- `rt.waitForListener(query, options)` / `rt.findListener(query)` resolve guest TCP listeners by `port`/`host`/`path`.
+
+`exec`, `run`, and `spawn` accept the same per-run options:
+
+```ts
+const controller = new AbortController();
+const result = await rt.exec(source, {
+	env: { EXTRA: "1" },                  // merged over VM env
+	cwd: "/tmp",
+	stdin: "piped to the program",        // string | Uint8Array
+	timeout: 5000,                        // kill after N ms
+	signal: controller.signal,            // abort -> SIGTERM, call rejects AbortError
+	onStdout: (chunk) => process.stdout.write(chunk), // Uint8Array chunks, live
+	onStderr: (chunk) => process.stderr.write(chunk),
+});
+```
+
+Host-to-guest dev-server pattern:
+
+```ts
+const server = await rt.spawn(`
+	import http from "node:http";
+	http.createServer((_, res) => res.end("ok")).listen(3000);
+`);
+const listener = await rt.waitForListener({ port: 3000 });
+const res = await rt.fetch(listener.port ?? 3000, { path: "/" });
+server.kill();
+await server.wait();
+```
 
 ## The platform ladder
 
-Internally the kernel models the guest host environment as a ladder, using
-esbuild's vocabulary: `node` / `browser` / `neutral`, plus `bare` for the
-language-only tier esbuild has no name for. `NodeRuntime` always runs
-the top rung (`node`); the lower rungs are described here for context and are
-**not currently selectable in secure-exec** (see the note below).
+The kernel models the guest host environment as a ladder, using esbuild's
+vocabulary (`node` / `browser` / `neutral`) plus `bare` for the language-only
+tier esbuild has no name for. `NodeRuntime` always runs the top rung (`node`);
+the lower rungs are described here for context and are **not currently selectable
+in Secure Exec** (see the note below).
 
 | Capability | `node` | `browser` | `neutral` | `bare` |
 |---|:---:|:---:|:---:|:---:|
@@ -88,40 +175,23 @@ the top rung (`node`); the lower rungs are described here for context and are
 | Universal primitives | ✅ | ✅ | ✅ | No |
 | Language + Wasm | ✅ | ✅ | ✅ | ✅ |
 
-Where each row means:
+- **`node`** (the default): full Node.js compatibility. Nothing removed.
+- **`browser`**: a browser/Deno-like runtime. The Node surface is gone; web-standard globals remain. `crypto` is the WebCrypto object (`crypto.subtle`, `crypto.getRandomValues`), *not* the `node:crypto` module, so `crypto.randomBytes`/`crypto.createHash` are absent.
+- **`neutral`**: universal primitives only (`console`, timers, `queueMicrotask`) plus the language. No `fetch`/`URL`/WebCrypto, no Node.
+- **`bare`**: language only: the ECMAScript spec globals plus `WebAssembly`. No `console`, no timers, no `fetch`. The caller provides any host functionality the guest needs.
 
-- **Node globals**: `process`, `Buffer`, `require`, `module`, `__dirname`, `__filename`.
-- **`node:*` builtins**: the Node builtin modules (`fs`, `path`, `crypto`, …).
-- **Node identity**: virtualized `process.versions`, `execPath`, pid/ppid/uid/gid.
-- **Web platform**: `fetch`, `URL`, `TextEncoder`, WebCrypto, `structuredClone`, `Blob`, `AbortController`, …
-- **Universal primitives**: `console`, timers (`setTimeout`/`setInterval`/…), `queueMicrotask`.
-- **Language + Wasm**: the ECMAScript spec globals plus `WebAssembly`.
+`WebAssembly` stays available on **every tier**, including `bare`. Compilation
+happens inside the isolate and is not a host escape.
 
-- **`node`** (the secure-exec default): full Node.js compatibility. Nothing is removed.
-- **`browser`**: a browser/Deno-like runtime. The Node surface is gone;
-  web-standard globals remain. `crypto` is the WebCrypto object (`crypto.subtle`,
-  `crypto.getRandomValues`), *not* the `node:crypto` module, so
-  `crypto.randomBytes` / `crypto.createHash` are absent.
-- **`neutral`**: universal primitives only (`console`, timers,
-  `queueMicrotask`) plus the language. No `fetch`/`URL`/WebCrypto, no Node.
-- **`bare`**: language only: the ECMAScript spec globals plus `WebAssembly`.
-  No `console`, no timers, no `fetch`. The caller is expected to provide any host
-  functionality the guest needs.
-
-`WebAssembly` stays available on every tier; compilation happens inside the
-isolate and is not a host escape.
-
-:::caution[Platform selection is not configurable in secure-exec yet]
-The kernel's wire protocol carries a `jsRuntime` configuration
-(`@secure-exec/core` exports the `JsRuntimeConfig` / `JsRuntimePlatform` types
-from `@secure-exec/core/vm-config`) with `platform`, `moduleResolution`, and
-`allowedBuiltins` fields. These tiers are real in the kernel, but
-`NodeRuntime.create()` does **not** plumb those fields through yet; it always
-boots the VM on the `node` platform with full Node module resolution. There is
-no ergonomic way to select `browser` / `neutral` / `bare`, change module
-resolution, or restrict the builtin allow-list from `NodeRuntime` today. The
-sections below document the intended model for those fields, not a
-`NodeRuntime.create()` option you can pass.
+:::caution[Platform selection is not configurable in Secure Exec yet]
+The kernel's wire protocol carries a `jsRuntime` config with `platform`,
+`moduleResolution`, and `allowedBuiltins` fields. The tiers are
+real in the kernel, but `NodeRuntime.create()` does **not** plumb those fields
+through: it always boots the VM on the `node` platform with full Node module
+resolution. There is no `NodeRuntime.create()` option to select
+`browser`/`neutral`/`bare`, change module resolution, or restrict the builtin
+allow-list today. The sections below document the intended model for those fields,
+not a `create()` option you can pass.
 :::
 
 ## `moduleResolution`: how imports resolve
@@ -139,23 +209,18 @@ platforms, which is exactly what `NodeRuntime` uses.
 (`import "pkg"` = bare/`node_modules` specifier; `import "./x.js"` = relative or
 absolute path; `node:*` follows the platform / `allowedBuiltins`.)
 
-- **`node`**: standard Node resolution: the `node_modules` ancestor walk,
-  `exports`/`imports`/conditions, and `realpath`/symlink following.
-- **`relative`**: only relative and absolute paths resolve from the VFS; bare
-  package specifiers and `node:*` builtins do not.
-- **`none`**: nothing resolves. Any `import` or `require` (including relative)
-  fails. Produces a single self-contained entrypoint module, useful for
-  locked-down evaluation of one script.
+- **`node`**: standard Node resolution: the `node_modules` ancestor walk, `exports`/`imports`/conditions, and `realpath`/symlink following.
+- **`relative`**: only relative and absolute paths resolve from the VFS; bare package specifiers and `node:*` builtins do not.
+- **`none`**: nothing resolves. Any `import` or `require` (including relative) fails. Produces a single self-contained entrypoint module, useful for locked-down evaluation of one script.
 
 ## `allowedBuiltins`: restrict Node builtins (node platform only)
 
-In the wire config, when `platform` is `node`, you can narrow which `node:*`
-builtin modules guest code may import:
+When `platform` is `node`, narrow which `node:*` builtin modules guest code may
+import:
 
-- **omitted**: the engine default allow-list (the behavior `NodeRuntime` uses).
+- **omitted**: the engine default allow-list (what `NodeRuntime` uses).
 - **`[]`**: deny **all** builtins.
-- **`["path", "fs"]`**: allow exactly these (a root name like `fs` also covers
-  `node:fs/promises`).
+- **`["path", "fs"]`**: allow exactly these (a root name like `fs` also covers `node:fs/promises`).
 
 `allowedBuiltins` is only meaningful under `platform: "node"`; the other
 platforms deny all `node:*` builtins regardless. Unknown builtin names are

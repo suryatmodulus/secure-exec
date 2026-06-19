@@ -6,23 +6,16 @@ import { LinkCard } from '@astrojs/starlight/components';
 
 <LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-networking" description="Runnable example for network access control." />
 
-Network access is governed by the VM permission policy. Set `network` to
-`"allow"` to let guest code open sockets and make outbound requests, or
-`"deny"` to block them. Guest `fetch()`, `node:http`, and socket operations all
-flow through the kernel socket table. Guest code never touches the real host
-network.
+Guest `fetch()`, `node:http`, and raw sockets all flow through the kernel socket table. Guest code never touches the real host network.
 
-## Making Network Requests
+- `network: "deny"` (the default) blocks all guest sockets and outbound requests.
+- `network: "allow"` lets guest code open sockets and make outbound requests.
+- `network: { default, rules }` matches request patterns to allow or deny.
+- Permissions merge over a secure default, so name only the scope you change: `{ network: "allow" }`. The default already grants the fs/childProcess/process/env scopes the runtime needs.
 
-The guest below starts a loopback HTTP server inside the VM and fetches it. With
-`network: "allow"` the request succeeds; with the default (network denied) the
-same code is blocked by the permission policy.
+## Guest fetch + network permission
 
-Permissions merge over a secure default, so to opt into the network you only
-name the scope you are changing: `{ network: "allow" }`. The default already
-grants the fs/child_process/process/env scopes the runtime needs to launch guest
-programs, so there is no need to restate them. Denying the network is the
-default, so a plain `create()` blocks it.
+The guest below starts a loopback HTTP server inside the VM and fetches it. With `network: "allow"` the request succeeds; with the default it is blocked by the permission policy.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
@@ -88,11 +81,11 @@ Running it prints:
 [network denied] stderr: "Error: EACCES: EACCES: permission denied, tcp://127.0.0.1:0: blocked by network.listen policy"
 ```
 
-## Permission gating
+When a request is denied, the guest operation fails with an `EACCES` error naming the policy that blocked it (for example `blocked by network.listen policy` or `blocked by network.connect policy`).
 
-The `network` permission accepts `"allow"`, `"deny"`, or a rule set that matches
-request patterns. A rule set has a `default` mode plus a list of `rules`, each
-with a `mode` and `patterns`:
+## Pattern-based gating
+
+The `network` permission accepts `"allow"`, `"deny"`, or a rule set. A rule set has a `default` mode plus a list of `rules`, each with a `mode` and `patterns`:
 
 ```ts
 const rt = await NodeRuntime.create({
@@ -105,6 +98,54 @@ const rt = await NodeRuntime.create({
 });
 ```
 
-When a request is denied, the guest operation fails with an `EACCES` error
-describing which policy blocked it (for example `blocked by network.listen
-policy` or `blocked by network.connect policy`).
+## Host to guest proxy with `rt.fetch`
+
+`rt.fetch(port, input)` drives an HTTP request into a guest server listening inside the VM and reads the response back on the host. The request never leaves the VM (it connects to the guest's loopback listener through the kernel socket table), so it works even when guest network egress is denied.
+
+```ts
+const rt = await NodeRuntime.create();
+
+// Start a long-running guest server with spawn() and get a live handle back.
+const server = await rt.spawn(`
+	import http from "node:http";
+	http.createServer((_req, res) => res.end("ok")).listen(3000);
+`);
+
+// Block until the listener is up, then drive a request into it from the host.
+await rt.waitForListener({ port: 3000 });
+const res = await rt.fetch(3000, { path: "/" });
+console.log(res.status, res.body); // 200 ok
+
+server.kill();
+await server.wait();
+await rt.dispose();
+```
+
+`rt.fetch(port, input)` takes the request `path` (required) plus optional `method` (default `GET`), `headers`, and a `string | Uint8Array` `body`. It resolves with `status`, `statusText`, lower-cased `headers`, and the `body` decoded as UTF-8 text.
+
+### Waiting for a guest listener
+
+Drive a request into a guest server only once it is accepting connections:
+
+- `rt.waitForListener(query)`: block until a listener matches the `port` (optionally narrowed by `host`/`path`), then resolve with it. See [SDK Overview](/docs/sdk-overview) for `timeoutMs`/`signal`/`pollIntervalMs`.
+- `rt.findListener(query)`: one-shot, non-blocking lookup; returns the match or `null`.
+
+```ts
+const listener = await rt.waitForListener({ port: 3000 });
+const res = await rt.fetch(listener.port ?? 3000, { path: "/health" });
+```
+
+## Exposing a guest server beyond loopback
+
+By default a guest server is reachable only over loopback inside the VM. List a port in `loopbackExemptPorts` to let connections from outside the loopback interface reach it (for example a dev server you expose beyond loopback):
+
+```ts
+const rt = await NodeRuntime.create({
+	permissions: { network: "allow" },
+	loopbackExemptPorts: [3000],
+});
+```
+
+## Cancelling in-flight requests
+
+To bound network work, pass a `signal` and `timeout` to `exec`/`run`/`spawn`. On abort the guest process is killed inside the VM and the call rejects with the abort reason. See [SDK Overview](/docs/sdk-overview) for details.

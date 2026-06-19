@@ -7,6 +7,7 @@ export type {
 	NodeRuntimeExecResult,
 	NodeRuntimeFetchInput,
 	NodeRuntimeFetchResponse,
+	NodeModulesMount,
 	NodeRuntimeListener,
 	NodeRuntimeListenerQuery,
 	NodeRuntimeProcess,
