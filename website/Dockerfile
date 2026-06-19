@@ -16,14 +16,21 @@ RUN pnpm install
 COPY website/ ./
 RUN pnpm build
 
-# Serve the static output.
+# Serve the static output. This is a static multi-page site (Astro/Starlight
+# emits <path>/index.html), NOT an SPA — so resolve each page's index.html and
+# serve the real 404.html on a miss (no SPA fallback to the landing page).
 FROM caddy:alpine
 COPY --from=build /app/dist /srv
 RUN cat > /etc/caddy/Caddyfile <<'EOF'
 :80 {
 	root * /srv
+	encode gzip
+	try_files {path} {path}/index.html {path}.html
 	file_server
-	try_files {path} /index.html
+	handle_errors {
+		rewrite * /404.html
+		file_server
+	}
 }
 EOF
 EXPOSE 80
