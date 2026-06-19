@@ -1,0 +1,9 @@
+# The only Dockerfile in this repo is website/Dockerfile, which builds the Astro
+# site from the repo-root build context (Railway default). Narrow that context to
+# website/ so the multi-GB monorepo (crates, pyodide wasm, etc.) is never sent to
+# the builder. If another Dockerfile is added that needs more, revisit this.
+*
+!website
+website/node_modules
+website/dist
+website/.astro
