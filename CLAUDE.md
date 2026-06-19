@@ -48,7 +48,7 @@ secure-exec is the fully virtualized runtime extracted from Agent OS. The kernel
 
 - `website/` is `@secure-exec/website`, a unified Astro app serving the public site at **secureexec.dev**: `/` is the React/Tailwind landing page and `/docs/*` is the Starlight documentation.
 - The docs theme matches the Rivet docs (rivet.dev) 1:1: light-only "porcelain" palette, Manrope + JetBrains Mono, dark code blocks.
-- The docs theme is the shared **`@rivet-dev/docs-theme`** package (`website/docs-theme/`, see its CLAUDE.md), wired in via `...docsTheme(starlight, siteConfig)` in `astro.config.mjs`. To change docs branding/chrome (header, sidebar, code blocks, fonts, palette), edit the package — not `website/src`. To change *this site's* identity/nav/sidebar/landing, edit `website/docs.config.mjs`. Sidebar icons attach via each item's `attrs['data-icon']`. Re-test with `pnpm --dir website build`.
+- Docs styling is owned by the shared **`@rivet-dev/docs-theme`** repo (`github.com/rivet-dev/docs-theme`), consumed via `github:rivet-dev/docs-theme#<tag>` and wired in via `...docsTheme(starlight, siteConfig)` in `astro.config.mjs`. **To change any docs styling** (header, sidebar, code blocks, fonts, palette), edit that repo and follow its CLAUDE.md release workflow — never restyle docs in `website/src`. To change *this site's* identity/nav/sidebar/landing, edit `website/docs.config.mjs` (sidebar icons via each item's `attrs['data-icon']`). Re-test with `pnpm --dir website build`.
 
 ## Version Control (jj)
 
