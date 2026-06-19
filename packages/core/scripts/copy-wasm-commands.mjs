@@ -39,17 +39,35 @@ const SOURCE_DIR = path.join(
 );
 const DEST_DIR = path.join(PACKAGE_ROOT, "commands");
 
+function destIsPopulated() {
+	try {
+		return readdirSync(DEST_DIR).some((entry) => !entry.startsWith("."));
+	} catch {
+		return false;
+	}
+}
+
 function main() {
 	if (!existsSync(SOURCE_DIR)) {
-		// In a clean checkout the Rust command build has not run yet. Don't fail
-		// the TypeScript build over it: a developer who hasn't built the commands
-		// can still iterate, and the in-repo path resolution falls back gracefully.
-		// CI/release must build the commands before packing so the tarball ships
-		// them; guard that with `--require`.
+		// No in-repo build output. If `commands/` is already populated (a clean
+		// checkout that vendored earlier, or CI that dropped a prebuilt commands
+		// artifact straight into the package), keep it: it already ships.
+		if (destIsPopulated()) {
+			console.log(
+				`Using already-vendored commands at ${path.relative(REPO_ROOT, DEST_DIR)}; ` +
+					`in-repo build output ${path.relative(REPO_ROOT, SOURCE_DIR)} is absent.`,
+			);
+			return;
+		}
+		// Nothing to ship. Don't fail the plain TypeScript build over it — a
+		// developer who hasn't built the commands can still iterate, and runtime
+		// resolution falls back to the in-repo path when it later appears. The
+		// release/pack path guards this with `--require` so a published tarball is
+		// never built without the commands.
 		const message =
-			`WASM commands not found at ${SOURCE_DIR}. ` +
-			"Build them with `make -C registry/native wasm` before packing the " +
-			"package so they ship in the tarball.";
+			`WASM commands not found at ${SOURCE_DIR} and none vendored at ${DEST_DIR}. ` +
+			"Build them with `make -C registry/native wasm` (or drop a prebuilt " +
+			"commands artifact into the package) before packing so they ship in the tarball.";
 		if (process.argv.includes("--require")) {
 			console.error(`error: ${message}`);
 			process.exit(1);

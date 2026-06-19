@@ -61,12 +61,25 @@ RUST_STD_SRC := $(shell rustc --print sysroot)/lib/rustlib/src/rust
 vendor:
 	@if [ ! -d vendor ]; then \
 		echo "Vendoring dependencies (including std library deps)..."; \
+		mkdir -p .cargo; \
 		cargo vendor \
 			--sync "$(RUST_STD_SRC)/library/std/Cargo.toml" \
-			--sync "$(RUST_STD_SRC)/library/test/Cargo.toml"; \
+			--sync "$(RUST_STD_SRC)/library/test/Cargo.toml" \
+			vendor > .cargo/config.toml; \
 	else \
 		echo "vendor/ exists — skipping (run 'make clean-vendor' to re-vendor)"; \
 	fi
+	@# Source-replacement config so cargo builds from the patched vendor/ tree
+	@# instead of the crates.io registry cache. This file is gitignored, so a
+	@# fresh checkout (CI) has none; without it every patches/crates/*.patch
+	@# wasi fix is silently ignored and crates like uu_tac fail to compile for
+	@# wasm32-wasip1. `cargo vendor` prints the exact config (including the
+	@# synced std-dep sources) on stdout, so capture it above.
+	@test -s .cargo/config.toml || { \
+		echo "ERROR: .cargo/config.toml missing or empty after vendor"; \
+		echo "Run 'make clean-vendor && make vendor' to regenerate."; \
+		exit 1; \
+	}
 
 # Apply crate-level patches to vendored sources
 patch-vendor: vendor
@@ -229,7 +242,7 @@ clean:
 	rm -rf host/dist
 
 clean-vendor:
-	rm -rf vendor
+	rm -rf vendor .cargo/config.toml
 
 patch-check:
 ifneq ($(PATCHES),)

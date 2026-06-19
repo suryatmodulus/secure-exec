@@ -186,7 +186,7 @@
 		"test": "vitest run"
 	},
 	"dependencies": {
-		"@secure-exec/sidecar": "^0.3.0-rc.2",
+		"@secure-exec/sidecar": "workspace:*",
 		"@rivetkit/bare-ts": "^0.6.2"
 	},
 	"devDependencies": {
