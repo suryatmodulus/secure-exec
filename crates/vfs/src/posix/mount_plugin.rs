@@ -1,5 +1,5 @@
-use crate::mount_table::MountedFileSystem;
-use crate::vfs::VfsError;
+use super::mount_table::MountedFileSystem;
+use super::vfs::VfsError;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;

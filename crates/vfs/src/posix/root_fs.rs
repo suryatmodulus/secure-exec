@@ -1,11 +1,12 @@
-use crate::overlay_fs::{OverlayFileSystem, OverlayMode};
-use crate::resource_accounting::{
-    ResourceLimits, DEFAULT_MAX_FILESYSTEM_BYTES, DEFAULT_MAX_INODE_COUNT,
+use super::overlay_fs::{OverlayFileSystem, OverlayMode};
+use super::usage::{
+    RootFilesystemResourceLimits, DEFAULT_MAX_FILESYSTEM_BYTES, DEFAULT_MAX_INODE_COUNT,
 };
-use crate::vfs::{
-    normalize_path, MemoryFileSystem, VfsError, VfsResult, VirtualFileSystem, VirtualUtimeSpec,
-    MAX_PATH_LENGTH,
+use super::vfs::{
+    normalize_path, MemoryFileSystem, VfsError, VfsResult, VirtualFileSystem, VirtualStat,
+    VirtualUtimeSpec, MAX_PATH_LENGTH,
 };
+use crate::posix::vfs::VirtualDirEntry;
 use base64::Engine;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -159,14 +160,14 @@ pub struct RootFilesystemImportLimits {
 }
 
 impl RootFilesystemImportLimits {
-    pub fn from_resource_limits(limits: &ResourceLimits) -> Self {
+    pub fn from_resource_limits(limits: &impl RootFilesystemResourceLimits) -> Self {
         Self {
             max_encoded_snapshot_bytes: encoded_snapshot_limit(
-                limits.max_filesystem_bytes,
-                limits.max_inode_count,
+                limits.max_filesystem_bytes(),
+                limits.max_inode_count(),
             ),
-            max_filesystem_bytes: limits.max_filesystem_bytes,
-            max_inode_count: limits.max_inode_count,
+            max_filesystem_bytes: limits.max_filesystem_bytes(),
+            max_inode_count: limits.max_inode_count(),
         }
     }
 }
@@ -314,7 +315,7 @@ impl VirtualFileSystem for RootFileSystem {
         self.overlay.read_dir_limited(path, max_entries)
     }
 
-    fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<crate::vfs::VirtualDirEntry>> {
+    fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
         self.overlay.read_dir_with_types(path)
     }
 
@@ -342,7 +343,7 @@ impl VirtualFileSystem for RootFileSystem {
         self.overlay.exists(path)
     }
 
-    fn stat(&mut self, path: &str) -> VfsResult<crate::vfs::VirtualStat> {
+    fn stat(&mut self, path: &str) -> VfsResult<VirtualStat> {
         self.overlay.stat(path)
     }
 
@@ -370,7 +371,7 @@ impl VirtualFileSystem for RootFileSystem {
         self.overlay.read_link(path)
     }
 
-    fn lstat(&self, path: &str) -> VfsResult<crate::vfs::VirtualStat> {
+    fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
         self.overlay.lstat(path)
     }
 

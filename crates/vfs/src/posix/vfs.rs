@@ -88,7 +88,7 @@ impl VfsError {
         Self::new("ENOTEMPTY", format!("directory not empty, rmdir '{path}'"))
     }
 
-    pub(crate) fn permission_denied(op: &'static str, path: &str) -> Self {
+    pub fn permission_denied(op: &'static str, path: &str) -> Self {
         Self::new("EPERM", format!("operation not permitted, {op} '{path}'"))
     }
 

@@ -6,6 +6,7 @@ describe("@secure-exec/s3", () => {
 		expect(
 			createS3Backend({
 				bucket: "bucket-123",
+				metadataPath: "/tmp/secure-exec-s3.sqlite",
 				prefix: "descriptor-test",
 				region: "us-east-1",
 				endpoint: "https://s3.example.com",
@@ -17,9 +18,10 @@ describe("@secure-exec/s3", () => {
 				inlineThreshold: 8,
 			}),
 		).toEqual({
-			id: "s3",
+			id: "chunked_s3",
 			config: {
 				bucket: "bucket-123",
+				metadataPath: "/tmp/secure-exec-s3.sqlite",
 				prefix: "descriptor-test",
 				region: "us-east-1",
 				endpoint: "https://s3.example.com",

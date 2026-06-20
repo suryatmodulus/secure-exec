@@ -1,6 +1,6 @@
-use crate::resource_accounting::FileSystemUsage;
-use crate::root_fs::RootFileSystem;
-use crate::vfs::{
+use super::root_fs::RootFileSystem;
+use super::usage::FileSystemUsage;
+use super::vfs::{
     VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat, VirtualUtimeSpec,
 };
 use std::any::Any;

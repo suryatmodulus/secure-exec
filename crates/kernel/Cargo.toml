@@ -8,6 +8,7 @@ description = "Shared kernel plane for secure-exec native and browser sidecars"
 
 [dependencies]
 secure-exec-bridge = { workspace = true }
+vfs = { workspace = true }
 base64 = "0.22"
 getrandom = "0.2"
 hickory-resolver = "0.26.0-beta.3"

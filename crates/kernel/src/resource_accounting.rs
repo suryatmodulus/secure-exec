@@ -3,13 +3,16 @@ use crate::pipe_manager::PipeManager;
 use crate::process_table::{ProcessStatus, ProcessTable};
 use crate::pty::PtyManager;
 use crate::socket_table::{SocketState, SocketTable};
-use crate::vfs::{VfsResult, VirtualFileSystem};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use vfs::posix::usage::RootFilesystemResourceLimits;
 
-pub const DEFAULT_MAX_FILESYSTEM_BYTES: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_MAX_INODE_COUNT: usize = 16_384;
+pub use vfs::posix::usage::{
+    measure_filesystem_usage, FileSystemUsage, DEFAULT_MAX_FILESYSTEM_BYTES,
+    DEFAULT_MAX_INODE_COUNT,
+};
+
 pub const DEFAULT_MAX_PROCESSES: usize = 256;
 pub const DEFAULT_MAX_OPEN_FDS: usize = 256;
 pub const DEFAULT_MAX_PIPES: usize = 128;
@@ -95,16 +98,20 @@ impl Default for ResourceLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct FileSystemUsage {
-    pub total_bytes: u64,
-    pub inode_count: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceError {
     code: &'static str,
     message: String,
+}
+
+impl RootFilesystemResourceLimits for ResourceLimits {
+    fn max_filesystem_bytes(&self) -> Option<u64> {
+        self.max_filesystem_bytes
+    }
+
+    fn max_inode_count(&self) -> Option<usize> {
+        self.max_inode_count
+    }
 }
 
 impl ResourceError {
@@ -464,48 +471,4 @@ fn merged_env_payload_bytes(
     }
 
     total
-}
-
-pub fn measure_filesystem_usage<F: VirtualFileSystem>(
-    filesystem: &mut F,
-) -> VfsResult<FileSystemUsage> {
-    let mut visited = BTreeSet::new();
-    measure_path_usage(filesystem, "/", &mut visited)
-}
-
-fn measure_path_usage<F: VirtualFileSystem>(
-    filesystem: &mut F,
-    path: &str,
-    visited: &mut BTreeSet<u64>,
-) -> VfsResult<FileSystemUsage> {
-    let stat = filesystem.lstat(path)?;
-    let mut usage = FileSystemUsage::default();
-
-    if visited.insert(stat.ino) {
-        usage.inode_count += 1;
-        if !stat.is_directory {
-            usage.total_bytes = usage.total_bytes.saturating_add(stat.size);
-        }
-    }
-
-    if !stat.is_directory || stat.is_symbolic_link {
-        return Ok(usage);
-    }
-
-    for entry in filesystem.read_dir_with_types(path)? {
-        if matches!(entry.name.as_str(), "." | "..") {
-            continue;
-        }
-
-        let child_path = if path == "/" {
-            format!("/{}", entry.name)
-        } else {
-            format!("{path}/{}", entry.name)
-        };
-        let child_usage = measure_path_usage(filesystem, &child_path, visited)?;
-        usage.total_bytes = usage.total_bytes.saturating_add(child_usage.total_bytes);
-        usage.inode_count = usage.inode_count.saturating_add(child_usage.inode_count);
-    }
-
-    Ok(usage)
 }

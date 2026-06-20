@@ -18,6 +18,8 @@ secure-exec-bridge = { workspace = true }
 secure-exec-kernel = { workspace = true }
 secure-exec-execution = { workspace = true }
 secure-exec-vm-config = { workspace = true }
+secure-exec-vfs = { workspace = true }
+async-trait = "0.1"
 aws-config = "1"
 aws-credential-types = "1"
 aws-sdk-s3 = "1"
@@ -52,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 ureq = { version = "2.10", features = ["json"] }
 url = "2"
 vbare = { workspace = true }
+vfs = { workspace = true }
 
 [build-dependencies]
 vbare-compiler = { workspace = true }

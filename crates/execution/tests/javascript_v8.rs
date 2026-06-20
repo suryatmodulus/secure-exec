@@ -1038,6 +1038,8 @@ fn javascript_execution_to_locale_date_string_does_not_crash_embedded_v8() {
 
     let execution = engine
         .start_execution(StartJavascriptExecutionRequest {
+            limits: Default::default(),
+            guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id,
             argv: vec![String::from("./entry.mjs")],

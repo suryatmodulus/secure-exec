@@ -402,7 +402,16 @@ fn legacy_loopback_exempt_ports(env: &std::collections::BTreeMap<String, String>
     let Some(value) = env.get("AGENT_OS_LOOPBACK_EXEMPT_PORTS") else {
         return Vec::new();
     };
-    serde_json::from_str::<Vec<u16>>(value).unwrap_or_default()
+    serde_json::from_str::<Vec<serde_json::Value>>(value)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| match value {
+            serde_json::Value::Number(number) => number.as_u64(),
+            serde_json::Value::String(value) => value.parse::<u64>().ok(),
+            _ => None,
+        })
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect()
 }
 
 fn legacy_limits_config(

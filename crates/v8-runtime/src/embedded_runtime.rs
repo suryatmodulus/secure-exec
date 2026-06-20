@@ -662,8 +662,13 @@ mod tests {
     use crate::runtime_protocol::{BridgeResponse, RuntimeCommand, RuntimeEvent, SessionMessage};
     use std::time::Duration;
 
+    static EMBEDDED_RUNTIME_CODEC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn embedded_runtime_handle_reports_liveness_and_shutdown() {
+        let _codec_guard = EMBEDDED_RUNTIME_CODEC_TEST_LOCK
+            .lock()
+            .expect("embedded runtime codec test lock poisoned");
         let (_stream, handle) =
             spawn_embedded_runtime_ipc(Some(1)).expect("spawn embedded runtime");
         assert!(
@@ -679,6 +684,9 @@ mod tests {
 
     #[test]
     fn embedded_runtime_session_shared_runtime_is_lazy() {
+        let _codec_guard = EMBEDDED_RUNTIME_CODEC_TEST_LOCK
+            .lock()
+            .expect("embedded runtime codec test lock poisoned");
         let first = shared_embedded_runtime().expect("shared embedded runtime");
         let second = shared_embedded_runtime().expect("shared embedded runtime");
         assert!(
@@ -689,6 +697,9 @@ mod tests {
 
     #[test]
     fn embedded_runtime_drop_releases_codec_after_destroying_sessions() {
+        let _codec_guard = EMBEDDED_RUNTIME_CODEC_TEST_LOCK
+            .lock()
+            .expect("embedded runtime codec test lock poisoned");
         let codec_before = bridge::is_cbor_codec();
         let alive = {
             let runtime = EmbeddedV8Runtime::new(Some(1)).expect("embedded runtime");
@@ -781,6 +792,9 @@ mod tests {
 
     #[test]
     fn embedded_runtime_session_handle_rejects_unknown_bridge_response_status() {
+        let _codec_guard = EMBEDDED_RUNTIME_CODEC_TEST_LOCK
+            .lock()
+            .expect("embedded runtime codec test lock poisoned");
         let runtime = Arc::new(EmbeddedV8Runtime::new(Some(1)).expect("embedded runtime"));
         let handle = runtime.session_handle("missing-session".into());
 
@@ -1046,6 +1060,9 @@ mod tests {
 
     #[test]
     fn embedded_runtime_stale_output_registration_cannot_destroy_reused_session_id() {
+        let _codec_guard = EMBEDDED_RUNTIME_CODEC_TEST_LOCK
+            .lock()
+            .expect("embedded runtime codec test lock poisoned");
         let runtime = Arc::new(EmbeddedV8Runtime::new(Some(1)).expect("embedded runtime"));
         let session_id = "stream-generation-reuse";
         let (_first_receiver, first_registration) = runtime

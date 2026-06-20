@@ -3036,7 +3036,7 @@ where
                             bootstrap_module: None,
                             compile_cache_root: Some(self.cache_root.join("node-compile-cache")),
                         });
-                let module_reader = build_module_reader(vm)
+                let module_reader = build_module_reader(vm, &resolved)
                     .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                 let execution = self
                     .javascript_engine
@@ -4927,7 +4927,7 @@ where
                 normalize_path(&format!("{guest_cwd}/{command}"))
             };
             let host_entrypoint = if command.starts_with("./") || command.starts_with("../") {
-                host_cwd.join(&command)
+                normalize_host_path(&host_cwd.join(&command))
             } else {
                 host_runtime_path_for_guest_path_with_env(
                     vm,
@@ -5053,7 +5053,7 @@ where
                 let host_entrypoint = if entrypoint_specifier.starts_with("./")
                     || entrypoint_specifier.starts_with("../")
                 {
-                    host_cwd.join(entrypoint_specifier)
+                    normalize_host_path(&host_cwd.join(entrypoint_specifier))
                 } else {
                     host_runtime_path_for_guest_path_with_env(
                         vm,
@@ -5313,8 +5313,9 @@ where
                         &resolved.entrypoint,
                         &execution_env,
                     );
+                    prepare_javascript_shadow(vm, &resolved)?;
 
-                    let module_reader = build_module_reader(vm)
+                    let module_reader = build_module_reader(vm, &resolved)
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
                         .javascript_engine
@@ -5705,8 +5706,9 @@ where
                         &resolved.entrypoint,
                         &execution_env,
                     );
+                    prepare_javascript_shadow(vm, &resolved)?;
 
-                    let module_reader = build_module_reader(vm)
+                    let module_reader = build_module_reader(vm, &resolved)
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
                         .javascript_engine
@@ -8965,7 +8967,10 @@ fn runtime_guest_path_mappings(vm: &VmState) -> Vec<RuntimeGuestPathMapping> {
 /// refusal), never the host-direct path translator. Returns `None` when the VM
 /// has no usable read-only mount, so resolution falls back to the service-loop
 /// kernel reader.
-fn build_module_reader(vm: &VmState) -> Option<crate::plugins::host_dir::HostDirModuleReader> {
+fn build_module_reader(
+    vm: &VmState,
+    resolved: &ResolvedChildProcessExecution,
+) -> Option<crate::plugins::host_dir::HostDirModuleReader> {
     let mut pairs: Vec<(String, PathBuf)> = vm
         .configuration
         .mounts
@@ -8977,6 +8982,20 @@ fn build_module_reader(vm: &VmState) -> Option<crate::plugins::host_dir::HostDir
                 .map(|host_path| (normalize_path(&mount.guest_path), PathBuf::from(host_path)))
         })
         .collect();
+
+    let guest_entrypoint = resolved
+        .env
+        .get("AGENT_OS_GUEST_ENTRYPOINT")
+        .map(|path| normalize_path(path));
+    if let Some(guest_entrypoint) = guest_entrypoint.as_deref() {
+        let entrypoint_in_read_only_mount = pairs.iter().any(|(guest_path, _)| {
+            guest_entrypoint == guest_path
+                || guest_entrypoint.starts_with(&format!("{guest_path}/"))
+        });
+        if !entrypoint_in_read_only_mount {
+            return None;
+        }
+    }
 
     // Mirror runtime_guest_path_mappings: a mount nested under
     // `/root/node_modules/<pkg>` implies a `/root/node_modules` root the resolver

@@ -1,16 +1,83 @@
-use secure_exec_kernel::overlay_fs::{OverlayFileSystem, OverlayMode};
-use secure_exec_kernel::resource_accounting::ResourceLimits;
-use secure_exec_kernel::root_fs::{
+use std::collections::BTreeMap;
+use vfs::posix::{
     decode_snapshot, decode_snapshot_with_import_limits, encode_snapshot, FilesystemEntry,
-    RootFileSystem, RootFilesystemDescriptor, RootFilesystemImportLimits, RootFilesystemMode,
+    MemoryFileSystemSnapshot, MemoryFileSystemSnapshotInode, MemoryFileSystemSnapshotInodeKind,
+    MemoryFileSystemSnapshotMetadata, RootFileSystem, RootFilesystemDescriptor,
+    RootFilesystemImportLimits, RootFilesystemMode, RootFilesystemResourceLimits,
     RootFilesystemSnapshot, ROOT_FILESYSTEM_SNAPSHOT_FORMAT,
 };
-use secure_exec_kernel::vfs::{MemoryFileSystem, VirtualFileSystem, S_IFDIR, S_IFLNK, S_IFREG};
+use vfs::posix::{MemoryFileSystem, VirtualFileSystem, S_IFDIR, S_IFLNK, S_IFREG};
+use vfs::posix::{OverlayFileSystem, OverlayMode};
 
-fn assert_error_code<T: std::fmt::Debug>(
-    result: Result<T, secure_exec_kernel::vfs::VfsError>,
-    expected: &str,
-) {
+#[derive(Debug, Clone, Copy, Default)]
+struct TestResourceLimits {
+    max_filesystem_bytes: Option<u64>,
+    max_inode_count: Option<usize>,
+}
+
+impl RootFilesystemResourceLimits for TestResourceLimits {
+    fn max_filesystem_bytes(&self) -> Option<u64> {
+        self.max_filesystem_bytes
+    }
+
+    fn max_inode_count(&self) -> Option<usize> {
+        self.max_inode_count
+    }
+}
+
+fn directory_metadata(ino: u64) -> MemoryFileSystemSnapshotMetadata {
+    MemoryFileSystemSnapshotMetadata {
+        mode: S_IFDIR | 0o755,
+        uid: 1000,
+        gid: 1000,
+        nlink: 2,
+        ino,
+        atime_ms: 0,
+        atime_nsec: 0,
+        mtime_ms: 0,
+        mtime_nsec: 0,
+        ctime_ms: 0,
+        ctime_nsec: 0,
+        birthtime_ms: 0,
+    }
+}
+
+fn directory_inode(ino: u64) -> MemoryFileSystemSnapshotInode {
+    MemoryFileSystemSnapshotInode {
+        metadata: directory_metadata(ino),
+        kind: MemoryFileSystemSnapshotInodeKind::Directory,
+    }
+}
+
+fn deep_directory_tree(child_depth: usize) -> MemoryFileSystem {
+    let mut path_index = BTreeMap::new();
+    let mut inodes = BTreeMap::new();
+    let mut next_ino = 1;
+
+    path_index.insert(String::from("/"), next_ino);
+    inodes.insert(next_ino, directory_inode(next_ino));
+    next_ino += 1;
+
+    let mut path = String::from("/deep");
+    path_index.insert(path.clone(), next_ino);
+    inodes.insert(next_ino, directory_inode(next_ino));
+    next_ino += 1;
+
+    for _ in 0..child_depth {
+        path.push_str("/d");
+        path_index.insert(path.clone(), next_ino);
+        inodes.insert(next_ino, directory_inode(next_ino));
+        next_ino += 1;
+    }
+
+    MemoryFileSystem::from_snapshot(MemoryFileSystemSnapshot {
+        path_index,
+        inodes,
+        next_ino,
+    })
+}
+
+fn assert_error_code<T: std::fmt::Debug>(result: Result<T, vfs::posix::VfsError>, expected: &str) {
     let error = result.expect_err("expected operation to fail");
     assert_eq!(error.code(), expected);
 }
@@ -169,14 +236,7 @@ fn overlay_remove_dir_rejects_lower_children_after_directory_copy_up() {
 
 #[test]
 fn overlay_rename_rejects_directory_trees_that_exceed_snapshot_depth_limit() {
-    let mut lower = MemoryFileSystem::new();
-    let mut path = String::from("/deep");
-    lower.create_dir(&path).expect("create root of deep tree");
-    for _ in 0..1025 {
-        path.push_str("/d");
-        lower.create_dir(&path).expect("create nested directory");
-    }
-
+    let lower = deep_directory_tree(1025);
     let mut overlay = OverlayFileSystem::new(vec![lower], OverlayMode::Ephemeral);
     assert_error_code(overlay.rename("/deep", "/renamed"), "EINVAL");
 }
@@ -606,10 +666,9 @@ fn decode_snapshot_allows_metadata_heavy_entries_within_import_limits() {
             }}
         }}"#
     );
-    let limits = RootFilesystemImportLimits::from_resource_limits(&ResourceLimits {
+    let limits = RootFilesystemImportLimits::from_resource_limits(&TestResourceLimits {
         max_filesystem_bytes: Some(0),
         max_inode_count: Some(1),
-        ..ResourceLimits::default()
     });
 
     let decoded = decode_snapshot_with_import_limits(snapshot.as_bytes(), &limits)

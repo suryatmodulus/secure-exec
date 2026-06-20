@@ -167,7 +167,7 @@ fn live_bare_codec_decodes_generated_response_bytes() {
 #[test]
 fn generated_protocol_preserves_json_utf8_strings() {
     let descriptor = MountPluginDescriptor {
-        id: "s3".to_string(),
+        id: "chunked_s3".to_string(),
         config: r#"{"bucket":"demo","prefix":"workspace"}"#.to_string(),
     };
 

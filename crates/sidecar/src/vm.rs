@@ -2007,7 +2007,7 @@ mod tests {
         materialize_shadow_root_snapshot_entries, native_root_plugin_from_config,
         prune_kernel_command_stub, shadow_path_for_guest, KERNEL_COMMAND_STUB,
     };
-    use crate::plugins::sqlite_vfs::SqliteVfsMountPlugin;
+    use crate::plugins::chunked_local::ChunkedLocalMountPlugin;
     use crate::protocol::{
         RootFilesystemDescriptor, RootFilesystemEntry, RootFilesystemEntryKind,
         RootFilesystemLowerDescriptor,
@@ -2062,18 +2062,23 @@ mod tests {
     }
 
     #[test]
-    fn native_root_config_opens_sqlite_vfs_as_persistent_root() {
+    fn native_root_config_opens_chunked_local_as_persistent_root() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be monotonic")
             .as_nanos();
         let database_path =
             std::env::temp_dir().join(format!("secure-exec-native-root-{unique}.sqlite"));
+        let block_root =
+            std::env::temp_dir().join(format!("secure-exec-native-root-blocks-{unique}"));
         let native_root = native_root_plugin_from_config(Some(
             &secure_exec_vm_config::NativeRootFilesystemConfig {
                 plugin: secure_exec_vm_config::MountPluginDescriptor {
-                    id: "sqlite_vfs".to_string(),
-                    config: serde_json::json!({ "databasePath": database_path.to_string_lossy() }),
+                    id: "chunked_local".to_string(),
+                    config: serde_json::json!({
+                        "metadataPath": database_path.to_string_lossy(),
+                        "blockRoot": block_root.to_string_lossy(),
+                    }),
                 },
                 read_only: false,
             },
@@ -2082,7 +2087,7 @@ mod tests {
         .expect("native root should be present");
         let config: serde_json::Value =
             serde_json::from_str(&native_root.plugin.config).expect("valid plugin config");
-        let plugin = SqliteVfsMountPlugin;
+        let plugin = ChunkedLocalMountPlugin;
         let mut filesystem = plugin
             .open(OpenFileSystemPluginRequest {
                 vm_id: "vm-test",
@@ -2142,8 +2147,8 @@ mod tests {
                 config: &config,
                 context: &(),
             })
-            .expect("sqlite root should reopen");
-        let mut reopened = MountTable::new_boxed_root(reopened, MountOptions::new("sqlite_vfs"));
+            .expect("chunked local root should reopen");
+        let mut reopened = MountTable::new_boxed_root(reopened, MountOptions::new("chunked_local"));
         assert_eq!(
             reopened
                 .read_file("/home/user/persist.txt")
@@ -2152,6 +2157,7 @@ mod tests {
         );
 
         let _ = fs::remove_file(database_path);
+        let _ = fs::remove_dir_all(block_root);
     }
 
     #[test]

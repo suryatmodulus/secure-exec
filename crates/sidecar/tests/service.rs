@@ -27,6 +27,9 @@ mod json_rpc;
 #[path = "../src/limits.rs"]
 mod limits;
 #[allow(dead_code)]
+#[path = "../src/metadata/mod.rs"]
+mod metadata;
+#[allow(dead_code)]
 #[path = "../src/plugins/mod.rs"]
 mod plugins;
 #[allow(dead_code, clippy::enum_variant_names)]
@@ -66,7 +69,7 @@ mod service {
             JavascriptSyncRpcServiceRequest,
         };
         use crate::filesystem::service_javascript_fs_sync_rpc;
-        use crate::plugins::s3::test_support::MockS3Server;
+        use crate::plugins::s3_common::test_support::MockS3Server;
         use crate::plugins::sandbox_agent::test_support::MockSandboxAgentServer;
         use crate::protocol::VmCreatedResponse;
         use crate::protocol::{
@@ -3367,11 +3370,17 @@ ykAheWCsAteSEWVc0w==\n\
 
             // Two distinct guest exec processes in one VM.
             let server_cwd = temp_dir("secure-exec-sidecar-js-cross-exec-server-cwd");
-            write_fixture(&server_cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                "setInterval(() => {}, 1000);",
+            );
             start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-server");
 
             let client_cwd = temp_dir("secure-exec-sidecar-js-cross-exec-client-cwd");
-            write_fixture(&client_cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
+            write_fixture(
+                &client_cwd.join("entry.mjs"),
+                "setInterval(() => {}, 1000);",
+            );
             start_fake_javascript_process(&mut sidecar, &vm_id, &client_cwd, "proc-client");
 
             // Process A (server) listens on loopback.
@@ -6522,6 +6531,12 @@ ykAheWCsAteSEWVc0w==\n\
         }
         fn configure_vm_instantiates_s3_mounts_through_the_plugin_registry() {
             let server = MockS3Server::start();
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be monotonic")
+                .as_nanos();
+            let metadata_path =
+                std::env::temp_dir().join(format!("secure-exec-service-s3-{unique}.sqlite"));
 
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
@@ -6565,10 +6580,11 @@ ykAheWCsAteSEWVc0w==\n\
                             guest_path: String::from("/data"),
                             read_only: false,
                             plugin: MountPluginDescriptor {
-                                id: String::from("s3"),
+                                id: String::from("chunked_s3"),
                                 config: json!({
                                     "bucket": "test-bucket",
                                     "prefix": "service-test",
+                                    "metadataPath": metadata_path.to_string_lossy(),
                                     "region": "us-east-1",
                                     "endpoint": server.base_url(),
                                     "credentials": {
@@ -6621,8 +6637,172 @@ ykAheWCsAteSEWVc0w==\n\
             assert!(
                 requests
                     .iter()
-                    .any(|request| request.path.contains("filesystem-manifest.json")),
-                "expected the native plugin to store a manifest object"
+                    .any(|request| request.path.contains("service-test/blocks/")),
+                "expected the native plugin to store block objects"
+            );
+            let _ = fs::remove_file(metadata_path);
+        }
+        fn configure_vm_instantiates_object_s3_mounts_through_the_plugin_registry() {
+            let server = MockS3Server::start();
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::BootstrapRootFilesystem(BootstrapRootFilesystemRequest {
+                        entries: vec![RootFilesystemEntry {
+                            path: String::from("/objects"),
+                            kind: RootFilesystemEntryKind::Directory,
+                            ..Default::default()
+                        }],
+                    }),
+                ))
+                .expect("bootstrap root object dir");
+
+            sidecar
+                .dispatch_blocking(request(
+                    5,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: vec![MountDescriptor {
+                            guest_path: String::from("/objects"),
+                            read_only: false,
+                            plugin: MountPluginDescriptor {
+                                id: String::from("object_s3"),
+                                config: json!({
+                                    "bucket": "test-bucket",
+                                    "prefix": "object-service-test",
+                                    "region": "us-east-1",
+                                    "endpoint": server.base_url(),
+                                    "credentials": {
+                                        "accessKeyId": "minioadmin",
+                                        "secretAccessKey": "minioadmin",
+                                    },
+                                })
+                                .to_string(),
+                            },
+                        }],
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: std::collections::HashMap::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure object_s3 mount");
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("configured vm");
+            vm.kernel
+                .filesystem_mut()
+                .write_file("/objects/file.txt", b"native object mount".to_vec())
+                .expect("write object s3-backed file");
+            assert_eq!(
+                vm.kernel
+                    .filesystem_mut()
+                    .read_file("/objects/file.txt")
+                    .expect("read object s3-backed file"),
+                b"native object mount".to_vec()
+            );
+            drop(sidecar);
+
+            assert!(server
+                .object_keys()
+                .iter()
+                .any(|key| key == "test-bucket/object-service-test/file.txt"));
+        }
+        fn configure_vm_instantiates_chunked_local_mounts_through_the_plugin_registry() {
+            let root = temp_dir("secure-exec-sidecar-chunked-local");
+            let metadata_path = root.join("metadata.sqlite");
+            let block_root = root.join("blocks");
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::BootstrapRootFilesystem(BootstrapRootFilesystemRequest {
+                        entries: vec![RootFilesystemEntry {
+                            path: String::from("/local"),
+                            kind: RootFilesystemEntryKind::Directory,
+                            ..Default::default()
+                        }],
+                    }),
+                ))
+                .expect("bootstrap root local dir");
+
+            sidecar
+                .dispatch_blocking(request(
+                    5,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: vec![MountDescriptor {
+                            guest_path: String::from("/local"),
+                            read_only: false,
+                            plugin: MountPluginDescriptor {
+                                id: String::from("chunked_local"),
+                                config: json!({
+                                    "metadataPath": metadata_path,
+                                    "blockRoot": block_root,
+                                    "chunkSize": 4,
+                                    "inlineThreshold": 1,
+                                })
+                                .to_string(),
+                            },
+                        }],
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: std::collections::HashMap::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure chunked_local mount");
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("configured vm");
+            vm.kernel
+                .filesystem_mut()
+                .write_file("/local/file.txt", b"native local mount".to_vec())
+                .expect("write chunked local file");
+            assert_eq!(
+                vm.kernel
+                    .filesystem_mut()
+                    .read_file("/local/file.txt")
+                    .expect("read chunked local file"),
+                b"native local mount".to_vec()
+            );
+            drop(sidecar);
+
+            assert!(metadata_path.exists());
+            assert!(
+                fs::read_dir(block_root)
+                    .expect("read block root")
+                    .next()
+                    .is_some(),
+                "chunked_local should persist block files"
             );
         }
         fn assert_kernel_permission_decision(
@@ -10228,6 +10408,17 @@ await new Promise(() => {});
 
                 match event {
                     ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
+                        if !request.method.starts_with("fs.promises.") {
+                            sidecar
+                                .handle_execution_event(
+                                    &vm_id,
+                                    "proc-js-promises",
+                                    ActiveExecutionEvent::JavascriptSyncRpcRequest(request),
+                                )
+                                .expect("handle javascript promises setup rpc event");
+                            continue;
+                        }
+
                         pending_requests.push(request);
 
                         let expected_method = if !saw_write_batch {
@@ -15330,6 +15521,12 @@ console.log(JSON.stringify({
                 vm.kernel
                     .write_file("/rpc/note.txt", b"hello from nested child".to_vec())
                     .expect("seed rpc note");
+                vm.kernel
+                    .write_file(
+                        "/root/child.mjs",
+                        fs::read(cwd.join("child.mjs")).expect("read child fixture"),
+                    )
+                    .expect("seed nested child fixture");
             }
 
             let context =
@@ -15575,6 +15772,18 @@ console.log(JSON.stringify({
 
             let kernel_handle = {
                 let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+                vm.kernel
+                    .write_file(
+                        "/root/child.mjs",
+                        fs::read(cwd.join("child.mjs")).expect("read child fixture"),
+                    )
+                    .expect("seed nested child fixture");
+                vm.kernel
+                    .write_file(
+                        "/root/leaf.mjs",
+                        fs::read(cwd.join("leaf.mjs")).expect("read leaf fixture"),
+                    )
+                    .expect("seed nested leaf fixture");
                 vm.kernel
                     .spawn_process(
                         JAVASCRIPT_COMMAND,
@@ -15843,6 +16052,8 @@ console.log(JSON.stringify({
             configure_vm_js_bridge_mount_maps_callback_errors_to_errno_codes();
             configure_vm_instantiates_sandbox_agent_mounts_through_the_plugin_registry();
             configure_vm_instantiates_s3_mounts_through_the_plugin_registry();
+            configure_vm_instantiates_object_s3_mounts_through_the_plugin_registry();
+            configure_vm_instantiates_chunked_local_mounts_through_the_plugin_registry();
             bridge_permissions_map_symlink_operations_to_symlink_access();
             vm_limits_config_reads_filesystem_limits();
             create_vm_applies_filesystem_permission_descriptors_to_kernel_access();

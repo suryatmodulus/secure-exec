@@ -8,19 +8,32 @@ pub mod device_layer;
 pub mod dns;
 pub mod fd_table;
 pub mod kernel;
-pub mod mount_plugin;
-pub mod mount_table;
-pub mod overlay_fs;
 pub mod permissions;
 pub mod pipe_manager;
 pub mod poll;
 pub mod process_table;
 pub mod pty;
 pub mod resource_accounting;
-pub mod root_fs;
 pub mod socket_table;
 pub mod user;
-pub mod vfs;
+
+pub use ::vfs::posix as vfs;
+
+pub mod mount_plugin {
+    pub use ::vfs::posix::mount_plugin::*;
+}
+
+pub mod mount_table {
+    pub use ::vfs::posix::mount_table::*;
+}
+
+pub mod overlay_fs {
+    pub use ::vfs::posix::overlay_fs::*;
+}
+
+pub mod root_fs {
+    pub use ::vfs::posix::root_fs::*;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelScaffold {

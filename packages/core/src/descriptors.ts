@@ -22,6 +22,80 @@ export interface NativeMountPluginDescriptor<
 	config?: TConfig;
 }
 
+export interface S3MountCredentialsConfig {
+	accessKeyId: string;
+	secretAccessKey: string;
+}
+
+export interface ObjectS3MountConfig {
+	bucket: string;
+	prefix?: string;
+	region?: string;
+	credentials?: S3MountCredentialsConfig;
+	endpoint?: string;
+	uid?: number;
+	gid?: number;
+	fileMode?: number;
+	dirMode?: number;
+}
+
+export interface ChunkedS3MountConfig {
+	bucket: string;
+	prefix?: string;
+	region?: string;
+	credentials?: S3MountCredentialsConfig;
+	endpoint?: string;
+	metadataBackend?: "sqlite" | "local" | "callback";
+	metadataPath?: string;
+	mountId?: string;
+	chunkSize?: number;
+	inlineThreshold?: number;
+	uid?: number;
+	gid?: number;
+	fileMode?: number;
+	dirMode?: number;
+	metadataCacheEntries?: number;
+}
+
+export interface ChunkedLocalMountConfig {
+	metadataPath: string;
+	blockRoot: string;
+	chunkSize?: number;
+	inlineThreshold?: number;
+	uid?: number;
+	gid?: number;
+	fileMode?: number;
+	dirMode?: number;
+	metadataCacheEntries?: number;
+}
+
+export function objectS3MountPlugin(
+	config: ObjectS3MountConfig,
+): NativeMountPluginDescriptor {
+	return {
+		id: "object_s3",
+		config: config as unknown as MountConfigJsonObject,
+	};
+}
+
+export function chunkedS3MountPlugin(
+	config: ChunkedS3MountConfig,
+): NativeMountPluginDescriptor {
+	return {
+		id: "chunked_s3",
+		config: config as unknown as MountConfigJsonObject,
+	};
+}
+
+export function chunkedLocalMountPlugin(
+	config: ChunkedLocalMountConfig,
+): NativeMountPluginDescriptor {
+	return {
+		id: "chunked_local",
+		config: config as unknown as MountConfigJsonObject,
+	};
+}
+
 export interface LiveMountDescriptor {
 	guest_path: string;
 	read_only: boolean;

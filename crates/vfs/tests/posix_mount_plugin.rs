@@ -1,9 +1,9 @@
-use secure_exec_kernel::mount_plugin::{
+use serde_json::json;
+use vfs::posix::MountedVirtualFileSystem;
+use vfs::posix::{
     FileSystemPluginFactory, FileSystemPluginRegistry, OpenFileSystemPluginRequest, PluginError,
 };
-use secure_exec_kernel::mount_table::MountedVirtualFileSystem;
-use secure_exec_kernel::vfs::{MemoryFileSystem, VirtualFileSystem};
-use serde_json::json;
+use vfs::posix::{MemoryFileSystem, VirtualFileSystem};
 
 #[derive(Debug)]
 struct SeededMemoryPlugin;
@@ -19,7 +19,7 @@ impl FileSystemPluginFactory<()> for SeededMemoryPlugin {
     fn open(
         &self,
         _request: OpenFileSystemPluginRequest<'_, ()>,
-    ) -> Result<Box<dyn secure_exec_kernel::mount_table::MountedFileSystem>, PluginError> {
+    ) -> Result<Box<dyn vfs::posix::MountedFileSystem>, PluginError> {
         let mut filesystem = MemoryFileSystem::new();
         filesystem
             .write_file("/hello.txt", b"hello".to_vec())
@@ -36,7 +36,7 @@ impl FileSystemPluginFactory<()> for NamedPlugin {
     fn open(
         &self,
         _request: OpenFileSystemPluginRequest<'_, ()>,
-    ) -> Result<Box<dyn secure_exec_kernel::mount_table::MountedFileSystem>, PluginError> {
+    ) -> Result<Box<dyn vfs::posix::MountedFileSystem>, PluginError> {
         Ok(Box::new(MountedVirtualFileSystem::new(
             MemoryFileSystem::new(),
         )))

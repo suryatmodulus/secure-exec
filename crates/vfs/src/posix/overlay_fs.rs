@@ -1,4 +1,4 @@
-use crate::vfs::{
+use super::vfs::{
     normalize_path, MemoryFileSystem, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem,
     VirtualStat, VirtualUtimeSpec,
 };
@@ -545,7 +545,7 @@ impl OverlayFileSystem {
                 ));
             }
 
-            let stat = self.lstat(&current_path)?;
+            let stat = self.merged_lstat(&current_path)?;
             if !self.has_entry_in_upper(&current_path) {
                 let bytes = if stat.is_symbolic_link {
                     self.read_link_inner(&current_path)?.len() as u64
@@ -980,7 +980,7 @@ impl OverlayFileSystem {
                 ));
             }
 
-            let stat = self.lstat(&current_path)?;
+            let stat = self.merged_lstat(&current_path)?;
 
             if stat.is_symbolic_link {
                 entries.push(OverlaySnapshotEntry {
@@ -998,7 +998,7 @@ impl OverlayFileSystem {
                     kind: OverlaySnapshotKind::Directory,
                 });
 
-                let children = self.read_dir_with_types(&current_path)?;
+                let children = self.read_dir_with_types_inner(&current_path)?;
                 for entry in children.into_iter().rev() {
                     pending.push((Self::join_path(&current_path, &entry.name), depth + 1));
                 }
@@ -1070,6 +1070,79 @@ impl OverlayFileSystem {
         }
 
         Ok(false)
+    }
+
+    fn read_dir_with_types_inner(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
+        if self.is_whited_out(path) {
+            return Err(Self::directory_not_found(path));
+        }
+
+        let normalized = Self::normalized(path);
+        let mut directory_exists = false;
+        let mut entries = Vec::<VirtualDirEntry>::new();
+        let mut seen = BTreeSet::<String>::new();
+        let upper = self.upper.as_ref();
+        let include_lowers = !Self::marker_exists_in_upper(upper, OverlayMarkerKind::Opaque, path);
+
+        if include_lowers {
+            for lower in self.lowers.iter_mut().rev() {
+                if let Ok(lower_entries) = lower.read_dir_with_types(path) {
+                    directory_exists = true;
+                    for entry in lower_entries {
+                        if entry.name == "."
+                            || entry.name == ".."
+                            || Self::should_hide_directory_entry(path, &entry.name)
+                        {
+                            continue;
+                        }
+                        let child_path = if normalized == "/" {
+                            format!("/{}", entry.name)
+                        } else {
+                            format!("{normalized}/{}", entry.name)
+                        };
+                        if Self::marker_exists_in_upper(
+                            upper,
+                            OverlayMarkerKind::Whiteout,
+                            &child_path,
+                        ) || seen.contains(&entry.name)
+                        {
+                            continue;
+                        }
+                        seen.insert(entry.name.clone());
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+
+        if let Some(upper) = self.upper.as_mut() {
+            if let Ok(upper_entries) = upper.read_dir_with_types(path) {
+                directory_exists = true;
+                for entry in upper_entries {
+                    if entry.name == "."
+                        || entry.name == ".."
+                        || Self::should_hide_directory_entry(path, &entry.name)
+                    {
+                        continue;
+                    }
+                    if let Some(index) = entries
+                        .iter()
+                        .position(|existing| existing.name == entry.name)
+                    {
+                        entries[index] = entry;
+                    } else {
+                        seen.insert(entry.name.clone());
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+
+        if !directory_exists {
+            return Err(Self::directory_not_found(path));
+        }
+
+        Ok(entries)
     }
 
     fn marker_paths_in_upper(&mut self, kind: OverlayMarkerKind) -> VfsResult<Vec<String>> {
@@ -1386,76 +1459,7 @@ impl VirtualFileSystem for OverlayFileSystem {
         if self.touches_internal_metadata(path) {
             return Err(Self::directory_not_found(path));
         }
-        if self.is_whited_out(path) {
-            return Err(Self::directory_not_found(path));
-        }
-
-        let normalized = Self::normalized(path);
-        let mut directory_exists = false;
-        let mut entries = Vec::<VirtualDirEntry>::new();
-        let mut seen = BTreeSet::<String>::new();
-        let upper = self.upper.as_ref();
-        let include_lowers = !Self::marker_exists_in_upper(upper, OverlayMarkerKind::Opaque, path);
-
-        if include_lowers {
-            for lower in self.lowers.iter_mut().rev() {
-                if let Ok(lower_entries) = lower.read_dir_with_types(path) {
-                    directory_exists = true;
-                    for entry in lower_entries {
-                        if entry.name == "."
-                            || entry.name == ".."
-                            || Self::should_hide_directory_entry(path, &entry.name)
-                        {
-                            continue;
-                        }
-                        let child_path = if normalized == "/" {
-                            format!("/{}", entry.name)
-                        } else {
-                            format!("{normalized}/{}", entry.name)
-                        };
-                        if Self::marker_exists_in_upper(
-                            upper,
-                            OverlayMarkerKind::Whiteout,
-                            &child_path,
-                        ) || seen.contains(&entry.name)
-                        {
-                            continue;
-                        }
-                        seen.insert(entry.name.clone());
-                        entries.push(entry);
-                    }
-                }
-            }
-        }
-
-        if let Some(upper) = self.upper.as_mut() {
-            if let Ok(upper_entries) = upper.read_dir_with_types(path) {
-                directory_exists = true;
-                for entry in upper_entries {
-                    if entry.name == "."
-                        || entry.name == ".."
-                        || Self::should_hide_directory_entry(path, &entry.name)
-                    {
-                        continue;
-                    }
-                    if let Some(index) = entries
-                        .iter()
-                        .position(|existing| existing.name == entry.name)
-                    {
-                        entries[index] = entry;
-                    } else {
-                        seen.insert(entry.name.clone());
-                        entries.push(entry);
-                    }
-                }
-            }
-        }
-
-        if !directory_exists {
-            return Err(Self::directory_not_found(path));
-        }
-
-        Ok(entries)
+        self.read_dir_with_types_inner(path)
     }
 
     fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
@@ -1858,7 +1862,7 @@ impl VirtualFileSystem for OverlayFileSystem {
 #[cfg(test)]
 mod tests {
     use super::{OverlayFileSystem, OverlayMode};
-    use crate::vfs::{MemoryFileSystem, VfsResult, VirtualFileSystem};
+    use crate::posix::vfs::{MemoryFileSystem, VfsResult, VirtualFileSystem};
 
     #[test]
     fn symlink_into_metadata_namespace_cannot_read_or_resurrect_whiteouts() {
@@ -1868,8 +1872,7 @@ mod tests {
             .write_file("/data/secret.txt", b"secret".to_vec())
             .expect("seed lower file");
 
-        let mut overlay =
-            OverlayFileSystem::with_upper(vec![lower], MemoryFileSystem::new());
+        let mut overlay = OverlayFileSystem::with_upper(vec![lower], MemoryFileSystem::new());
 
         // Delete a lower-layer file: a whiteout marker is written under the
         // reserved metadata root and the file disappears from the merged view.
@@ -1893,9 +1896,7 @@ mod tests {
         // Removing the whiteout marker through the symlink must be denied, so the
         // deleted lower-layer file cannot be resurrected.
         assert!(
-            overlay
-                .remove_file("/escape/anything")
-                .is_err(),
+            overlay.remove_file("/escape/anything").is_err(),
             "tampering with metadata via a symlink must be denied"
         );
         assert!(

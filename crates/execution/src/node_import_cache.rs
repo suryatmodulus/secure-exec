@@ -8651,6 +8651,9 @@ const DEFAULT_VIRTUAL_OS_HOMEDIR = '/root';
 const DEFAULT_VIRTUAL_OS_SHELL = '/bin/sh';
 
 function parseVirtualProcessNumber(value, fallback) {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 0 ? value : fallback;
+  }
   if (typeof value !== 'string' || value.trim() === '') {
     return fallback;
   }
@@ -8805,19 +8808,19 @@ const frozenTimeValue = Number(process.env.AGENT_OS_FROZEN_TIME_MS);
 const frozenTimeMs = Number.isFinite(frozenTimeValue) ? Math.trunc(frozenTimeValue) : Date.now();
 const frozenTimeNs = BigInt(frozenTimeMs) * 1000000n;
 const VIRTUAL_UID = parseVirtualProcessNumber(
-  process.env.AGENT_OS_VIRTUAL_PROCESS_UID,
+  process.uid ?? process.env.AGENT_OS_VIRTUAL_PROCESS_UID,
   DEFAULT_VIRTUAL_UID,
 );
 const VIRTUAL_GID = parseVirtualProcessNumber(
-  process.env.AGENT_OS_VIRTUAL_PROCESS_GID,
+  process.gid ?? process.env.AGENT_OS_VIRTUAL_PROCESS_GID,
   DEFAULT_VIRTUAL_GID,
 );
 const VIRTUAL_PID = parseVirtualProcessNumber(
-  process.env.AGENT_OS_VIRTUAL_PROCESS_PID,
+  process.pid ?? process.env.AGENT_OS_VIRTUAL_PROCESS_PID,
   DEFAULT_VIRTUAL_PID,
 );
 const VIRTUAL_PPID = parseVirtualProcessNumber(
-  process.env.AGENT_OS_VIRTUAL_PROCESS_PPID,
+  process.ppid ?? process.env.AGENT_OS_VIRTUAL_PROCESS_PPID,
   DEFAULT_VIRTUAL_PPID,
 );
 const VIRTUAL_OS_USER = parseVirtualProcessString(

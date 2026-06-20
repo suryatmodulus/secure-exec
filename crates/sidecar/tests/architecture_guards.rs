@@ -257,6 +257,9 @@ const FS_ALLOW: &[&str] = &[
     "crates/sidecar/src/vm.rs",
     "crates/sidecar/src/service.rs",
     "crates/sidecar/src/execution.rs",
+    "crates/sidecar/src/plugins/chunked_local.rs",
+    "crates/secure-exec-vfs/src/local/file_block_store.rs",
+    "crates/secure-exec-vfs/src/local/sqlite_metadata_store.rs",
     // language-runtime asset / module loaders (read host runtime assets)
     "crates/execution/src/python.rs",
     "crates/execution/src/wasm.rs",
@@ -282,7 +285,9 @@ const NET_ALLOW: &[&str] = &[
     "crates/sidecar/src/state.rs",
     "crates/sidecar/src/vm.rs",
     // host-backed storage / agent plugins (network egress)
-    "crates/sidecar/src/plugins/s3.rs",
+    "crates/sidecar/src/plugins/s3_common.rs",
+    "crates/secure-exec-vfs/src/s3/block_store.rs",
+    "crates/secure-exec-vfs/src/s3/object_backend.rs",
     "crates/sidecar/src/plugins/google_drive.rs",
     "crates/sidecar/src/plugins/sandbox_agent.rs",
     // embedded runtime IPC socketpair (not external egress)
@@ -310,7 +315,7 @@ const ENV_ALLOW: &[&str] = &[
     "crates/execution/src/host_node.rs",
     "crates/v8-runtime/src/bridge.rs",
     "crates/sidecar/src/execution.rs",
-    "crates/sidecar/src/plugins/s3.rs",
+    "crates/sidecar/src/plugins/s3_common.rs",
 ];
 
 fn fs_class() -> BannedClass {

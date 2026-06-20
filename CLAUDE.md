@@ -33,6 +33,8 @@ Two corollaries that are easy to get wrong:
 
 - Keep this repo Agent OS-agnostic: no ACP, agents, sessions, `agent-os-protocol`, `agent-os-client`, or `agent-os-sidecar` dependencies in secure-exec code.
 - `crates/bridge/` is the browser/native portability seam. Shared contracts belong there.
+- `crates/vfs/` is generic filesystem infrastructure: POSIX-style in-memory/overlay/mount/root engines plus generic chunked/object engines and in-memory stores. It must stay free of secure-exec sidecar, bridge, S3, SQLite, and host-disk coupling.
+- `crates/secure-exec-vfs/` contains concrete secure-exec filesystem backends: S3 adapters, host-disk SQLite/file stores, and bridge/callback-backed metadata stores. Policy decisions, config validation, and mount descriptor parsing stay in sidecar plugins.
 - `crates/execution/` is the native execution implementation and must not become the browser portability layer.
 - `crates/sidecar/` builds the `secure-exec-sidecar` crate and binary. Extension APIs must stay transport-agnostic.
 - The protocol has no backwards compatibility. The sidecar and its clients run in same-version lockstep, so never add protocol or config versioning, runtime negotiation, fallbacks, or converters. Wire types and configs such as `CreateVmConfig` carry no `version` field beyond the single same-version handshake. Change the protocol freely and update all sides together.

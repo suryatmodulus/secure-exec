@@ -174,7 +174,7 @@
 	},
 	{
 		"name": "MAX_SNAPSHOT_DEPTH",
-		"path": "crates/kernel/src/overlay_fs.rs",
+		"path": "crates/vfs/src/posix/overlay_fs.rs",
 		"class": "invariant",
 		"rationale": "Recursion guard against cyclic/abusive layer chains; parser-safety."
 	},
@@ -231,14 +231,14 @@
 	},
 	{
 		"name": "DEFAULT_MAX_FILESYSTEM_BYTES",
-		"path": "crates/kernel/src/resource_accounting.rs",
+		"path": "crates/vfs/src/posix/usage.rs",
 		"class": "policy",
 		"rationale": "Kernel resource policy surface.",
 		"wired": "VmLimits.resources.max_filesystem_bytes"
 	},
 	{
 		"name": "DEFAULT_MAX_INODE_COUNT",
-		"path": "crates/kernel/src/resource_accounting.rs",
+		"path": "crates/vfs/src/posix/usage.rs",
 		"class": "policy",
 		"rationale": "Kernel resource policy surface.",
 		"wired": "VmLimits.resources.max_inode_count"
@@ -322,15 +322,39 @@
 	},
 	{
 		"name": "MAX_PATH_LENGTH",
-		"path": "crates/kernel/src/vfs.rs",
+		"path": "crates/vfs/src/posix/vfs.rs",
 		"class": "invariant",
 		"rationale": "Linux PATH_MAX; changing it diverges from Linux."
 	},
 	{
 		"name": "MAX_SYMLINK_DEPTH",
-		"path": "crates/kernel/src/vfs.rs",
+		"path": "crates/vfs/src/posix/vfs.rs",
 		"class": "invariant",
 		"rationale": "Linux ELOOP resolution limit."
+	},
+	{
+		"name": "MAX_PATH",
+		"path": "crates/vfs/src/engine/types.rs",
+		"class": "invariant",
+		"rationale": "Linux PATH_MAX mirror for engine-backed VFS paths."
+	},
+	{
+		"name": "MAX_SYMLINK_DEPTH",
+		"path": "crates/vfs/src/engine/types.rs",
+		"class": "invariant",
+		"rationale": "Linux ELOOP resolution limit for engine-backed VFS paths."
+	},
+	{
+		"name": "DEFAULT_METADATA_CACHE_ENTRIES",
+		"path": "crates/sidecar/src/plugins/chunked_local.rs",
+		"class": "invariant",
+		"rationale": "In-memory chunk metadata cache size; performance detail, not guest policy."
+	},
+	{
+		"name": "DEFAULT_METADATA_CACHE_ENTRIES",
+		"path": "crates/sidecar/src/plugins/chunked_s3.rs",
+		"class": "invariant",
+		"rationale": "In-memory chunk metadata cache size; performance detail, not guest policy."
 	},
 	{
 		"name": "CONTROL_FRAME_QUEUE_CAPACITY",
@@ -593,20 +617,6 @@
 		"class": "policy",
 		"rationale": "Reads the VM's configured max_pread_bytes resource limit.",
 		"wired": "VmLimits.resources.max_pread_bytes"
-	},
-	{
-		"name": "MAX_PERSISTED_MANIFEST_BYTES",
-		"path": "crates/sidecar/src/plugins/s3.rs",
-		"class": "policy",
-		"rationale": "Mount manifest size policy.",
-		"wired": "VmLimits.plugins.max_persisted_manifest_bytes"
-	},
-	{
-		"name": "MAX_PERSISTED_MANIFEST_FILE_BYTES",
-		"path": "crates/sidecar/src/plugins/s3.rs",
-		"class": "policy",
-		"rationale": "Mount manifest file size policy.",
-		"wired": "VmLimits.plugins.max_persisted_manifest_file_bytes"
 	},
 	{
 		"name": "DEFAULT_MAX_FULL_READ_BYTES",

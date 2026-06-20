@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/bridge",
     "crates/kernel",
+    "crates/vfs",
+    "crates/secure-exec-vfs",
     "crates/execution",
     "crates/secure-exec-client",
     "crates/sidecar",
@@ -25,5 +27,7 @@ secure-exec-vm-config = { path = "crates/vm-config", version = "0.3.0-rc.1" }
 secure-exec-v8-runtime = { path = "crates/v8-runtime", version = "0.3.0-rc.1" }
 secure-exec-client = { path = "crates/secure-exec-client", version = "0.3.0-rc.1" }
 secure-exec-sidecar = { path = "crates/sidecar", version = "0.3.0-rc.1" }
+secure-exec-vfs = { path = "crates/secure-exec-vfs", version = "0.3.0-rc.1" }
+vfs = { path = "crates/vfs", version = "0.3.0-rc.1" }
 vbare = "0.0.4"
 vbare-compiler = { package = "rivet-vbare-compiler", version = "0.0.5" }

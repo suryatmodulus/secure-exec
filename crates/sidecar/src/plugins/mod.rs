@@ -4,21 +4,24 @@ use secure_exec_kernel::mount_plugin::{
     FileSystemPluginFactory, FileSystemPluginRegistry, PluginError,
 };
 
+pub(crate) mod chunked_local;
+pub(crate) mod chunked_s3;
 pub(crate) mod google_drive;
 pub(crate) mod host_dir;
 pub(crate) mod js_bridge;
 pub(crate) mod module_access;
-pub(crate) mod s3;
+pub(crate) mod object_s3;
+pub(crate) mod s3_common;
 pub(crate) mod sandbox_agent;
-pub(crate) mod sqlite_vfs;
 
+use chunked_local::ChunkedLocalMountPlugin;
+use chunked_s3::ChunkedS3MountPlugin;
 use google_drive::GoogleDriveMountPlugin;
 use host_dir::HostDirMountPlugin;
 use js_bridge::JsBridgeMountPlugin;
 use module_access::ModuleAccessMountPlugin;
-use s3::S3MountPlugin;
+use object_s3::ObjectS3MountPlugin;
 use sandbox_agent::SandboxAgentMountPlugin;
-use sqlite_vfs::SqliteVfsMountPlugin;
 
 pub(crate) trait SidecarMountPluginFactory<Context>:
     FileSystemPluginFactory<Context>
@@ -41,8 +44,9 @@ pub(crate) fn register_native_mount_plugins<B>(
     register_plugin(registry, ModuleAccessMountPlugin)?;
     register_plugin(registry, JsBridgeMountPlugin)?;
     register_plugin(registry, SandboxAgentMountPlugin)?;
-    register_plugin(registry, SqliteVfsMountPlugin)?;
-    register_plugin(registry, S3MountPlugin)?;
+    register_plugin(registry, ChunkedLocalMountPlugin)?;
+    register_plugin(registry, ObjectS3MountPlugin)?;
+    register_plugin(registry, ChunkedS3MountPlugin)?;
     register_plugin(registry, GoogleDriveMountPlugin)?;
     Ok(())
 }

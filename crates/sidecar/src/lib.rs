@@ -11,6 +11,7 @@ pub mod generated_protocol;
 #[allow(dead_code)]
 pub(crate) mod json_rpc;
 pub mod limits;
+pub(crate) mod metadata;
 pub(crate) mod plugins;
 pub mod protocol;
 pub mod service;

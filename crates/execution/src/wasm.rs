@@ -5427,13 +5427,14 @@ mod tests {
     }
 
     #[test]
-    fn wasm_limits_default_to_none_when_unset_even_with_env_present() {
-        // Same misleading env, but no typed limits: every limit must be absent.
+    fn wasm_limits_default_to_bounded_timeout_when_unset_even_with_env_present() {
+        // Same misleading env, but no typed limits: execution gets the default
+        // bounded timeout, while memory and stack limits remain absent.
         let request = request_with_typed_limits_and_misleading_env(WasmExecutionLimits::default());
 
         assert_eq!(
             resolve_wasm_execution_timeout(&request).expect("fuel"),
-            None
+            Some(Duration::from_millis(DEFAULT_WASM_EXECUTION_TIMEOUT_MS))
         );
         assert_eq!(wasm_memory_limit_bytes(&request).expect("memory"), None);
         assert_eq!(
