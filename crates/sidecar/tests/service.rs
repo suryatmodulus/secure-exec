@@ -10,6 +10,9 @@ mod bootstrap;
 #[path = "../src/bridge.rs"]
 mod bridge;
 #[allow(dead_code)]
+#[path = "../src/crypto_cipher.rs"]
+mod crypto_cipher;
+#[allow(dead_code)]
 #[path = "../src/execution.rs"]
 mod execution;
 #[allow(dead_code)]
@@ -18,12 +21,10 @@ mod extension;
 #[allow(dead_code)]
 #[path = "../src/filesystem.rs"]
 mod filesystem;
-#[path = "../src/generated_protocol.rs"]
-mod generated_protocol;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/json_rpc.rs"]
 mod json_rpc;
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/limits.rs"]
 mod limits;
 // macOS-only: `filesystem`/`plugins::host_dir` (included above) reference
@@ -39,9 +40,10 @@ mod metadata;
 #[allow(dead_code)]
 #[path = "../src/plugins/mod.rs"]
 mod plugins;
-#[allow(dead_code, clippy::enum_variant_names)]
-#[path = "../src/protocol.rs"]
-mod protocol;
+#[allow(dead_code, unused_imports, clippy::enum_variant_names)]
+mod protocol {
+    pub use secure_exec_sidecar_protocol::protocol::*;
+}
 #[allow(dead_code)]
 #[path = "../src/state.rs"]
 mod state;
@@ -52,8 +54,9 @@ mod tools;
 #[path = "../src/vm.rs"]
 mod vm;
 #[allow(dead_code, unused_imports)]
-#[path = "../src/wire.rs"]
-mod wire;
+mod wire {
+    pub use secure_exec_sidecar_protocol::wire::*;
+}
 
 // The unit tests include!d from src/service.rs reference crate::stdio::LocalBridge,
 // and stdio.rs in turn uses these crate-root re-exports (mirrored from lib.rs) so it
@@ -102,10 +105,11 @@ mod service {
             GuestRuntimeKind, HostCallbackResultResponse, MountDescriptor, MountPluginDescriptor,
             OpenSessionRequest, OwnershipScope, PatternPermissionRule, PatternPermissionRuleSet,
             PatternPermissionScope, PermissionMode, PermissionsPolicy,
-            RegisterHostCallbacksRequest, RegisteredHostCallbackDefinition, RequestFrame,
-            RequestPayload, ResponsePayload, RootFilesystemEntry, RootFilesystemEntryEncoding,
-            RootFilesystemEntryKind, SidecarPlacement, SidecarPlacementShared, SidecarRequestFrame,
-            SidecarRequestPayload, SidecarResponsePayload, WriteStdinRequest,
+            RegisterHostCallbacksRequest, RegisteredHostCallbackDefinition, RejectedResponse,
+            RequestFrame, RequestPayload, ResponsePayload, RootFilesystemEntry,
+            RootFilesystemEntryEncoding, RootFilesystemEntryKind, SessionOpenedResponse,
+            SidecarPlacement, SidecarPlacementShared, SidecarRequestFrame, SidecarRequestPayload,
+            SidecarResponsePayload, WriteStdinRequest,
         };
         use crate::state::{
             ActiveCipherSession, ActiveDiffieHellmanSession, ActiveEcdhSession, ActiveExecution,
@@ -654,21 +658,20 @@ ykAheWCsAteSEWVc0w==\n\
         fn cipher_session_handles_are_bounded() {
             let mut process = create_crypto_test_process();
             for index in 0..crate::execution::MAX_PER_PROCESS_STATE_HANDLES {
-                let context = openssl::symm::Crypter::new(
-                    openssl::symm::Cipher::aes_256_cbc(),
-                    openssl::symm::Mode::Encrypt,
+                let context = crate::crypto_cipher::StreamCipherSession::new(
+                    "aes-256-cbc",
                     &[0_u8; 32],
                     Some(&[0_u8; 16]),
+                    false,
+                    true,
+                    None,
+                    None,
+                    16,
                 )
                 .expect("create cipher context");
-                process.cipher_sessions.insert(
-                    index as u64,
-                    ActiveCipherSession {
-                        algorithm: String::from("aes-256-cbc"),
-                        auth_tag_len: 0,
-                        context,
-                    },
-                );
+                process
+                    .cipher_sessions
+                    .insert(index as u64, ActiveCipherSession { context });
             }
 
             let error = crate::execution::service_javascript_crypto_sync_rpc(
@@ -2075,6 +2078,130 @@ ykAheWCsAteSEWVc0w==\n\
                 length = message.len() + 1,
             ))
             .expect("compile wasm stdout fixture")
+        }
+
+        fn wat_escape_ascii(input: &str) -> String {
+            let mut escaped = String::new();
+            for ch in input.chars() {
+                match ch {
+                    '\\' => escaped.push_str("\\\\"),
+                    '"' => escaped.push_str("\\\""),
+                    '\n' => escaped.push_str("\\n"),
+                    '\r' => escaped.push_str("\\0d"),
+                    _ => escaped.push(ch),
+                }
+            }
+            escaped
+        }
+
+        fn wasm_expect_read_errno_module(path: &str, expected_errno: u32) -> Vec<u8> {
+            wat::parse_str(format!(
+                r#"
+(module
+  (type $path_open_t (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (type $fd_read_t (func (param i32 i32 i32 i32) (result i32)))
+  (type $fd_close_t (func (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_open" (func $path_open (type $path_open_t)))
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (type $fd_read_t)))
+  (import "wasi_snapshot_preview1" "fd_close" (func $fd_close (type $fd_close_t)))
+  (memory (export "memory") 1)
+  (data (i32.const 64) "{path}")
+  (func $_start (export "_start")
+    (local $errno i32)
+    (local $fd i32)
+    (local.set $errno
+      (call $path_open
+        (i32.const 3)
+        (i32.const 0)
+        (i32.const 64)
+        (i32.const {path_len})
+        (i32.const 0)
+        (i64.const 2)
+        (i64.const 2)
+        (i32.const 0)
+        (i32.const 8)
+      )
+    )
+    (if
+      (i32.ne
+        (local.get $errno)
+        (i32.const 0)
+      )
+      (then unreachable)
+    )
+    (local.set $fd (i32.load (i32.const 8)))
+    (i32.store (i32.const 16) (i32.const 128))
+    (i32.store (i32.const 20) (i32.const 8))
+    (local.set $errno
+      (call $fd_read
+        (local.get $fd)
+        (i32.const 16)
+        (i32.const 1)
+        (i32.const 24)
+      )
+    )
+    (if
+      (i32.ne
+        (local.get $errno)
+        (i32.const {expected_errno})
+      )
+      (then unreachable)
+    )
+    (drop (call $fd_close (local.get $fd)))
+  )
+)
+"#,
+                path = wat_escape_ascii(path),
+                path_len = path.len(),
+            ))
+            .expect("compile wasm read errno fixture")
+        }
+
+        fn wasm_expect_write_open_errno_module(path: &str, expected_errno: u32) -> Vec<u8> {
+            wat::parse_str(format!(
+                r#"
+(module
+  (type $path_open_t (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (type $fd_close_t (func (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_open" (func $path_open (type $path_open_t)))
+  (import "wasi_snapshot_preview1" "fd_close" (func $fd_close (type $fd_close_t)))
+  (memory (export "memory") 1)
+  (data (i32.const 64) "{path}")
+  (func $_start (export "_start")
+    (local $errno i32)
+    (local.set $errno
+      (call $path_open
+        (i32.const 3)
+        (i32.const 0)
+        (i32.const 64)
+        (i32.const {path_len})
+        (i32.const 1)
+        (i64.const 64)
+        (i64.const 64)
+        (i32.const 0)
+        (i32.const 8)
+      )
+    )
+    (if
+      (i32.ne
+        (local.get $errno)
+        (i32.const {expected_errno})
+      )
+      (then unreachable)
+    )
+    (if
+      (i32.eq (local.get $errno) (i32.const 0))
+      (then
+        (drop (call $fd_close (i32.load (i32.const 8))))
+      )
+    )
+  )
+)
+"#,
+                path = wat_escape_ascii(path),
+                path_len = path.len(),
+            ))
+            .expect("compile wasm write-open errno fixture")
         }
 
         fn start_fake_wasm_process(
@@ -7475,6 +7602,64 @@ ykAheWCsAteSEWVc0w==\n\
         }
 
         #[test]
+        fn bridge_permissions_map_readlink_operations_to_readlink_access() {
+            let bridge = SharedBridge::new(RecordingBridge::default());
+            let permissions = bridge_permissions(bridge.clone(), "vm-readlink");
+            let check = permissions
+                .filesystem
+                .as_ref()
+                .expect("filesystem permission callback");
+
+            let decision = check(&FsAccessRequest {
+                vm_id: String::from("ignored-by-bridge"),
+                op: FsOperation::ReadLink,
+                path: String::from("/workspace/link.txt"),
+            });
+            assert!(decision.allow);
+
+            let recorded = bridge
+                .inspect(|bridge| bridge.filesystem_permission_requests.clone())
+                .expect("inspect bridge");
+            assert_eq!(
+                recorded,
+                vec![FilesystemPermissionRequest {
+                    vm_id: String::from("vm-readlink"),
+                    path: String::from("/workspace/link.txt"),
+                    access: FilesystemAccess::ReadLink,
+                }]
+            );
+        }
+
+        #[test]
+        fn bridge_permissions_map_truncate_operations_to_truncate_access() {
+            let bridge = SharedBridge::new(RecordingBridge::default());
+            let permissions = bridge_permissions(bridge.clone(), "vm-truncate");
+            let check = permissions
+                .filesystem
+                .as_ref()
+                .expect("filesystem permission callback");
+
+            let decision = check(&FsAccessRequest {
+                vm_id: String::from("ignored-by-bridge"),
+                op: FsOperation::Truncate,
+                path: String::from("/workspace/file.txt"),
+            });
+            assert!(decision.allow);
+
+            let recorded = bridge
+                .inspect(|bridge| bridge.filesystem_permission_requests.clone())
+                .expect("inspect bridge");
+            assert_eq!(
+                recorded,
+                vec![FilesystemPermissionRequest {
+                    vm_id: String::from("vm-truncate"),
+                    path: String::from("/workspace/file.txt"),
+                    access: FilesystemAccess::Truncate,
+                }]
+            );
+        }
+
+        #[test]
         fn bridge_permissions_fail_closed_for_missing_mount_sensitive_policy() {
             let bridge = SharedBridge::new(RecordingBridge::default());
             let permissions = bridge_permissions(bridge, "vm-mount-sensitive");
@@ -7822,7 +8007,10 @@ ykAheWCsAteSEWVc0w==\n\
                 .get(&vm_id)
                 .cloned()
                 .expect("vm permissions tracked");
-            assert_eq!(stored_permissions, PermissionsPolicy::deny_all());
+            assert_eq!(
+                stored_permissions,
+                secure_exec_sidecar_core::permissions::deny_all_policy()
+            );
             assert_eq!(
                 sidecar
                     .vms
@@ -7830,7 +8018,7 @@ ykAheWCsAteSEWVc0w==\n\
                     .expect("configured vm")
                     .configuration
                     .permissions,
-                PermissionsPolicy::deny_all()
+                secure_exec_sidecar_core::permissions::deny_all_policy()
             );
 
             let permission_check_count_before_write = sidecar
@@ -7922,10 +8110,16 @@ ykAheWCsAteSEWVc0w==\n\
                 .get(&vm_id)
                 .cloned()
                 .expect("vm permissions tracked");
-            assert_eq!(stored_permissions, PermissionsPolicy::deny_all());
+            assert_eq!(
+                stored_permissions,
+                secure_exec_sidecar_core::permissions::deny_all_policy()
+            );
 
             let vm = sidecar.vms.get(&vm_id).expect("configured vm");
-            assert_eq!(vm.configuration.permissions, PermissionsPolicy::deny_all());
+            assert_eq!(
+                vm.configuration.permissions,
+                secure_exec_sidecar_core::permissions::deny_all_policy()
+            );
             assert_eq!(vm.toolkits, toolkits_before);
             assert_eq!(vm.command_guest_paths, command_paths_before);
         }
@@ -8094,7 +8288,10 @@ ykAheWCsAteSEWVc0w==\n\
                 .bridge
                 .set_vm_permissions(
                     &vm_id,
-                    &capability_permissions(&[("fs.write", PermissionMode::Deny)]),
+                    &crate::wire::permissions_policy_config_from_wire(capability_permissions(&[(
+                        "fs.write",
+                        PermissionMode::Deny,
+                    )])),
                 )
                 .expect("set vm permissions");
 
@@ -8290,10 +8487,10 @@ ykAheWCsAteSEWVc0w==\n\
                 .bridge
                 .set_vm_permissions(
                     &vm_id,
-                    &capability_permissions(&[
+                    &crate::wire::permissions_policy_config_from_wire(capability_permissions(&[
                         ("fs.write", PermissionMode::Allow),
                         ("fs.mount_sensitive", PermissionMode::Deny),
-                    ]),
+                    ])),
                 )
                 .expect("set vm permissions");
 
@@ -8881,6 +9078,135 @@ ykAheWCsAteSEWVc0w==\n\
                 "stdout B leaked A marker: {stdout_b:?}"
             );
         }
+        fn wasm_path_open_read_goes_through_kernel_filesystem_permissions() {
+            let cwd = temp_dir("secure-exec-sidecar-wasm-fs-permissions");
+            write_fixture(
+                &cwd.join("guest.wasm"),
+                wasm_expect_read_errno_module("secret.txt", 2),
+            );
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                capability_permissions(&[
+                    ("fs", PermissionMode::Allow),
+                    ("fs.read", PermissionMode::Deny),
+                    ("child_process.spawn", PermissionMode::Allow),
+                ]),
+            )
+            .expect("create vm");
+
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("wasm vm")
+                .kernel
+                .filesystem_mut()
+                .write_file("/secret.txt", b"should-not-read".to_vec())
+                .expect("seed denied-read fixture");
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    6,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::Execute(crate::protocol::ExecuteRequest {
+                        process_id: String::from("proc-wasm-fs-permission"),
+                        command: None,
+                        runtime: Some(GuestRuntimeKind::WebAssembly),
+                        entrypoint: Some(cwd.join("guest.wasm").to_string_lossy().into_owned()),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        cwd: Some(String::from("/")),
+                        wasm_permission_tier: None,
+                    }),
+                ))
+                .expect("dispatch wasm execute");
+
+            match response.response.payload {
+                ResponsePayload::ProcessStarted(response) => {
+                    assert_eq!(response.process_id, "proc-wasm-fs-permission");
+                }
+                other => panic!("unexpected execute response: {other:?}"),
+            }
+
+            let (stdout, stderr, exit_code) =
+                drain_process_output(&mut sidecar, &vm_id, "proc-wasm-fs-permission");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout} stderr: {stderr}");
+            assert!(stdout.is_empty(), "unexpected stdout: {stdout}");
+            assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+        }
+
+        fn wasm_path_open_write_goes_through_kernel_filesystem_permissions() {
+            let cwd = temp_dir("secure-exec-sidecar-wasm-fs-write-permissions");
+            write_fixture(
+                &cwd.join("guest.wasm"),
+                wasm_expect_write_open_errno_module("created.txt", 2),
+            );
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                capability_permissions(&[
+                    ("fs", PermissionMode::Allow),
+                    ("fs.read", PermissionMode::Allow),
+                    ("fs.write", PermissionMode::Deny),
+                    ("child_process.spawn", PermissionMode::Allow),
+                ]),
+            )
+            .expect("create vm");
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    6,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::Execute(crate::protocol::ExecuteRequest {
+                        process_id: String::from("proc-wasm-fs-write-permission"),
+                        command: None,
+                        runtime: Some(GuestRuntimeKind::WebAssembly),
+                        entrypoint: Some(cwd.join("guest.wasm").to_string_lossy().into_owned()),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        cwd: Some(String::from("/")),
+                        wasm_permission_tier: None,
+                    }),
+                ))
+                .expect("dispatch wasm execute");
+
+            match response.response.payload {
+                ResponsePayload::ProcessStarted(response) => {
+                    assert_eq!(response.process_id, "proc-wasm-fs-write-permission");
+                }
+                other => panic!("unexpected execute response: {other:?}"),
+            }
+
+            let (stdout, stderr, exit_code) =
+                drain_process_output(&mut sidecar, &vm_id, "proc-wasm-fs-write-permission");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout} stderr: {stderr}");
+            assert!(stdout.is_empty(), "unexpected stdout: {stdout}");
+            assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+            assert!(
+                !sidecar
+                    .vms
+                    .get_mut(&vm_id)
+                    .expect("wasm vm")
+                    .kernel
+                    .filesystem_mut()
+                    .exists("/created.txt")
+                    .expect("check denied-created file"),
+                "denied WASI write open should not create a kernel file"
+            );
+        }
+
         fn wasm_fd_write_sync_rpc_routes_stdout_into_kernel_pty() {
             let cwd = temp_dir("secure-exec-sidecar-wasm-stdio-pty");
             write_fixture(&cwd.join("guest.wasm"), wasm_stdout_module("PTY_MARKER"));
@@ -11258,6 +11584,503 @@ await new Promise(() => {});
             };
             cleanup_fake_runtime_process(process);
         }
+        #[test]
+        fn javascript_crypto_basic_sync_rpcs_match_shared_conformance_fixture() {
+            #[derive(serde::Deserialize)]
+            struct CryptoScryptFixture {
+                #[serde(rename = "N")]
+                n: u64,
+                r: u32,
+                p: u32,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct CryptoAesCbcFixture {
+                algorithm: String,
+                plaintext: String,
+                #[serde(rename = "keyHex")]
+                key_hex: String,
+                #[serde(rename = "ivHex")]
+                iv_hex: String,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct CryptoAesGcmFixture {
+                algorithm: String,
+                plaintext: String,
+                aad: String,
+                #[serde(rename = "keyHex")]
+                key_hex: String,
+                #[serde(rename = "ivHex")]
+                iv_hex: String,
+                #[serde(rename = "authTagLength")]
+                auth_tag_length: usize,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct CryptoExpectedFixture {
+                md5: String,
+                sha224: String,
+                sha256: String,
+                sha384: String,
+                #[serde(rename = "hmacSha256")]
+                hmac_sha256: String,
+                #[serde(rename = "hmacSha384")]
+                hmac_sha384: String,
+                #[serde(rename = "pbkdf2Sha256")]
+                pbkdf2_sha256: String,
+                #[serde(rename = "pbkdf2Sha384")]
+                pbkdf2_sha384: String,
+                scrypt: String,
+                #[serde(rename = "aes256CbcCiphertext")]
+                aes256_cbc_ciphertext: String,
+                #[serde(rename = "aes256GcmCiphertext")]
+                aes256_gcm_ciphertext: String,
+                #[serde(rename = "aes256GcmAuthTag")]
+                aes256_gcm_auth_tag: String,
+                #[serde(rename = "aes256GcmWebCryptoCiphertext")]
+                aes256_gcm_web_crypto_ciphertext: String,
+                primes: CryptoPrimeFixture,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct CryptoPrimeFixture {
+                bits: u64,
+                #[serde(rename = "safeBits")]
+                safe_bits: u64,
+                #[serde(rename = "bufferBits")]
+                buffer_bits: u64,
+                #[serde(rename = "bufferByteLength")]
+                buffer_byte_length: usize,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct CryptoBasicFixture {
+                message: String,
+                #[serde(rename = "hmacKey")]
+                hmac_key: String,
+                password: String,
+                salt: String,
+                iterations: u32,
+                #[serde(rename = "keyLength")]
+                key_length: u32,
+                scrypt: CryptoScryptFixture,
+                #[serde(rename = "aesCbc")]
+                aes_cbc: CryptoAesCbcFixture,
+                #[serde(rename = "aesGcm")]
+                aes_gcm: CryptoAesGcmFixture,
+                expected: CryptoExpectedFixture,
+            }
+
+            fn decode_hex(input: &str) -> Vec<u8> {
+                input
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        u8::from_str_radix(std::str::from_utf8(chunk).expect("hex utf8"), 16)
+                            .expect("hex byte")
+                    })
+                    .collect()
+            }
+
+            fn decode_base64_response(value: Value) -> String {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(value.as_str().expect("crypto response string"))
+                    .expect("crypto response base64");
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            }
+
+            fn base64_arg(value: &str) -> Value {
+                json!(base64::engine::general_purpose::STANDARD.encode(value))
+            }
+
+            fn base64_bytes_arg(value: &[u8]) -> Value {
+                json!(base64::engine::general_purpose::STANDARD.encode(value))
+            }
+
+            fn base64_bytes(value: &[u8]) -> String {
+                base64::engine::general_purpose::STANDARD.encode(value)
+            }
+
+            fn parse_json_string(value: Value) -> Value {
+                serde_json::from_str(value.as_str().expect("crypto response string"))
+                    .expect("crypto response json")
+            }
+
+            fn bit_len_decimal(value: &Value) -> usize {
+                let mut number = value
+                    .as_str()
+                    .expect("prime decimal string")
+                    .parse::<u128>()
+                    .expect("prime decimal fits fixture range");
+                let mut bits = 0;
+                while number > 0 {
+                    bits += 1;
+                    number >>= 1;
+                }
+                bits
+            }
+
+            let fixture: CryptoBasicFixture = serde_json::from_str(include_str!(
+                "../../../tests/fixtures/crypto-basic-conformance.json"
+            ))
+            .expect("crypto fixture");
+            let mut process = create_crypto_test_process();
+            let mut next_id = 1;
+
+            for (algorithm, expected) in [
+                ("md5", fixture.expected.md5.as_str()),
+                ("sha224", fixture.expected.sha224.as_str()),
+                ("sha256", fixture.expected.sha256.as_str()),
+                ("sha384", fixture.expected.sha384.as_str()),
+            ] {
+                let response = crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id,
+                        method: String::from("crypto.hashDigest"),
+                        args: vec![json!(algorithm), base64_arg(&fixture.message)],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("hashDigest response");
+                next_id += 1;
+                assert_eq!(decode_base64_response(response), expected, "{algorithm}");
+            }
+
+            for (algorithm, expected) in [
+                ("sha256", fixture.expected.hmac_sha256.as_str()),
+                ("sha384", fixture.expected.hmac_sha384.as_str()),
+            ] {
+                let response = crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id,
+                        method: String::from("crypto.hmacDigest"),
+                        args: vec![
+                            json!(algorithm),
+                            base64_arg(&fixture.hmac_key),
+                            base64_arg(&fixture.message),
+                        ],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("hmacDigest response");
+                next_id += 1;
+                assert_eq!(decode_base64_response(response), expected, "{algorithm}");
+            }
+
+            for (algorithm, expected) in [
+                ("sha256", fixture.expected.pbkdf2_sha256.as_str()),
+                ("sha384", fixture.expected.pbkdf2_sha384.as_str()),
+            ] {
+                let response = crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id,
+                        method: String::from("crypto.pbkdf2"),
+                        args: vec![
+                            base64_arg(&fixture.password),
+                            base64_arg(&fixture.salt),
+                            json!(fixture.iterations),
+                            json!(fixture.key_length),
+                            json!(algorithm),
+                        ],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("pbkdf2 response");
+                next_id += 1;
+                assert_eq!(decode_base64_response(response), expected, "{algorithm}");
+            }
+
+            let scrypt_options = json!({
+                "N": fixture.scrypt.n,
+                "r": fixture.scrypt.r,
+                "p": fixture.scrypt.p,
+            })
+            .to_string();
+            let scrypt = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: next_id,
+                    method: String::from("crypto.scrypt"),
+                    args: vec![
+                        base64_arg(&fixture.password),
+                        base64_arg(&fixture.salt),
+                        json!(fixture.key_length),
+                        json!(scrypt_options),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("scrypt response");
+            assert_eq!(decode_base64_response(scrypt), fixture.expected.scrypt);
+
+            let cipher = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: next_id + 1,
+                    method: String::from("crypto.cipheriv"),
+                    args: vec![
+                        json!(fixture.aes_cbc.algorithm.clone()),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_cbc.key_hex)),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_cbc.iv_hex)),
+                        base64_arg(&fixture.aes_cbc.plaintext),
+                        json!("{}"),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("cipheriv response");
+            let cipher_payload: Value =
+                serde_json::from_str(cipher.as_str().expect("cipheriv string response"))
+                    .expect("cipheriv json");
+            let ciphertext = cipher_payload["data"].as_str().expect("cipher data");
+            assert_eq!(
+                decode_base64_response(Value::String(ciphertext.to_string())),
+                fixture.expected.aes256_cbc_ciphertext
+            );
+
+            let decipher = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: next_id + 2,
+                    method: String::from("crypto.decipheriv"),
+                    args: vec![
+                        json!(fixture.aes_cbc.algorithm.clone()),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_cbc.key_hex)),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_cbc.iv_hex)),
+                        json!(ciphertext),
+                        json!("{}"),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("decipheriv response");
+            let plaintext = base64::engine::general_purpose::STANDARD
+                .decode(decipher.as_str().expect("decipher response"))
+                .expect("decipher base64");
+            assert_eq!(plaintext, fixture.aes_cbc.plaintext.as_bytes());
+
+            let gcm_options = json!({
+                "aad": base64::engine::general_purpose::STANDARD.encode(&fixture.aes_gcm.aad),
+                "authTagLength": fixture.aes_gcm.auth_tag_length,
+            })
+            .to_string();
+            let gcm_cipher = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: next_id + 3,
+                    method: String::from("crypto.cipheriv"),
+                    args: vec![
+                        json!(fixture.aes_gcm.algorithm.clone()),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_gcm.key_hex)),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_gcm.iv_hex)),
+                        base64_arg(&fixture.aes_gcm.plaintext),
+                        json!(gcm_options),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("gcm cipheriv response");
+            let gcm_payload: Value =
+                serde_json::from_str(gcm_cipher.as_str().expect("gcm cipheriv string response"))
+                    .expect("gcm cipheriv json");
+            let gcm_ciphertext = gcm_payload["data"].as_str().expect("gcm cipher data");
+            let gcm_auth_tag = gcm_payload["authTag"].as_str().expect("gcm auth tag");
+            assert_eq!(
+                decode_base64_response(Value::String(gcm_ciphertext.to_string())),
+                fixture.expected.aes256_gcm_ciphertext
+            );
+            assert_eq!(
+                decode_base64_response(Value::String(gcm_auth_tag.to_string())),
+                fixture.expected.aes256_gcm_auth_tag
+            );
+
+            let gcm_decipher_options = json!({
+                "aad": base64::engine::general_purpose::STANDARD.encode(&fixture.aes_gcm.aad),
+                "authTag": gcm_auth_tag,
+                "authTagLength": fixture.aes_gcm.auth_tag_length,
+            })
+            .to_string();
+            let gcm_decipher = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: next_id + 4,
+                    method: String::from("crypto.decipheriv"),
+                    args: vec![
+                        json!(fixture.aes_gcm.algorithm.clone()),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_gcm.key_hex)),
+                        base64_bytes_arg(&decode_hex(&fixture.aes_gcm.iv_hex)),
+                        json!(gcm_ciphertext),
+                        json!(gcm_decipher_options),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("gcm decipheriv response");
+            let gcm_plaintext = base64::engine::general_purpose::STANDARD
+                .decode(gcm_decipher.as_str().expect("gcm decipher response"))
+                .expect("gcm decipher base64");
+            assert_eq!(gcm_plaintext, fixture.aes_gcm.plaintext.as_bytes());
+
+            let aes_gcm_key = decode_hex(&fixture.aes_gcm.key_hex);
+            let aes_gcm_iv = decode_hex(&fixture.aes_gcm.iv_hex);
+            let subtle_imported_key = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id + 5,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "importKey",
+                            "format": "raw",
+                            "keyData": base64_bytes(&aes_gcm_key),
+                            "algorithm": { "name": "AES-GCM" },
+                            "extractable": false,
+                            "usages": ["encrypt", "decrypt"],
+                        }))
+                        .expect("serialize subtle importKey request"))],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("fixture crypto.subtle importKey response"),
+            )["key"]
+                .clone();
+            let subtle_algorithm = json!({
+                "name": "AES-GCM",
+                "iv": base64_bytes(&aes_gcm_iv),
+                "additionalData": base64_bytes(fixture.aes_gcm.aad.as_bytes()),
+                "tagLength": fixture.aes_gcm.auth_tag_length * 8,
+            });
+            let subtle_encrypted = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id + 6,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "encrypt",
+                            "algorithm": subtle_algorithm,
+                            "key": subtle_imported_key,
+                            "data": base64_bytes(fixture.aes_gcm.plaintext.as_bytes()),
+                        }))
+                        .expect("serialize subtle encrypt request"))],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("fixture crypto.subtle encrypt response"),
+            );
+            let subtle_ciphertext = subtle_encrypted["data"]
+                .as_str()
+                .expect("subtle encrypted data");
+            assert_eq!(
+                decode_base64_response(Value::String(subtle_ciphertext.to_string())),
+                fixture.expected.aes256_gcm_web_crypto_ciphertext
+            );
+            let subtle_decrypted = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id + 7,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "decrypt",
+                            "algorithm": subtle_algorithm,
+                            "key": subtle_imported_key,
+                            "data": subtle_ciphertext,
+                        }))
+                        .expect("serialize subtle decrypt request"))],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("fixture crypto.subtle decrypt response"),
+            );
+            let subtle_plaintext = base64::engine::general_purpose::STANDARD
+                .decode(
+                    subtle_decrypted["data"]
+                        .as_str()
+                        .expect("subtle decrypted data"),
+                )
+                .expect("subtle decrypt base64");
+            assert_eq!(subtle_plaintext, fixture.aes_gcm.plaintext.as_bytes());
+
+            let generated_prime = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id + 8,
+                        method: String::from("crypto.generatePrimeSync"),
+                        args: vec![
+                            json!(fixture.expected.primes.bits),
+                            json!(r#"{"hasOptions":true,"options":{"bigint":true}}"#),
+                        ],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("generatePrimeSync bigint response"),
+            );
+            assert_eq!(generated_prime["__type"], json!("bigint"));
+            assert_eq!(
+                bit_len_decimal(&generated_prime["value"]),
+                fixture.expected.primes.bits as usize
+            );
+
+            let generated_safe_prime = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id + 9,
+                        method: String::from("crypto.generatePrimeSync"),
+                        args: vec![
+                            json!(fixture.expected.primes.safe_bits),
+                            json!(r#"{"hasOptions":true,"options":{"bigint":true,"safe":true}}"#),
+                        ],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("generatePrimeSync safe bigint response"),
+            );
+            assert_eq!(generated_safe_prime["__type"], json!("bigint"));
+            assert_eq!(
+                bit_len_decimal(&generated_safe_prime["value"]),
+                fixture.expected.primes.safe_bits as usize
+            );
+
+            let generated_prime_buffer = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut process,
+                    &JavascriptSyncRpcRequest {
+                        id: next_id + 10,
+                        method: String::from("crypto.generatePrimeSync"),
+                        args: vec![
+                            json!(fixture.expected.primes.buffer_bits),
+                            json!(r#"{"hasOptions":true,"options":{}}"#),
+                        ],
+                        raw_bytes_args: std::collections::HashMap::new(),
+                    },
+                )
+                .expect("generatePrimeSync buffer response"),
+            );
+            assert_eq!(generated_prime_buffer["__type"], json!("buffer"));
+            let generated_prime_buffer = base64::engine::general_purpose::STANDARD
+                .decode(
+                    generated_prime_buffer["value"]
+                        .as_str()
+                        .expect("prime buffer base64"),
+                )
+                .expect("prime buffer decode");
+            assert_eq!(
+                generated_prime_buffer.len(),
+                fixture.expected.primes.buffer_byte_length
+            );
+        }
+
+        #[test]
         fn javascript_crypto_basic_sync_rpcs_round_trip_through_sidecar() {
             fn decode_hex(input: &str) -> Vec<u8> {
                 input
@@ -11325,6 +12148,38 @@ await new Promise(() => {});
                 decode_hex("1d43407501651ea75bc63085f352f99bdcc6e364")
             );
 
+            let sha224 = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 8,
+                    method: String::from("crypto.hashDigest"),
+                    args: vec![json!("sha224"), json!("YWdlbnQtb3M=")],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("hashDigest response");
+            assert_eq!(
+                decode_base64_response(sha224),
+                decode_hex("eb0fa702ceaabc1849b424fb402cdb2a1cf07e1ec51e151873b397a0")
+            );
+
+            let sha384 = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 9,
+                    method: String::from("crypto.hashDigest"),
+                    args: vec![json!("sha384"), json!("YWdlbnQtb3M=")],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("hashDigest response");
+            assert_eq!(
+                decode_base64_response(sha384),
+                decode_hex(
+                    "68c265442956e3bae3ff6698ef43570023fd1060553d4d1aeaecee42186c6f94353a107d45e680bffb7ef2ad7f81e082"
+                )
+            );
+
             let md5 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
@@ -11359,6 +12214,25 @@ await new Promise(() => {});
                 decode_hex("c24fdd6215522cb3e716855135a1dec9402a3b13be243892c2192d17c57db3a3")
             );
 
+            let hmac_sha384 = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 10,
+                    method: String::from("crypto.hmacDigest"),
+                    args: vec![
+                        json!("sha384"),
+                        json!("YnJpZGdlLWtleQ=="),
+                        json!("YWdlbnQtb3M="),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("hmacDigest response");
+            assert_eq!(
+                decode_base64_response(hmac_sha384),
+                decode_hex("fe3cf09b6f8cf9b78849c4429f54eda460b8c99bb1569ae376a45bbe64386df38b16164387ee263f9fa1dc5ef24e6bcf")
+            );
+
             let pbkdf2 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
@@ -11378,6 +12252,27 @@ await new Promise(() => {});
             assert_eq!(
                 decode_base64_response(pbkdf2),
                 decode_hex("8e97a9f68ca2ebf44885a7a82d1ec3185cf2d6dcfde51a90278f793f9e57f0e8")
+            );
+
+            let pbkdf2_sha384 = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 11,
+                    method: String::from("crypto.pbkdf2"),
+                    args: vec![
+                        json!("aHVudGVyMg=="),
+                        json!("YWdlbnQtb3Mtc2FsdA=="),
+                        json!(1000),
+                        json!(32),
+                        json!("sha384"),
+                    ],
+                    raw_bytes_args: std::collections::HashMap::new(),
+                },
+            )
+            .expect("pbkdf2 response");
+            assert_eq!(
+                decode_base64_response(pbkdf2_sha384),
+                decode_hex("92c0016509e37027704e1c797e38d05d5ab49f0548e78073366889e2f7242be3")
             );
 
             let scrypt = crate::execution::service_javascript_crypto_sync_rpc(
@@ -17814,6 +18709,8 @@ console.log(JSON.stringify({
             command_resolution_executes_wasm_command_from_sidecar_path();
             wasm_command_timeout_is_enforced_by_sidecar_poll_path();
             wasm_fd_write_sync_rpc_keeps_stdout_isolated_per_vm();
+            wasm_path_open_read_goes_through_kernel_filesystem_permissions();
+            wasm_path_open_write_goes_through_kernel_filesystem_permissions();
             wasm_fd_write_sync_rpc_routes_stdout_into_kernel_pty();
             javascript_child_process_searches_path_for_mounted_wasm_commands();
             javascript_child_process_shell_mode_without_guest_sh_fails_loudly();
@@ -17944,6 +18841,16 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn aab_wasm_path_open_read_uses_kernel_filesystem_permissions() {
+            run_isolated_service_test("wasm-fs-permissions");
+        }
+
+        #[test]
+        fn aab_wasm_path_open_write_uses_kernel_filesystem_permissions() {
+            run_isolated_service_test("wasm-fs-write-permissions");
+        }
+
+        #[test]
         fn aad_http_socket_backed_server_rejects_oversized_incomplete_headers() {
             run_isolated_service_test("http-oversized-incomplete-header");
         }
@@ -18014,6 +18921,12 @@ console.log(JSON.stringify({
                 }
                 "wasm-command-timeout" => {
                     wasm_command_timeout_is_enforced_by_sidecar_poll_path();
+                }
+                "wasm-fs-permissions" => {
+                    wasm_path_open_read_goes_through_kernel_filesystem_permissions();
+                }
+                "wasm-fs-write-permissions" => {
+                    wasm_path_open_write_goes_through_kernel_filesystem_permissions();
                 }
                 "http-oversized-incomplete-header" => {
                     javascript_http_socket_backed_server_rejects_oversized_incomplete_headers();

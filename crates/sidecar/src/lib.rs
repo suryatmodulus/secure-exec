@@ -4,10 +4,11 @@
 
 pub(crate) mod bootstrap;
 pub(crate) mod bridge;
+// Pure-Rust AES cipher primitives (RustCrypto) replacing the OpenSSL `Crypter`.
+pub(crate) mod crypto_cipher;
 pub(crate) mod execution;
 pub mod extension;
 pub(crate) mod filesystem;
-pub mod generated_protocol;
 #[allow(dead_code)]
 pub(crate) mod json_rpc;
 pub mod limits;
@@ -15,13 +16,12 @@ pub mod limits;
 pub(crate) mod macos_fs;
 pub(crate) mod metadata;
 pub(crate) mod plugins;
-pub mod protocol;
 pub mod service;
 pub(crate) mod state;
 pub mod stdio;
 pub(crate) mod tools;
 pub(crate) mod vm;
-pub mod wire;
+pub use secure_exec_sidecar_protocol::{generated_protocol, protocol, wire};
 
 pub use extension::{
     Extension, ExtensionContext, ExtensionFuture, ExtensionInterruptRequest,

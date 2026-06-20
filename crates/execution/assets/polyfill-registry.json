@@ -33,6 +33,7 @@
         "dgram",
         "diagnostics_channel",
         "dns",
+        "dns/promises",
         "fs",
         "fs/promises",
         "http",

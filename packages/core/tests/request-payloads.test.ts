@@ -50,9 +50,7 @@ describe("request payload conversion", () => {
 					mode: "read-only",
 					disableDefaultBaseLayer: true,
 					lowers: [],
-					bootstrapEntries: [
-						{ path: "/tmp", kind: "directory", executable: false },
-					],
+					bootstrapEntries: [{ path: "/tmp", kind: "directory" }],
 				},
 				permissions: { fs: "allow" },
 				loopbackExemptPorts: [],
@@ -60,20 +58,15 @@ describe("request payload conversion", () => {
 		});
 		expect(createVmPayload).toMatchObject({
 			tag: "CreateVmRequest",
+			val: {
+				runtime: protocol.GuestRuntimeKind.JavaScript,
+			},
 		});
-		expect(
-			JSON.parse(
-				(
-					createVmPayload as Extract<
-						protocol.RequestPayload,
-						{ tag: "CreateVmRequest" }
-					>
-				).val.config,
-			),
-		).toMatchObject({
+		expect(JSON.parse(createVmPayload.val.config)).toMatchObject({
 			rootFilesystem: {
 				mode: "read-only",
 				disableDefaultBaseLayer: true,
+				bootstrapEntries: [{ path: "/tmp", kind: "directory" }],
 			},
 			permissions: { fs: "allow" },
 		});
@@ -211,6 +204,27 @@ describe("request payload conversion", () => {
 				env: new Map([["A", "1"]]),
 				cwd: null,
 				wasmPermissionTier: protocol.WasmPermissionTier.Isolated,
+			},
+		});
+	});
+
+	it("maps guest kernel call requests", () => {
+		const payload = new TextEncoder().encode(
+			JSON.stringify({ host: "127.0.0.1", port: 39221 }),
+		).buffer;
+		expect(
+			toGeneratedRequestPayload({
+				type: "guest_kernel_call",
+				execution_id: "exec-1",
+				operation: "net.connect",
+				payload,
+			}),
+		).toEqual({
+			tag: "GuestKernelCallRequest",
+			val: {
+				executionId: "exec-1",
+				operation: "net.connect",
+				payload,
 			},
 		});
 	});

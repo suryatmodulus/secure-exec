@@ -6,7 +6,7 @@ use super::vfs::{
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub trait MountedFileSystem: Any {
     fn as_any(&self) -> &dyn Any;

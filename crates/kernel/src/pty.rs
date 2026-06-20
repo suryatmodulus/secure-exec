@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 pub const MAX_PTY_BUFFER_BYTES: usize = 65_536;
 pub const MAX_CANON: usize = 4_096;
@@ -476,6 +477,14 @@ impl PtyManager {
 
                     let processed = process_output(&pty.termios, payload);
                     deliver_output(pty, waiters, &processed, false)?;
+                    // Terminal emulation: answer a Device Status Report cursor-position
+                    // query (ESC[6n) with a cursor report (ESC[row;colR) on the slave's
+                    // input. A real terminal emulator on the master side does this; the
+                    // converged PTY may have no such emulator, so crossterm/reedline guests
+                    // that probe the cursor at startup would otherwise stall and abort.
+                    if contains_dsr_cursor_query(payload) {
+                        deliver_input(pty, waiters, b"\x1b[1;1R")?;
+                    }
                 }
             }
         }
@@ -881,6 +890,13 @@ impl PtyManager {
     }
 }
 
+/// True if `data` contains a Device Status Report cursor-position query
+/// (`ESC [ 6 n`). Used to drive the converged PTY's terminal-style auto-reply.
+fn contains_dsr_cursor_query(data: &[u8]) -> bool {
+    const QUERY: &[u8] = b"\x1b[6n";
+    data.windows(QUERY.len()).any(|window| window == QUERY)
+}
+
 fn process_output(termios: &Termios, data: &[u8]) -> Vec<u8> {
     if !termios.opost || !termios.onlcr || !data.contains(&b'\n') {
         return data.to_vec();
@@ -927,8 +943,17 @@ fn process_input(
                 if pty.termios.icanon {
                     pty.line_buffer.clear();
                 }
-                if pty.foreground_pgid > 0 {
+                let has_foreground_process_group = pty.foreground_pgid > 0;
+                if pty.termios.echo {
+                    deliver_output(pty, waiters, &echo_control_byte(byte), true)?;
+                    if !has_foreground_process_group && pty.termios.icanon {
+                        deliver_output(pty, waiters, b"\r\n", true)?;
+                    }
+                }
+                if has_foreground_process_group {
                     signals.push((pty.foreground_pgid, signal));
+                } else if pty.termios.icanon {
+                    deliver_input(pty, waiters, b"\n")?;
                 }
                 continue;
             }
@@ -1095,6 +1120,16 @@ fn signal_for_byte(termios: &Termios, byte: u8) -> Option<i32> {
         return Some(SIGTSTP);
     }
     None
+}
+
+fn echo_control_byte(byte: u8) -> Vec<u8> {
+    if byte < 0x20 {
+        vec![b'^', byte + 0x40]
+    } else if byte == 0x7f {
+        b"^?".to_vec()
+    } else {
+        vec![byte]
+    }
 }
 
 fn buffer_size(buffer: &VecDeque<Vec<u8>>) -> usize {

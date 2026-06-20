@@ -535,7 +535,7 @@ pub fn is_supported_root_filesystem_snapshot_format(format: &str) -> bool {
         || format == LEGACY_AGENTOS_ROOT_FILESYSTEM_SNAPSHOT_FORMAT
 }
 
-fn load_bundled_base_snapshot_with_limits(
+pub fn load_bundled_base_snapshot_with_limits(
     limits: &RootFilesystemImportLimits,
 ) -> Result<RootFilesystemSnapshot, RootFilesystemError> {
     validate_encoded_snapshot_size(

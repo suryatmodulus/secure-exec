@@ -3041,6 +3041,252 @@ console.log(JSON.stringify({
     );
 }
 
+fn crypto_basic_fixture_matches_shared_expected_impl() {
+    assert_node_available();
+
+    let fixture_json = include_str!("../../../tests/fixtures/crypto-basic-conformance.json");
+    let fixture: Value = serde_json::from_str(fixture_json).expect("parse crypto fixture");
+    let script = r#"
+import crypto from "node:crypto";
+
+const fixture = __CRYPTO_FIXTURE__;
+const pbkdf2Hex = await new Promise((resolve, reject) => {
+  crypto.pbkdf2(fixture.password, fixture.salt, fixture.iterations, fixture.keyLength, "sha256", (error, value) => {
+    if (error) reject(error);
+    else resolve(value.toString("hex"));
+  });
+});
+const pbkdf2Sha384Hex = await new Promise((resolve, reject) => {
+  crypto.pbkdf2(fixture.password, fixture.salt, fixture.iterations, fixture.keyLength, "sha384", (error, value) => {
+    if (error) reject(error);
+    else resolve(value.toString("hex"));
+  });
+});
+const scryptHex = await new Promise((resolve, reject) => {
+  crypto.scrypt(fixture.password, fixture.salt, fixture.keyLength, fixture.scrypt, (error, value) => {
+    if (error) reject(error);
+    else resolve(value.toString("hex"));
+  });
+});
+const generatedPrime = crypto.generatePrimeSync(fixture.expected.primes.bits, { bigint: true });
+const generatedSafePrime = crypto.generatePrimeSync(fixture.expected.primes.safeBits, {
+  bigint: true,
+  safe: true,
+});
+const generatedPrimeBuffer = crypto.generatePrimeSync(fixture.expected.primes.bufferBits);
+const bytesFromHex = (hex) => Uint8Array.from(hex.match(/../g).map((byte) => parseInt(byte, 16)));
+const bytesToHex = (bytes) => Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+const aesCbcKey = Buffer.from(fixture.aesCbc.keyHex, "hex");
+const aesCbcIv = Buffer.from(fixture.aesCbc.ivHex, "hex");
+const cipher = crypto.createCipheriv(fixture.aesCbc.algorithm, aesCbcKey, aesCbcIv);
+const aes256CbcCiphertext = cipher.update(fixture.aesCbc.plaintext, "utf8", "hex") + cipher.final("hex");
+const decipher = crypto.createDecipheriv(fixture.aesCbc.algorithm, aesCbcKey, aesCbcIv);
+const aes256CbcPlaintext = decipher.update(aes256CbcCiphertext, "hex", "utf8") + decipher.final("utf8");
+const aesGcmKey = Buffer.from(fixture.aesGcm.keyHex, "hex");
+const aesGcmIv = Buffer.from(fixture.aesGcm.ivHex, "hex");
+const aesGcmAad = Buffer.from(fixture.aesGcm.aad);
+const gcmCipher = crypto.createCipheriv(fixture.aesGcm.algorithm, aesGcmKey, aesGcmIv, {
+  authTagLength: fixture.aesGcm.authTagLength,
+});
+gcmCipher.setAAD(aesGcmAad);
+const aes256GcmCiphertext = gcmCipher.update(fixture.aesGcm.plaintext, "utf8", "hex") + gcmCipher.final("hex");
+const aes256GcmAuthTag = gcmCipher.getAuthTag().toString("hex");
+const gcmDecipher = crypto.createDecipheriv(fixture.aesGcm.algorithm, aesGcmKey, aesGcmIv, {
+  authTagLength: fixture.aesGcm.authTagLength,
+});
+gcmDecipher.setAAD(aesGcmAad);
+gcmDecipher.setAuthTag(bytesFromHex(aes256GcmAuthTag));
+const aes256GcmPlaintext = gcmDecipher.update(aes256GcmCiphertext, "hex", "utf8") + gcmDecipher.final("utf8");
+const subtleKey = await crypto.subtle.importKey("raw", aesGcmKey, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+const subtleAlgorithm = {
+  name: "AES-GCM",
+  iv: aesGcmIv,
+  additionalData: aesGcmAad,
+  tagLength: fixture.aesGcm.authTagLength * 8,
+};
+const aes256GcmWebCryptoBytes = new Uint8Array(await crypto.subtle.encrypt(
+  subtleAlgorithm,
+  subtleKey,
+  Buffer.from(fixture.aesGcm.plaintext),
+));
+const aes256GcmWebCryptoCiphertext = bytesToHex(aes256GcmWebCryptoBytes);
+const aes256GcmWebCryptoPlaintext = Buffer.from(await crypto.subtle.decrypt(
+  subtleAlgorithm,
+  subtleKey,
+  aes256GcmWebCryptoBytes,
+)).toString("utf8");
+const importedPrivateKey = crypto.createPrivateKey(fixture.rsa.privatePem);
+const importedPublicKey = crypto.createPublicKey(fixture.rsa.publicPem);
+const rsaSignature = crypto.createSign("sha256").update(fixture.rsa.message).sign(importedPrivateKey);
+const rsaVerified = crypto.createVerify("sha256").update(fixture.rsa.message).verify(importedPublicKey, rsaSignature);
+const rsaExpectedVerified = crypto.createVerify("sha256")
+  .update(fixture.rsa.message)
+  .verify(importedPublicKey, Buffer.from(fixture.rsa.sha256SignatureHex, "hex"));
+const rsaOneShotSignature = crypto.sign("sha256", Buffer.from(fixture.rsa.message), importedPrivateKey);
+const rsaOneShotVerified = crypto.verify(
+  "sha256",
+  Buffer.from(fixture.rsa.message),
+  importedPublicKey,
+  rsaOneShotSignature,
+);
+const dhAlice = crypto.createDiffieHellman(
+  Buffer.from(fixture.dh.primeHex, "hex"),
+  Buffer.from(fixture.dh.generatorHex, "hex"),
+);
+const dhBob = crypto.createDiffieHellman(
+  Buffer.from(fixture.dh.primeHex, "hex"),
+  Buffer.from(fixture.dh.generatorHex, "hex"),
+);
+dhAlice.setPrivateKey(Buffer.from(fixture.dh.privateAHex, "hex"));
+dhAlice.setPublicKey(Buffer.from(fixture.dh.publicAHex, "hex"));
+dhBob.setPrivateKey(Buffer.from(fixture.dh.privateBHex, "hex"));
+dhBob.setPublicKey(Buffer.from(fixture.dh.publicBHex, "hex"));
+const dhSecretA = dhAlice.computeSecret(Buffer.from(fixture.dh.publicBHex, "hex"));
+const dhSecretB = dhBob.computeSecret(Buffer.from(fixture.dh.publicAHex, "hex"));
+const ecdhAlice = crypto.createECDH(fixture.ecdh.curve);
+const ecdhBob = crypto.createECDH(fixture.ecdh.curve);
+ecdhAlice.setPrivateKey(Buffer.from(fixture.ecdh.privateAHex, "hex"));
+ecdhBob.setPrivateKey(Buffer.from(fixture.ecdh.privateBHex, "hex"));
+const ecdhSecretA = ecdhAlice.computeSecret(Buffer.from(fixture.ecdh.publicBHex, "hex"));
+const ecdhSecretB = ecdhBob.computeSecret(Buffer.from(fixture.ecdh.publicAHex, "hex"));
+
+console.log(JSON.stringify({
+  hashes: crypto.getHashes(),
+  ciphers: crypto.getCiphers(),
+  curves: crypto.getCurves(),
+  md5: crypto.createHash("md5").update(fixture.message).digest("hex"),
+  sha224: crypto.createHash("sha224").update(fixture.message).digest("hex"),
+  sha256: crypto.createHash("sha256").update(fixture.message).digest("hex"),
+  sha384: crypto.createHash("sha384").update(fixture.message).digest("hex"),
+  hmacSha256: crypto.createHmac("sha256", fixture.hmacKey).update(fixture.message).digest("hex"),
+  hmacSha384: crypto.createHmac("sha384", fixture.hmacKey).update(fixture.message).digest("hex"),
+  pbkdf2SyncHex: crypto.pbkdf2Sync(fixture.password, fixture.salt, fixture.iterations, fixture.keyLength, "sha256").toString("hex"),
+  pbkdf2Sha384Hex,
+  pbkdf2Hex,
+  scryptSyncHex: crypto.scryptSync(fixture.password, fixture.salt, fixture.keyLength, fixture.scrypt).toString("hex"),
+  scryptHex,
+  generatedPrimeType: typeof generatedPrime,
+  generatedPrimeBits: generatedPrime.toString(2).length,
+  generatedPrimePositive: generatedPrime > 0n,
+  generatedSafePrimeBits: generatedSafePrime.toString(2).length,
+  generatedSafePrimePositive: generatedSafePrime > 0n,
+  generatedPrimeBufferBits: fixture.expected.primes.bufferBits,
+  generatedPrimeBufferByteLength: generatedPrimeBuffer.byteLength,
+  aes256CbcCiphertext,
+  aes256CbcPlaintext,
+  aes256GcmCiphertext,
+  aes256GcmAuthTag,
+  aes256GcmPlaintext,
+  aes256GcmWebCryptoCiphertext,
+  aes256GcmWebCryptoPlaintext,
+  rsaSignatureHex: rsaSignature.toString("hex"),
+  rsaVerified,
+  rsaExpectedVerified,
+  rsaOneShotSignatureHex: rsaOneShotSignature.toString("hex"),
+  rsaOneShotVerified,
+  dhPublicAHex: dhAlice.getPublicKey("hex"),
+  dhPublicBHex: dhBob.getPublicKey("hex"),
+  dhSecretAHex: dhSecretA.toString("hex"),
+  dhSecretBHex: dhSecretB.toString("hex"),
+  ecdhPublicAHex: ecdhAlice.getPublicKey("hex"),
+  ecdhPublicBHex: ecdhBob.getPublicKey("hex"),
+  ecdhSecretAHex: ecdhSecretA.toString("hex"),
+  ecdhSecretBHex: ecdhSecretB.toString("hex"),
+}));
+"#
+    .replace("__CRYPTO_FIXTURE__", fixture_json);
+
+    let cwd = temp_dir("builtin-conformance-crypto-basic-fixture");
+    let entrypoint = cwd.join("entry.mjs");
+    write_fixture(&entrypoint, &script);
+    let guest = run_guest_probe("crypto-basic-fixture", &cwd, &entrypoint);
+    let expected = &fixture["expected"];
+    let dh_expected_secret = format!(
+        "{:0>width$}",
+        fixture["dh"]["secretHex"]
+            .as_str()
+            .expect("dh secret fixture must be a string"),
+        width = fixture["dh"]["primeHex"]
+            .as_str()
+            .expect("dh prime fixture must be a string")
+            .len()
+    );
+
+    assert_eq!(guest["hashes"], expected["hashes"]);
+    assert_eq!(guest["ciphers"], expected["ciphers"]);
+    assert_eq!(guest["curves"], expected["curves"]);
+    assert_eq!(guest["md5"], expected["md5"]);
+    assert_eq!(guest["sha224"], expected["sha224"]);
+    assert_eq!(guest["sha256"], expected["sha256"]);
+    assert_eq!(guest["sha384"], expected["sha384"]);
+    assert_eq!(guest["hmacSha256"], expected["hmacSha256"]);
+    assert_eq!(guest["hmacSha384"], expected["hmacSha384"]);
+    assert_eq!(guest["pbkdf2SyncHex"], expected["pbkdf2Sha256"]);
+    assert_eq!(guest["pbkdf2Hex"], expected["pbkdf2Sha256"]);
+    assert_eq!(guest["pbkdf2Sha384Hex"], expected["pbkdf2Sha384"]);
+    assert_eq!(guest["scryptSyncHex"], expected["scrypt"]);
+    assert_eq!(guest["scryptHex"], expected["scrypt"]);
+    assert_eq!(guest["generatedPrimeType"], json!("bigint"));
+    assert_eq!(guest["generatedPrimeBits"], expected["primes"]["bits"]);
+    assert_eq!(guest["generatedPrimePositive"], json!(true));
+    assert_eq!(
+        guest["generatedSafePrimeBits"],
+        expected["primes"]["safeBits"]
+    );
+    assert_eq!(guest["generatedSafePrimePositive"], json!(true));
+    assert_eq!(
+        guest["generatedPrimeBufferBits"],
+        expected["primes"]["bufferBits"]
+    );
+    assert_eq!(
+        guest["generatedPrimeBufferByteLength"],
+        expected["primes"]["bufferByteLength"]
+    );
+    assert_eq!(
+        guest["aes256CbcCiphertext"],
+        expected["aes256CbcCiphertext"]
+    );
+    assert_eq!(guest["aes256CbcPlaintext"], fixture["aesCbc"]["plaintext"]);
+    assert_eq!(
+        guest["aes256GcmCiphertext"],
+        expected["aes256GcmCiphertext"]
+    );
+    assert_eq!(guest["aes256GcmAuthTag"], expected["aes256GcmAuthTag"]);
+    assert_eq!(guest["aes256GcmPlaintext"], fixture["aesGcm"]["plaintext"]);
+    assert_eq!(
+        guest["aes256GcmWebCryptoCiphertext"],
+        expected["aes256GcmWebCryptoCiphertext"]
+    );
+    assert_eq!(
+        guest["aes256GcmWebCryptoPlaintext"],
+        fixture["aesGcm"]["plaintext"]
+    );
+    assert_eq!(
+        guest["rsaSignatureHex"],
+        fixture["rsa"]["sha256SignatureHex"]
+    );
+    assert_eq!(guest["rsaVerified"], json!(true));
+    assert_eq!(guest["rsaExpectedVerified"], json!(true));
+    assert_eq!(
+        guest["rsaOneShotSignatureHex"],
+        fixture["rsa"]["sha256SignatureHex"]
+    );
+    assert_eq!(guest["rsaOneShotVerified"], json!(true));
+    assert_eq!(guest["dhPublicAHex"], fixture["dh"]["publicAHex"]);
+    assert_eq!(guest["dhPublicBHex"], fixture["dh"]["publicBHex"]);
+    assert_eq!(guest["dhSecretAHex"], json!(dh_expected_secret));
+    assert_eq!(guest["dhSecretBHex"], json!(dh_expected_secret));
+    assert_eq!(guest["ecdhPublicAHex"], fixture["ecdh"]["publicAHex"]);
+    assert_eq!(guest["ecdhPublicBHex"], fixture["ecdh"]["publicBHex"]);
+    assert_eq!(guest["ecdhSecretAHex"], fixture["ecdh"]["secretHex"]);
+    assert_eq!(guest["ecdhSecretBHex"], fixture["ecdh"]["secretHex"]);
+}
+
+#[test]
+fn crypto_basic_fixture_matches_shared_expected_isolated() {
+    run_isolated_builtin_conformance_test("crypto-basic-fixture");
+}
+
 #[test]
 fn crypto_extended_surface_matches_host_node_isolated() {
     run_isolated_builtin_conformance_test("crypto-extended");
@@ -4011,6 +4257,7 @@ fn __builtin_conformance_extra_test_runner() {
         "http-socket-writes" => http_socket_writes_do_not_silently_drop_data_impl(),
         "buffer-concat-truncation" => buffer_concat_truncation_matches_host_node_impl(),
         "mkdtemp-sync-collision-safe" => mkdtemp_sync_collision_safe_matches_host_node_impl(),
+        "crypto-basic-fixture" => crypto_basic_fixture_matches_shared_expected_impl(),
         "crypto-extended" => crypto_extended_surface_matches_host_node(),
         "child-process-exec-spawn-error-code" => {
             child_process_exec_preserves_spawn_error_codes_impl()

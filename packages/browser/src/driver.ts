@@ -4,6 +4,7 @@ import type {
 	SystemDriver,
 	VirtualFileSystem,
 } from "./runtime.js";
+import { bytesToBase64 } from "./encoding.js";
 import {
 	createCommandExecutorStub,
 	createEnosysError,
@@ -21,6 +22,13 @@ const BROWSER_SYSTEM_DRIVER_OPTIONS = Symbol.for(
 	"secure-exec.browserSystemDriverOptions",
 );
 
+const LOOPBACK_DNS_NAMES = new Set([
+	"localhost",
+	"ip4-localhost",
+	"ip4-loopback",
+]);
+const LOOPBACK_IPV6_DNS_NAMES = new Set(["ip6-localhost", "ip6-loopback"]);
+
 export interface BrowserRuntimeSystemOptions {
 	filesystem: "opfs" | "memory";
 	networkEnabled: boolean;
@@ -29,6 +37,44 @@ export interface BrowserRuntimeSystemOptions {
 type BrowserSystemDriver = SystemDriver & {
 	[BROWSER_SYSTEM_DRIVER_OPTIONS]?: BrowserRuntimeSystemOptions;
 };
+
+function isIpv4Literal(hostname: string): boolean {
+	const parts = hostname.split(".");
+	return (
+		parts.length === 4 &&
+		parts.every((part) => {
+			if (!/^\d+$/.test(part)) return false;
+			const value = Number(part);
+			return value >= 0 && value <= 255 && String(value) === part;
+		})
+	);
+}
+
+function isIpv6Literal(hostname: string): boolean {
+	return hostname.includes(":") && /^[0-9a-fA-F:.]+$/.test(hostname);
+}
+
+function browserLocalDnsLookup(hostname: string): {
+	address?: string;
+	family?: number;
+	error?: string;
+	code?: string;
+} {
+	const normalized = hostname.trim().toLowerCase();
+	if (LOOPBACK_DNS_NAMES.has(normalized)) {
+		return { address: "127.0.0.1", family: 4 };
+	}
+	if (LOOPBACK_IPV6_DNS_NAMES.has(normalized)) {
+		return { address: "::1", family: 6 };
+	}
+	if (isIpv4Literal(normalized)) {
+		return { address: normalized, family: 4 };
+	}
+	if (isIpv6Literal(normalized)) {
+		return { address: normalized, family: 6 };
+	}
+	return { error: "DNS not supported in browser", code: "ENOSYS" };
+}
 
 function normalizePath(path: string): string {
 	if (!path) return "/";
@@ -312,6 +358,7 @@ export class OpfsFileSystem implements VirtualFileSystem {
 export interface BrowserDriverOptions {
 	filesystem?: "opfs" | "memory";
 	permissions?: Permissions;
+	networkAdapter?: NetworkAdapter;
 	useDefaultNetwork?: boolean;
 }
 
@@ -326,11 +373,20 @@ export async function createOpfsFileSystem(): Promise<VirtualFileSystem> {
 	return new OpfsFileSystem();
 }
 
+// The platform fetch captured at module load — BEFORE any guest `fetch` global is
+// installed over globalThis.fetch. The guest fetch routes through this adapter, so the
+// adapter MUST call the real fetch (not the overridden global) or it recurses infinitely.
+const NATIVE_FETCH: typeof fetch | undefined =
+	typeof globalThis !== "undefined" && typeof globalThis.fetch === "function"
+		? globalThis.fetch.bind(globalThis)
+		: undefined;
+
 /** Network adapter that delegates to the browser's native `fetch`. DNS and http2 are unsupported. */
 export function createBrowserNetworkAdapter(): NetworkAdapter {
+	const platformFetch = NATIVE_FETCH ?? fetch;
 	return {
 		async fetch(url, options) {
-			const response = await fetch(url, {
+			const response = await platformFetch(url, {
 				method: options?.method || "GET",
 				headers: options?.headers,
 				body: options?.body as RequestInit["body"],
@@ -349,7 +405,7 @@ export function createBrowserNetworkAdapter(): NetworkAdapter {
 			let body: string;
 			if (isBinary) {
 				const buffer = await response.arrayBuffer();
-				body = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+				body = bytesToBase64(new Uint8Array(buffer));
 				headers["x-body-encoding"] = "base64";
 			} else {
 				body = await response.text();
@@ -366,12 +422,12 @@ export function createBrowserNetworkAdapter(): NetworkAdapter {
 			};
 		},
 
-		async dnsLookup(_hostname) {
-			return { error: "DNS not supported in browser", code: "ENOSYS" };
+		async dnsLookup(hostname) {
+			return browserLocalDnsLookup(hostname);
 		},
 
 		async httpRequest(url, options) {
-			const response = await fetch(url, {
+			const response = await platformFetch(url, {
 				method: options?.method || "GET",
 				headers: options?.headers,
 				body: options?.body as RequestInit["body"],
@@ -418,8 +474,11 @@ export async function createBrowserDriver(
 		filesystemMode === "memory"
 			? createInMemoryFileSystem()
 			: await createOpfsFileSystem();
-	const networkAdapter = options.useDefaultNetwork
-		? wrapNetworkAdapter(createBrowserNetworkAdapter(), permissions)
+	const rawNetworkAdapter =
+		options.networkAdapter ??
+		(options.useDefaultNetwork ? createBrowserNetworkAdapter() : undefined);
+	const networkAdapter = rawNetworkAdapter
+		? wrapNetworkAdapter(rawNetworkAdapter, permissions)
 		: undefined;
 
 	const systemDriver: BrowserSystemDriver = {

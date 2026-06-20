@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 pub const MAX_PIPE_BUFFER_BYTES: usize = 65_536;
 pub const PIPE_BUF_BYTES: usize = 4_096;

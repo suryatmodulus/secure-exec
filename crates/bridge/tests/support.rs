@@ -63,6 +63,8 @@ pub struct RecordingBridge {
     pub closed_executions: Vec<ExecutionHandleRequest>,
     pub killed_executions: Vec<KillExecutionRequest>,
     #[allow(dead_code)]
+    pub browser_worker_spawns: Vec<BTreeMap<String, String>>,
+    #[allow(dead_code)]
     pub terminated_workers: Vec<(String, String, String)>,
 }
 
@@ -93,6 +95,7 @@ impl Default for RecordingBridge {
             stdin_writes: Vec::new(),
             closed_executions: Vec::new(),
             killed_executions: Vec::new(),
+            browser_worker_spawns: Vec::new(),
             terminated_workers: Vec::new(),
         }
     }

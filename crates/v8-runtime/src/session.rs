@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 #[cfg(not(test))]
 use secure_exec_bridge::queue_tracker::{warn_limit_exhausted, TrackedLimit};
+use secure_exec_bridge::{bridge_contract, BridgeCallConvention};
 
 use crate::execution;
 #[cfg(not(test))]
@@ -1036,6 +1037,8 @@ fn session_thread(
                         // Both paths use the same function — global.set() works for both.
                         let _sync_store;
                         let _async_store;
+                        let sync_bridge_fns = sync_bridge_fns();
+                        let async_bridge_fns = async_bridge_fns();
                         {
                             let scope = &mut v8::HandleScope::new(iso);
                             let ctx = v8::Local::new(scope, &exec_context);
@@ -1047,8 +1050,8 @@ fn session_thread(
                                 &pending as *const bridge::PendingPromises,
                                 &session_buffers
                                     as *const std::cell::RefCell<bridge::SessionBuffers>,
-                                SYNC_BRIDGE_FNS,
-                                ASYNC_BRIDGE_FNS,
+                                sync_bridge_fns,
+                                async_bridge_fns,
                             );
                         }
 
@@ -1538,209 +1541,42 @@ fn session_thread(
     }
 }
 
-/// Sync and async bridge function names registered on the V8 global.
-/// These match the bridge contract (bridge-contract.ts HOST_BRIDGE_GLOBAL_KEYS).
-///
-/// Sync functions block V8 while the host processes the call (applySync/applySyncPromise).
-/// Async functions return a Promise to V8, resolved when the host responds (apply).
-pub(crate) const SYNC_BRIDGE_FNS: &[&str] = &[
-    // Console
-    "_log",
-    "_error",
-    // Benchmark diagnostics
-    "_benchNoop",
-    "_benchNetTcpMetricsResetRaw",
-    "_benchNetTcpMetricsSnapshotRaw",
-    // Python guest VFS RPC bridge
-    "_pythonRpc",
-    "_pythonStdinRead",
-    // Module loading (syncPromise — host resolves async, Rust blocks)
-    "_loadPolyfill",
-    "_resolveModule",
-    "_loadFile",
-    // Sync module loading (bypass _loadPolyfill dispatch, used by CJS require)
-    "_resolveModuleSync",
-    "_loadFileSync",
-    "_moduleFormat",
-    "_batchResolveModules",
-    // Crypto
-    "_cryptoRandomFill",
-    "_cryptoRandomUUID",
-    "_cryptoHashDigest",
-    "_cryptoHmacDigest",
-    "_cryptoPbkdf2",
-    "_cryptoScrypt",
-    "_cryptoCipheriv",
-    "_cryptoDecipheriv",
-    "_cryptoCipherivCreate",
-    "_cryptoCipherivUpdate",
-    "_cryptoCipherivFinal",
-    "_cryptoSign",
-    "_cryptoVerify",
-    "_cryptoAsymmetricOp",
-    "_cryptoCreateKeyObject",
-    "_cryptoGenerateKeyPairSync",
-    "_cryptoGenerateKeySync",
-    "_cryptoGeneratePrimeSync",
-    "_cryptoDiffieHellman",
-    "_cryptoDiffieHellmanGroup",
-    "_cryptoDiffieHellmanSessionCreate",
-    "_cryptoDiffieHellmanSessionCall",
-    "_cryptoSubtle",
-    // Filesystem (all syncPromise)
-    "_fsReadFile",
-    "_fsWriteFile",
-    "_fsReadFileBinary",
-    "_fsWriteFileBinary",
-    "_fsReadDir",
-    "_fsMkdir",
-    "_fsRmdir",
-    "_fsExists",
-    "_fsStat",
-    "_fsUnlink",
-    "_fsRename",
-    "_fsChmod",
-    "_fsChown",
-    "_fsLink",
-    "_fsSymlink",
-    "_fsReadlink",
-    "_fsLstat",
-    "_fsTruncate",
-    "_fsUtimes",
-    "fs.openSync",
-    "fs.closeSync",
-    "fs.readSync",
-    "fs.writeSync",
-    "fs.fstatSync",
-    // Child process (sync)
-    "_childProcessSpawnStart",
-    "_childProcessPoll",
-    "_childProcessStdinWrite",
-    "_childProcessStdinClose",
-    "_childProcessKill",
-    "_childProcessSpawnSync",
-    "_processKill",
-    "_processSignalState",
-    "_vmCreateContext",
-    "_vmRunInContext",
-    "_vmRunInThisContext",
-    "process.memoryUsage",
-    "process.cpuUsage",
-    "process.resourceUsage",
-    "process.versions",
-    // HTTP/2 and network bridge operations with sync or syncPromise semantics
-    "_networkHttp2ServerListenRaw",
-    "_networkHttp2SessionConnectRaw",
-    "_networkHttp2SessionRequestRaw",
-    "_networkHttp2SessionSettingsRaw",
-    "_networkHttp2SessionSetLocalWindowSizeRaw",
-    "_networkHttp2SessionGoawayRaw",
-    "_networkHttp2SessionCloseRaw",
-    "_networkHttp2SessionDestroyRaw",
-    "_networkHttp2ServerPollRaw",
-    "_networkHttp2SessionPollRaw",
-    "_networkHttp2StreamRespondRaw",
-    "_networkHttp2StreamPushStreamRaw",
-    "_networkHttp2StreamWriteRaw",
-    "_networkHttp2StreamEndRaw",
-    "_networkHttp2StreamCloseRaw",
-    "_networkHttp2StreamPauseRaw",
-    "_networkHttp2StreamResumeRaw",
-    "_networkHttp2StreamRespondWithFileRaw",
-    "_networkHttp2ServerRespondRaw",
-    "_networkHttpServerRespondRaw",
-    "_networkHttpServerRequestRaw",
-    "_upgradeSocketWriteRaw",
-    "_upgradeSocketEndRaw",
-    "_upgradeSocketDestroyRaw",
-    "_networkDnsLookupSyncRaw",
-    "_netSocketConnectRaw",
-    "_netSocketPollRaw",
-    "_netSocketReadRaw",
-    "_netSocketSetNoDelayRaw",
-    "_netSocketSetKeepAliveRaw",
-    "_netSocketWriteRaw",
-    "_netSocketEndRaw",
-    "_netSocketDestroyRaw",
-    "_netSocketUpgradeTlsRaw",
-    "_netSocketGetTlsClientHelloRaw",
-    "_netSocketTlsQueryRaw",
-    "_tlsGetCiphersRaw",
-    "_netReserveTcpPortRaw",
-    "_netReleaseTcpPortRaw",
-    "_netServerListenRaw",
-    "_netServerAcceptRaw",
-    "_dgramSocketCreateRaw",
-    "_dgramSocketBindRaw",
-    "_dgramSocketRecvRaw",
-    "_dgramSocketSendRaw",
-    "_dgramSocketCloseRaw",
-    "_dgramSocketAddressRaw",
-    "_dgramSocketSetBufferSizeRaw",
-    "_dgramSocketGetBufferSizeRaw",
-    "_sqliteConstantsRaw",
-    "_sqliteDatabaseOpenRaw",
-    "_sqliteDatabaseCloseRaw",
-    "_sqliteDatabaseExecRaw",
-    "_sqliteDatabaseQueryRaw",
-    "_sqliteDatabasePrepareRaw",
-    "_sqliteDatabaseLocationRaw",
-    "_sqliteDatabaseCheckpointRaw",
-    "_sqliteStatementRunRaw",
-    "_sqliteStatementGetRaw",
-    "_sqliteStatementAllRaw",
-    "_sqliteStatementColumnsRaw",
-    "_sqliteStatementSetReturnArraysRaw",
-    "_sqliteStatementSetReadBigIntsRaw",
-    "_sqliteStatementSetAllowBareNamedParametersRaw",
-    "_sqliteStatementSetAllowUnknownNamedParametersRaw",
-    "_sqliteStatementFinalizeRaw",
-    "_kernelStdinReadRaw",
-    "_kernelStdioWriteRaw",
-    "_kernelPollRaw",
-    "_kernelIsattyRaw",
-    "_kernelTtySizeRaw",
-    "_ptySetRawMode",
-];
+/// Sync bridge functions block V8 while the host processes the call
+/// (applySync/applySyncPromise). Async bridge functions return a Promise to V8.
+struct BridgeFnPartitions {
+    sync: Vec<&'static str>,
+    async_fns: Vec<&'static str>,
+}
 
-pub(crate) const ASYNC_BRIDGE_FNS: &[&str] = &[
-    // Module loading (async)
-    "_dynamicImport",
-    // Timer
-    "_scheduleTimer",
-    "_kernelStdinRead",
-    // Network (async)
-    "_networkDnsLookupRaw",
-    "_networkDnsResolveRaw",
-    "_networkHttpServerListenRaw",
-    "_networkHttpServerCloseRaw",
-    "_networkHttpServerWaitRaw",
-    "_networkHttp2ServerCloseRaw",
-    "_networkHttp2ServerWaitRaw",
-    "_networkHttp2SessionWaitRaw",
-    "_netSocketWaitConnectRaw",
-    "_netServerCloseRaw",
-    // Filesystem promises (async)
-    "_fsReadFileAsync",
-    "_fsWriteFileAsync",
-    "_fsReadFileBinaryAsync",
-    "_fsWriteFileBinaryAsync",
-    "_fsReadDirAsync",
-    "_fsMkdirAsync",
-    "_fsRmdirAsync",
-    "_fsAccessAsync",
-    "_fsStatAsync",
-    "_fsUnlinkAsync",
-    "_fsRenameAsync",
-    "_fsChmodAsync",
-    "_fsChownAsync",
-    "_fsLinkAsync",
-    "_fsSymlinkAsync",
-    "_fsReadlinkAsync",
-    "_fsLstatAsync",
-    "_fsTruncateAsync",
-    "_fsUtimesAsync",
-];
+pub(crate) fn sync_bridge_fns() -> &'static [&'static str] {
+    &bridge_fn_partitions().sync
+}
+
+pub(crate) fn async_bridge_fns() -> &'static [&'static str] {
+    &bridge_fn_partitions().async_fns
+}
+
+fn bridge_fn_partitions() -> &'static BridgeFnPartitions {
+    static PARTITIONS: OnceLock<BridgeFnPartitions> = OnceLock::new();
+    PARTITIONS.get_or_init(|| BridgeFnPartitions {
+        sync: bridge_fns_for(|convention| {
+            matches!(
+                convention,
+                BridgeCallConvention::Sync | BridgeCallConvention::SyncPromise
+            )
+        }),
+        async_fns: bridge_fns_for(|convention| convention == BridgeCallConvention::Async),
+    })
+}
+
+fn bridge_fns_for(filter: impl Fn(BridgeCallConvention) -> bool) -> Vec<&'static str> {
+    bridge_contract()
+        .groups
+        .iter()
+        .filter(|group| filter(group.convention))
+        .flat_map(|group| group.names.iter().map(String::as_str))
+        .collect()
+}
 
 /// Reset every pending promise-resolver `v8::Global` handle held by `pending`.
 ///
@@ -2094,7 +1930,6 @@ fn push_deferred_sync_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secure_exec_bridge::{bridge_contract, BridgeCallConvention};
     use std::collections::{HashMap, HashSet};
 
     /// Helper to create a SessionManager for tests
@@ -2148,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_contract_globals_are_registered() {
+    fn bridge_contract_function_partitions_cover_contract() {
         let contract = bridge_contract();
 
         let expected_sync = contract
@@ -2169,16 +2004,22 @@ mod tests {
             .flat_map(|group| group.names.iter().map(String::as_str))
             .collect::<HashSet<_>>();
 
-        let registered_sync = SYNC_BRIDGE_FNS.iter().copied().collect::<HashSet<_>>();
-        let registered_async = ASYNC_BRIDGE_FNS.iter().copied().collect::<HashSet<_>>();
+        let sync_names = sync_bridge_fns();
+        let async_names = async_bridge_fns();
+        let registered_sync = sync_names.iter().copied().collect::<HashSet<_>>();
+        let registered_async = async_names.iter().copied().collect::<HashSet<_>>();
 
         assert_eq!(
             registered_sync, expected_sync,
-            "SYNC_BRIDGE_FNS drifted from crates/bridge/bridge-contract.json"
+            "sync bridge function partition drifted from crates/bridge/bridge-contract.json"
         );
         assert_eq!(
             registered_async, expected_async,
-            "ASYNC_BRIDGE_FNS drifted from crates/bridge/bridge-contract.json"
+            "async bridge function partition drifted from crates/bridge/bridge-contract.json"
+        );
+        assert!(
+            registered_sync.is_disjoint(&registered_async),
+            "sync and async bridge function partitions must not overlap"
         );
     }
 

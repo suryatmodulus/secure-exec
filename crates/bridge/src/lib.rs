@@ -437,11 +437,34 @@ pub struct GuestKernelCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalDispositionAction {
+    Default,
+    Ignore,
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalHandlerRegistration {
+    pub action: SignalDispositionAction,
+    pub mask: Vec<u32>,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionSignalState {
+    pub vm_id: String,
+    pub execution_id: String,
+    pub signal: u32,
+    pub registration: SignalHandlerRegistration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionEvent {
     Stdout(OutputChunk),
     Stderr(OutputChunk),
     Exited(ExecutionExited),
     GuestRequest(GuestKernelCall),
+    SignalState(ExecutionSignalState),
 }
 
 pub trait ExecutionBridge: BridgeTypes {
@@ -508,9 +531,19 @@ pub struct BridgeContractGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BridgeDispatchTarget {
+    pub method: String,
+    #[serde(default)]
+    pub translate_args: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeContract {
     pub version: u32,
     pub groups: Vec<BridgeContractGroup>,
+    #[serde(default)]
+    pub dispatch: BTreeMap<String, BridgeDispatchTarget>,
 }
 
 static BRIDGE_CONTRACT: OnceLock<BridgeContract> = OnceLock::new();
@@ -546,6 +579,41 @@ mod tests {
                     "duplicate bridge contract method: {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bridge_contract_dispatch_targets_are_declared_methods() {
+        let contract = bridge_contract();
+        let names: std::collections::BTreeSet<_> = contract
+            .groups
+            .iter()
+            .flat_map(|group| group.names.iter())
+            .collect();
+
+        for name in contract.dispatch.keys() {
+            assert!(
+                names.contains(name),
+                "bridge dispatch target {name} must be listed in bridge contract names"
+            );
+        }
+
+        for required in [
+            "_fsReadFile",
+            "_fsReadFileBinary",
+            "_fsLutimes",
+            "_fsLutimesAsync",
+            "fs.futimesSync",
+            "_cryptoHashDigest",
+            "_cryptoDiffieHellmanSessionDestroy",
+            "_netSocketConnectRaw",
+            "_kernelStdioWriteRaw",
+            "_ptySetRawMode",
+        ] {
+            assert!(
+                contract.dispatch.contains_key(required),
+                "bridge dispatch metadata missing for {required}"
+            );
         }
     }
 
@@ -607,5 +675,31 @@ mod tests {
             "\"module\" | \"commonjs\" | \"json\" | null"
         );
         assert_eq!(format_group.names, vec!["_moduleFormat"]);
+    }
+
+    #[test]
+    fn bridge_contract_includes_diffie_hellman_session_lifecycle_callbacks() {
+        let contract = bridge_contract();
+        let crypto_group = contract
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .names
+                    .iter()
+                    .any(|name| name == "_cryptoDiffieHellmanSessionCreate")
+            })
+            .expect("crypto bridge group");
+
+        for method in [
+            "_cryptoDiffieHellmanSessionCreate",
+            "_cryptoDiffieHellmanSessionCall",
+            "_cryptoDiffieHellmanSessionDestroy",
+        ] {
+            assert!(
+                crypto_group.names.iter().any(|name| name == method),
+                "missing Diffie-Hellman session bridge callback {method}"
+            );
+        }
     }
 }

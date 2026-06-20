@@ -36,3 +36,6 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3"
 wat = "1"
+
+[build-dependencies]
+secure-exec-build-support = { workspace = true }

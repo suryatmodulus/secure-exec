@@ -5,11 +5,37 @@ import {
 	tryDecodeLengthPrefixedPayload,
 } from "../src/framing.js";
 
+function readUint32Be(bytes: Uint8Array): number {
+	return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+		0,
+		false,
+	);
+}
+
+function writeUint32Be(bytes: Uint8Array, value: number): void {
+	new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(
+		0,
+		value,
+		false,
+	);
+}
+
+function concatBytes(...chunks: Uint8Array[]): Uint8Array {
+	const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+	const combined = new Uint8Array(totalLength);
+	let offset = 0;
+	for (const chunk of chunks) {
+		combined.set(chunk, offset);
+		offset += chunk.length;
+	}
+	return combined;
+}
+
 describe("length-prefixed framing", () => {
 	test("encodes payload length as a four-byte big-endian prefix", () => {
 		const encoded = encodeLengthPrefixedPayload(Uint8Array.from([1, 2, 3]));
 
-		expect(encoded.readUInt32BE(0)).toBe(3);
+		expect(readUint32Be(encoded)).toBe(3);
 		expect([...encoded.subarray(LENGTH_PREFIX_BYTES)]).toEqual([1, 2, 3]);
 	});
 
@@ -23,13 +49,11 @@ describe("length-prefixed framing", () => {
 	test("decodes one payload and returns remaining bytes", () => {
 		const first = encodeLengthPrefixedPayload(Uint8Array.from([7, 8]));
 		const second = encodeLengthPrefixedPayload(Uint8Array.from([9]));
-		const decoded = tryDecodeLengthPrefixedPayload(
-			Buffer.concat([first, second]),
-		);
+		const decoded = tryDecodeLengthPrefixedPayload(concatBytes(first, second));
 
 		expect(decoded).not.toBeNull();
 		expect([...(decoded?.payload ?? [])]).toEqual([7, 8]);
-		expect(Buffer.from(decoded?.remaining ?? []).equals(second)).toBe(true);
+		expect([...(decoded?.remaining ?? [])]).toEqual([...second]);
 	});
 
 	// Adversarial coverage (VECTORS.md E2 / browser TS frame-length cap): a
@@ -40,8 +64,8 @@ describe("length-prefixed framing", () => {
 	// an out-of-bounds read or an unbounded allocation from the length field.
 	test("an oversized declared length never over-reads or over-allocates", () => {
 		// declaredLength = 0xFFFFFFFF (~4 GiB) but only a handful of real bytes.
-		const hostile = Buffer.alloc(LENGTH_PREFIX_BYTES + 8);
-		hostile.writeUInt32BE(0xffffffff, 0);
+		const hostile = new Uint8Array(LENGTH_PREFIX_BYTES + 8);
+		writeUint32Be(hostile, 0xffffffff);
 		hostile.fill(0x41, LENGTH_PREFIX_BYTES);
 
 		// No 4 GiB allocation, no throw: the decoder simply waits for bytes that
@@ -59,8 +83,8 @@ describe("length-prefixed framing", () => {
 
 	test("a declared length larger than the buffer is treated as incomplete", () => {
 		// Claim 1 KiB but provide only 10 payload bytes.
-		const buf = Buffer.alloc(LENGTH_PREFIX_BYTES + 10);
-		buf.writeUInt32BE(1024, 0);
+		const buf = new Uint8Array(LENGTH_PREFIX_BYTES + 10);
+		writeUint32Be(buf, 1024);
 		expect(tryDecodeLengthPrefixedPayload(buf)).toBeNull();
 	});
 });

@@ -7,7 +7,6 @@ use std::mem::{self, MaybeUninit};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use openssl::version as openssl_version;
 use serde::de;
 use v8::MapFnTo;
 use v8::ValueDeserializerHelper;
@@ -931,9 +930,12 @@ fn current_thread_resource_usage() -> Result<ThreadResourceUsageSnapshot, String
     })
 }
 
-fn normalize_openssl_version(raw: &str) -> String {
-    raw.split_whitespace().nth(1).unwrap_or(raw).to_string()
-}
+// Guest crypto is served by pure-Rust crates (RustCrypto), not OpenSSL, so there
+// is no live OpenSSL library to query. We still surface a `process.versions.openssl`
+// string for guest compatibility, pinned to the OpenSSL release vendored by the
+// sidecar (openssl-sys 300.6.0+3.6.2). The browser executor reports the same
+// constant so both runtimes present an identical identity.
+const EMULATED_OPENSSL_VERSION: &str = "3.6.2";
 
 fn set_object_string_property<'s>(
     scope: &mut v8::HandleScope<'s>,
@@ -1082,12 +1084,7 @@ fn process_resource_usage_value<'s>(
 fn process_versions_value<'s>(scope: &mut v8::HandleScope<'s>) -> v8::Local<'s, v8::Value> {
     let object = v8::Object::new(scope);
     set_object_string_property(scope, object, "v8", v8::V8::get_version());
-    set_object_string_property(
-        scope,
-        object,
-        "openssl",
-        &normalize_openssl_version(openssl_version::version()),
-    );
+    set_object_string_property(scope, object, "openssl", EMULATED_OPENSSL_VERSION);
     object.into()
 }
 

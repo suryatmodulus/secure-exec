@@ -4,10 +4,9 @@
 //! types, and other shared data structures extracted from service.rs.
 
 use crate::protocol::{
-    EventFrame, GuestRuntimeKind, MountDescriptor, PermissionsPolicy, ProjectedModuleDescriptor,
-    RegisterHostCallbacksRequest, ResponseFrame, SidecarRequestFrame, SidecarRequestPayload,
-    SidecarResponseFrame, SidecarResponsePayload, SignalHandlerRegistration, SoftwareDescriptor,
-    WasmPermissionTier,
+    GuestRuntimeKind, MountDescriptor, ProjectedModuleDescriptor, RegisterHostCallbacksRequest,
+    SidecarRequestFrame, SidecarRequestPayload, SidecarResponseFrame, SidecarResponsePayload,
+    SignalHandlerRegistration, SoftwareDescriptor, WasmPermissionTier,
 };
 use crate::wire::DEFAULT_MAX_FRAME_BYTES;
 use rusqlite::Connection;
@@ -19,9 +18,11 @@ use secure_exec_execution::{
 };
 use secure_exec_kernel::kernel::{KernelProcessHandle, KernelVm};
 use secure_exec_kernel::mount_table::MountTable;
-use secure_exec_kernel::root_fs::{RootFileSystem, RootFilesystemMode, RootFilesystemSnapshot};
+use secure_exec_kernel::root_fs::RootFilesystemMode;
 use secure_exec_kernel::socket_table::SocketId;
+use secure_exec_sidecar_core::VmLayerStore;
 use secure_exec_vm_config as vm_config;
+use secure_exec_vm_config::PermissionsPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -102,12 +103,6 @@ impl Default for NativeSidecarConfig {
             acp_termination_grace: Duration::from_secs(3),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct DispatchResult {
-    pub response: ResponseFrame,
-    pub events: Vec<EventFrame>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +279,7 @@ pub(crate) struct SessionState {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct VmConfiguration {
     pub(crate) mounts: Vec<MountDescriptor>,
     pub(crate) software: Vec<SoftwareDescriptor>,
@@ -300,35 +295,20 @@ pub(crate) struct VmConfiguration {
     pub(crate) loopback_exempt_ports: Vec<u16>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct VmLayerStore {
-    pub(crate) next_layer_id: u64,
-    pub(crate) layers: BTreeMap<String, VmLayer>,
-}
-
-impl Default for VmLayerStore {
+impl Default for VmConfiguration {
     fn default() -> Self {
         Self {
-            next_layer_id: 1,
-            layers: BTreeMap::new(),
+            mounts: Vec::new(),
+            software: Vec::new(),
+            permissions: secure_exec_sidecar_core::permissions::deny_all_policy(),
+            module_access_cwd: None,
+            instructions: Vec::new(),
+            projected_modules: Vec::new(),
+            command_permissions: BTreeMap::new(),
+            js_runtime: None,
+            loopback_exempt_ports: Vec::new(),
         }
     }
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum VmLayer {
-    Writable(RootFileSystem),
-    Snapshot(RootFilesystemSnapshot),
-    Overlay(VmOverlayLayer),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct VmOverlayLayer {
-    pub(crate) mode: RootFilesystemMode,
-    pub(crate) upper_layer_id: Option<String>,
-    pub(crate) lower_layer_ids: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -503,9 +483,7 @@ pub(crate) struct ActiveMappedHostFd {
 }
 
 pub(crate) struct ActiveCipherSession {
-    pub(crate) algorithm: String,
-    pub(crate) auth_tag_len: usize,
-    pub(crate) context: openssl::symm::Crypter,
+    pub(crate) context: crate::crypto_cipher::StreamCipherSession,
 }
 
 pub(crate) struct ActiveSqliteDatabase {

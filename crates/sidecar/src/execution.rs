@@ -7,20 +7,19 @@ use crate::filesystem::{
     service_javascript_fs_sync_rpc, service_javascript_module_sync_rpc,
 };
 use crate::protocol::{
-    BoundUdpSnapshotResponse, CloseStdinRequest, EventFrame, EventPayload, ExecuteRequest,
-    FindBoundUdpRequest, FindListenerRequest, GetProcessSnapshotRequest,
-    GetResourceSnapshotRequest, GetSignalStateRequest, GetZombieTimerCountRequest,
-    GuestRuntimeKind, JavascriptChildProcessSpawnOptions, JavascriptChildProcessSpawnRequest,
-    JavascriptDgramBindRequest, JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest,
-    JavascriptDnsLookupRequest, JavascriptDnsResolveRequest, JavascriptNetConnectRequest,
-    JavascriptNetListenRequest, JavascriptNetReserveTcpPortRequest, KillProcessRequest,
-    ListenerSnapshotResponse, OwnershipScope, ProcessExitedEvent, ProcessKilledResponse,
-    ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotResponse, ProcessSnapshotStatus,
-    ProcessStartedResponse, PtyResizedResponse, QueueSnapshotEntry, RequestFrame, ResizePtyRequest,
-    ResourceSnapshotResponse, ResponseFrame, ResponsePayload, SidecarRequestPayload,
-    SignalDispositionAction, SignalHandlerRegistration, SignalStateResponse, SocketStateEntry,
-    StdinClosedResponse, StdinWrittenResponse, StreamChannel, VmFetchRequest, VmFetchResponse,
-    WasmPermissionTier, WriteStdinRequest, ZombieTimerCountResponse,
+    CloseStdinRequest, EventFrame, EventPayload, ExecuteRequest, FindBoundUdpRequest,
+    FindListenerRequest, GetProcessSnapshotRequest, GetResourceSnapshotRequest,
+    GetSignalStateRequest, GetZombieTimerCountRequest, GuestKernelCallRequest,
+    GuestKernelResultResponse, GuestRuntimeKind, JavascriptChildProcessSpawnOptions,
+    JavascriptChildProcessSpawnRequest, JavascriptDgramBindRequest,
+    JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest, JavascriptDnsLookupRequest,
+    JavascriptDnsResolveRequest, JavascriptNetConnectRequest, JavascriptNetListenRequest,
+    JavascriptNetReserveTcpPortRequest, KillProcessRequest, OwnershipScope, ProcessExitedEvent,
+    ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotStatus, PtyResizedResponse,
+    QueueSnapshotEntry, RequestFrame, ResizePtyRequest, ResourceSnapshotResponse, ResponseFrame,
+    ResponsePayload, SidecarRequestPayload, SignalDispositionAction, SignalHandlerRegistration,
+    SocketStateEntry, StreamChannel, VmFetchRequest, VmFetchResponse, WasmPermissionTier,
+    WriteStdinRequest,
 };
 use crate::service::{
     audit_fields, dirname, emit_security_audit_event, emit_structured_event, javascript_error,
@@ -52,7 +51,7 @@ use crate::tools::{
     format_tool_failure_output, is_tool_command, normalized_tool_command_name,
     resolve_tool_command, ToolCommandResolution,
 };
-use crate::wire::{ProtocolFrame as WireProtocolFrame, WireFrameCodec, DEFAULT_MAX_FRAME_BYTES};
+use crate::wire::{ProtocolFrame as WireProtocolFrame, WireFrameCodec};
 use crate::{DispatchResult, NativeSidecar, NativeSidecarBridge, SidecarError};
 
 use base64::Engine;
@@ -80,8 +79,9 @@ use openssl::pkey::{Id as PKeyId, PKey, Params, Private, Public};
 use openssl::rand::rand_bytes;
 use openssl::rsa::{Padding, Rsa};
 use openssl::sign::{Signer, Verifier};
-use openssl::symm::{Cipher, Crypter, Mode};
 use pbkdf2::pbkdf2_hmac;
+
+use crate::crypto_cipher::{CipherError as AesCipherError, StreamCipherSession};
 use rusqlite::types::ValueRef as SqliteValueRef;
 use rusqlite::{
     Connection as SqliteConnection, OpenFlags as SqliteOpenFlags, Statement as SqliteStatement,
@@ -110,6 +110,10 @@ use secure_exec_kernel::dns::{
     DnsLookupPolicy, DnsRecordResolution, DnsResolutionSource as KernelDnsResolutionSource,
 };
 use secure_exec_kernel::kernel::{KernelProcessHandle, SpawnOptions, VirtualProcessOptions};
+pub(crate) use secure_exec_kernel::network_policy::format_tcp_resource;
+use secure_exec_kernel::network_policy::{
+    is_loopback_ip, loopback_cidr, restricted_non_loopback_ip_range,
+};
 use secure_exec_kernel::permissions::NetworkOperation;
 use secure_exec_kernel::poll::{PollEvents, PollFd, PollTargetEntry, POLLERR, POLLHUP, POLLIN};
 use secure_exec_kernel::process_table::{ProcessStatus, WaitPidFlags, SIGKILL, SIGTERM};
@@ -121,10 +125,23 @@ use secure_exec_kernel::socket_table::{
     InetSocketAddress, SocketDomain, SocketId, SocketShutdown as KernelSocketShutdown, SocketSpec,
     SocketState, SocketType,
 };
+use secure_exec_sidecar_core::{
+    apply_process_signal_state_update, bound_udp_snapshot_response, bridge_buffer_value,
+    decode_base64, decode_bridge_buffer_value, decode_encoded_bytes_value, encoded_bytes_value,
+    ensure_vm_fetch_raw_response_buffer_within_limit, ensure_vm_fetch_response_within_limit,
+    listener_snapshot_response, local_endpoint_value, parse_kernel_http_fetch_response,
+    parse_process_signal_state_request, process_killed_response,
+    process_snapshot_entry_from_kernel, process_snapshot_response, process_started_response,
+    remote_endpoint_value, shared_guest_runtime_identity, signal_state_response,
+    socket_addr_family, socket_address_value, stdin_closed_response, stdin_written_response,
+    tcp_socket_info_value, unix_socket_info_value, zombie_timer_count_response,
+    SharedProcessSnapshotEntry, SharedProcessSnapshotStatus, SidecarCoreError,
+    VM_FETCH_BUFFER_LIMIT_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha1::Sha1;
-use sha2::{digest::Digest, Sha256, Sha512};
+use sha2::{digest::Digest, Sha224, Sha256, Sha384, Sha512};
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
@@ -227,7 +244,6 @@ impl NetTcpTraceCounters {
 
 static NET_TCP_TRACE_COUNTERS: NetTcpTraceCounters = NetTcpTraceCounters::new();
 pub(crate) const MAX_PER_PROCESS_STATE_HANDLES: usize = 1024;
-const VM_FETCH_BUFFER_LIMIT_BYTES: usize = DEFAULT_MAX_FRAME_BYTES;
 const DEFAULT_SCRYPT_COST: u64 = 16_384;
 const DEFAULT_SCRYPT_BLOCK_SIZE: u32 = 8;
 const DEFAULT_SCRYPT_PARALLELIZATION: u32 = 1;
@@ -240,14 +256,11 @@ trait Http2AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> Http2AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 fn http_loopback_request_timeout() -> Duration {
-    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
-    *TIMEOUT.get_or_init(|| {
-        std::env::var(HTTP_LOOPBACK_REQUEST_TIMEOUT_MS_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .unwrap_or(HTTP_LOOPBACK_REQUEST_TIMEOUT)
-    })
+    std::env::var(HTTP_LOOPBACK_REQUEST_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(HTTP_LOOPBACK_REQUEST_TIMEOUT)
 }
 
 const DEFAULT_ALLOWED_NODE_BUILTINS: &[&str] = &[
@@ -283,7 +296,9 @@ const EXECUTION_REQUEST_TTY_ENV: &str = "AGENTOS_EXEC_TTY";
 enum JavascriptCryptoDigestAlgorithm {
     Md5,
     Sha1,
+    Sha224,
     Sha256,
+    Sha384,
     Sha512,
 }
 
@@ -700,6 +715,25 @@ fn missing_process_error(vm_id: &str, process_id: &str) -> SidecarError {
     SidecarError::InvalidState(format!(
         "VM {vm_id} no longer has active process {process_id}"
     ))
+}
+
+/// Map a shared guest-kernel-call dispatcher error into a sidecar error,
+/// preserving POSIX errno codes (`ECODE: message`) as kernel errors so guest
+/// callers observe Linux-faithful failures, mirroring the filesystem path.
+fn guest_kernel_core_error(error: secure_exec_sidecar_core::SidecarCoreError) -> SidecarError {
+    let message = error.to_string();
+    let is_errno = message.split_once(':').is_some_and(|(code, _)| {
+        code.len() >= 2
+            && code.starts_with('E')
+            && code[1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    });
+    if is_errno {
+        SidecarError::Kernel(message)
+    } else {
+        SidecarError::InvalidState(message)
+    }
 }
 
 fn is_broken_pipe_error(error: &SidecarError) -> bool {
@@ -1548,14 +1582,7 @@ impl ActiveTcpSocket {
     }
 
     fn socket_info(&self) -> Value {
-        json!({
-            "localAddress": self.guest_local_addr.ip().to_string(),
-            "localPort": self.guest_local_addr.port(),
-            "localFamily": socket_addr_family(&self.guest_local_addr),
-            "remoteAddress": self.guest_remote_addr.ip().to_string(),
-            "remotePort": self.guest_remote_addr.port(),
-            "remoteFamily": socket_addr_family(&self.guest_remote_addr),
-        })
+        tcp_socket_info_value(&self.guest_local_addr, &self.guest_remote_addr)
     }
 
     fn set_no_delay(&mut self, enable: bool) -> Result<(), SidecarError> {
@@ -2111,10 +2138,7 @@ impl ActiveUnixSocket {
     }
 
     fn socket_info(&self) -> Value {
-        json!({
-            "localPath": self.local_path.clone(),
-            "remotePath": self.remote_path.clone(),
-        })
+        unix_socket_info_value(self.local_path.as_deref(), self.remote_path.as_deref())
     }
 
     fn write_all(&self, contents: &[u8]) -> Result<usize, SidecarError> {
@@ -3327,12 +3351,10 @@ where
                 });
 
                 return Ok(DispatchResult {
-                    response: self.respond(
+                    response: process_started_response(
                         request,
-                        ResponsePayload::ProcessStarted(ProcessStartedResponse {
-                            process_id: payload.process_id,
-                            pid: Some(kernel_pid),
-                        }),
+                        payload.process_id,
+                        Some(kernel_pid),
                     ),
                     events: Vec::new(),
                 });
@@ -3584,15 +3606,13 @@ where
         record_execute_phase("execute_total", execute_total_start.elapsed());
 
         Ok(DispatchResult {
-            response: self.respond(
+            response: process_started_response(
                 request,
-                ResponsePayload::ProcessStarted(ProcessStartedResponse {
-                    process_id: payload.process_id,
-                    pid: Some(if child_pid == 0 {
-                        kernel_pid
-                    } else {
-                        child_pid
-                    }),
+                payload.process_id,
+                Some(if child_pid == 0 {
+                    kernel_pid
+                } else {
+                    child_pid
                 }),
             ),
             events: Vec::new(),
@@ -3674,12 +3694,10 @@ where
         write_kernel_process_stdin(&mut vm.kernel, process, &payload.chunk)?;
 
         Ok(DispatchResult {
-            response: self.respond(
+            response: stdin_written_response(
                 request,
-                ResponsePayload::StdinWritten(StdinWrittenResponse {
-                    process_id: payload.process_id,
-                    accepted_bytes: payload.chunk.len() as u64,
-                }),
+                payload.process_id,
+                payload.chunk.len() as u64,
             ),
             events: Vec::new(),
         })
@@ -3710,12 +3728,7 @@ where
         close_kernel_process_stdin(&mut vm.kernel, process)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::StdinClosed(StdinClosedResponse {
-                    process_id: payload.process_id,
-                }),
-            ),
+            response: stdin_closed_response(request, payload.process_id),
             events: Vec::new(),
         })
     }
@@ -3730,12 +3743,7 @@ where
         self.kill_process_internal(&vm_id, &payload.process_id, &payload.signal)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::ProcessKilled(ProcessKilledResponse {
-                    process_id: payload.process_id,
-                }),
-            ),
+            response: process_killed_response(request, payload.process_id),
             events: Vec::new(),
         })
     }
@@ -3759,10 +3767,7 @@ where
             find_socket_state_entry(self.vms.get(&vm_id), SocketQueryKind::TcpListener, &payload)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::ListenerSnapshot(ListenerSnapshotResponse { listener }),
-            ),
+            response: listener_snapshot_response(request, listener),
             events: Vec::new(),
         })
     }
@@ -3792,9 +3797,46 @@ where
             .unwrap_or_default();
 
         Ok(DispatchResult {
+            response: process_snapshot_response(request, processes),
+            events: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn guest_kernel_call(
+        &mut self,
+        request: &RequestFrame,
+        payload: GuestKernelCallRequest,
+    ) -> Result<DispatchResult, SidecarError> {
+        let (connection_id, session_id, vm_id) = self.vm_scope_for(&request.ownership)?;
+        self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
+
+        let vm = self.vms.get_mut(&vm_id).ok_or_else(|| {
+            SidecarError::InvalidState(format!("VM {vm_id} no longer exists for guest kernel call"))
+        })?;
+        let kernel_pid = vm
+            .active_processes
+            .get(&payload.execution_id)
+            .map(|process| process.kernel_pid)
+            .ok_or_else(|| {
+                SidecarError::InvalidState(format!(
+                    "VM {vm_id} has no active process {} for guest kernel call",
+                    payload.execution_id
+                ))
+            })?;
+
+        let response = secure_exec_sidecar_core::handle_guest_kernel_call(
+            &mut vm.kernel,
+            kernel_pid,
+            EXECUTION_DRIVER_NAME,
+            &payload.operation,
+            &payload.payload,
+        )
+        .map_err(guest_kernel_core_error)?;
+
+        Ok(DispatchResult {
             response: self.respond(
                 request,
-                ResponsePayload::ProcessSnapshot(ProcessSnapshotResponse { processes }),
+                ResponsePayload::GuestKernelResult(GuestKernelResultResponse { payload: response }),
             ),
             events: Vec::new(),
         })
@@ -3884,10 +3926,7 @@ where
         )?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::BoundUdpSnapshot(BoundUdpSnapshotResponse { socket }),
-            ),
+            response: bound_udp_snapshot_response(request, socket),
             events: Vec::new(),
         })
     }
@@ -4030,13 +4069,7 @@ where
             .unwrap_or_default();
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::SignalState(SignalStateResponse {
-                    process_id: payload.process_id,
-                    handlers: handlers.into_iter().collect(),
-                }),
-            ),
+            response: signal_state_response(request, payload.process_id, handlers),
             events: Vec::new(),
         })
     }
@@ -4056,10 +4089,7 @@ where
             .unwrap_or_default();
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::ZombieTimerCount(ZombieTimerCountResponse { count }),
-            ),
+            response: zombie_timer_count_response(request, count),
             events: Vec::new(),
         })
     }
@@ -7379,7 +7409,8 @@ where
                     current_child_path.push(child_process_id);
                     let response = if request.method == "process.signal_state" {
                         let (signal, registration) =
-                            parse_process_signal_state_request(&request.args)?;
+                            parse_process_signal_state_request(&request.args)
+                                .map_err(|error| SidecarError::InvalidState(error.to_string()))?;
                         let Some(vm) = self.vms.get_mut(vm_id) else {
                             return Ok(Value::Null);
                         };
@@ -8291,68 +8322,6 @@ fn map_wasm_signal_registration(
         mask: registration.mask,
         flags: registration.flags,
     }
-}
-
-fn parse_process_signal_state_request(
-    args: &[Value],
-) -> Result<(u32, SignalHandlerRegistration), SidecarError> {
-    let signal = javascript_sync_rpc_arg_u32(args, 0, "process.signal_state signal")?;
-    let action = javascript_sync_rpc_arg_str(args, 1, "process.signal_state action")?;
-    let mask_json = javascript_sync_rpc_arg_str(args, 2, "process.signal_state mask")?;
-    let flags = javascript_sync_rpc_arg_u32(args, 3, "process.signal_state flags")?;
-    let mask: Vec<u32> = serde_json::from_str(mask_json).map_err(|error| {
-        SidecarError::InvalidState(format!(
-            "process.signal_state mask must be valid JSON: {error}"
-        ))
-    })?;
-    let action = match action.trim().to_ascii_lowercase().as_str() {
-        "default" => SignalDispositionAction::Default,
-        "ignore" => SignalDispositionAction::Ignore,
-        "user" => SignalDispositionAction::User,
-        other => {
-            return Err(SidecarError::InvalidState(format!(
-                "unsupported process.signal_state action {other}"
-            )));
-        }
-    };
-
-    Ok((
-        signal,
-        SignalHandlerRegistration {
-            action,
-            mask,
-            flags,
-        },
-    ))
-}
-
-fn apply_process_signal_state_update(
-    signal_states: &mut BTreeMap<String, BTreeMap<u32, SignalHandlerRegistration>>,
-    process_id: &str,
-    signal: u32,
-    registration: SignalHandlerRegistration,
-) {
-    if registration.action == SignalDispositionAction::Default
-        && registration.mask.is_empty()
-        && registration.flags == 0
-    {
-        let remove_process_entry = signal_states
-            .get_mut(process_id)
-            .map(|handlers| {
-                handlers.remove(&signal);
-                handlers.is_empty()
-            })
-            .unwrap_or(false);
-        if remove_process_entry {
-            signal_states.remove(process_id);
-        }
-        return;
-    }
-
-    signal_states
-        .entry(process_id.to_owned())
-        .or_default()
-        .insert(signal, registration);
 }
 
 fn map_node_signal_registration(
@@ -9964,22 +9933,6 @@ fn prepare_guest_runtime_env(
     Ok(())
 }
 
-fn virtual_os_cpu_count(resource_limits: &ResourceLimits) -> usize {
-    resource_limits.virtual_cpu_count.unwrap_or(1).max(1)
-}
-
-fn virtual_os_totalmem_bytes(resource_limits: &ResourceLimits) -> u64 {
-    resource_limits
-        .max_wasm_memory_bytes
-        .unwrap_or(1024 * 1024 * 1024)
-}
-
-fn virtual_os_freemem_bytes(resource_limits: &ResourceLimits) -> u64 {
-    resource_limits
-        .max_wasm_memory_bytes
-        .unwrap_or(512 * 1024 * 1024)
-}
-
 /// Build the typed per-execution JavaScript limits from the per-VM `VmLimits`
 /// (sourced from `CreateVmConfig` on the BARE wire). These ride the execution
 /// request, not `AGENTOS_*` env vars — see the env-vs-wire rule in
@@ -10003,19 +9956,25 @@ fn guest_runtime_identity(
 ) -> GuestRuntimeConfig {
     let user = vm.kernel.user_profile();
     let resource_limits = vm.kernel.resource_limits();
+    let identity = shared_guest_runtime_identity(&user, resource_limits, virtual_pid, virtual_ppid);
     GuestRuntimeConfig {
-        virtual_uid: Some(u64::from(user.uid)),
-        virtual_gid: Some(u64::from(user.gid)),
-        virtual_pid,
-        virtual_ppid,
+        virtual_uid: Some(identity.virtual_uid),
+        virtual_gid: Some(identity.virtual_gid),
+        virtual_pid: identity.virtual_pid,
+        virtual_ppid: identity.virtual_ppid,
         virtual_exec_path: None,
-        os_cpu_count: Some(virtual_os_cpu_count(resource_limits) as u64),
-        os_totalmem: Some(virtual_os_totalmem_bytes(resource_limits)),
-        os_freemem: Some(virtual_os_freemem_bytes(resource_limits)),
-        os_homedir: Some(user.homedir.clone()),
-        os_hostname: None,
-        os_shell: Some(user.shell.clone()),
-        os_user: Some(user.username.clone()),
+        os_cpu_count: Some(identity.os_cpu_count),
+        os_totalmem: Some(identity.os_totalmem),
+        os_freemem: Some(identity.os_freemem),
+        os_homedir: Some(identity.os_homedir),
+        os_hostname: Some(identity.os_hostname),
+        os_tmpdir: Some(identity.os_tmpdir),
+        os_type: Some(identity.os_type),
+        os_release: Some(identity.os_release),
+        os_version: Some(identity.os_version),
+        os_machine: Some(identity.os_machine),
+        os_shell: Some(identity.os_shell),
+        os_user: Some(identity.os_user),
         // Userland bundle to bake into the per-sidecar snapshot, supplied by the
         // (trusted) client via jsRuntime.snapshotUserlandCode. The agent-os layer
         // sets this to the agent SDK bundle for snapshot-enabled agents; `None`
@@ -11526,26 +11485,33 @@ fn build_process_snapshot_entry(
     info: &secure_exec_kernel::process_table::ProcessInfo,
     exit_code: Option<i32>,
 ) -> ProcessSnapshotEntry {
+    wire_process_snapshot_entry_from_shared(process_snapshot_entry_from_kernel(
+        process_id,
+        info,
+        process.guest_cwd.clone(),
+        exit_code,
+    ))
+}
+
+fn wire_process_snapshot_entry_from_shared(
+    entry: SharedProcessSnapshotEntry,
+) -> ProcessSnapshotEntry {
     ProcessSnapshotEntry {
-        process_id: process_id.to_owned(),
-        pid: info.pid,
-        ppid: info.ppid,
-        pgid: info.pgid,
-        sid: info.sid,
-        driver: info.driver.clone(),
-        command: info.command.clone(),
-        args: Vec::new(),
-        cwd: process.guest_cwd.clone(),
-        status: if exit_code.is_some() {
-            ProcessSnapshotStatus::Exited
-        } else {
-            match info.status {
-                ProcessStatus::Running => ProcessSnapshotStatus::Running,
-                ProcessStatus::Stopped => ProcessSnapshotStatus::Stopped,
-                ProcessStatus::Exited => ProcessSnapshotStatus::Exited,
-            }
+        process_id: entry.process_id,
+        pid: entry.pid,
+        ppid: entry.ppid,
+        pgid: entry.pgid,
+        sid: entry.sid,
+        driver: entry.driver,
+        command: entry.command,
+        args: entry.args,
+        cwd: entry.cwd,
+        status: match entry.status {
+            SharedProcessSnapshotStatus::Running => ProcessSnapshotStatus::Running,
+            SharedProcessSnapshotStatus::Stopped => ProcessSnapshotStatus::Stopped,
+            SharedProcessSnapshotStatus::Exited => ProcessSnapshotStatus::Exited,
         },
-        exit_code: exit_code.or(info.exit_code),
+        exit_code: entry.exit_code,
     }
 }
 
@@ -12666,10 +12632,6 @@ pub(crate) fn format_dns_resource(hostname: &str) -> String {
     format!("dns://{hostname}")
 }
 
-pub(crate) fn format_tcp_resource(host: &str, port: u16) -> String {
-    format!("tcp://{host}:{port}")
-}
-
 // --- Guest Python socket bridge helpers ------------------------------------
 
 /// Host-socket read timeout for one `recv`/`recvfrom` RPC. Kept short so the
@@ -12744,108 +12706,6 @@ fn python_socket_kind_error(op: &str, expected: &str) -> SidecarError {
     SidecarError::Execution(format!(
         "EOPNOTSUPP: python socket {op} requires a {expected} socket"
     ))
-}
-
-fn is_loopback_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback(),
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| mapped.is_loopback())
-        }
-    }
-}
-
-fn loopback_cidr(ip: IpAddr) -> &'static str {
-    match ip {
-        IpAddr::V4(ip) if ip.is_loopback() => "127.0.0.0/8",
-        IpAddr::V6(ip)
-            if ip
-                .to_ipv4_mapped()
-                .is_some_and(|mapped| mapped.is_loopback()) =>
-        {
-            "127.0.0.0/8"
-        }
-        IpAddr::V6(_) => "::1/128",
-        IpAddr::V4(_) => "127.0.0.0/8",
-    }
-}
-
-/// Returns the embedded IPv4 address of an IPv4-compatible IPv6 address
-/// (`::a.b.c.d`): the first six 16-bit segments are zero and the final 32 bits
-/// hold the IPv4 address. The all-zero (`::`) and loopback (`::1`) addresses are
-/// deliberately excluded so they are handled by the unspecified/loopback paths
-/// rather than treated as IPv4-compatible.
-fn ipv4_compatible_embedded(ip: Ipv6Addr) -> Option<Ipv4Addr> {
-    let segments = ip.segments();
-    if segments[0..6].iter().any(|&s| s != 0) {
-        return None;
-    }
-    let embedded = (u32::from(segments[6]) << 16) | u32::from(segments[7]);
-    // Skip :: (0.0.0.0) and ::1 (0.0.0.1) — these are the IPv6 unspecified /
-    // loopback addresses, not IPv4-compatible representations of an IPv4 host.
-    if embedded == 0 || embedded == 1 {
-        return None;
-    }
-    Some(Ipv4Addr::from(embedded))
-}
-
-fn restricted_non_loopback_ip_range(ip: IpAddr) -> Option<(&'static str, &'static str)> {
-    match ip {
-        IpAddr::V4(ip) => {
-            if ip.is_unspecified() {
-                // 0.0.0.0 is unspecified; the host stack routes a connect() to
-                // it back to 127.0.0.1, so it must not bypass the loopback gate.
-                return Some(("0.0.0.0/32", "unspecified"));
-            }
-            let [first, second, ..] = ip.octets();
-            match (first, second) {
-                (10, _) => Some(("10.0.0.0/8", "private")),
-                (100, 64..=127) => Some(("100.64.0.0/10", "carrier-grade-nat")),
-                (172, 16..=31) => Some(("172.16.0.0/12", "private")),
-                (192, 168) => Some(("192.168.0.0/16", "private")),
-                (169, 254) => Some(("169.254.0.0/16", "link-local")),
-                // 224.0.0.0/4 is the IPv4 multicast range and 240.0.0.0/4 is
-                // reserved/future-use (255.255.255.255 broadcast falls in it).
-                // Neither is a legitimate unicast egress target, so a guest
-                // connect to them must be denied rather than attempted.
-                (224..=239, _) => Some(("224.0.0.0/4", "multicast")),
-                (240..=255, _) => Some(("240.0.0.0/4", "reserved")),
-                _ => None,
-            }
-        }
-        IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return restricted_non_loopback_ip_range(IpAddr::V4(mapped));
-            }
-            // IPv4-compatible IPv6 (::a.b.c.d): the first six segments are zero
-            // and the last two carry an embedded IPv4 address. `to_ipv4_mapped`
-            // returns None for this form, so without canonicalizing it here a
-            // guest could spell a restricted IPv4 target (e.g. cloud-metadata
-            // ::169.254.169.254) and bypass the IPv4 classifier. `::`/`::1` are
-            // excluded so they fall through to the unspecified/loopback paths.
-            if let Some(compat) = ipv4_compatible_embedded(ip) {
-                return restricted_non_loopback_ip_range(IpAddr::V4(compat));
-            }
-
-            if ip.is_unspecified() {
-                // :: is the IPv6 unspecified address; same routing hazard as
-                // 0.0.0.0, so deny it rather than letting it reach the host.
-                return Some(("::/128", "unspecified"));
-            }
-
-            let segments = ip.segments();
-            if (segments[0] & 0xfe00) == 0xfc00 {
-                return Some(("fc00::/7", "unique-local"));
-            }
-            if (segments[0] & 0xffc0) == 0xfe80 {
-                return Some(("fe80::/10", "link-local"));
-            }
-            None
-        }
-    }
 }
 
 fn blocked_dns_resolution_error(
@@ -13127,13 +12987,6 @@ where
             family.socket_type()
         ))
     })
-}
-
-fn socket_addr_family(addr: &SocketAddr) -> &'static str {
-    match addr {
-        SocketAddr::V4(_) => "IPv4",
-        SocketAddr::V6(_) => "IPv6",
-    }
 }
 
 fn javascript_net_timeout_value() -> Value {
@@ -14801,30 +14654,12 @@ pub(crate) fn javascript_sync_rpc_bytes_arg(
         return Ok(text.as_bytes().to_vec());
     }
 
-    let Some(base64_value) = value
-        .get("__agentOSType")
-        .and_then(Value::as_str)
-        .filter(|kind| *kind == "bytes")
-        .and_then(|_| value.get("base64"))
-        .and_then(Value::as_str)
-    else {
-        return Err(SidecarError::InvalidState(format!(
-            "{label} must be a string or encoded bytes payload"
-        )));
-    };
-
-    base64::engine::general_purpose::STANDARD
-        .decode(base64_value)
-        .map_err(|error| {
-            SidecarError::InvalidState(format!("{label} contains invalid base64: {error}"))
-        })
+    decode_encoded_bytes_value(value)
+        .map_err(|error| SidecarError::InvalidState(format!("{label} {error}")))
 }
 
 pub(crate) fn javascript_sync_rpc_bytes_value(bytes: &[u8]) -> Value {
-    json!({
-        "__agentOSType": "bytes",
-        "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-    })
+    encoded_bytes_value(bytes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -14846,11 +14681,7 @@ fn javascript_sync_rpc_base64_arg(
     label: &str,
 ) -> Result<Vec<u8>, SidecarError> {
     let value = javascript_sync_rpc_arg_str(args, index, label)?;
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|error| {
-            SidecarError::InvalidState(format!("{label} contains invalid base64: {error}"))
-        })
+    decode_base64(value).map_err(|error| SidecarError::InvalidState(format!("{label} {error}")))
 }
 
 // ── Sync-RPC round-trip counting (opt-in via AGENTOS_SYNC_RPC_TRACE=1) ──
@@ -15661,7 +15492,9 @@ impl JavascriptCryptoDigestAlgorithm {
         match value.trim().to_ascii_lowercase().replace('-', "").as_str() {
             "md5" => Ok(Self::Md5),
             "sha1" => Ok(Self::Sha1),
+            "sha224" => Ok(Self::Sha224),
             "sha256" => Ok(Self::Sha256),
+            "sha384" => Ok(Self::Sha384),
             "sha512" => Ok(Self::Sha512),
             _ => Err(SidecarError::InvalidState(format!(
                 "unsupported crypto digest algorithm {value}"
@@ -15673,7 +15506,9 @@ impl JavascriptCryptoDigestAlgorithm {
         match self {
             Self::Md5 => Md5::digest(data).to_vec(),
             Self::Sha1 => Sha1::digest(data).to_vec(),
+            Self::Sha224 => Sha224::digest(data).to_vec(),
             Self::Sha256 => Sha256::digest(data).to_vec(),
+            Self::Sha384 => Sha384::digest(data).to_vec(),
             Self::Sha512 => Sha512::digest(data).to_vec(),
         }
     }
@@ -15694,8 +15529,22 @@ impl JavascriptCryptoDigestAlgorithm {
                 mac.update(data);
                 Ok(mac.finalize().into_bytes().to_vec())
             }
+            Self::Sha224 => {
+                let mut mac = Hmac::<Sha224>::new_from_slice(key).map_err(|error| {
+                    SidecarError::InvalidState(format!("invalid HMAC key: {error}"))
+                })?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
             Self::Sha256 => {
                 let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|error| {
+                    SidecarError::InvalidState(format!("invalid HMAC key: {error}"))
+                })?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            Self::Sha384 => {
+                let mut mac = Hmac::<Sha384>::new_from_slice(key).map_err(|error| {
                     SidecarError::InvalidState(format!("invalid HMAC key: {error}"))
                 })?;
                 mac.update(data);
@@ -15715,7 +15564,9 @@ impl JavascriptCryptoDigestAlgorithm {
         match self {
             Self::Md5 => pbkdf2_hmac::<Md5>(password, salt, iterations, output),
             Self::Sha1 => pbkdf2_hmac::<Sha1>(password, salt, iterations, output),
+            Self::Sha224 => pbkdf2_hmac::<Sha224>(password, salt, iterations, output),
             Self::Sha256 => pbkdf2_hmac::<Sha256>(password, salt, iterations, output),
+            Self::Sha384 => pbkdf2_hmac::<Sha384>(password, salt, iterations, output),
             Self::Sha512 => pbkdf2_hmac::<Sha512>(password, salt, iterations, output),
         }
     }
@@ -15778,8 +15629,7 @@ fn service_javascript_crypto_cipheriv_create_sync_rpc(
     let iv = javascript_sync_rpc_base64_arg_optional(&request.args, 3, "crypto.cipherivCreate iv")?;
     let options =
         javascript_sync_rpc_json_arg_optional(&request.args, 4, "crypto.cipherivCreate options")?;
-    let auth_tag_len = javascript_crypto_requested_aead_tag_len(algorithm, options.as_ref())?;
-    let context = javascript_crypto_build_cipher_context(
+    let context = javascript_crypto_build_cipher_session(
         algorithm,
         &key,
         iv.as_deref(),
@@ -15788,14 +15638,9 @@ fn service_javascript_crypto_cipheriv_create_sync_rpc(
     )?;
     process.next_cipher_session_id += 1;
     let session_id = process.next_cipher_session_id;
-    process.cipher_sessions.insert(
-        session_id,
-        ActiveCipherSession {
-            algorithm: algorithm.to_string(),
-            auth_tag_len,
-            context,
-        },
-    );
+    process
+        .cipher_sessions
+        .insert(session_id, ActiveCipherSession { context });
     Ok(json!(session_id))
 }
 
@@ -15824,21 +15669,19 @@ fn service_javascript_crypto_cipheriv_final_sync_rpc(
 ) -> Result<Value, SidecarError> {
     let session_id =
         javascript_sync_rpc_arg_u64(&request.args, 0, "crypto.cipherivFinal session id")?;
-    let mut session = process.cipher_sessions.remove(&session_id).ok_or_else(|| {
+    let session = process.cipher_sessions.remove(&session_id).ok_or_else(|| {
         SidecarError::InvalidState(format!("Cipher session {session_id} not found"))
     })?;
-    let data = javascript_crypto_cipher_finalize(&mut session.context)?;
+    let outcome = session
+        .context
+        .finalize()
+        .map_err(javascript_crypto_cipher_error)?;
     let mut response = Map::new();
     response.insert(
         String::from("data"),
-        Value::String(base64::engine::general_purpose::STANDARD.encode(data)),
+        Value::String(base64::engine::general_purpose::STANDARD.encode(outcome.data)),
     );
-    if javascript_crypto_is_aead(&session.algorithm) {
-        let mut auth_tag = vec![0_u8; session.auth_tag_len];
-        session
-            .context
-            .get_tag(&mut auth_tag)
-            .map_err(javascript_crypto_openssl_error)?;
+    if let Some(auth_tag) = outcome.auth_tag {
         response.insert(
             String::from("authTag"),
             Value::String(base64::engine::general_purpose::STANDARD.encode(auth_tag)),
@@ -16657,21 +16500,22 @@ fn service_javascript_crypto_subtle_aes_crypt_sync_rpc(
         );
     }
     let cipher_name = format!("aes-{}-gcm", key.len() * 8);
-    let mut context = javascript_crypto_build_cipher_context(
+    let mut session = javascript_crypto_build_cipher_session(
         &cipher_name,
         &key,
         Some(&iv),
         decrypt,
         Some(&Value::Object(options)),
     )?;
-    let mut output = javascript_crypto_cipher_update(&mut context, &data)?;
-    output.extend(javascript_crypto_cipher_finalize(&mut context)?);
+    let mut output = javascript_crypto_cipher_update(&mut session, &data)?;
+    let outcome = session
+        .finalize()
+        .map_err(javascript_crypto_cipher_error)?;
+    output.extend(outcome.data);
     if !decrypt {
-        let mut auth_tag = vec![0_u8; tag_len];
-        context
-            .get_tag(&mut auth_tag)
-            .map_err(javascript_crypto_openssl_error)?;
-        output.extend(auth_tag);
+        if let Some(auth_tag) = outcome.auth_tag {
+            output.extend(auth_tag);
+        }
     }
     Ok(Value::String(
         serde_json::to_string(&json!({
@@ -16713,19 +16557,20 @@ fn service_javascript_crypto_cipheriv_inner(
     let data = javascript_sync_rpc_base64_arg(&request.args, 3, &format!("{label} data"))?;
     let options =
         javascript_sync_rpc_json_arg_optional(&request.args, 4, &format!("{label} options"))?;
-    let auth_tag_len = javascript_crypto_requested_aead_tag_len(algorithm, options.as_ref())?;
-    let mut context = javascript_crypto_build_cipher_context(
+    let mut session = javascript_crypto_build_cipher_session(
         algorithm,
         &key,
         iv.as_deref(),
         decrypt,
         options.as_ref(),
     )?;
-    let payload = javascript_crypto_cipher_update(&mut context, &data)?;
-    let final_bytes = javascript_crypto_cipher_finalize(&mut context)?;
+    let payload = javascript_crypto_cipher_update(&mut session, &data)?;
+    let outcome = session
+        .finalize()
+        .map_err(javascript_crypto_cipher_error)?;
     if decrypt {
         let mut output = payload;
-        output.extend(final_bytes);
+        output.extend(outcome.data);
         return Ok(Value::String(
             base64::engine::general_purpose::STANDARD.encode(output),
         ));
@@ -16733,16 +16578,12 @@ fn service_javascript_crypto_cipheriv_inner(
 
     let mut response = Map::new();
     let mut encrypted = payload;
-    encrypted.extend(final_bytes);
+    encrypted.extend(outcome.data);
     response.insert(
         String::from("data"),
         Value::String(base64::engine::general_purpose::STANDARD.encode(encrypted)),
     );
-    if javascript_crypto_is_aead(algorithm) {
-        let mut auth_tag = vec![0_u8; auth_tag_len];
-        context
-            .get_tag(&mut auth_tag)
-            .map_err(javascript_crypto_openssl_error)?;
+    if let Some(auth_tag) = outcome.auth_tag {
         response.insert(
             String::from("authTag"),
             Value::String(base64::engine::general_purpose::STANDARD.encode(auth_tag)),
@@ -17044,19 +16885,8 @@ fn javascript_crypto_decode_bridge_buffer(
     value: &Value,
     label: &str,
 ) -> Result<Vec<u8>, SidecarError> {
-    let base64_value = value
-        .as_object()
-        .filter(|object| object.get("__type").and_then(Value::as_str) == Some("buffer"))
-        .and_then(|object| object.get("value"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            SidecarError::InvalidState(format!("{label} must be a serialized bridge buffer"))
-        })?;
-    base64::engine::general_purpose::STANDARD
-        .decode(base64_value)
-        .map_err(|error| {
-            SidecarError::InvalidState(format!("{label} contains invalid base64: {error}"))
-        })
+    decode_bridge_buffer_value(value)
+        .map_err(|error| SidecarError::InvalidState(format!("{label} {error}")))
 }
 
 fn javascript_crypto_serialize_sandbox_key_object(
@@ -17297,13 +17127,24 @@ fn javascript_crypto_call_dh_session(
                 })?,
                 "Diffie-Hellman peer public key",
             )?;
-            let secret = session
+            let private_key = session
                 .key_pair
                 .as_ref()
                 .expect("dh key pair")
-                .compute_key(&peer)
+                .private_key();
+            let mut secret = BigNum::new().map_err(javascript_crypto_openssl_error)?;
+            let mut ctx = BigNumContext::new().map_err(javascript_crypto_openssl_error)?;
+            secret
+                .mod_exp(&peer, private_key, session.params.prime_p(), &mut ctx)
                 .map_err(javascript_crypto_openssl_error)?;
-            Ok((javascript_crypto_bridge_buffer_value(&secret), true))
+            Ok((
+                javascript_crypto_bridge_buffer_value(
+                    &secret
+                        .to_vec_padded(session.params.prime_p().num_bytes())
+                        .map_err(javascript_crypto_openssl_error)?,
+                ),
+                true,
+            ))
         }
         "getPrime" => Ok((
             javascript_crypto_bridge_buffer_value(&session.params.prime_p().to_vec()),
@@ -17352,6 +17193,55 @@ fn javascript_crypto_call_dh_session(
                 ),
                 true,
             ))
+        }
+        "setPrivateKey" => {
+            let private_key = javascript_crypto_bignum_from_bridge_value(
+                args.first().ok_or_else(|| {
+                    SidecarError::InvalidState(String::from("setPrivateKey requires private key"))
+                })?,
+                "Diffie-Hellman private key",
+            )?;
+            let mut public_key = BigNum::new().map_err(javascript_crypto_openssl_error)?;
+            let mut ctx = BigNumContext::new().map_err(javascript_crypto_openssl_error)?;
+            public_key
+                .mod_exp(
+                    session.params.generator(),
+                    &private_key,
+                    session.params.prime_p(),
+                    &mut ctx,
+                )
+                .map_err(javascript_crypto_openssl_error)?;
+            session.key_pair = Some(
+                javascript_crypto_clone_dh_params(&session.params)?
+                    .set_key(public_key, private_key)
+                    .map_err(javascript_crypto_openssl_error)?,
+            );
+            Ok((Value::Null, false))
+        }
+        "setPublicKey" => {
+            let public_key = javascript_crypto_bignum_from_bridge_value(
+                args.first().ok_or_else(|| {
+                    SidecarError::InvalidState(String::from("setPublicKey requires public key"))
+                })?,
+                "Diffie-Hellman public key",
+            )?;
+            let private_key = session
+                .key_pair
+                .as_ref()
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "setPublicKey requires private key to be set first",
+                    ))
+                })?
+                .private_key()
+                .to_owned()
+                .map_err(javascript_crypto_openssl_error)?;
+            session.key_pair = Some(
+                javascript_crypto_clone_dh_params(&session.params)?
+                    .set_key(public_key, private_key)
+                    .map_err(javascript_crypto_openssl_error)?,
+            );
+            Ok((Value::Null, false))
         }
         other => Err(SidecarError::InvalidState(format!(
             "Unsupported Diffie-Hellman method: {other}"
@@ -17446,6 +17336,51 @@ fn javascript_crypto_call_ecdh_session(
                 true,
             ))
         }
+        "setPrivateKey" => {
+            let private_key = javascript_crypto_bignum_from_bridge_value(
+                args.first().ok_or_else(|| {
+                    SidecarError::InvalidState(String::from("setPrivateKey requires private key"))
+                })?,
+                "ECDH private key",
+            )?;
+            let mut ctx = BigNumContext::new().map_err(javascript_crypto_openssl_error)?;
+            let mut public_key = EcPoint::new(&group).map_err(javascript_crypto_openssl_error)?;
+            public_key
+                .mul_generator(&group, &private_key, &mut ctx)
+                .map_err(javascript_crypto_openssl_error)?;
+            session.key_pair = Some(
+                EcKey::from_private_components(&group, &private_key, &public_key)
+                    .map_err(javascript_crypto_openssl_error)?,
+            );
+            Ok((Value::Null, false))
+        }
+        "setPublicKey" => {
+            let public_key_bytes = javascript_crypto_decode_bridge_buffer(
+                args.first().ok_or_else(|| {
+                    SidecarError::InvalidState(String::from("setPublicKey requires public key"))
+                })?,
+                "ECDH public key",
+            )?;
+            let mut ctx = BigNumContext::new().map_err(javascript_crypto_openssl_error)?;
+            let public_key = EcPoint::from_bytes(&group, &public_key_bytes, &mut ctx)
+                .map_err(javascript_crypto_openssl_error)?;
+            let private_key = session
+                .key_pair
+                .as_ref()
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "setPublicKey requires private key to be set first",
+                    ))
+                })?
+                .private_key()
+                .to_owned()
+                .map_err(javascript_crypto_openssl_error)?;
+            session.key_pair = Some(
+                EcKey::from_private_components(&group, &private_key, &public_key)
+                    .map_err(javascript_crypto_openssl_error)?,
+            );
+            Ok((Value::Null, false))
+        }
         other => Err(SidecarError::InvalidState(format!(
             "Unsupported Diffie-Hellman method: {other}"
         ))),
@@ -17511,69 +17446,61 @@ fn javascript_crypto_serialize_encoded_key_value_private(
 }
 
 fn javascript_crypto_bridge_buffer_value(bytes: &[u8]) -> Value {
-    json!({
-        "__type": "buffer",
-        "value": base64::engine::general_purpose::STANDARD.encode(bytes),
-    })
+    bridge_buffer_value(bytes)
 }
 
-fn javascript_crypto_build_cipher_context(
+fn javascript_crypto_cipher_error(error: AesCipherError) -> SidecarError {
+    SidecarError::InvalidState(error.0)
+}
+
+fn javascript_crypto_decode_cipher_option_b64(
+    options: Option<&Value>,
+    field: &str,
+) -> Result<Option<Vec<u8>>, SidecarError> {
+    let Some(encoded) = options.and_then(|value| value.get(field)).and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map(Some)
+        .map_err(|error| {
+            SidecarError::InvalidState(format!("cipher {field} contains invalid base64: {error}"))
+        })
+}
+
+fn javascript_crypto_build_cipher_session(
     algorithm: &str,
     key: &[u8],
     iv: Option<&[u8]>,
     decrypt: bool,
     options: Option<&Value>,
-) -> Result<Crypter, SidecarError> {
-    let cipher = javascript_crypto_cipher_from_name(algorithm)?;
-    let mode = if decrypt {
-        Mode::Decrypt
-    } else {
-        Mode::Encrypt
-    };
-    let mut context =
-        Crypter::new(cipher, mode, key, iv).map_err(javascript_crypto_openssl_error)?;
-    if let Some(auto_padding) = options
+) -> Result<StreamCipherSession, SidecarError> {
+    let pad = options
         .and_then(|value| value.get("autoPadding"))
         .and_then(Value::as_bool)
-    {
-        context.pad(auto_padding);
-    }
-    if javascript_crypto_is_aead(algorithm) {
-        if let Some(aad) = options
-            .and_then(|value| value.get("aad"))
-            .and_then(Value::as_str)
-        {
-            context
-                .aad_update(
-                    &base64::engine::general_purpose::STANDARD
-                        .decode(aad)
-                        .map_err(|error| {
-                            SidecarError::InvalidState(format!(
-                                "cipher aad contains invalid base64: {error}"
-                            ))
-                        })?,
-                )
-                .map_err(javascript_crypto_openssl_error)?;
-        }
-        if decrypt {
-            if let Some(auth_tag) = options
-                .and_then(|value| value.get("authTag"))
-                .and_then(Value::as_str)
-            {
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(auth_tag)
-                    .map_err(|error| {
-                        SidecarError::InvalidState(format!(
-                            "cipher authTag contains invalid base64: {error}"
-                        ))
-                    })?;
-                context
-                    .set_tag(&decoded)
-                    .map_err(javascript_crypto_openssl_error)?;
-            }
-        }
-    }
-    Ok(context)
+        .unwrap_or(true);
+    let aad = if javascript_crypto_is_aead(algorithm) {
+        javascript_crypto_decode_cipher_option_b64(options, "aad")?
+    } else {
+        None
+    };
+    let auth_tag = if decrypt && javascript_crypto_is_aead(algorithm) {
+        javascript_crypto_decode_cipher_option_b64(options, "authTag")?
+    } else {
+        None
+    };
+    let tag_len = javascript_crypto_requested_aead_tag_len(algorithm, options)?;
+    StreamCipherSession::new(
+        algorithm,
+        key,
+        iv,
+        decrypt,
+        pad,
+        aad.as_deref(),
+        auth_tag.as_deref(),
+        tag_len,
+    )
+    .map_err(javascript_crypto_cipher_error)
 }
 
 fn javascript_crypto_requested_aead_tag_len(
@@ -17593,49 +17520,18 @@ fn javascript_crypto_requested_aead_tag_len(
 }
 
 fn javascript_crypto_cipher_update(
-    context: &mut Crypter,
+    session: &mut StreamCipherSession,
     data: &[u8],
 ) -> Result<Vec<u8>, SidecarError> {
-    let mut output = vec![0_u8; data.len() + 32];
-    let written = context
-        .update(data, &mut output)
-        .map_err(javascript_crypto_openssl_error)?;
-    output.truncate(written);
-    Ok(output)
-}
-
-fn javascript_crypto_cipher_finalize(context: &mut Crypter) -> Result<Vec<u8>, SidecarError> {
-    let mut output = vec![0_u8; 32];
-    let written = context
-        .finalize(&mut output)
-        .map_err(javascript_crypto_openssl_error)?;
-    output.truncate(written);
-    Ok(output)
-}
-
-fn javascript_crypto_cipher_from_name(name: &str) -> Result<Cipher, SidecarError> {
-    match name.to_ascii_lowercase().as_str() {
-        "aes-128-cbc" => Ok(Cipher::aes_128_cbc()),
-        "aes-192-cbc" => Ok(Cipher::aes_192_cbc()),
-        "aes-256-cbc" => Ok(Cipher::aes_256_cbc()),
-        "aes-128-ctr" => Ok(Cipher::aes_128_ctr()),
-        "aes-192-ctr" => Ok(Cipher::aes_192_ctr()),
-        "aes-256-ctr" => Ok(Cipher::aes_256_ctr()),
-        "aes-128-gcm" => Ok(Cipher::aes_128_gcm()),
-        "aes-192-gcm" => Ok(Cipher::aes_192_gcm()),
-        "aes-256-gcm" => Ok(Cipher::aes_256_gcm()),
-        other => Err(SidecarError::InvalidState(format!(
-            "unsupported crypto cipher algorithm {other}"
-        ))),
-    }
+    session.update(data).map_err(javascript_crypto_cipher_error)
 }
 
 fn javascript_crypto_is_aead(algorithm: &str) -> bool {
-    algorithm.to_ascii_lowercase().ends_with("-gcm")
+    crate::crypto_cipher::is_aead(algorithm)
 }
 
 fn javascript_crypto_aead_tag_len(_algorithm: &str) -> usize {
-    16
+    crate::crypto_cipher::default_aead_tag_len()
 }
 
 fn javascript_crypto_openssl_error(error: openssl::error::ErrorStack) -> SidecarError {
@@ -18048,216 +17944,6 @@ fn serialize_kernel_http_fetch_request(
     request
 }
 
-fn parse_kernel_http_fetch_response(
-    buffer: &[u8],
-    peer_closed: bool,
-    url: &str,
-) -> Result<Option<String>, SidecarError> {
-    let Some(header_end) = find_http_header_end(buffer) else {
-        return Ok(None);
-    };
-    let header_bytes = &buffer[..header_end];
-    let head = String::from_utf8_lossy(header_bytes);
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let mut status_parts = status_line.splitn(3, ' ');
-    let version = status_parts.next().unwrap_or_default();
-    if !version.starts_with("HTTP/") {
-        return Err(SidecarError::Execution(format!(
-            "invalid vm.fetch HTTP response status line: {status_line}"
-        )));
-    }
-    let status = status_parts
-        .next()
-        .ok_or_else(|| {
-            SidecarError::Execution(format!(
-                "invalid vm.fetch HTTP response status line: {status_line}"
-            ))
-        })?
-        .parse::<u16>()
-        .map_err(|error| {
-            SidecarError::Execution(format!(
-                "invalid vm.fetch HTTP response status code in {status_line:?}: {error}"
-            ))
-        })?;
-    let status_text = status_parts.next().unwrap_or_default();
-    let mut headers = Vec::new();
-    let mut raw_headers = Vec::new();
-    let mut content_length = None;
-    let mut transfer_encoding_values = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(SidecarError::Execution(format!(
-                "invalid vm.fetch HTTP response header line: {line}"
-            )));
-        };
-        let value = value.trim().to_owned();
-        let normalized = name.to_ascii_lowercase();
-        if normalized == "content-length" {
-            content_length = Some(value.parse::<usize>().map_err(|error| {
-                SidecarError::Execution(format!(
-                    "invalid vm.fetch Content-Length header {value:?}: {error}"
-                ))
-            })?);
-        } else if normalized == "transfer-encoding" {
-            transfer_encoding_values.push(value.clone());
-        }
-        headers.push(json!([normalized, value.clone()]));
-        raw_headers.push(Value::String(name.to_owned()));
-        raw_headers.push(Value::String(value));
-    }
-
-    let body_start = header_end + 4;
-    let transfer_encoding = transfer_encoding_tokens(&transfer_encoding_values);
-    let is_chunked = transfer_encoding.iter().any(|token| token == "chunked");
-    let body = if is_chunked {
-        if content_length.is_some() {
-            return Err(SidecarError::Execution(String::from(
-                "vm.fetch HTTP response cannot include both Transfer-Encoding: chunked and Content-Length",
-            )));
-        }
-        if transfer_encoding.len() != 1 {
-            return Err(SidecarError::Execution(format!(
-                "unsupported vm.fetch Transfer-Encoding: {}",
-                transfer_encoding.join(", ")
-            )));
-        }
-        let Some(decoded) = decode_kernel_http_chunked_body(&buffer[body_start..])? else {
-            return Ok(None);
-        };
-        decoded
-    } else if !transfer_encoding.is_empty() {
-        return Err(SidecarError::Execution(format!(
-            "unsupported vm.fetch Transfer-Encoding: {}",
-            transfer_encoding.join(", ")
-        )));
-    } else if let Some(content_length) = content_length {
-        let body_end = body_start.saturating_add(content_length);
-        // Reject a response whose declared length exceeds the hard raw-buffer cap
-        // before waiting for the whole body: such a body can never satisfy the
-        // limit, and the guest cannot stream it through the bounded kernel socket
-        // buffer before the request deadline, so the read loop would otherwise
-        // stall on an incomplete body until it times out. (A smaller-but-still-
-        // over-a-configured-limit response is delivered in full and rejected by
-        // the payload-size check, preserving that error's message.)
-        if body_end > VM_FETCH_BUFFER_LIMIT_BYTES {
-            return Err(SidecarError::Execution(format!(
-                "vm.fetch raw response buffer is {body_end} bytes, limit is {VM_FETCH_BUFFER_LIMIT_BYTES}"
-            )));
-        }
-        if buffer.len() < body_end {
-            return Ok(None);
-        }
-        buffer[body_start..body_end].to_vec()
-    } else if peer_closed {
-        buffer[body_start..].to_vec()
-    } else {
-        return Ok(None);
-    };
-
-    serde_json::to_string(&json!({
-        "status": status,
-        "statusText": status_text,
-        "headers": headers,
-        "rawHeaders": raw_headers,
-        "body": base64::engine::general_purpose::STANDARD.encode(&body),
-        "bodyEncoding": "base64",
-        "url": url,
-    }))
-    .map(Some)
-    .map_err(|error| SidecarError::Execution(format!("ERR_AGENTOS_NODE_SYNC_RPC: {error}")))
-}
-
-fn find_http_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn find_crlf(buffer: &[u8], start: usize) -> Option<usize> {
-    buffer
-        .get(start..)?
-        .windows(2)
-        .position(|window| window == b"\r\n")
-        .map(|offset| start + offset)
-}
-
-fn transfer_encoding_tokens(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .flat_map(|value| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn decode_kernel_http_chunked_body(buffer: &[u8]) -> Result<Option<Vec<u8>>, SidecarError> {
-    let mut offset = 0;
-    let mut body = Vec::new();
-    loop {
-        let Some(line_end) = find_crlf(buffer, offset) else {
-            return Ok(None);
-        };
-        let size_line = std::str::from_utf8(&buffer[offset..line_end]).map_err(|error| {
-            SidecarError::Execution(format!(
-                "invalid vm.fetch chunk size line encoding: {error}"
-            ))
-        })?;
-        let size_part = size_line.split(';').next().unwrap_or_default();
-        if size_part.is_empty() || !size_part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(SidecarError::Execution(format!(
-                "invalid vm.fetch chunk size line: {size_line:?}"
-            )));
-        }
-        let chunk_size = usize::from_str_radix(size_part, 16).map_err(|error| {
-            SidecarError::Execution(format!(
-                "invalid vm.fetch chunk size {size_part:?}: {error}"
-            ))
-        })?;
-        let chunk_start = line_end + 2;
-        let chunk_end = chunk_start
-            .checked_add(chunk_size)
-            .ok_or_else(|| SidecarError::Execution(String::from("vm.fetch chunk size overflow")))?;
-        if chunk_size > 0 {
-            let chunk_terminator_end = chunk_end.checked_add(2).ok_or_else(|| {
-                SidecarError::Execution(String::from("vm.fetch chunk terminator overflow"))
-            })?;
-            if chunk_terminator_end > buffer.len() {
-                return Ok(None);
-            }
-            if buffer.get(chunk_end..chunk_terminator_end) != Some(b"\r\n") {
-                return Err(SidecarError::Execution(String::from(
-                    "invalid vm.fetch chunk terminator",
-                )));
-            }
-            body.extend_from_slice(&buffer[chunk_start..chunk_end]);
-            offset = chunk_terminator_end;
-            continue;
-        }
-
-        if buffer.get(chunk_start..chunk_start + 2) == Some(b"\r\n") {
-            return Ok(Some(body));
-        }
-        let Some(trailer_end) = find_http_header_end(&buffer[chunk_start..]) else {
-            return Ok(None);
-        };
-        let trailer_bytes = &buffer[chunk_start..chunk_start + trailer_end];
-        let trailers = String::from_utf8_lossy(trailer_bytes);
-        for line in trailers.split("\r\n") {
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with(' ') || line.starts_with('\t') || !line.contains(':') {
-                return Err(SidecarError::Execution(format!(
-                    "invalid vm.fetch chunk trailer line: {line}"
-                )));
-            }
-        }
-        return Ok(Some(body));
-    }
-}
-
 fn kernel_http_fetch_target_exit_code(error: &SidecarError) -> Option<i32> {
     let SidecarError::Execution(message) = error else {
         return None;
@@ -18508,9 +18194,11 @@ where
     let deadline = Instant::now() + http_loopback_request_timeout();
     loop {
         if let Some(response) =
-            parse_kernel_http_fetch_response(&response_buffer, peer_closed, &url)?
+            parse_kernel_http_fetch_response(&response_buffer, peer_closed, &url)
+                .map_err(sidecar_core_execution_error)?
         {
-            ensure_vm_fetch_response_within_limit(&response, "vm.fetch", max_fetch_response_bytes)?;
+            ensure_vm_fetch_response_within_limit(&response, "vm.fetch", max_fetch_response_bytes)
+                .map_err(sidecar_core_execution_error)?;
             return Ok(response);
         }
         if Instant::now() >= deadline {
@@ -18577,7 +18265,8 @@ where
                         ensure_vm_fetch_raw_response_buffer_within_limit(
                             response_buffer.len(),
                             "vm.fetch",
-                        )?;
+                        )
+                        .map_err(sidecar_core_execution_error)?;
                     }
                     Ok(Some(_)) => break,
                     Ok(None) => {
@@ -18851,30 +18540,8 @@ where
     })
 }
 
-fn ensure_vm_fetch_response_within_limit(
-    response_json: &str,
-    operation: &str,
-    limit: usize,
-) -> Result<(), SidecarError> {
-    let size = response_json.len();
-    if size > limit {
-        return Err(SidecarError::Execution(format!(
-            "{operation} payload is {size} bytes, limit is {limit}"
-        )));
-    }
-    Ok(())
-}
-
-fn ensure_vm_fetch_raw_response_buffer_within_limit(
-    size: usize,
-    operation: &str,
-) -> Result<(), SidecarError> {
-    if size > VM_FETCH_BUFFER_LIMIT_BYTES {
-        return Err(SidecarError::Execution(format!(
-            "{operation} raw response buffer is {size} bytes, limit is {VM_FETCH_BUFFER_LIMIT_BYTES}"
-        )));
-    }
-    Ok(())
+fn sidecar_core_execution_error(error: SidecarCoreError) -> SidecarError {
+    SidecarError::Execution(error.to_string())
 }
 
 pub(crate) fn ensure_vm_fetch_response_frame_within_limit(
@@ -19071,11 +18738,7 @@ where
                 payload.port,
                 socket_paths,
             )?;
-            Ok(json!({
-                "localAddress": local_addr.ip().to_string(),
-                "localPort": local_addr.port(),
-                "family": socket_addr_family(&local_addr),
-            }))
+            Ok(local_endpoint_value(&local_addr))
         }
         "dgram.send" => {
             let socket_id = javascript_sync_rpc_arg_str(&request.args, 0, "dgram.send socket id")?;
@@ -19137,13 +18800,12 @@ where
                     } else {
                         remote_addr.port()
                     };
-                    Ok(json!({
-                    "type": "message",
-                    "data": javascript_sync_rpc_bytes_value(&data),
-                    "remoteAddress": remote_addr.ip().to_string(),
-                    "remotePort": guest_remote_port,
-                    "remoteFamily": socket_addr_family(&remote_addr),
-                    }))
+                    let mut response = remote_endpoint_value(&remote_addr, guest_remote_port);
+                    if let Value::Object(fields) = &mut response {
+                        fields.insert(String::from("type"), Value::String(String::from("message")));
+                        fields.insert(String::from("data"), javascript_sync_rpc_bytes_value(&data));
+                    }
+                    Ok(response)
                 }
                 Some(JavascriptUdpSocketEvent::Error { code, message }) => Ok(json!({
                     "type": "error",
@@ -21023,11 +20685,7 @@ where
             );
             javascript_net_json_string(
                 json!({
-                    "address": {
-                        "address": guest_local_addr.ip().to_string(),
-                        "family": socket_addr_family(&guest_local_addr),
-                        "port": guest_local_addr.port(),
-                    }
+                    "address": socket_address_value(&guest_local_addr)
                 }),
                 "net.http2_server_listen",
             )
@@ -21092,7 +20750,8 @@ where
                 response_json,
                 "net.http2_server_respond",
                 VM_FETCH_BUFFER_LIMIT_BYTES,
-            )?;
+            )
+            .map_err(sidecar_core_execution_error)?;
             serde_json::from_str::<Value>(response_json).map_err(|error| {
                 SidecarError::Execution(format!(
                     "net.http2_server_respond payload must be valid JSON: {error}"
@@ -21645,11 +21304,7 @@ where
                 },
             );
             serde_json::to_string(&json!({
-                "address": {
-                    "address": guest_local_addr.ip().to_string(),
-                    "family": socket_addr_family(&guest_local_addr),
-                    "port": guest_local_addr.port(),
-                }
+                "address": socket_address_value(&guest_local_addr)
             }))
             .map(Value::String)
             .map_err(|error| SidecarError::Execution(format!("ERR_AGENTOS_NODE_SYNC_RPC: {error}")))
@@ -21682,7 +21337,8 @@ where
                 response_json,
                 "net.http_respond",
                 VM_FETCH_BUFFER_LIMIT_BYTES,
-            )?;
+            )
+            .map_err(sidecar_core_execution_error)?;
             serde_json::from_str::<Value>(response_json).map_err(|error| {
                 SidecarError::Execution(format!(
                     "net.http_respond payload must be valid JSON: {error}"
@@ -22356,14 +22012,7 @@ where
                                 "connection",
                             )?;
                         }
-                        let info = json!({
-                            "localAddress": guest_local_addr.ip().to_string(),
-                            "localPort": guest_local_addr.port(),
-                            "localFamily": socket_addr_family(&guest_local_addr),
-                            "remoteAddress": guest_remote_addr.ip().to_string(),
-                            "remotePort": guest_remote_addr.port(),
-                            "remoteFamily": socket_addr_family(&guest_remote_addr),
-                        });
+                        let info = tcp_socket_info_value(&guest_local_addr, &guest_remote_addr);
                         let socket = if let Some(stream) = stream {
                             ActiveTcpSocket::from_stream(
                                 stream,
@@ -22637,39 +22286,7 @@ fn signal_name_for_stream_event(signal: i32) -> Option<&'static str> {
 }
 
 pub(crate) fn canonical_signal_name(signal: i32) -> Option<&'static str> {
-    match signal {
-        1 => Some("SIGHUP"),
-        2 => Some("SIGINT"),
-        3 => Some("SIGQUIT"),
-        4 => Some("SIGILL"),
-        5 => Some("SIGTRAP"),
-        6 => Some("SIGABRT"),
-        7 => Some("SIGBUS"),
-        8 => Some("SIGFPE"),
-        9 => Some("SIGKILL"),
-        10 => Some("SIGUSR1"),
-        11 => Some("SIGSEGV"),
-        12 => Some("SIGUSR2"),
-        13 => Some("SIGPIPE"),
-        14 => Some("SIGALRM"),
-        15 => Some("SIGTERM"),
-        17 => Some("SIGCHLD"),
-        18 => Some("SIGCONT"),
-        19 => Some("SIGSTOP"),
-        20 => Some("SIGTSTP"),
-        21 => Some("SIGTTIN"),
-        22 => Some("SIGTTOU"),
-        23 => Some("SIGURG"),
-        24 => Some("SIGXCPU"),
-        25 => Some("SIGXFSZ"),
-        26 => Some("SIGVTALRM"),
-        27 => Some("SIGPROF"),
-        28 => Some("SIGWINCH"),
-        29 => Some("SIGIO"),
-        30 => Some("SIGPWR"),
-        31 => Some("SIGSYS"),
-        _ => None,
-    }
+    secure_exec_sidecar_core::canonical_signal_name(signal)
 }
 
 fn dispatch_v8_process_signal(process: &ActiveProcess, signal: i32) -> Result<bool, SidecarError> {
@@ -22720,50 +22337,9 @@ pub(crate) fn parse_signal(signal: &str) -> Result<i32, SidecarError> {
         };
     }
 
-    let upper = trimmed.to_ascii_uppercase();
-    let normalized = upper.strip_prefix("SIG").unwrap_or(&upper);
-
-    signal_number_from_name(normalized).ok_or_else(|| {
+    secure_exec_sidecar_core::parse_posix_signal(trimmed).ok_or_else(|| {
         SidecarError::InvalidState(format!("unsupported kill_process signal {signal}"))
     })
-}
-
-fn signal_number_from_name(signal: &str) -> Option<i32> {
-    match signal {
-        "0" => Some(0),
-        "HUP" => Some(1),
-        "INT" => Some(2),
-        "QUIT" => Some(3),
-        "ILL" => Some(4),
-        "TRAP" => Some(5),
-        "ABRT" | "IOT" => Some(6),
-        "BUS" => Some(7),
-        "FPE" => Some(8),
-        "KILL" => Some(9),
-        "USR1" => Some(10),
-        "SEGV" => Some(11),
-        "USR2" => Some(12),
-        "PIPE" => Some(13),
-        "ALRM" => Some(14),
-        "TERM" => Some(15),
-        "STKFLT" => Some(16),
-        "CHLD" => Some(17),
-        "CONT" => Some(18),
-        "STOP" => Some(19),
-        "TSTP" => Some(20),
-        "TTIN" => Some(21),
-        "TTOU" => Some(22),
-        "URG" => Some(23),
-        "XCPU" => Some(24),
-        "XFSZ" => Some(25),
-        "VTALRM" => Some(26),
-        "PROF" => Some(27),
-        "WINCH" => Some(28),
-        "IO" | "POLL" => Some(29),
-        "PWR" => Some(30),
-        "SYS" => Some(31),
-        _ => None,
-    }
 }
 
 pub(crate) fn runtime_child_is_alive(child_pid: u32) -> Result<bool, SidecarError> {

@@ -3029,6 +3029,36 @@ var __bridge = (() => {
       rationale: "Bridge bootstrap configuration must not be replaced by sandbox code."
     },
     {
+      name: "process.cpuUsage",
+      classification: "hardened",
+      rationale: "Host process CPU usage bridge reference."
+    },
+    {
+      name: "process.memoryUsage",
+      classification: "hardened",
+      rationale: "Host process memory usage bridge reference."
+    },
+    {
+      name: "process.resourceUsage",
+      classification: "hardened",
+      rationale: "Host process resource usage bridge reference."
+    },
+    {
+      name: "process.versions",
+      classification: "hardened",
+      rationale: "Host process versions bridge reference."
+    },
+    {
+      name: "_processKill",
+      classification: "hardened",
+      rationale: "Host process signal bridge reference."
+    },
+    {
+      name: "_processSignalState",
+      classification: "hardened",
+      rationale: "Host process signal-listener state bridge reference."
+    },
+    {
       name: "_osConfig",
       classification: "hardened",
       rationale: "Bridge bootstrap configuration must not be replaced by sandbox code."
@@ -3112,6 +3142,21 @@ var __bridge = (() => {
       name: "_tlsModule",
       classification: "hardened",
       rationale: "Bridge-owned tls module handle for require resolution."
+    },
+    {
+      name: "_vmCreateContext",
+      classification: "hardened",
+      rationale: "Host vm context creation bridge reference."
+    },
+    {
+      name: "_vmRunInContext",
+      classification: "hardened",
+      rationale: "Host vm context execution bridge reference."
+    },
+    {
+      name: "_vmRunInThisContext",
+      classification: "hardened",
+      rationale: "Host vm current-context execution bridge reference."
     },
     {
       name: "_netSocketDispatch",
@@ -3524,9 +3569,49 @@ var __bridge = (() => {
       rationale: "Host filesystem bridge reference."
     },
     {
+      name: "_fsLutimes",
+      classification: "hardened",
+      rationale: "Host filesystem bridge reference."
+    },
+    {
       name: "_fsUtimesAsync",
       classification: "hardened",
       rationale: "Host filesystem bridge reference."
+    },
+    {
+      name: "_fsLutimesAsync",
+      classification: "hardened",
+      rationale: "Host filesystem bridge reference."
+    },
+    {
+      name: "fs.futimesSync",
+      classification: "hardened",
+      rationale: "Host filesystem bridge reference."
+    },
+    {
+      name: "fs.openSync",
+      classification: "hardened",
+      rationale: "Host file-descriptor open bridge reference."
+    },
+    {
+      name: "fs.closeSync",
+      classification: "hardened",
+      rationale: "Host file-descriptor close bridge reference."
+    },
+    {
+      name: "fs.readSync",
+      classification: "hardened",
+      rationale: "Host file-descriptor read bridge reference."
+    },
+    {
+      name: "fs.writeSync",
+      classification: "hardened",
+      rationale: "Host file-descriptor write bridge reference."
+    },
+    {
+      name: "fs.fstatSync",
+      classification: "hardened",
+      rationale: "Host file-descriptor stat bridge reference."
     },
     {
       name: "_fs",
@@ -3577,6 +3662,11 @@ var __bridge = (() => {
       name: "_networkDnsLookupRaw",
       classification: "hardened",
       rationale: "Host network bridge reference."
+    },
+    {
+      name: "_networkDnsLookupSyncRaw",
+      classification: "hardened",
+      rationale: "Host synchronous network lookup bridge reference."
     },
     {
       name: "_networkDnsResolveRaw",
@@ -3967,6 +4057,21 @@ var __bridge = (() => {
       name: "_kernelTtySizeRaw",
       classification: "hardened",
       rationale: "Host kernel TTY size bridge reference for WASM terminal commands."
+    },
+    {
+      name: "_kernelStdioWriteRaw",
+      classification: "hardened",
+      rationale: "Host kernel stdio write bridge reference."
+    },
+    {
+      name: "_kernelStdinReadRaw",
+      classification: "hardened",
+      rationale: "Host synchronous kernel stdin read bridge reference."
+    },
+    {
+      name: "_kernelStdinRead",
+      classification: "hardened",
+      rationale: "Host asynchronous kernel stdin read bridge reference."
     },
     {
       name: "_ptySetRawMode",
@@ -6175,10 +6280,33 @@ var __bridge = (() => {
     if (flags in flagMap) return flagMap[flags];
     throw new Error("Unknown file flag: " + flags);
   }
+  // Full Linux errno table so guest `err.errno` matches real Node for every
+  // code (Node reports the negated Linux errno), not just the handful the old
+  // inline ternary covered. The structured `code` from the kernel is the source
+  // of truth; this maps it to the canonical number.
+  const POSIX_ERRNO = {
+    EPERM: 1, ENOENT: 2, ESRCH: 3, EINTR: 4, EIO: 5, ENXIO: 6, E2BIG: 7,
+    ENOEXEC: 8, EBADF: 9, ECHILD: 10, EAGAIN: 11, EWOULDBLOCK: 11, ENOMEM: 12,
+    EACCES: 13, EFAULT: 14, ENOTBLK: 15, EBUSY: 16, EEXIST: 17, EXDEV: 18,
+    ENODEV: 19, ENOTDIR: 20, EISDIR: 21, EINVAL: 22, ENFILE: 23, EMFILE: 24,
+    ENOTTY: 25, ETXTBSY: 26, EFBIG: 27, ENOSPC: 28, ESPIPE: 29, EROFS: 30,
+    EMLINK: 31, EPIPE: 32, EDOM: 33, ERANGE: 34, ENAMETOOLONG: 36, ENOSYS: 38,
+    ENOTEMPTY: 39, ELOOP: 40, EOVERFLOW: 75, ENOTSOCK: 88, EDESTADDRREQ: 89,
+    EMSGSIZE: 90, EPROTOTYPE: 91, ENOPROTOOPT: 92, EPROTONOSUPPORT: 93,
+    ENOTSUP: 95, EOPNOTSUPP: 95, EAFNOSUPPORT: 97, EADDRINUSE: 98,
+    EADDRNOTAVAIL: 99, ENETDOWN: 100, ENETUNREACH: 101, ECONNABORTED: 103,
+    ECONNRESET: 104, ENOBUFS: 105, EISCONN: 106, ENOTCONN: 107, ETIMEDOUT: 110,
+    ECONNREFUSED: 111, EHOSTUNREACH: 113, EALREADY: 114, EINPROGRESS: 115,
+  };
+  function errnoForCode(code) {
+    return Object.prototype.hasOwnProperty.call(POSIX_ERRNO, code)
+      ? -POSIX_ERRNO[code]
+      : -1;
+  }
   function createFsError(code, message, syscall, path) {
     const err = new Error(message);
     err.code = code;
-    err.errno = code === "ENOENT" ? -2 : code === "EACCES" ? -13 : code === "EBADF" ? -9 : code === "EMFILE" ? -24 : -1;
+    err.errno = errnoForCode(code);
     err.syscall = syscall;
     if (path) err.path = path;
     return err;
@@ -6206,6 +6334,9 @@ var __bridge = (() => {
     if (msg.includes("EINVAL") || msg.includes("invalid argument")) {
       return "EINVAL";
     }
+    if (msg.includes("EXDEV") || msg.includes("cross-device link")) {
+      return "EXDEV";
+    }
     if (typeof err?.code === "string" && err.code.length > 0) {
       return err.code;
     }
@@ -6227,6 +6358,9 @@ var __bridge = (() => {
       }
       if (code === "EINVAL") {
         throw createFsError("EINVAL", `EINVAL: invalid argument, ${syscall} '${path}'`, syscall, path);
+      }
+      if (code === "EXDEV") {
+        throw createFsError("EXDEV", `EXDEV: cross-device link not permitted, ${syscall} '${path}'`, syscall, path);
       }
       throw err;
     }
@@ -8306,23 +8440,27 @@ var __bridge = (() => {
     platform: typeof _osConfig !== "undefined" && _osConfig.platform || "linux",
     arch: typeof _osConfig !== "undefined" && _osConfig.arch || "x64",
     type: typeof _osConfig !== "undefined" && _osConfig.type || "Linux",
-    release: typeof _osConfig !== "undefined" && _osConfig.release || "5.15.0",
-    version: typeof _osConfig !== "undefined" && _osConfig.version || "#1 SMP",
-    homedir: typeof _osConfig !== "undefined" && _osConfig.homedir || "/root",
+    release: typeof _osConfig !== "undefined" && _osConfig.release || "6.8.0-secure-exec",
+    version: typeof _osConfig !== "undefined" && _osConfig.version || "#1 SMP PREEMPT_DYNAMIC secure-exec",
+    homedir: typeof _osConfig !== "undefined" && _osConfig.homedir || "/home/user",
     tmpdir: typeof _osConfig !== "undefined" && _osConfig.tmpdir || "/tmp",
-    hostname: typeof _osConfig !== "undefined" && _osConfig.hostname || "sandbox"
+    hostname: typeof _osConfig !== "undefined" && _osConfig.hostname || "secure-exec",
+    machine: typeof _osConfig !== "undefined" && _osConfig.machine || "x86_64"
   };
   function getRuntimeHomeDir() {
-    return globalThis.process?.env?.HOME || config.homedir;
+    return runtimeVirtualOsString("homedir", globalThis.process?.env?.HOME || config.homedir);
   }
   function getRuntimeTmpDir() {
-    return globalThis.process?.env?.TMPDIR || config.tmpdir;
+    return runtimeVirtualOsString("tmpdir", globalThis.process?.env?.TMPDIR || config.tmpdir);
   }
   function getRuntimeUserName() {
-    return globalThis.process?.env?.USER || globalThis.process?.env?.LOGNAME || "root";
+    return runtimeVirtualOsString(
+      "user",
+      globalThis.process?.env?.USER || globalThis.process?.env?.LOGNAME || "user"
+    );
   }
   function getRuntimeShell() {
-    return globalThis.process?.env?.SHELL || "/bin/bash";
+    return runtimeVirtualOsString("shell", globalThis.process?.env?.SHELL || "/bin/sh");
   }
   function getRuntimeUid() {
     const value = globalThis.process?.uid;
@@ -8354,6 +8492,10 @@ var __bridge = (() => {
   }
   function getRuntimeVirtualOs() {
     return globalThis.__agentOSVirtualOs || {};
+  }
+  function runtimeVirtualOsString(name, fallback) {
+    const value = getRuntimeVirtualOs()[name];
+    return typeof value === "string" && value.length > 0 ? value : fallback;
   }
   function runtimeVirtualOsPositiveInt(name, fallback) {
     const parsed = Number(getRuntimeVirtualOs()[name]);
@@ -8554,19 +8696,19 @@ var __bridge = (() => {
   var os = {
     // Platform information
     platform() {
-      return config.platform;
+      return runtimeVirtualOsString("platform", config.platform);
     },
     arch() {
-      return config.arch;
+      return runtimeVirtualOsString("arch", config.arch);
     },
     type() {
-      return config.type;
+      return runtimeVirtualOsString("type", config.type);
     },
     release() {
-      return config.release;
+      return runtimeVirtualOsString("release", config.release);
     },
     version() {
-      return config.version;
+      return runtimeVirtualOsString("version", config.version);
     },
     // Directory information
     homedir() {
@@ -8577,7 +8719,7 @@ var __bridge = (() => {
     },
     // System information
     hostname() {
-      return config.hostname;
+      return runtimeVirtualOsString("hostname", config.hostname);
     },
     // User information
     userInfo(_options) {
@@ -8632,7 +8774,7 @@ var __bridge = (() => {
     devNull: "/dev/null",
     // Machine type
     machine() {
-      return config.arch;
+      return runtimeVirtualOsString("machine", config.machine);
     },
     // Constants (partial — Linux subset, no Windows WSA* or RTLD_DEEPBIND)
     constants: {
@@ -10546,7 +10688,8 @@ var __bridge = (() => {
     let parsed = resultJson;
     if (typeof parsed === "string") {
       parsed = JSON.parse(parsed);
-    } else if (parsed && typeof parsed === "object" && Array.isArray(parsed.records)) {
+    }
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.records)) {
       parsed = parsed.records;
     } else if (parsed && typeof parsed === "object" && typeof parsed.address === "string") {
       parsed = [parsed];
@@ -23506,6 +23649,9 @@ ${headerLines}\r
     return String(value);
   }
   function formatConsoleArgs(args) {
+    if (typeof builtinUtilModule !== "undefined" && typeof builtinUtilModule?.formatWithOptions === "function") {
+      return builtinUtilModule.formatWithOptions({ colors: false }, ...args);
+    }
     return args.map((value) => formatConsoleValue(value)).join(" ");
   }
   function formatConsoleLine(args) {
@@ -26988,6 +27134,12 @@ ${headerLines}\r
     }
     getPrivateKey(encoding = void 0) {
       return encodeCryptoResult(toCryptoBuffer(this._call("getPrivateKey")), encoding);
+    }
+    setPrivateKey(privateKey, encoding = void 0) {
+      this._call("setPrivateKey", [toCryptoBuffer(privateKey, encoding)]);
+    }
+    setPublicKey(publicKey, encoding = void 0) {
+      this._call("setPublicKey", [toCryptoBuffer(publicKey, encoding)]);
     }
   }
   var builtinCryptoModule = {

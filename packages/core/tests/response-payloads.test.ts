@@ -57,6 +57,21 @@ describe("response payload conversion", () => {
 		});
 	});
 
+	it("maps guest kernel call results", () => {
+		const payload = new TextEncoder().encode(
+			JSON.stringify({ socketId: 3, written: 5 }),
+		).buffer;
+		expect(
+			fromGeneratedResponsePayload({
+				tag: "GuestKernelResultResponse",
+				val: { payload },
+			}),
+		).toEqual({
+			type: "guest_kernel_result",
+			payload,
+		});
+	});
+
 	it("maps process and socket snapshots", () => {
 		expect(
 			fromGeneratedResponsePayload({

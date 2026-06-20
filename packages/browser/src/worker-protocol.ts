@@ -11,19 +11,20 @@ import type {
 	BrowserWorkerSyncRequestMessage,
 } from "./sync-bridge.js";
 
-export type SerializedPermissions = {
-	fs?: string;
-	network?: string;
-	childProcess?: string;
-	env?: string;
-};
-
 export type BrowserWorkerExecOptions = {
 	filePath?: string;
 	env?: Record<string, string>;
 	cwd?: string;
 	stdin?: string;
+	stdioPty?: {
+		open?: boolean;
+		slaveFd?: number;
+		columns?: number;
+		rows?: number;
+	};
 	timingMitigation?: TimingMitigation;
+	persistent?: boolean;
+	streamingStdin?: boolean;
 };
 
 export type BrowserWorkerExtensionRequestPayload = {
@@ -39,7 +40,6 @@ export type BrowserWorkerExtensionResponse = {
 export type BrowserWorkerInitPayload = {
 	processConfig?: ProcessConfig;
 	osConfig?: OSConfig;
-	permissions?: SerializedPermissions;
 	filesystem?: "opfs" | "memory";
 	networkEnabled?: boolean;
 	timingMitigation?: TimingMitigation;
@@ -65,6 +65,7 @@ export type BrowserWorkerRequestMessage =
 			id: number;
 			type: "exec";
 			payload: {
+				executionId: string;
 				code: string;
 				options?: BrowserWorkerExecOptions;
 				captureStdio?: boolean;
@@ -75,15 +76,43 @@ export type BrowserWorkerRequestMessage =
 			id: number;
 			type: "run";
 			payload: {
+				executionId: string;
 				code: string;
 				filePath?: string;
 				captureStdio?: boolean;
+			};
+	  }
+	| {
+			controlToken: string;
+			id: number;
+			type: "signal";
+			payload: {
+				executionId: string;
+				signal: number;
 			};
 	  }
 	| (BrowserWorkerControlMessage & {
 			id: number;
 			type: "extension";
 			payload: BrowserWorkerExtensionRequestPayload;
+	  })
+	| (BrowserWorkerControlMessage & {
+			id: number;
+			type: "write-stdin";
+			executionId: string;
+			data: string;
+	  })
+	| (BrowserWorkerControlMessage & {
+			id: number;
+			type: "end-stdin";
+			executionId: string;
+	  })
+	| (BrowserWorkerControlMessage & {
+			id: number;
+			type: "resize-pty";
+			executionId: string;
+			columns: number;
+			rows: number;
 	  })
 	| (BrowserWorkerControlMessage & { id: number; type: "dispose" });
 
@@ -104,12 +133,25 @@ export type BrowserWorkerResponseMessage =
 
 export type BrowserWorkerStdioMessage = BrowserWorkerControlMessage & {
 	type: "stdio";
+	executionId: string;
 	requestId: number;
 	channel: StdioChannel;
 	message: string;
 };
 
+export type BrowserWorkerPtyOpenedMessage = BrowserWorkerControlMessage & {
+	type: "pty-opened";
+	executionId: string;
+	requestId: number;
+	masterFd: number;
+	slaveFd: number;
+	path?: string;
+	columns: number;
+	rows: number;
+};
+
 export type BrowserWorkerOutboundMessage =
 	| BrowserWorkerResponseMessage
 	| BrowserWorkerStdioMessage
+	| BrowserWorkerPtyOpenedMessage
 	| BrowserWorkerSyncRequestMessage;

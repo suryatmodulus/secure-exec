@@ -1,9 +1,13 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
+import type { FrameTransport } from "../src/frame-stream.js";
 import { encodeLengthPrefixedPayload } from "../src/framing.js";
 import {
 	encodeProtocolFramePayload,
 	type LiveProtocolFrame,
+	type LiveResponseFrame,
+	type LiveEventFrame,
+	type LiveSidecarRequestFrame,
 } from "../src/protocol-frames.js";
 import { SidecarProtocolClient } from "../src/protocol-client.js";
 import { SIDECAR_PROTOCOL_SCHEMA } from "../src/protocol-schema.js";
@@ -25,6 +29,60 @@ function createClient() {
 		stderrText: () => "stderr",
 	});
 	return { stdin, stdout, client };
+}
+
+class MemoryFrameTransport
+	implements
+		FrameTransport<
+			LiveResponseFrame | LiveEventFrame | LiveSidecarRequestFrame,
+			LiveProtocolFrame
+		>
+{
+	readonly writes: LiveProtocolFrame[] = [];
+	private readonly frameListeners = new Set<
+		(frame: LiveResponseFrame | LiveEventFrame | LiveSidecarRequestFrame) => void
+	>();
+	private readonly errorListeners = new Set<(error: Error) => void>();
+	private readonly endListeners = new Set<() => void>();
+
+	onFrame(
+		handler: (frame: LiveResponseFrame | LiveEventFrame | LiveSidecarRequestFrame) => void,
+	): () => void {
+		this.frameListeners.add(handler);
+		return () => {
+			this.frameListeners.delete(handler);
+		};
+	}
+
+	onError(handler: (error: Error) => void): () => void {
+		this.errorListeners.add(handler);
+		return () => {
+			this.errorListeners.delete(handler);
+		};
+	}
+
+	onEnd(handler: () => void): () => void {
+		this.endListeners.add(handler);
+		return () => {
+			this.endListeners.delete(handler);
+		};
+	}
+
+	async writeFrame(frame: LiveProtocolFrame): Promise<void> {
+		this.writes.push(frame);
+	}
+
+	emitFrame(frame: LiveResponseFrame | LiveEventFrame | LiveSidecarRequestFrame): void {
+		for (const listener of this.frameListeners) {
+			listener(frame);
+		}
+	}
+
+	dispose(): void {
+		this.frameListeners.clear();
+		this.errorListeners.clear();
+		this.endListeners.clear();
+	}
 }
 
 function readWrittenFrame(stdin: PassThrough): Promise<unknown> {
@@ -61,6 +119,44 @@ describe("sidecar protocol client", () => {
 		});
 
 		writeIncomingFrame(stdout, {
+			frame_type: "response",
+			schema: SIDECAR_PROTOCOL_SCHEMA,
+			request_id: 1,
+			ownership,
+			payload: { type: "layer_created", layer_id: "layer" },
+		});
+
+		await expect(response).resolves.toMatchObject({
+			frame_type: "response",
+			request_id: 1,
+			payload: { type: "layer_created", layer_id: "layer" },
+		});
+		client.dispose();
+	});
+
+	it("can run over an injected non-stdio frame transport", async () => {
+		const frameTransport = new MemoryFrameTransport();
+		const client = new SidecarProtocolClient({
+			frameTransport,
+			frameTimeoutMs: 1_000,
+			eventBufferCapacity: 8,
+			payloadCodec: "json",
+			stderrText: () => "stderr",
+		});
+
+		const response = client.sendRequest({
+			ownership,
+			payload: { type: "create_layer" },
+		});
+
+		await expect.poll(() => frameTransport.writes.length).toBe(1);
+		expect(frameTransport.writes[0]).toMatchObject({
+			frame_type: "request",
+			request_id: 1,
+			payload: { type: "create_layer" },
+		});
+
+		frameTransport.emitFrame({
 			frame_type: "response",
 			schema: SIDECAR_PROTOCOL_SCHEMA,
 			request_id: 1,

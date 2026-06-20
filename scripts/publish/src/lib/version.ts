@@ -155,12 +155,13 @@ export async function bumpCargoVersions(
 		/(\[workspace\.package\]\n(?:[^\n]*\n)*?[ \t]*version = )"[^"]+"/,
 		`$1"${version}"`,
 	);
-	// Match EVERY internal path-dep, not just `agentos-*`/`secure-exec-*`: the
-	// presence of a `path = "..."` is what marks an in-repo workspace crate, so
-	// unprefixed members (e.g. `vfs = { path = "crates/vfs", version = "..." }`)
-	// must be bumped in lock-step too. Missing one leaves a dependent pinned to
-	// the old `^0.3.0-rc.1` while the crate itself moved to the preview version,
-	// which fails cargo resolution ("failed to select a version for `vfs`").
+	// Rewrite the lock-step version of EVERY internal crate dep in
+	// `[workspace.dependencies]`, matched by the presence of `path = "..."` rather
+	// than a name prefix — earlier this only matched `agent-os-*`/`secure-exec-*`
+	// and missed bare-named internal crates, leaving their version requirement
+	// stale after the bump and breaking cargo resolution during publish. The
+	// `[^}\n]*` spans tolerate other attributes before `path`/`version` (e.g. a
+	// dep-rename alias `vfs = { package = "secure-exec-vfs-core", path = "...", version = "..." }`).
 	next = next.replace(
 		/^([a-zA-Z0-9_-]+ = \{ [^}\n]*path = "[^"]+", [^}\n]*version = ")[^"]+("[^}\n]*\})/gm,
 		`$1${version}$2`,

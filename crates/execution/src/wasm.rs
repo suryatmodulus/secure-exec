@@ -93,6 +93,32 @@ const MAX_SYNC_WASM_PREWARM_MODULE_BYTES: u64 = 16 * 1024 * 1024;
 const WASM_CAPTURED_OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const WASM_SYNC_READ_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const WASM_INLINE_RUNNER_ENTRYPOINT: &str = "./__agentos_wasm_runner__.mjs";
+const NODE_WASI_MODULE_SOURCE: &str = include_str!("../assets/runners/wasi-module.js");
+const WASM_SIDECAR_ROUTED_FS_SYNC_METHODS: &[&str] = &[
+    "fs.accessSync",
+    "fs.chmodSync",
+    "fs.closeSync",
+    "fs.existsSync",
+    "fs.fdatasyncSync",
+    "fs.fstatSync",
+    "fs.fsyncSync",
+    "fs.ftruncateSync",
+    "fs.linkSync",
+    "fs.lstatSync",
+    "fs.mkdirSync",
+    "fs.openSync",
+    "fs.readFileSync",
+    "fs.readSync",
+    "fs.readdirSync",
+    "fs.readlinkSync",
+    "fs.renameSync",
+    "fs.rmdirSync",
+    "fs.statSync",
+    "fs.symlinkSync",
+    "fs.unlinkSync",
+    "fs.writeFileSync",
+    "fs.writeSync",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmSignalDispositionAction {
@@ -387,6 +413,7 @@ struct WasmInternalSyncRpc {
     host_cwd: PathBuf,
     sandbox_root: Option<PathBuf>,
     guest_path_mappings: Vec<WasmGuestPathMapping>,
+    route_fs_through_sidecar: bool,
     next_fd: u32,
     open_files: BTreeMap<u32, fs::File>,
     pending_events: VecDeque<WasmExecutionEvent>,
@@ -907,6 +934,7 @@ impl WasmExecutionEngine {
             },
         )?;
         let child_pid = javascript_execution.child_pid();
+        let sandbox_root = wasm_sandbox_root(&request.env);
         let guest_path_mappings = wasm_guest_path_mappings(&request);
 
         Ok(WasmExecution {
@@ -935,8 +963,9 @@ impl WasmExecutionEngine {
                 module_host_path: resolved_module.resolved_path.clone(),
                 guest_cwd: wasm_guest_cwd(&request.env),
                 host_cwd: request.cwd.clone(),
-                sandbox_root: wasm_sandbox_root(&request.env),
+                sandbox_root: sandbox_root.clone(),
                 guest_path_mappings,
+                route_fs_through_sidecar: sandbox_root.is_some(),
                 next_fd: 64,
                 open_files: BTreeMap::new(),
                 pending_events: VecDeque::new(),
@@ -1024,6 +1053,10 @@ fn handle_internal_wasm_sync_rpc_request(
             )
             .map_err(map_javascript_error)?;
         return Ok(true);
+    }
+
+    if wasm_sync_rpc_method_routes_through_sidecar_kernel(request, internal_sync_rpc) {
+        return Ok(false);
     }
 
     if request.method == "fs.openSync" {
@@ -1466,6 +1499,14 @@ fn handle_internal_wasm_sync_rpc_request(
     }
 
     Ok(false)
+}
+
+fn wasm_sync_rpc_method_routes_through_sidecar_kernel(
+    request: &JavascriptSyncRpcRequest,
+    internal_sync_rpc: &WasmInternalSyncRpc,
+) -> bool {
+    internal_sync_rpc.route_fs_through_sidecar
+        && WASM_SIDECAR_ROUTED_FS_SYNC_METHODS.contains(&request.method.as_str())
 }
 
 fn translate_wasm_guest_path(
@@ -2278,12 +2319,13 @@ fn build_wasm_runner_bootstrap(
             .unwrap_or_else(|_| String::from("\"\""))
     });
     let warmup_emit = warmup_metrics_json
-        .map(|metrics| {
-            format!(
-                "if (typeof process?.stderr?.write === \"function\") {{\n  process.stderr.write({metrics});\n}}\n"
-            )
-        })
-        .unwrap_or_default();
+		.map(|metrics| {
+			format!(
+				"if (typeof process?.stderr?.write === \"function\") {{\n  process.stderr.write({metrics});\n}}\n"
+			)
+		})
+		.unwrap_or_default();
+    let wasi_module_source = render_native_wasi_module_source();
 
     format!(
         r#"const __agentOSWasmInternalEnv = {internal_env_json};
@@ -2296,2216 +2338,7 @@ const __agentOSRequireBuiltin = (specifier) => {{
   }}
   throw new Error(`secure-exec WASM bootstrap cannot load ${{specifier}}`);
 }};
-if (typeof globalThis !== "undefined") {{
-  const __agentOSFs = () => __agentOSRequireBuiltin("node:fs");
-  const __agentOSPath = () => __agentOSRequireBuiltin("node:path");
-  const __agentOSCrypto = () => __agentOSRequireBuiltin("node:crypto");
-  const __agentOSWasiErrnoSuccess = 0;
-  const __agentOSWasiErrnoAgain = 6;
-  const __agentOSWasiErrnoAcces = 2;
-  const __agentOSWasiErrnoBadf = 8;
-  const __agentOSWasiErrnoExist = 20;
-  const __agentOSWasiErrnoFault = 21;
-  const __agentOSWasiErrnoInval = 28;
-  const __agentOSWasiErrnoIo = 29;
-  const __agentOSWasiErrnoNoent = 44;
-  const __agentOSWasiErrnoNosys = 52;
-  const __agentOSWasiErrnoNotdir = 54;
-  const __agentOSWasiErrnoPipe = 64;
-  const __agentOSWasiErrnoRofs = 69;
-  const __agentOSWasiFiletypeUnknown = 0;
-  const __agentOSWasiFiletypeCharacterDevice = 2;
-  const __agentOSWasiFiletypeDirectory = 3;
-  const __agentOSWasiFiletypeRegularFile = 4;
-  const __agentOSWasiFiletypeSymbolicLink = 7;
-  const __agentOSWasiLookupSymlinkFollow = 1;
-  const __agentOSWasiOpenCreate = 1;
-  const __agentOSWasiOpenDirectory = 2;
-  const __agentOSWasiOpenExclusive = 4;
-  const __agentOSWasiOpenTruncate = 8;
-  const __agentOSWasiRightFdWrite = 1n << 6n;
-  const __agentOSWasiDefaultRightsBase = 0xffffffffffffffffn;
-  const __agentOSWasiDefaultRightsInheriting = 0xffffffffffffffffn;
-  const __agentOSWasiWhenceSet = 0;
-  const __agentOSWasiWhenceCur = 1;
-  const __agentOSWasiWhenceEnd = 2;
-  const __agentOSWasmSyncReadLimitBytes = {WASM_SYNC_READ_LIMIT_BYTES};
-  const __agentOSKernelStdioSyncRpcEnabled = () =>
-    process?.env?.AGENTOS_WASI_STDIO_SYNC_RPC === "1";
-  const __agentOSWasiDebugEnabled = () => process?.env?.AGENTOS_WASM_WASI_DEBUG === "1";
-  const __agentOSWasiSyscallCountersEnabled = () =>
-    process?.env?.AGENTOS_WASI_SYSCALL_COUNTERS === "1";
-  const __agentOSWasiNow = () =>
-    typeof performance?.now === "function" ? performance.now() : Date.now();
-  const __agentOSWasiDebug = (message) => {{
-    if (!__agentOSWasiDebugEnabled() || typeof process?.stderr?.write !== "function") {{
-      return;
-    }}
-    try {{
-      process.stderr.write(`[secure-exec-wasi] ${{message}}\n`);
-    }} catch {{
-      // Ignore debug logging failures.
-    }}
-  }};
-
-  class WASI {{
-    constructor(options = {{}}) {{
-      this.args = Array.isArray(options.args) ? options.args.map((value) => String(value)) : [];
-      this.env =
-        options.env && typeof options.env === "object"
-          ? Object.fromEntries(
-              Object.entries(options.env).map(([key, value]) => [String(key), String(value)]),
-            )
-          : {{}};
-      this.preopens = options.preopens && typeof options.preopens === "object" ? options.preopens : {{}};
-      this.returnOnExit = options.returnOnExit === true;
-      this.instance = null;
-      this.nextFd = 3;
-      this.fdTable = new Map([
-        [0, {{ kind: "stdin", fdFlags: 0 }}],
-        [1, {{ kind: "stdout", fdFlags: 0 }}],
-        [2, {{ kind: "stderr", fdFlags: 0 }}],
-      ]);
-      this.syscallCountersEnabled = __agentOSWasiSyscallCountersEnabled();
-      for (const [guestPath, spec] of Object.entries(this.preopens)) {{
-        const normalized = this._normalizePreopenSpec(spec);
-        if (!normalized) {{
-          continue;
-        }}
-        this.fdTable.set(this.nextFd++, {{
-          kind: "preopen",
-          guestPath: String(guestPath),
-          hostPath: normalized.hostPath,
-          readOnly: normalized.readOnly,
-          rightsBase: normalized.rightsBase,
-          rightsInheriting: normalized.rightsInheriting,
-          fdFlags: 0,
-        }});
-      }}
-      this.wasiImport = {{
-        args_get: (...args) => this._argsGet(...args),
-        args_sizes_get: (...args) => this._argsSizesGet(...args),
-        clock_time_get: (...args) => this._clockTimeGet(...args),
-        clock_res_get: (...args) => this._clockResGet(...args),
-        environ_get: (...args) => this._environGet(...args),
-        environ_sizes_get: (...args) => this._environSizesGet(...args),
-        fd_close: (...args) => this._fdClose(...args),
-        fd_fdstat_get: (...args) => this._fdFdstatGet(...args),
-        fd_fdstat_set_flags: (...args) => this._fdFdstatSetFlags(...args),
-        fd_filestat_get: (...args) => this._fdFilestatGet(...args),
-        fd_filestat_set_size: (...args) => this._fdFilestatSetSize(...args),
-        fd_prestat_dir_name: (...args) => this._fdPrestatDirName(...args),
-        fd_prestat_get: (...args) => this._fdPrestatGet(...args),
-        fd_pread: (...args) => this._fdPread(...args),
-        fd_pwrite: (...args) => this._fdPwrite(...args),
-        fd_readdir: (...args) => this._fdReaddir(...args),
-        fd_read: (...args) => this._fdRead(...args),
-        fd_seek: (...args) => this._fdSeek(...args),
-        fd_sync: (...args) => this._fdSync(...args),
-        fd_tell: (...args) => this._fdTell(...args),
-        fd_write: (...args) => this._fdWrite(...args),
-        path_create_directory: (...args) => this._pathCreateDirectory(...args),
-        path_filestat_get: (...args) => this._pathFilestatGet(...args),
-        path_filestat_set_times: (...args) => this._pathFilestatSetTimes(...args),
-        path_link: (...args) => this._pathLink(...args),
-        path_open: (...args) => this._pathOpen(...args),
-        path_readlink: (...args) => this._pathReadlink(...args),
-        path_remove_directory: (...args) => this._pathRemoveDirectory(...args),
-        path_rename: (...args) => this._pathRename(...args),
-        path_symlink: (...args) => this._pathSymlink(...args),
-        path_unlink_file: (...args) => this._pathUnlinkFile(...args),
-        poll_oneoff: (...args) => this._pollOneoff(...args),
-        proc_exit: (...args) => this._procExit(...args),
-        random_get: (...args) => this._randomGet(...args),
-        sched_yield: (...args) => this._schedYield(...args),
-      }};
-      this._installSyscallCounterWrappers();
-    }}
-
-    _recordWasiSyscallMetric(name, startedAt, details = {{}}) {{
-      if (!this.syscallCountersEnabled || typeof process?.stderr?.write !== "function") {{
-        return;
-      }}
-      try {{
-        const elapsedMs = __agentOSWasiNow() - startedAt;
-        process.stderr.write(
-          `__AGENTOS_WASI_SYSCALL_METRICS__:${{JSON.stringify({{
-            name,
-            elapsedMs,
-            ...details,
-          }})}}\n`,
-        );
-      }} catch {{
-        // Ignore metrics failures.
-      }}
-    }}
-
-    _installSyscallCounterWrappers() {{
-      if (!this.syscallCountersEnabled) {{
-        return;
-      }}
-      for (const name of [
-        "path_open",
-        "path_filestat_get",
-        "fd_filestat_get",
-        "fd_write",
-      ]) {{
-        const original = this.wasiImport[name];
-        if (typeof original !== "function") {{
-          continue;
-        }}
-        this.wasiImport[name] = (...args) => {{
-          const startedAt = __agentOSWasiNow();
-          const result = original(...args);
-          const details = {{
-            result,
-            fd: Number(args[0]) >>> 0,
-            iovsLen: name === "fd_write" ? Number(args[2]) >>> 0 : undefined,
-          }};
-          if (name === "path_filestat_get") {{
-            try {{
-              const target = this._readString(args[2], args[3]);
-              details.pathLen = target.length;
-              details.pathKind = target.startsWith("/")
-                ? "absolute"
-                : target.includes("/")
-                  ? "relative-nested"
-                  : "relative-child";
-              details.pathSample =
-                target.length > 120 ? `${{target.slice(0, 120)}}...` : target;
-            }} catch {{
-              // Leave path-shape fields absent if the guest pointer is invalid.
-            }}
-          }}
-          this._recordWasiSyscallMetric(name, startedAt, {{
-            ...details,
-          }});
-          return result;
-        }};
-      }}
-    }}
-
-    start(instance) {{
-      this.instance = instance;
-      try {{
-        if (typeof instance?.exports?._start === "function") {{
-          instance.exports._start();
-        }}
-        return 0;
-      }} catch (error) {{
-        if (error && error.__agentOSWasiExit === true) {{
-          return Number(error.code) >>> 0;
-        }}
-        throw error;
-      }}
-    }}
-
-    _memoryView() {{
-      const memory = this.instance?.exports?.memory;
-      if (!(memory instanceof WebAssembly.Memory)) {{
-        throw new Error("WASI memory export is unavailable");
-      }}
-      return new DataView(memory.buffer);
-    }}
-
-    _memoryBytes() {{
-      const memory = this.instance?.exports?.memory;
-      if (!(memory instanceof WebAssembly.Memory)) {{
-        throw new Error("WASI memory export is unavailable");
-      }}
-      return new Uint8Array(memory.buffer);
-    }}
-
-    _boundedIovLength(iovs, iovsLen) {{
-      const view = this._memoryView();
-      let length = 0;
-      for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-        const entryOffset = (Number(iovs) >>> 0) + index * 8;
-        length += view.getUint32(entryOffset + 4, true);
-        if (length > __agentOSWasmSyncReadLimitBytes) {{
-          throw new RangeError(
-            `WASI read iov length ${{length}} exceeds ${{__agentOSWasmSyncReadLimitBytes}}`,
-          );
-        }}
-      }}
-      return length >>> 0;
-    }}
-
-    _normalizeRights(value, fallback) {{
-      try {{
-        return BigInt(value);
-      }} catch {{
-        return fallback;
-      }}
-    }}
-
-    _normalizePreopenSpec(value) {{
-      if (typeof value === "string") {{
-        return {{
-          hostPath: String(value),
-          readOnly: false,
-          rightsBase: __agentOSWasiDefaultRightsBase,
-          rightsInheriting: __agentOSWasiDefaultRightsInheriting,
-        }};
-      }}
-      if (!value || typeof value !== "object" || typeof value.hostPath !== "string") {{
-        return null;
-      }}
-      return {{
-        hostPath: String(value.hostPath),
-        readOnly: value.readOnly === true,
-        rightsBase: this._normalizeRights(
-          value.rightsBase,
-          __agentOSWasiDefaultRightsBase,
-        ),
-        rightsInheriting: this._normalizeRights(
-          value.rightsInheriting,
-          __agentOSWasiDefaultRightsInheriting,
-        ),
-      }};
-    }}
-
-    _descriptorRightsBase(entry) {{
-      return this._normalizeRights(
-        entry?.rightsBase,
-        __agentOSWasiDefaultRightsBase,
-      );
-    }}
-
-    _descriptorRightsInheriting(entry) {{
-      return this._normalizeRights(
-        entry?.rightsInheriting,
-        __agentOSWasiDefaultRightsInheriting,
-      );
-    }}
-
-    _hasWriteRights(rights) {{
-      try {{
-        return (BigInt(rights) & __agentOSWasiRightFdWrite) !== 0n;
-      }} catch {{
-        return true;
-      }}
-    }}
-
-    _writeUint32(ptr, value) {{
-      try {{
-        this._memoryView().setUint32(Number(ptr) >>> 0, Number(value) >>> 0, true);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        __agentOSWasiDebug(`writeUint32 failed ptr=${{Number(ptr)}} value=${{Number(value)}}`);
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _writeUint64(ptr, value) {{
-      try {{
-        this._memoryView().setBigUint64(Number(ptr) >>> 0, BigInt(value), true);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        __agentOSWasiDebug(`writeUint64 failed ptr=${{Number(ptr)}} value=${{String(value)}}`);
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _writeBytes(ptr, bytes) {{
-      try {{
-        this._memoryBytes().set(bytes, Number(ptr) >>> 0);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        __agentOSWasiDebug(`writeBytes failed ptr=${{Number(ptr)}} len=${{bytes?.length ?? 0}}`);
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _readBytes(ptr, len) {{
-      const start = Number(ptr) >>> 0;
-      const end = start + (Number(len) >>> 0);
-      return Buffer.from(this._memoryBytes().slice(start, end));
-    }}
-
-    _readString(ptr, len) {{
-      return this._readBytes(ptr, len).toString("utf8");
-    }}
-
-    _decodeSyncRpcBytes(value) {{
-      if (value == null) {{
-        return null;
-      }}
-      if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {{
-        return value;
-      }}
-      if (value instanceof Uint8Array) {{
-        return Buffer.from(value);
-      }}
-      if (ArrayBuffer.isView(value)) {{
-        return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-      }}
-      if (value instanceof ArrayBuffer) {{
-        return Buffer.from(value);
-      }}
-      if (
-        value &&
-        typeof value === "object" &&
-        value.__agentOSType === "bytes" &&
-        typeof value.base64 === "string"
-      ) {{
-        return Buffer.from(value.base64, "base64");
-      }}
-      return null;
-    }}
-
-    _dequeuePipeBytes(pipe, maxBytes) {{
-      if (!pipe || !Array.isArray(pipe.chunks) || pipe.chunks.length === 0) {{
-        return Buffer.alloc(0);
-      }}
-
-      let remaining = Math.max(0, Number(maxBytes) >>> 0);
-      if (remaining === 0) {{
-        return Buffer.alloc(0);
-      }}
-
-      const parts = [];
-      while (remaining > 0 && pipe.chunks.length > 0) {{
-        const chunk = pipe.chunks[0];
-        if (!chunk || chunk.length === 0) {{
-          pipe.chunks.shift();
-          continue;
-        }}
-
-        if (chunk.length <= remaining) {{
-          parts.push(chunk);
-          pipe.chunks.shift();
-          remaining -= chunk.length;
-          continue;
-        }}
-
-        parts.push(chunk.subarray(0, remaining));
-        pipe.chunks[0] = chunk.subarray(remaining);
-        remaining = 0;
-      }}
-
-      return Buffer.concat(parts);
-    }}
-
-    _enqueuePipeBytes(pipe, bytes) {{
-      if (!pipe || !Array.isArray(pipe.chunks)) {{
-        return;
-      }}
-      const chunk = Buffer.from(bytes ?? []);
-      if (chunk.length === 0) {{
-        return;
-      }}
-      pipe.chunks.push(chunk);
-    }}
-
-    _pipeHasReaders(pipe) {{
-      return (
-        (pipe?.readHandleCount ?? 0) > 0 ||
-        (pipe?.consumers?.size ?? 0) > 0
-      );
-    }}
-
-    _flushPipeConsumers(pipe) {{
-      if (
-        !pipe ||
-        typeof pipe.consumers?.entries !== "function" ||
-        !Array.isArray(pipe.chunks) ||
-        pipe.chunks.length === 0 ||
-        typeof globalThis?.__agentOSSyncRpc?.callSync !== "function"
-      ) {{
-        return false;
-      }}
-
-      let flushed = false;
-      while (pipe.chunks.length > 0) {{
-        const chunk = pipe.chunks.shift();
-        if (!chunk || chunk.length === 0) {{
-          continue;
-        }}
-
-        for (const [consumerKey, consumer] of Array.from(pipe.consumers.entries())) {{
-          if (!consumer || typeof consumer.childId !== "string") {{
-            pipe.consumers.delete(consumerKey);
-            continue;
-          }}
-          try {{
-            globalThis.__agentOSSyncRpc.callSync("child_process.write_stdin", [
-              consumer.childId,
-              chunk,
-            ]);
-            flushed = true;
-          }} catch {{
-            pipe.consumers.delete(consumerKey);
-          }}
-        }}
-      }}
-
-      return flushed;
-    }}
-
-    _closePipeConsumers(pipe) {{
-      if (
-        !pipe ||
-        typeof pipe.consumers?.entries !== "function" ||
-        typeof globalThis?.__agentOSSyncRpc?.callSync !== "function"
-      ) {{
-        return false;
-      }}
-
-      let closed = false;
-      for (const [consumerKey, consumer] of Array.from(pipe.consumers.entries())) {{
-        if (!consumer || typeof consumer.childId !== "string") {{
-          pipe.consumers.delete(consumerKey);
-          continue;
-        }}
-        try {{
-          globalThis.__agentOSSyncRpc.callSync("child_process.close_stdin", [
-            consumer.childId,
-          ]);
-          closed = true;
-        }} catch {{
-          // Ignore close errors during teardown.
-        }}
-        pipe.consumers.delete(consumerKey);
-      }}
-
-      return closed;
-    }}
-
-    _pumpPipeProducers(pipe, waitMs) {{
-      if (
-        !pipe ||
-        typeof pipe.producers?.entries !== "function" ||
-        typeof globalThis?.__agentOSSyncRpc?.callSync !== "function"
-      ) {{
-        return false;
-      }}
-
-      let processed = false;
-      for (const [producerKey, producer] of Array.from(pipe.producers.entries())) {{
-        if (!producer || typeof producer.childId !== "string") {{
-          pipe.producers.delete(producerKey);
-          continue;
-        }}
-
-        let event = null;
-        try {{
-          event = globalThis.__agentOSSyncRpc.callSync("child_process.poll", [
-            producer.childId,
-            Math.max(0, Number(waitMs) >>> 0),
-          ]);
-        }} catch {{
-          pipe.producers.delete(producerKey);
-          continue;
-        }}
-
-        if (!event) {{
-          continue;
-        }}
-
-        processed = true;
-        const streamType =
-          producer.stream === "stderr" ? "stderr" : producer.stream === "stdout" ? "stdout" : null;
-        if ((event.type === "stdout" || event.type === "stderr") && event.type === streamType) {{
-          const chunk = this._decodeSyncRpcBytes(event.data);
-          if (chunk && chunk.length > 0) {{
-            pipe.chunks.push(Buffer.from(chunk));
-          }}
-          continue;
-        }}
-
-        if (event.type === "exit") {{
-          pipe.producers.delete(producerKey);
-          if (pipe.producers.size === 0 && (pipe.writeHandleCount ?? 0) === 0) {{
-            this._closePipeConsumers(pipe);
-          }}
-          continue;
-        }}
-      }}
-
-      return processed;
-    }}
-
-    _collectIovs(iovs, iovsLen) {{
-      const totalLength = this._boundedIovLength(iovs, iovsLen);
-      const view = this._memoryView();
-      const chunks = [];
-      for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-        const entryOffset = (Number(iovs) >>> 0) + index * 8;
-        const ptr = view.getUint32(entryOffset, true);
-        const len = view.getUint32(entryOffset + 4, true);
-        chunks.push(this._readBytes(ptr, len));
-      }}
-      return Buffer.concat(chunks, totalLength);
-    }}
-
-    _writeToIovs(iovs, iovsLen, bytes) {{
-      const view = this._memoryView();
-      const memory = this._memoryBytes();
-      let sourceOffset = 0;
-      for (let index = 0; index < (Number(iovsLen) >>> 0) && sourceOffset < bytes.length; index += 1) {{
-        const entryOffset = (Number(iovs) >>> 0) + index * 8;
-        const ptr = view.getUint32(entryOffset, true);
-        const len = view.getUint32(entryOffset + 4, true);
-        const chunk = bytes.subarray(sourceOffset, sourceOffset + len);
-        memory.set(chunk, Number(ptr) >>> 0);
-        sourceOffset += chunk.length;
-      }}
-      return sourceOffset;
-    }}
-
-    _stringTable(values) {{
-      return values.map((value) => Buffer.from(`${{String(value)}}\0`, "utf8"));
-    }}
-
-    _writeStringTable(values, offsetsPtr, bufferPtr) {{
-      try {{
-        const view = this._memoryView();
-        const memory = this._memoryBytes();
-        let cursor = Number(bufferPtr) >>> 0;
-        for (let index = 0; index < values.length; index += 1) {{
-          const bytes = values[index];
-          view.setUint32((Number(offsetsPtr) >>> 0) + index * 4, cursor, true);
-          memory.set(bytes, cursor);
-          cursor += bytes.length;
-        }}
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        __agentOSWasiDebug(
-          `writeStringTable failed offsetsPtr=${{Number(offsetsPtr)}} bufferPtr=${{Number(bufferPtr)}} count=${{values.length}}`,
-        );
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _filetypeForStats(stats) {{
-      if (!stats) {{
-        return __agentOSWasiFiletypeUnknown;
-      }}
-      if (typeof stats.isDirectory === "function" && stats.isDirectory()) {{
-        return __agentOSWasiFiletypeDirectory;
-      }}
-      if (typeof stats.isFile === "function" && stats.isFile()) {{
-        return __agentOSWasiFiletypeRegularFile;
-      }}
-      if (typeof stats.isSymbolicLink === "function" && stats.isSymbolicLink()) {{
-        return __agentOSWasiFiletypeSymbolicLink;
-      }}
-      if (typeof stats.isCharacterDevice === "function" && stats.isCharacterDevice()) {{
-        return __agentOSWasiFiletypeCharacterDevice;
-      }}
-      return __agentOSWasiFiletypeUnknown;
-    }}
-
-    _fdFiletype(entry) {{
-      if (!entry) {{
-        return __agentOSWasiFiletypeUnknown;
-      }}
-      if (
-        entry.kind === "stdin" ||
-        entry.kind === "stdout" ||
-        entry.kind === "stderr"
-      ) {{
-        return __agentOSWasiFiletypeCharacterDevice;
-      }}
-      if (entry.kind === "preopen" || entry.kind === "directory") {{
-        return __agentOSWasiFiletypeDirectory;
-      }}
-      if (entry.kind === "symlink") {{
-        return __agentOSWasiFiletypeSymbolicLink;
-      }}
-      return __agentOSWasiFiletypeRegularFile;
-    }}
-
-    _mapFsError(error) {{
-      switch (error?.code) {{
-        case "EACCES":
-        case "EPERM":
-          return __agentOSWasiErrnoAcces;
-        case "ENOENT":
-          return __agentOSWasiErrnoNoent;
-        case "ENOTDIR":
-          return __agentOSWasiErrnoNotdir;
-        case "EEXIST":
-          return __agentOSWasiErrnoExist;
-        case "EINVAL":
-          return __agentOSWasiErrnoInval;
-        case "EROFS":
-          return __agentOSWasiErrnoRofs;
-        default:
-          return __agentOSWasiErrnoIo;
-      }}
-    }}
-
-    _descriptorEntry(fd) {{
-      return this.fdTable.get(Number(fd) >>> 0) ?? null;
-    }}
-
-    _localFdHandle(fd) {{
-      const entry = this._descriptorEntry(fd);
-      if (!entry || typeof entry.realFd !== "number") {{
-        return null;
-      }}
-      return {{
-        kind: "host-passthrough",
-        targetFd: entry.realFd,
-        displayFd: Number(fd) >>> 0,
-        refCount: 1,
-        open: true,
-        readOnly: entry.readOnly === true,
-      }};
-    }}
-
-    _externalFdHandle(fd) {{
-      const descriptor = Number(fd) >>> 0;
-      const localHandle = this._localFdHandle(descriptor);
-      if (localHandle) {{
-        return localHandle;
-      }}
-      try {{
-        if (typeof lookupFdHandle === "function") {{
-          return lookupFdHandle(descriptor) ?? null;
-        }}
-      }} catch {{
-        // Fall through to other lookup paths.
-      }}
-      try {{
-        if (typeof globalThis.lookupFdHandle === "function") {{
-          return globalThis.lookupFdHandle(descriptor) ?? null;
-        }}
-      }} catch {{
-        // Ignore missing global bridge helpers.
-      }}
-      return null;
-    }}
-
-    _descriptorHostPath(entry) {{
-      if (!entry) {{
-        return null;
-      }}
-      if (typeof entry.hostPath === "string") {{
-        return entry.hostPath;
-      }}
-      if (typeof entry.realFd === "number") {{
-        return __agentOSFs().readlinkSync(`/proc/self/fd/${{entry.realFd}}`);
-      }}
-      return null;
-    }}
-
-    _descriptorFsPath(entry) {{
-      if (!entry) {{
-        return null;
-      }}
-      if (typeof entry.hostPath === "string" && entry.hostPath.length > 0) {{
-        return entry.hostPath;
-      }}
-      if (typeof entry.guestPath === "string" && entry.guestPath.length > 0) {{
-        return entry.guestPath;
-      }}
-      return null;
-    }}
-
-    _sidecarManagedProcess() {{
-      if (
-        typeof __agentOSWasmInternalEnv?.AGENTOS_SANDBOX_ROOT === "string" &&
-        __agentOSWasmInternalEnv.AGENTOS_SANDBOX_ROOT.length > 0
-      ) {{
-        return true;
-      }}
-      return (
-        typeof process?.env?.AGENTOS_SANDBOX_ROOT === "string" &&
-        process.env.AGENTOS_SANDBOX_ROOT.length > 0
-      );
-    }}
-
-    _descriptorDirectoryFsPath(entry) {{
-      if (
-        (entry?.kind === "preopen" || entry?.kind === "directory") &&
-        this._sidecarManagedProcess()
-      ) {{
-        return this._descriptorGuestPath(entry);
-      }}
-      return this._descriptorFsPath(entry);
-    }}
-
-    _descriptorGuestPath(entry) {{
-      if (!entry) {{
-        return null;
-      }}
-      const guestPath = typeof entry.guestPath === "string" ? entry.guestPath : null;
-      if (guestPath === ".") {{
-        return this._currentGuestCwd();
-      }}
-      if (typeof guestPath === "string" && guestPath.length > 0) {{
-        return __agentOSPath().posix.normalize(guestPath);
-      }}
-      return null;
-    }}
-
-    _descriptorPreopenName(entry) {{
-      if (!entry) {{
-        return null;
-      }}
-      const guestPath = typeof entry.guestPath === "string" ? entry.guestPath : null;
-      if (guestPath === ".") {{
-        return this._descriptorGuestPath(entry);
-      }}
-      if (typeof guestPath === "string" && guestPath.length > 0) {{
-        return __agentOSPath().posix.normalize(guestPath);
-      }}
-      return null;
-    }}
-
-    _currentDirectoryPreopen() {{
-      for (const entry of this.fdTable.values()) {{
-        if (entry?.kind === "preopen" && entry.guestPath === ".") {{
-          return entry;
-        }}
-      }}
-      return null;
-    }}
-
-    _descriptorPathBase(entry, target) {{
-      const baseGuestPath = this._descriptorGuestPath(entry);
-      if (typeof baseGuestPath !== "string") {{
-        return null;
-      }}
-      return {{
-        entry,
-        guestPath: baseGuestPath,
-        hostPath: typeof entry?.hostPath === "string" ? entry.hostPath : null,
-      }};
-    }}
-
-    _hostPathExists(hostPath) {{
-      try {{
-        __agentOSFs().statSync(hostPath);
-        return true;
-      }} catch {{
-        return false;
-      }}
-    }}
-
-    _currentGuestCwd() {{
-      const pwd =
-        typeof this.env?.PWD === "string" && this.env.PWD.startsWith("/")
-          ? this.env.PWD
-          : typeof this.env?.HOME === "string" && this.env.HOME.startsWith("/")
-            ? this.env.HOME
-            : "/";
-      return __agentOSPath().posix.normalize(pwd);
-    }}
-
-    _resolveHostMappingForGuestPath(guestPath) {{
-      const normalized = __agentOSPath().posix.normalize(guestPath);
-      const mappings = [];
-      for (const entry of this.fdTable.values()) {{
-        if (entry?.kind !== "preopen" || typeof entry.hostPath !== "string") {{
-          continue;
-        }}
-        const guestRoot = this._descriptorGuestPath(entry);
-        if (typeof guestRoot !== "string") {{
-          continue;
-        }}
-        mappings.push({{
-          guestRoot,
-          hostPath: entry.hostPath,
-          readOnly: entry.readOnly === true,
-        }});
-      }}
-      mappings.sort((left, right) => right.guestRoot.length - left.guestRoot.length);
-
-      for (const mapping of mappings) {{
-        const matchesRoot = mapping.guestRoot === "/" && normalized.startsWith("/");
-        const matchesNested =
-          normalized === mapping.guestRoot ||
-          normalized.startsWith(`${{mapping.guestRoot}}/`);
-        if (!matchesRoot && !matchesNested) {{
-          continue;
-        }}
-        const suffix =
-          normalized === mapping.guestRoot
-            ? ""
-            : mapping.guestRoot === "/"
-              ? normalized.slice(1)
-              : normalized.slice(mapping.guestRoot.length + 1);
-        return {{
-          hostPath: suffix
-            ? __agentOSPath().join(mapping.hostPath, ...suffix.split("/"))
-            : mapping.hostPath,
-          readOnly: mapping.readOnly,
-        }};
-      }}
-
-      return null;
-    }}
-
-    _resolveHostPathForGuestPath(guestPath) {{
-      return this._resolveHostMappingForGuestPath(guestPath)?.hostPath ?? null;
-    }}
-
-    _rootRelativeTargetPrefersCwd(target) {{
-      const normalizedTarget = __agentOSPath().posix.normalize(target || ".");
-      if (normalizedTarget !== ".") {{
-        return false;
-      }}
-      return !this._rootRelativeTargetMatchesAbsoluteArg(target);
-    }}
-
-    _rootRelativeTargetMatchesAbsoluteArg(target) {{
-      const rootGuestPath = __agentOSPath().posix.resolve("/", target);
-      return this.args
-        .slice(1)
-        .some(
-          (arg) =>
-            typeof arg === "string" &&
-            arg.startsWith("/") &&
-            __agentOSPath().posix.normalize(arg) === rootGuestPath,
-        );
-    }}
-
-    _rootRelativeTargetIsWithinAbsoluteArg(target) {{
-      const rootGuestPath = __agentOSPath().posix.resolve("/", target);
-      return this.args
-        .slice(1)
-        .some((arg) => {{
-          if (typeof arg !== "string" || !arg.startsWith("/")) {{
-            return false;
-          }}
-          const normalizedArg = __agentOSPath().posix.normalize(arg);
-          return (
-            rootGuestPath === normalizedArg ||
-            rootGuestPath.startsWith(`${{normalizedArg}}/`)
-          );
-        }});
-    }}
-
-    _resolveRootRelativePath(target, preferCreateParent = false) {{
-      const rootGuestPath = __agentOSPath().posix.resolve("/", target);
-      const rootMapping = this._resolveHostMappingForGuestPath(rootGuestPath);
-      const rootHostPath = rootMapping?.hostPath ?? null;
-      const cwdGuestPath = this._currentGuestCwd();
-      if (cwdGuestPath !== "/") {{
-        const cwdGuestTarget = __agentOSPath().posix.resolve(cwdGuestPath, target);
-        const cwdMapping = this._resolveHostMappingForGuestPath(cwdGuestTarget);
-        const cwdHostTarget = cwdMapping?.hostPath ?? null;
-        if (
-          typeof cwdHostTarget === "string" &&
-          (
-            (preferCreateParent && !this._rootRelativeTargetMatchesAbsoluteArg(target)) ||
-            this._rootRelativeTargetPrefersCwd(target) ||
-            (
-              this._hostPathExists(cwdHostTarget) &&
-              !(typeof rootHostPath === "string" && this._hostPathExists(rootHostPath))
-            )
-          )
-        ) {{
-          return {{
-            guestPath: cwdGuestTarget,
-            hostPath: cwdHostTarget,
-            readOnly: cwdMapping?.readOnly === true,
-          }};
-        }}
-      }}
-      return {{
-        guestPath: rootGuestPath,
-        hostPath: rootHostPath,
-        readOnly: rootMapping?.readOnly === true,
-      }};
-    }}
-
-    _resolveDescriptorPath(fd, pathPtr, pathLen, options = {{}}) {{
-      const entry = this._descriptorEntry(fd);
-      if (!entry) {{
-        return {{ error: __agentOSWasiErrnoBadf }};
-      }}
-      const target = this._readString(pathPtr, pathLen);
-      const base = this._descriptorPathBase(entry, target);
-      if (!base || typeof base.guestPath !== "string") {{
-        return {{ error: __agentOSWasiErrnoBadf }};
-      }}
-      const guestPath = target.startsWith("/")
-        ? __agentOSPath().posix.normalize(target)
-        : __agentOSPath().posix.resolve(base.guestPath, target);
-      const mapped =
-        base.guestPath === "/" && !target.startsWith("/")
-          ? this._resolveRootRelativePath(
-              target,
-              options.preferCreateParent === true,
-            )
-          : {{
-              guestPath,
-              ...(
-                this._resolveHostMappingForGuestPath(guestPath) ??
-                {{ hostPath: null, readOnly: false }}
-              ),
-            }};
-      const hostPath = mapped.hostPath;
-      if (typeof hostPath !== "string") {{
-        return {{ error: __agentOSWasiErrnoNoent }};
-      }}
-      return {{
-        error: __agentOSWasiErrnoSuccess,
-        guestPath: mapped.guestPath,
-        hostPath,
-        readOnly: mapped.readOnly === true,
-      }};
-    }}
-
-    _resolveDescriptorDirectStatPath(fd, target) {{
-      if (
-        typeof target !== "string" ||
-        target.length === 0 ||
-        target === "." ||
-        target === ".." ||
-        target.startsWith("/")
-      ) {{
-        return null;
-      }}
-      const entry = this._descriptorEntry(fd);
-      if (
-        !entry ||
-        (entry.kind !== "directory" && entry.kind !== "preopen") ||
-        typeof entry.hostPath !== "string" ||
-        entry.hostPath.length === 0
-      ) {{
-        return null;
-      }}
-      const baseGuestPath = this._descriptorGuestPath(entry);
-      if (typeof baseGuestPath !== "string") {{
-        return null;
-      }}
-      if (entry.kind === "preopen" && baseGuestPath === "/") {{
-        if (!this._rootRelativeTargetIsWithinAbsoluteArg(target)) {{
-          return null;
-        }}
-      }} else if (target.includes("/")) {{
-        return null;
-      }}
-      return {{
-        error: __agentOSWasiErrnoSuccess,
-        guestPath: __agentOSPath().posix.resolve(baseGuestPath, target),
-        hostPath: __agentOSPath().join(entry.hostPath, target),
-        readOnly: entry.readOnly === true,
-      }};
-    }}
-
-    _writeFilestat(statPtr, stats, fallbackType) {{
-      try {{
-        const view = this._memoryView();
-        const offset = Number(statPtr) >>> 0;
-        const filetype = stats ? this._filetypeForStats(stats) : fallbackType;
-        view.setBigUint64(offset, 0n, true);
-        view.setBigUint64(offset + 8, BigInt(stats?.ino ?? 0), true);
-        view.setUint8(offset + 16, filetype);
-        view.setBigUint64(offset + 24, BigInt(stats?.nlink ?? 1), true);
-        view.setBigUint64(offset + 32, BigInt(stats?.size ?? 0), true);
-        view.setBigUint64(offset + 40, BigInt(Math.trunc((stats?.atimeMs ?? 0) * 1000000)), true);
-        view.setBigUint64(offset + 48, BigInt(Math.trunc((stats?.mtimeMs ?? 0) * 1000000)), true);
-        view.setBigUint64(offset + 56, BigInt(Math.trunc((stats?.ctimeMs ?? 0) * 1000000)), true);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _argsSizesGet(argcPtr, argvBufSizePtr) {{
-      const values = this._stringTable(this.args);
-      const total = values.reduce((sum, value) => sum + value.length, 0);
-      const argcStatus = this._writeUint32(argcPtr, values.length);
-      if (argcStatus !== __agentOSWasiErrnoSuccess) {{
-        return argcStatus;
-      }}
-      return this._writeUint32(argvBufSizePtr, total);
-    }}
-
-    _argsGet(argvPtr, argvBufPtr) {{
-      return this._writeStringTable(this._stringTable(this.args), argvPtr, argvBufPtr);
-    }}
-
-    _environEntries() {{
-      return Object.entries(this.env).map(([key, value]) => `${{key}}=${{value}}`);
-    }}
-
-    _environSizesGet(countPtr, bufSizePtr) {{
-      const values = this._stringTable(this._environEntries());
-      const total = values.reduce((sum, value) => sum + value.length, 0);
-      const countStatus = this._writeUint32(countPtr, values.length);
-      if (countStatus !== __agentOSWasiErrnoSuccess) {{
-        return countStatus;
-      }}
-      return this._writeUint32(bufSizePtr, total);
-    }}
-
-    _environGet(environPtr, environBufPtr) {{
-      return this._writeStringTable(
-        this._stringTable(this._environEntries()),
-        environPtr,
-        environBufPtr,
-      );
-    }}
-
-    _clockTimeGet(_clockId, _precision, resultPtr) {{
-      return this._writeUint64(resultPtr, BigInt(Date.now()) * 1000000n);
-    }}
-
-    _clockResGet(_clockId, resultPtr) {{
-      return this._writeUint64(resultPtr, 1000000n);
-    }}
-
-    _fdWrite(fd, iovs, iovsLen, nwrittenPtr) {{
-      try {{
-        const bytes = this._collectIovs(iovs, iovsLen);
-        const descriptor = Number(fd) >>> 0;
-        const handle = this._externalFdHandle(descriptor);
-        if (handle?.kind === "pipe-write" && handle.pipe) {{
-          if (bytes.length > 0 && !this._pipeHasReaders(handle.pipe)) {{
-            return __agentOSWasiErrnoPipe;
-          }}
-          this._enqueuePipeBytes(handle.pipe, bytes);
-          this._flushPipeConsumers(handle.pipe);
-          return this._writeUint32(nwrittenPtr, bytes.length);
-        }}
-        if (
-          (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-          typeof handle.targetFd === "number"
-        ) {{
-          if (handle.readOnly === true) {{
-            return __agentOSWasiErrnoRofs;
-          }}
-          if (descriptor === 1 || descriptor === 2) {{
-            const sidecarManagedProcess =
-              typeof process?.env?.AGENTOS_SANDBOX_ROOT === "string" &&
-              process.env.AGENTOS_SANDBOX_ROOT.length > 0;
-            const useKernelStdioSyncRpc =
-              sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
-            if (useKernelStdioSyncRpc) {{
-              const written = Number(
-                globalThis.__agentOSSyncRpc.callSync("__kernel_stdio_write", [descriptor, bytes]),
-              ) >>> 0;
-              return this._writeUint32(nwrittenPtr, written);
-            }}
-          }}
-          const written = __agentOSFs().writeSync(
-            handle.targetFd,
-            bytes,
-            0,
-            bytes.length,
-            null,
-          );
-          return this._writeUint32(nwrittenPtr, written);
-        }}
-        if (handle?.kind === "guest-file" && typeof handle.targetFd === "number") {{
-          const position = handle.append ? null : (handle.position ?? 0);
-          const written = __agentOSFs().writeSync(
-            handle.targetFd,
-            bytes,
-            0,
-            bytes.length,
-            position,
-          );
-          if (handle.append) {{
-            handle.position = Number(__agentOSFs().fstatSync(handle.targetFd).size ?? 0);
-          }} else {{
-            handle.position = (handle.position ?? 0) + written;
-          }}
-          return this._writeUint32(nwrittenPtr, written);
-        }}
-        const entry = this.fdTable.get(descriptor);
-        if (!entry) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        if (entry.kind === "stdout") {{
-          const sidecarManagedProcess =
-            typeof process?.env?.AGENTOS_SANDBOX_ROOT === "string" &&
-            process.env.AGENTOS_SANDBOX_ROOT.length > 0;
-          const useKernelStdioSyncRpc =
-            sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
-          const written = useKernelStdioSyncRpc
-            ? Number(globalThis.__agentOSSyncRpc.callSync("__kernel_stdio_write", [1, bytes])) >>> 0
-            : (process.stdout.write(bytes), bytes.length);
-          return this._writeUint32(nwrittenPtr, written);
-        }}
-        if (entry.kind === "stderr") {{
-          const sidecarManagedProcess =
-            typeof process?.env?.AGENTOS_SANDBOX_ROOT === "string" &&
-            process.env.AGENTOS_SANDBOX_ROOT.length > 0;
-          const useKernelStdioSyncRpc =
-            sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
-          const written = useKernelStdioSyncRpc
-            ? Number(globalThis.__agentOSSyncRpc.callSync("__kernel_stdio_write", [2, bytes])) >>> 0
-            : (process.stderr.write(bytes), bytes.length);
-          return this._writeUint32(nwrittenPtr, written);
-        }}
-        if (entry.readOnly === true) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        if (entry.kind === "file") {{
-          const position = typeof entry.offset === "number" ? entry.offset : null;
-          const written = __agentOSFs().writeSync(
-            entry.realFd,
-            bytes,
-            0,
-            bytes.length,
-            position,
-          );
-          if (typeof entry.offset === "number") {{
-            entry.offset += written;
-          }}
-          return this._writeUint32(nwrittenPtr, written);
-        }}
-        return __agentOSWasiErrnoBadf;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdPwrite(fd, iovs, iovsLen, offset, nwrittenPtr) {{
-      try {{
-        const bytes = this._collectIovs(iovs, iovsLen);
-        const descriptor = Number(fd) >>> 0;
-        const handle = this._externalFdHandle(descriptor);
-        if (
-          (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-          typeof handle.targetFd === "number"
-        ) {{
-          if (handle.readOnly === true) {{
-            return __agentOSWasiErrnoRofs;
-          }}
-          const written = __agentOSFs().writeSync(
-            handle.targetFd,
-            bytes,
-            0,
-            bytes.length,
-            Number(offset) >>> 0,
-          );
-          return this._writeUint32(nwrittenPtr, written);
-        }}
-        const entry = this.fdTable.get(descriptor);
-        if (!entry || entry.kind !== "file") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        if (entry.readOnly === true) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        const written = __agentOSFs().writeSync(
-          entry.realFd,
-          bytes,
-          0,
-          bytes.length,
-          Number(offset) >>> 0,
-        );
-        return this._writeUint32(nwrittenPtr, written);
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdPread(fd, iovs, iovsLen, offset, nreadPtr) {{
-      try {{
-        const descriptor = Number(fd) >>> 0;
-        const explicitOffset = Number(offset) >>> 0;
-        const totalLength = this._boundedIovLength(iovs, iovsLen);
-        const buffer = Buffer.alloc(totalLength);
-        const handle = this._externalFdHandle(descriptor);
-        if (
-          (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-          typeof handle.targetFd === "number"
-        ) {{
-          const bytesRead = __agentOSFs().readSync(
-            handle.targetFd,
-            buffer,
-            0,
-            totalLength,
-            explicitOffset,
-          );
-          const written = this._writeToIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
-          return this._writeUint32(nreadPtr, written);
-        }}
-        const entry = this.fdTable.get(descriptor);
-        if (!entry || entry.kind !== "file") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const bytesRead = __agentOSFs().readSync(
-          entry.realFd,
-          buffer,
-          0,
-          totalLength,
-          explicitOffset,
-        );
-        const written = this._writeToIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
-        return this._writeUint32(nreadPtr, written);
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdRead(fd, iovs, iovsLen, nreadPtr) {{
-      try {{
-        const descriptor = Number(fd) >>> 0;
-        const handle = this._externalFdHandle(descriptor);
-        if (handle?.kind === "pipe-read" && handle.pipe) {{
-          const totalLength = this._boundedIovLength(iovs, iovsLen);
-          // When the read fd is marked non-blocking (FDFLAGS_NONBLOCK, set via
-          // fd_fdstat_set_flags), an empty pipe returns EAGAIN instead of
-          // synchronously spinning, so a single-threaded caller (e.g. tokio's
-          // ChildStdio::poll_read on wasm32-wasip1, which has no I/O reactor) can
-          // yield to the executor instead of pinning the only thread. Default
-          // (blocking) reads are byte-identical to before.
-          const __nonblock = ((handle.pipe.fdFlags >>> 0) & 4) !== 0;
-          while (handle.pipe.chunks.length === 0) {{
-            if (handle.pipe.writeHandleCount === 0 && handle.pipe.producers.size === 0) {{
-              return this._writeUint32(nreadPtr, 0);
-            }}
-            // Still drive the child so it keeps producing; in non-blocking mode
-            // pump once without waiting, then return EAGAIN if still empty.
-            this._pumpPipeProducers(handle.pipe, __nonblock ? 0 : 10);
-            if (__nonblock && handle.pipe.chunks.length === 0) {{
-              return __agentOSWasiErrnoAgain;
-            }}
-          }}
-          const chunk = this._dequeuePipeBytes(handle.pipe, totalLength);
-          const written = this._writeToIovs(iovs, iovsLen, chunk);
-          return this._writeUint32(nreadPtr, written);
-        }}
-        const entry = this.fdTable.get(descriptor);
-        if (!entry) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        if (entry.kind === "stdin") {{
-          const totalLength = this._boundedIovLength(iovs, iovsLen);
-          const syncRpc =
-            typeof globalThis?.__agentOSSyncRpc?.callSync === "function"
-              ? globalThis.__agentOSSyncRpc
-              : null;
-          const sidecarManagedProcess =
-            typeof process?.env?.AGENTOS_SANDBOX_ROOT === "string" &&
-            process.env.AGENTOS_SANDBOX_ROOT.length > 0;
-          if (syncRpc) {{
-            try {{
-              let chunk = null;
-              while (true) {{
-                const response = syncRpc.callSync("__kernel_stdin_read", [totalLength, 10]);
-                if (
-                  response &&
-                  typeof response === "object" &&
-                  typeof response.dataBase64 === "string"
-                ) {{
-                  chunk = Buffer.from(response.dataBase64, "base64");
-                  break;
-                }}
-                if (response && typeof response === "object" && response.done === true) {{
-                  chunk = Buffer.alloc(0);
-                  break;
-                }}
-                if (
-                  typeof Atomics?.wait === "function" &&
-                  typeof syntheticWaitArray !== "undefined"
-                ) {{
-                  Atomics.wait(syntheticWaitArray, 0, 0, 10);
-                }}
-              }}
-              if (!chunk || chunk.length === 0) {{
-                return this._writeUint32(nreadPtr, 0);
-              }}
-              const written = this._writeToIovs(iovs, iovsLen, chunk);
-              return this._writeUint32(nreadPtr, written);
-            }} catch {{
-              // Fall back to direct stdin reads when the sync bridge is unavailable
-              // in the standalone runner bootstrap.
-            }}
-          }}
-          const buffer = Buffer.alloc(totalLength);
-          const directStdinFd =
-            (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-            typeof handle.targetFd === "number"
-              ? handle.targetFd
-              : typeof process?.stdin?.fd === "number"
-                ? process.stdin.fd
-                : 0;
-          const bytesRead = __agentOSFs().readSync(
-            directStdinFd,
-            buffer,
-            0,
-            totalLength,
-            null,
-          );
-          const written = this._writeToIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
-          return this._writeUint32(nreadPtr, written);
-        }}
-        if (
-          (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-          typeof handle.targetFd === "number"
-        ) {{
-          const totalLength = this._boundedIovLength(iovs, iovsLen);
-          const buffer = Buffer.alloc(totalLength);
-          const bytesRead = __agentOSFs().readSync(
-            handle.targetFd,
-            buffer,
-            0,
-            totalLength,
-            null,
-          );
-          const written = this._writeToIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
-          return this._writeUint32(nreadPtr, written);
-        }}
-        if (entry.kind !== "file") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const totalLength = this._boundedIovLength(iovs, iovsLen);
-        const buffer = Buffer.alloc(totalLength);
-        const position = typeof entry.offset === "number" ? entry.offset : null;
-        const bytesRead = __agentOSFs().readSync(
-          entry.realFd,
-          buffer,
-          0,
-          totalLength,
-          position,
-        );
-        if (typeof entry.offset === "number") {{
-          entry.offset += bytesRead;
-        }}
-        const written = this._writeToIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
-        return this._writeUint32(nreadPtr, written);
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdClose(fd) {{
-      try {{
-        const descriptor = Number(fd) >>> 0;
-        const entry = this.fdTable.get(descriptor);
-        if (!entry) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const retainedDelegateRefs = (() => {{
-          try {{
-            if (typeof globalThis.__agentOSWasiDelegateFdRefCount === "function") {{
-              return Number(globalThis.__agentOSWasiDelegateFdRefCount(descriptor)) || 0;
-            }}
-          }} catch {{
-            // Fall through to the default close path.
-          }}
-          return 0;
-        }})();
-        if (entry.kind === "file" && retainedDelegateRefs <= 0) {{
-          __agentOSFs().closeSync(entry.realFd);
-        }}
-        if (descriptor > 2 && retainedDelegateRefs <= 0) {{
-          this.fdTable.delete(descriptor);
-        }}
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdSync(fd) {{
-      try {{
-        const descriptor = Number(fd) >>> 0;
-        const handle = this._externalFdHandle(descriptor);
-        if (
-          (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-          typeof handle.targetFd === "number"
-        ) {{
-          __agentOSFs().fsyncSync(handle.targetFd);
-          return __agentOSWasiErrnoSuccess;
-        }}
-        const entry = this.fdTable.get(descriptor);
-        if (!entry || entry.kind !== "file" || typeof entry.realFd !== "number") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        __agentOSFs().fsyncSync(entry.realFd);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdFdstatGet(fd, statPtr) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const view = this._memoryView();
-        const offset = Number(statPtr) >>> 0;
-        view.setUint8(offset, this._fdFiletype(entry));
-        view.setUint16(offset + 2, (Number(entry.fdFlags) >>> 0) & 0xffff, true);
-        view.setBigUint64(offset + 8, this._descriptorRightsBase(entry), true);
-        view.setBigUint64(offset + 16, this._descriptorRightsInheriting(entry), true);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdFdstatSetFlags(fd, flags) {{
-      try {{
-        const normalizedFlags = (Number(flags) >>> 0) & 0xffff;
-        const entry = this._descriptorEntry(fd);
-        if (entry) {{
-          entry.fdFlags = normalizedFlags;
-          return __agentOSWasiErrnoSuccess;
-        }}
-        // Pipe-read fds (e.g. a child process's stdout/stderr) have no fdTable
-        // entry; they are external handles backed by a stable pipe object.
-        // Persist the flags on the pipe so _fdRead can honor FDFLAGS_NONBLOCK.
-        const handle = this._externalFdHandle(fd);
-        if (handle?.kind === "pipe-read" && handle.pipe) {{
-          handle.pipe.fdFlags = normalizedFlags;
-          return __agentOSWasiErrnoSuccess;
-        }}
-        return __agentOSWasiErrnoBadf;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdFilestatGet(fd, statPtr) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        if (
-          entry.kind === "stdin" ||
-          entry.kind === "stdout" ||
-          entry.kind === "stderr"
-        ) {{
-          return this._writeFilestat(statPtr, null, __agentOSWasiFiletypeCharacterDevice);
-        }}
-        if (entry.kind === "preopen") {{
-          const stats = __agentOSFs().statSync(entry.guestPath);
-          return this._writeFilestat(statPtr, stats, __agentOSWasiFiletypeDirectory);
-        }}
-        const stats =
-          typeof entry.realFd === "number"
-            ? __agentOSFs().fstatSync(entry.realFd)
-            : __agentOSFs().statSync(this._descriptorFsPath(entry));
-        return this._writeFilestat(statPtr, stats, this._fdFiletype(entry));
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _fdFilestatSetSize(fd, size) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry || entry.kind !== "file" || typeof entry.realFd !== "number") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        if (entry.readOnly === true) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        __agentOSFs().ftruncateSync(entry.realFd, Number(size));
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _fdSeek(fd, offset, whence, newOffsetPtr) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry || entry.kind !== "file" || typeof entry.realFd !== "number") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const delta = Number(offset);
-        if (!Number.isFinite(delta)) {{
-          return __agentOSWasiErrnoInval;
-        }}
-        const currentOffset = typeof entry.offset === "number" ? entry.offset : 0;
-        let nextOffset = 0;
-        switch (Number(whence) >>> 0) {{
-          case __agentOSWasiWhenceSet:
-            nextOffset = delta;
-            break;
-          case __agentOSWasiWhenceCur:
-            nextOffset = currentOffset + delta;
-            break;
-          case __agentOSWasiWhenceEnd: {{
-            const stats = __agentOSFs().fstatSync(entry.realFd);
-            nextOffset = Number(stats?.size ?? 0) + delta;
-            break;
-          }}
-          default:
-            return __agentOSWasiErrnoInval;
-        }}
-        if (!Number.isFinite(nextOffset) || nextOffset < 0) {{
-          return __agentOSWasiErrnoInval;
-        }}
-        entry.offset = nextOffset;
-        return this._writeUint64(newOffsetPtr, BigInt(nextOffset));
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _fdTell(fd, offsetPtr) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry || entry.kind !== "file") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const offset = typeof entry.offset === "number" ? entry.offset : 0;
-        return this._writeUint64(offsetPtr, BigInt(offset));
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _fdPrestatGet(fd, prestatPtr) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry || entry.kind !== "preopen") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const guestPath = this._descriptorPreopenName(entry);
-        if (typeof guestPath !== "string") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const view = this._memoryView();
-        const offset = Number(prestatPtr) >>> 0;
-        view.setUint8(offset, 0);
-        view.setUint32(offset + 4, Buffer.byteLength(guestPath), true);
-        return __agentOSWasiErrnoSuccess;
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdPrestatDirName(fd, pathPtr, pathLen) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (!entry || entry.kind !== "preopen") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const guestPath = this._descriptorPreopenName(entry);
-        if (typeof guestPath !== "string") {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const bytes = Buffer.from(guestPath, "utf8");
-        if ((Number(pathLen) >>> 0) < bytes.length) {{
-          return __agentOSWasiErrnoFault;
-        }}
-        return this._writeBytes(pathPtr, bytes);
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _fdReaddir(fd, bufPtr, bufLen, cookie, bufUsedPtr) {{
-      const startedAt = __agentOSWasiNow();
-      const requestedCookie = Number(cookie) >>> 0;
-      const requestedBufLen = Number(bufLen) >>> 0;
-      try {{
-        const entry = this._descriptorEntry(fd);
-        const fsPath = this._descriptorDirectoryFsPath(entry);
-        if (
-          !entry ||
-          (entry.kind !== "preopen" && entry.kind !== "directory") ||
-          typeof fsPath !== "string"
-        ) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        let dirents =
-          requestedCookie > 0 && Array.isArray(entry.readdirCache)
-            ? entry.readdirCache
-            : null;
-        if (!dirents) {{
-          dirents = __agentOSFs()
-            .readdirSync(fsPath, {{ withFileTypes: true }})
-            .sort((left, right) => left.name.localeCompare(right.name));
-          entry.readdirCache = dirents;
-        }}
-        const view = this._memoryView();
-        const memory = this._memoryBytes();
-        let offset = Number(bufPtr) >>> 0;
-        const limit = offset + requestedBufLen;
-        let used = 0;
-        let recordsReturned = 0;
-        let stoppedRecordTooLarge = false;
-        for (let index = requestedCookie; index < dirents.length; index += 1) {{
-          const dirent = dirents[index];
-          const nameBytes = Buffer.from(dirent.name, "utf8");
-          const recordLen = 24 + nameBytes.length;
-          if (offset + recordLen > limit) {{
-            const remaining = Math.max(0, limit - offset);
-            if (remaining > 0) {{
-              const record = Buffer.alloc(recordLen);
-              const recordView = new DataView(
-                record.buffer,
-                record.byteOffset,
-                record.byteLength,
-              );
-              recordView.setBigUint64(0, BigInt(index + 1), true);
-              recordView.setBigUint64(8, BigInt(index + 1), true);
-              recordView.setUint32(16, nameBytes.length, true);
-              recordView.setUint8(
-                20,
-                dirent.isDirectory()
-                  ? __agentOSWasiFiletypeDirectory
-                  : dirent.isSymbolicLink()
-                    ? __agentOSWasiFiletypeSymbolicLink
-                    : __agentOSWasiFiletypeRegularFile,
-              );
-              record.set(nameBytes, 24);
-              memory.set(record.subarray(0, remaining), offset);
-              offset += remaining;
-              used += remaining;
-            }}
-            stoppedRecordTooLarge = true;
-            break;
-          }}
-          view.setBigUint64(offset, BigInt(index + 1), true);
-          view.setBigUint64(offset + 8, BigInt(index + 1), true);
-          view.setUint32(offset + 16, nameBytes.length, true);
-          view.setUint8(
-            offset + 20,
-            dirent.isDirectory()
-              ? __agentOSWasiFiletypeDirectory
-              : dirent.isSymbolicLink()
-                ? __agentOSWasiFiletypeSymbolicLink
-                : __agentOSWasiFiletypeRegularFile,
-          );
-          memory.set(nameBytes, offset + 24);
-          offset += recordLen;
-          used += recordLen;
-          recordsReturned += 1;
-        }}
-        const result = this._writeUint32(bufUsedPtr, used);
-        this._recordWasiSyscallMetric("fd_readdir", startedAt, {{
-          result,
-          fd: Number(fd) >>> 0,
-          cookie: requestedCookie,
-          bufLen: requestedBufLen,
-          used,
-          recordsReturned,
-          totalDirentsRead: dirents.length,
-          stoppedRecordTooLarge,
-        }});
-        return result;
-      }} catch (error) {{
-        this._recordWasiSyscallMetric("fd_readdir", startedAt, {{
-          result: "error",
-          fd: Number(fd) >>> 0,
-          cookie: requestedCookie,
-          bufLen: requestedBufLen,
-        }});
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathCreateDirectory(fd, pathPtr, pathLen) {{
-      try {{
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        if (resolved.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        __agentOSFs().mkdirSync(resolved.hostPath);
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathLink(oldFd, _oldFlags, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen) {{
-      try {{
-        const source = this._resolveDescriptorPath(oldFd, oldPathPtr, oldPathLen);
-        if (source.error !== __agentOSWasiErrnoSuccess) {{
-          return source.error;
-        }}
-        const destination = this._resolveDescriptorPath(newFd, newPathPtr, newPathLen);
-        if (destination.error !== __agentOSWasiErrnoSuccess) {{
-          return destination.error;
-        }}
-        if (source.readOnly || destination.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        __agentOSFs().linkSync(source.hostPath, destination.hostPath);
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathOpen(fd, _dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, _fdflags, openedFdPtr) {{
-      try {{
-        const entry = this._descriptorEntry(fd);
-        if (
-          !entry ||
-          (entry.kind !== "preopen" && entry.kind !== "directory") ||
-          typeof entry.hostPath !== "string"
-        ) {{
-          return __agentOSWasiErrnoBadf;
-        }}
-        const requestedFlags = Number(oflags) >>> 0;
-        const createOrTruncate =
-          (requestedFlags & __agentOSWasiOpenCreate) !== 0 ||
-          (requestedFlags & __agentOSWasiOpenTruncate) !== 0;
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen, {{
-          preferCreateParent: createOrTruncate,
-        }});
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        const guestPath = resolved.guestPath;
-        const hostPath = resolved.hostPath;
-        const openDirectory = (requestedFlags & __agentOSWasiOpenDirectory) !== 0;
-        const allowedRightsBase = this._descriptorRightsBase(entry);
-        const allowedRightsInheriting = this._descriptorRightsInheriting(entry);
-        const requestedRightsBase = this._normalizeRights(rightsBase, allowedRightsInheriting);
-        const requestedRightsInheriting = this._normalizeRights(
-          rightsInheriting,
-          allowedRightsInheriting,
-        );
-        if (
-          (requestedRightsBase & ~allowedRightsInheriting) !== 0n ||
-          (requestedRightsInheriting & ~allowedRightsInheriting) !== 0n
-        ) {{
-          return __agentOSWasiErrnoAcces;
-        }}
-        const requestedWriteAccess =
-          !openDirectory &&
-          (createOrTruncate || this._hasWriteRights(requestedRightsBase));
-        if (
-          requestedWriteAccess &&
-          !this._hasWriteRights(allowedRightsBase)
-        ) {{
-          return __agentOSWasiErrnoAcces;
-        }}
-        if (requestedWriteAccess && resolved.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        const fsConstants = __agentOSFs().constants ?? {{}};
-        let openFlags = requestedWriteAccess
-          ? fsConstants.O_RDWR ?? 2
-          : fsConstants.O_RDONLY ?? 0;
-        if ((requestedFlags & __agentOSWasiOpenCreate) !== 0) {{
-          openFlags |= fsConstants.O_CREAT ?? 64;
-        }}
-        if ((requestedFlags & __agentOSWasiOpenExclusive) !== 0) {{
-          openFlags |= fsConstants.O_EXCL ?? 128;
-        }}
-        if ((requestedFlags & __agentOSWasiOpenTruncate) !== 0) {{
-          openFlags |= fsConstants.O_TRUNC ?? 512;
-        }}
-        if (openDirectory) {{
-          openFlags |= fsConstants.O_DIRECTORY ?? 0;
-        }}
-        if (createOrTruncate && !openDirectory) {{
-          __agentOSFs().statSync(__agentOSPath().dirname(hostPath));
-        }} else {{
-          __agentOSFs().statSync(hostPath);
-        }}
-        const realFd = __agentOSFs().openSync(hostPath, openFlags);
-        const stats =
-          createOrTruncate && !openDirectory
-            ? __agentOSFs().fstatSync(realFd)
-            : __agentOSFs().statSync(hostPath);
-        const openedFd = this.nextFd++;
-        this.fdTable.set(openedFd, {{
-          kind: stats.isDirectory() ? "directory" : "file",
-          guestPath,
-          hostPath,
-          readOnly: resolved.readOnly === true,
-          realFd,
-          offset: 0,
-          rightsBase: requestedRightsBase & allowedRightsInheriting,
-          rightsInheriting: requestedRightsInheriting & allowedRightsInheriting,
-          fdFlags: (Number(_fdflags) >>> 0) & 0xffff,
-        }});
-        return this._writeUint32(openedFdPtr, openedFd);
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathSymlink(targetPtr, targetLen, fd, pathPtr, pathLen) {{
-      try {{
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        if (resolved.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        const target = this._readString(targetPtr, targetLen);
-        __agentOSFs().symlinkSync(target, resolved.hostPath);
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathRemoveDirectory(fd, pathPtr, pathLen) {{
-      try {{
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        if (resolved.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        __agentOSFs().rmdirSync(resolved.hostPath);
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathRename(oldFd, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen) {{
-      try {{
-        const source = this._resolveDescriptorPath(oldFd, oldPathPtr, oldPathLen);
-        if (source.error !== __agentOSWasiErrnoSuccess) {{
-          return source.error;
-        }}
-        const destination = this._resolveDescriptorPath(newFd, newPathPtr, newPathLen);
-        if (destination.error !== __agentOSWasiErrnoSuccess) {{
-          return destination.error;
-        }}
-        if (source.readOnly || destination.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        __agentOSFs().renameSync(source.hostPath, destination.hostPath);
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathUnlinkFile(fd, pathPtr, pathLen) {{
-      try {{
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        if (resolved.readOnly) {{
-          return __agentOSWasiErrnoRofs;
-        }}
-        __agentOSFs().unlinkSync(resolved.hostPath);
-        return __agentOSWasiErrnoSuccess;
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathFilestatSetTimes(fd, flags, pathPtr, pathLen, atim, mtim, fstFlags) {{
-      const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
-      if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-        return resolved.error;
-      }}
-      return __agentOSWasiErrnoSuccess;
-    }}
-
-    _pathFilestatGet(fd, flags, pathPtr, pathLen, statPtr) {{
-      try {{
-        const target = this._readString(pathPtr, pathLen);
-        const resolved =
-          this._resolveDescriptorDirectStatPath(fd, target) ??
-          this._resolveDescriptorPath(fd, pathPtr, pathLen);
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        const follow = (Number(flags) & __agentOSWasiLookupSymlinkFollow) !== 0;
-        const stats = follow
-          ? __agentOSFs().statSync(resolved.hostPath)
-          : __agentOSFs().lstatSync(resolved.hostPath);
-        return this._writeFilestat(statPtr, stats, this._filetypeForStats(stats));
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pathReadlink(fd, pathPtr, pathLen, bufPtr, bufLen, bufUsedPtr) {{
-      try {{
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
-        if (resolved.error !== __agentOSWasiErrnoSuccess) {{
-          return resolved.error;
-        }}
-        const bytes = Buffer.from(__agentOSFs().readlinkSync(resolved.guestPath), "utf8");
-        const length = Math.min(bytes.length, Number(bufLen) >>> 0);
-        const writeStatus = this._writeBytes(bufPtr, bytes.subarray(0, length));
-        if (writeStatus !== __agentOSWasiErrnoSuccess) {{
-          return writeStatus;
-        }}
-        return this._writeUint32(bufUsedPtr, length);
-      }} catch (error) {{
-        return this._mapFsError(error);
-      }}
-    }}
-
-    _pollOneoff(inPtr, outPtr, nsubscriptions, neventsPtr) {{
-      try {{
-        const subscriptionCount = Number(nsubscriptions) >>> 0;
-        if (subscriptionCount === 0) {{
-          return this._writeUint32(neventsPtr, 0);
-        }}
-
-        const subscriptionSize = 48;
-        const eventSize = 32;
-        const kernelPollIn = 0x0001;
-        const kernelPollOut = 0x0004;
-        const kernelPollErr = 0x0008;
-        const kernelPollHup = 0x0010;
-        const view = this._memoryView();
-        const memory = this._memoryBytes();
-        const syncRpc =
-          typeof globalThis?.__agentOSSyncRpc?.callSync === "function"
-            ? globalThis.__agentOSSyncRpc
-            : null;
-        const subscriptions = [];
-        let timeoutMs = null;
-
-        for (let index = 0; index < subscriptionCount; index += 1) {{
-          const base = (Number(inPtr) >>> 0) + index * subscriptionSize;
-          const tag = view.getUint8(base + 8);
-          const userdata = memory.slice(base, base + 8);
-          if (tag === 0) {{
-            const timeoutNs = view.getBigUint64(base + 24, true);
-            const relativeTimeoutMs = Number(timeoutNs / 1000000n);
-            timeoutMs =
-              timeoutMs == null ? relativeTimeoutMs : Math.min(timeoutMs, relativeTimeoutMs);
-            subscriptions.push({{ kind: "clock", userdata }});
-            continue;
-          }}
-
-          if (tag !== 1 && tag !== 2) {{
-            subscriptions.push({{ kind: "unsupported", userdata }});
-            continue;
-          }}
-
-          const fd = view.getUint32(base + 16, true);
-          const descriptor = Number(fd) >>> 0;
-          const handle = this._externalFdHandle(descriptor);
-          const entry = this._descriptorEntry(descriptor);
-          let targetFd = null;
-          if (
-            (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
-            typeof handle.targetFd === "number"
-          ) {{
-            targetFd = Number(handle.targetFd) >>> 0;
-          }} else if (
-            entry?.kind === "stdin" ||
-            entry?.kind === "stdout" ||
-            entry?.kind === "stderr"
-          ) {{
-            targetFd = descriptor;
-          }}
-
-          subscriptions.push({{
-            kind: tag === 1 ? "fd_read" : "fd_write",
-            fd: descriptor,
-            handle,
-            targetFd,
-            userdata,
-          }});
-        }}
-
-        const deadline = timeoutMs == null ? null : Date.now() + Math.max(0, timeoutMs);
-        const readyEvents = [];
-
-        while (readyEvents.length === 0) {{
-          for (const subscription of subscriptions) {{
-            if (subscription.kind === "fd_read" && subscription.handle?.kind === "pipe-read") {{
-              const pipe = subscription.handle.pipe;
-              if (
-                pipe &&
-                (pipe.chunks.length > 0 ||
-                  (pipe.writeHandleCount === 0 && pipe.producers.size === 0))
-              ) {{
-                readyEvents.push({{
-                  userdata: subscription.userdata,
-                  error: __agentOSWasiErrnoSuccess,
-                  type: 1,
-                  nbytes: pipe.chunks[0]?.length ?? 0,
-                  flags: 0,
-                }});
-              }}
-              continue;
-            }}
-
-            if (subscription.kind === "fd_write" && subscription.handle?.kind === "pipe-write") {{
-              readyEvents.push({{
-                userdata: subscription.userdata,
-                error: __agentOSWasiErrnoSuccess,
-                type: 2,
-                nbytes: 65536,
-                flags: 0,
-              }});
-            }}
-          }}
-
-          if (readyEvents.length > 0) {{
-            break;
-          }}
-
-          const pollTargets = subscriptions
-            .filter(
-              (subscription) =>
-                (subscription.kind === "fd_read" || subscription.kind === "fd_write") &&
-                typeof subscription.targetFd === "number",
-            )
-            .map((subscription) => ({{
-              fd: subscription.targetFd,
-              events: subscription.kind === "fd_read" ? kernelPollIn : kernelPollOut,
-            }}));
-          const waitMs =
-            deadline == null ? 10 : Math.max(0, Math.min(10, deadline - Date.now()));
-
-          if (syncRpc && pollTargets.length > 0) {{
-            let response = null;
-            try {{
-              response = syncRpc.callSync("__kernel_poll", [pollTargets, waitMs]);
-            }} catch (error) {{
-              __agentOSWasiDebug(
-                `poll_oneoff __kernel_poll failed: ${{
-                  error instanceof Error ? error.message : String(error)
-                }}`,
-              );
-            }}
-
-            const responseEntries = Array.isArray(response?.fds) ? response.fds : [];
-            for (const subscription of subscriptions) {{
-              if (
-                (subscription.kind !== "fd_read" && subscription.kind !== "fd_write") ||
-                typeof subscription.targetFd !== "number"
-              ) {{
-                continue;
-              }}
-
-              const responseEntry = responseEntries.find(
-                (entry) => (Number(entry?.fd) >>> 0) === subscription.targetFd,
-              );
-              const revents = Number(responseEntry?.revents) >>> 0;
-              const interested =
-                subscription.kind === "fd_read"
-                  ? kernelPollIn | kernelPollErr | kernelPollHup
-                  : kernelPollOut | kernelPollErr | kernelPollHup;
-              if ((revents & interested) === 0) {{
-                continue;
-              }}
-
-              readyEvents.push({{
-                userdata: subscription.userdata,
-                error: __agentOSWasiErrnoSuccess,
-                type: subscription.kind === "fd_read" ? 1 : 2,
-                nbytes: subscription.kind === "fd_read" ? 1 : 65536,
-                flags: 0,
-              }});
-            }}
-          }}
-
-          if (readyEvents.length > 0) {{
-            break;
-          }}
-
-          let pumped = false;
-          for (const subscription of subscriptions) {{
-            if (subscription.kind === "fd_read" && subscription.handle?.kind === "pipe-read") {{
-              pumped = this._pumpPipeProducers(subscription.handle.pipe, 10) || pumped;
-            }}
-          }}
-
-          if (pumped) {{
-            continue;
-          }}
-
-          if (deadline != null && Date.now() >= deadline) {{
-            break;
-          }}
-
-          if (
-            pollTargets.length === 0 &&
-            typeof Atomics?.wait !== "function" &&
-            deadline == null
-          ) {{
-            break;
-          }}
-
-          if (
-            typeof Atomics?.wait === "function" &&
-            typeof syntheticWaitArray !== "undefined"
-          ) {{
-            Atomics.wait(syntheticWaitArray, 0, 0, waitMs);
-          }} else if (!syncRpc && pollTargets.length === 0) {{
-            break;
-          }}
-        }}
-
-        if (
-          readyEvents.length === 0 &&
-          subscriptions.some((subscription) => subscription.kind === "clock")
-        ) {{
-          const clockSubscription = subscriptions.find(
-            (subscription) => subscription.kind === "clock",
-          );
-          readyEvents.push({{
-            userdata: clockSubscription.userdata,
-            error: __agentOSWasiErrnoSuccess,
-            type: 0,
-            nbytes: 0,
-            flags: 0,
-          }});
-        }}
-
-        for (let index = 0; index < readyEvents.length; index += 1) {{
-          const base = (Number(outPtr) >>> 0) + index * eventSize;
-          const event = readyEvents[index];
-          memory.set(event.userdata, base);
-          view.setUint16(base + 8, event.error, true);
-          view.setUint8(base + 10, event.type);
-          view.setBigUint64(base + 16, BigInt(event.nbytes), true);
-          view.setUint16(base + 24, event.flags, true);
-        }}
-
-        return this._writeUint32(neventsPtr, readyEvents.length);
-      }} catch (error) {{
-        __agentOSWasiDebug(
-          `poll_oneoff failed: ${{error instanceof Error ? error.message : String(error)}}`,
-        );
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _randomGet(bufPtr, bufLen) {{
-      try {{
-        const length = Number(bufLen) >>> 0;
-        const bytes = Buffer.allocUnsafe(length);
-        __agentOSCrypto().randomFillSync(bytes);
-        return this._writeBytes(bufPtr, bytes);
-      }} catch {{
-        return __agentOSWasiErrnoFault;
-      }}
-    }}
-
-    _schedYield() {{
-      return __agentOSWasiErrnoSuccess;
-    }}
-
-    _procExit(code) {{
-      if (this.returnOnExit) {{
-        const error = new Error(`wasi exit(${{Number(code) >>> 0}})`);
-        error.__agentOSWasiExit = true;
-        error.code = Number(code) >>> 0;
-        throw error;
-      }}
-      process.exit(Number(code) >>> 0);
-    }}
-  }}
-
-  Object.defineProperty(globalThis, "__agentOSWasiModule", {{
-    configurable: true,
-    enumerable: false,
-    value: {{ WASI }},
-    writable: true,
-  }});
-}}
+{wasi_module_source}
 if (typeof process !== "undefined") {{
   process.env = {{ ...(process.env || {{}}), ...__agentOSWasmInternalEnv }};
 }}
@@ -4767,6 +2600,13 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSSyncRpc === 
     )
 }
 
+fn render_native_wasi_module_source() -> String {
+    NODE_WASI_MODULE_SOURCE.replace(
+        "__SECURE_EXEC_WASM_SYNC_READ_LIMIT_BYTES__",
+        &WASM_SYNC_READ_LIMIT_BYTES.to_string(),
+    )
+}
+
 fn insert_wasm_runner_bootstrap(source: &str, bootstrap: &str) -> String {
     let mut insert_at = 0usize;
     let mut saw_import = false;
@@ -4851,6 +2691,7 @@ fn prewarm_wasm_path(
         host_cwd: request.cwd.clone(),
         sandbox_root: wasm_sandbox_root(&request.env),
         guest_path_mappings: wasm_guest_path_mappings(request),
+        route_fs_through_sidecar: false,
         next_fd: 64,
         open_files: BTreeMap::new(),
         pending_events: VecDeque::new(),
@@ -5716,15 +3557,16 @@ mod tests {
         translate_wasm_guest_path, translate_wasm_host_symlink_target, wasm_guest_module_paths,
         wasm_host_path_is_read_only, wasm_memory_limit_bytes, wasm_memory_limit_pages,
         wasm_mutation_touches_read_only_mapping, wasm_read_only_filesystem_error,
-        wasm_runner_heap_limit_mb, wasm_sandbox_root, wasm_sync_read_length,
-        wasm_sync_rpc_error_code, GuestRuntimeConfig, StartWasmExecutionRequest, Value,
-        WasmExecutionError, WasmExecutionLimits, WasmInternalSyncRpc, WasmPermissionTier,
-        DEFAULT_WASM_EXECUTION_TIMEOUT_MS, DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB,
+        wasm_sandbox_root, wasm_sync_read_length, wasm_sync_rpc_error_code,
+        wasm_sync_rpc_method_routes_through_sidecar_kernel, GuestRuntimeConfig,
+        JavascriptSyncRpcRequest, StartWasmExecutionRequest, Value, WasmExecutionError,
+        WasmExecutionLimits, WasmInternalSyncRpc, WasmPermissionTier,
+        DEFAULT_WASM_EXECUTION_TIMEOUT_MS, NODE_WASI_MODULE_SOURCE,
         WASM_CAPTURED_OUTPUT_LIMIT_BYTES, WASM_MAX_FUEL_ENV, WASM_MAX_MEMORY_BYTES_ENV,
         WASM_MAX_STACK_BYTES_ENV, WASM_PAGE_BYTES, WASM_PREWARM_TIMEOUT_MS_ENV,
-        WASM_RUNNER_HEAP_LIMIT_MB_ENV, WASM_SANDBOX_ROOT_ENV, WASM_SYNC_READ_LIMIT_BYTES,
+        WASM_SANDBOX_ROOT_ENV, WASM_SIDECAR_ROUTED_FS_SYNC_METHODS, WASM_SYNC_READ_LIMIT_BYTES,
     };
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
@@ -5753,43 +3595,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wasm_runner_heap_limit_defaults_and_honors_operator_override() {
-        let dir = tempdir().expect("tempdir");
+    fn wasi_imports_from_source(source: &str) -> BTreeSet<String> {
+        let table_start = source
+            .find("this.wasiImport = {")
+            .expect("WASI source should define a wasiImport table");
+        let table_body = &source[table_start + "this.wasiImport = {".len()..];
+        let table_end = table_body
+            .find("\n      };")
+            .expect("WASI source should close the wasiImport table");
 
-        // No override -> bounded default (large enough to compile the WASI runtime +
-        // guest module; the 128 MiB per-guest default OOMs warmup).
-        let default_req = request_with_env(dir.path(), BTreeMap::new());
-        assert_eq!(
-            wasm_runner_heap_limit_mb(&default_req),
-            DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB
-        );
+        table_body[..table_end]
+            .lines()
+            .filter_map(|line| {
+                let (name, _) = line.trim_start().split_once(':')?;
+                name.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
 
-        // Positive operator override is honored.
-        let override_req = request_with_env(
-            dir.path(),
-            BTreeMap::from([(
-                String::from(WASM_RUNNER_HEAP_LIMIT_MB_ENV),
-                String::from("512"),
-            )]),
-        );
-        assert_eq!(wasm_runner_heap_limit_mb(&override_req), 512);
-
-        // Zero / non-numeric fall back to the default (it's a tuning knob, not
-        // guest-supplied policy, so a bad value must not fail the execution).
-        for bad in ["0", "not-a-number", ""] {
-            let req = request_with_env(
-                dir.path(),
-                BTreeMap::from([(
-                    String::from(WASM_RUNNER_HEAP_LIMIT_MB_ENV),
-                    String::from(bad),
-                )]),
-            );
-            assert_eq!(
-                wasm_runner_heap_limit_mb(&req),
-                DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB,
-                "invalid override {bad:?} should fall back to the default"
-            );
+    fn wasm_sync_rpc_request(method: &str) -> JavascriptSyncRpcRequest {
+        JavascriptSyncRpcRequest {
+            id: 1,
+            method: method.to_string(),
+            args: Vec::new(),
+            raw_bytes_args: Default::default(),
         }
     }
 
@@ -5996,14 +3827,29 @@ mod tests {
     fn wasm_runner_bootstrap_caps_wasi_iov_lengths_before_allocation() {
         let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
 
-        assert!(bootstrap.contains(&format!(
-            "const __agentOSWasmSyncReadLimitBytes = {WASM_SYNC_READ_LIMIT_BYTES};"
-        )));
+        // The read cap now comes from the per-backend host seam, with the native
+        // build-substituted constant as the fallback; assert the constant is
+        // defined and the placeholder was substituted to the value.
+        assert!(bootstrap.contains("const __agentOSWasmSyncReadLimitBytes ="));
+        assert!(bootstrap.contains(&format!(": {WASM_SYNC_READ_LIMIT_BYTES};")));
+        assert!(!bootstrap.contains("__SECURE_EXEC_WASM_SYNC_READ_LIMIT_BYTES__"));
         assert!(bootstrap.contains("_boundedIovLength(iovs, iovsLen)"));
         assert!(bootstrap.contains("const totalLength = this._boundedIovLength(iovs, iovsLen);\n      const view = this._memoryView();"));
         assert!(bootstrap.contains("return Buffer.concat(chunks, totalLength);"));
         assert!(bootstrap.contains("const totalLength = this._boundedIovLength(iovs, iovsLen);"));
         assert!(!bootstrap.contains("const totalLength = (() => {"));
+    }
+
+    #[test]
+    fn wasi_preview1_import_manifest_matches_native_runner() {
+        let expected: BTreeSet<String> = serde_json::from_str::<Vec<String>>(include_str!(
+            "../assets/wasi-preview1-imports.json"
+        ))
+        .expect("parse WASI preview1 import manifest")
+        .into_iter()
+        .collect();
+
+        assert_eq!(expected, wasi_imports_from_source(NODE_WASI_MODULE_SOURCE));
     }
 
     #[test]
@@ -6043,6 +3889,7 @@ mod tests {
             host_cwd: cwd.clone(),
             sandbox_root: Some(sandbox_root.clone()),
             guest_path_mappings: Vec::new(),
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6076,6 +3923,7 @@ mod tests {
                 host_path: sandbox_root.clone(),
                 read_only: false,
             }],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6114,6 +3962,7 @@ mod tests {
                 host_path: cwd.clone(),
                 read_only: false,
             }],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6153,6 +4002,7 @@ mod tests {
                     read_only: false,
                 },
             ],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6209,6 +4059,7 @@ mod tests {
                 host_path: sandbox_root,
                 read_only: false,
             }],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6244,6 +4095,7 @@ mod tests {
                 host_path: readonly_root.clone(),
                 read_only: true,
             }],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6304,6 +4156,7 @@ mod tests {
                     read_only: false,
                 },
             ],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6355,6 +4208,7 @@ mod tests {
                 host_path: cwd,
                 read_only: false,
             }],
+            route_fs_through_sidecar: false,
             next_fd: 64,
             open_files: Default::default(),
             pending_events: VecDeque::new(),
@@ -6379,6 +4233,53 @@ mod tests {
             String::from("relative/shadow"),
         )]));
         assert_eq!(relative, None);
+    }
+
+    #[test]
+    fn wasm_sidecar_managed_fs_methods_route_to_kernel_sync_rpc() {
+        let mut standalone = WasmInternalSyncRpc {
+            module_guest_paths: Vec::new(),
+            module_host_path: PathBuf::from("/tmp/module.wasm"),
+            guest_cwd: String::from("/"),
+            host_cwd: PathBuf::from("/tmp"),
+            sandbox_root: None,
+            guest_path_mappings: Vec::new(),
+            route_fs_through_sidecar: false,
+            next_fd: 64,
+            open_files: Default::default(),
+            pending_events: VecDeque::new(),
+        };
+        let sidecar_managed = WasmInternalSyncRpc {
+            module_guest_paths: Vec::new(),
+            module_host_path: PathBuf::from("/tmp/module.wasm"),
+            guest_cwd: String::from("/"),
+            host_cwd: PathBuf::from("/tmp"),
+            sandbox_root: Some(PathBuf::from("/tmp/secure-exec-shadow")),
+            guest_path_mappings: Vec::new(),
+            route_fs_through_sidecar: true,
+            next_fd: 64,
+            open_files: Default::default(),
+            pending_events: VecDeque::new(),
+        };
+
+        for method in WASM_SIDECAR_ROUTED_FS_SYNC_METHODS {
+            let request = wasm_sync_rpc_request(method);
+            assert!(
+                wasm_sync_rpc_method_routes_through_sidecar_kernel(&request, &sidecar_managed),
+                "{method} should route through the sidecar kernel for managed WASI executions"
+            );
+            assert!(
+                !wasm_sync_rpc_method_routes_through_sidecar_kernel(&request, &standalone),
+                "{method} should stay host-direct for standalone/prewarm WASI execution"
+            );
+        }
+
+        standalone.route_fs_through_sidecar = true;
+        let non_fs_request = wasm_sync_rpc_request("child_process.spawn");
+        assert!(!wasm_sync_rpc_method_routes_through_sidecar_kernel(
+            &non_fs_request,
+            &standalone
+        ));
     }
 
     #[test]

@@ -3,13 +3,21 @@
 //! Browser-side sidecar scaffold for the secure-exec runtime migration.
 
 mod service;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+pub mod wire_dispatch;
 
 pub use service::{
-    BrowserExtension, BrowserExtensionContext, BrowserExtensionHost, BrowserExtensionRequest,
-    BrowserExtensionResponse, BrowserSidecar, BrowserSidecarConfig, BrowserSidecarError,
+    BrowserExecutionOptions, BrowserExtension, BrowserExtensionContext, BrowserExtensionHost,
+    BrowserExtensionRequest, BrowserExtensionResponse, BrowserSidecar, BrowserSidecarConfig,
+    BrowserSidecarError,
 };
+#[cfg(target_arch = "wasm32")]
+pub use wasm::{BrowserJsBridge, BrowserSidecarWasm};
 
 use secure_exec_bridge::{BridgeTypes, GuestRuntime, HostBridge};
+use secure_exec_sidecar_protocol::wire::WasmPermissionTier;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserWorkerEntrypoint {
@@ -21,8 +29,46 @@ pub enum BrowserWorkerEntrypoint {
 pub struct BrowserWorkerSpawnRequest {
     pub vm_id: String,
     pub context_id: String,
+    pub execution_id: String,
     pub runtime: GuestRuntime,
     pub entrypoint: BrowserWorkerEntrypoint,
+    pub wasm_permission_tier: Option<WasmPermissionTier>,
+    pub process_config: BrowserWorkerProcessConfig,
+    pub os_config: BrowserWorkerOsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserWorkerProcessConfig {
+    pub cwd: String,
+    pub env: BTreeMap<String, String>,
+    pub argv: Vec<String>,
+    pub platform: String,
+    pub arch: String,
+    pub version: String,
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserWorkerOsConfig {
+    pub platform: String,
+    pub arch: String,
+    pub r#type: String,
+    pub release: String,
+    pub version: String,
+    pub cpu_count: u64,
+    pub totalmem: u64,
+    pub freemem: u64,
+    pub hostname: String,
+    pub homedir: String,
+    pub tmpdir: String,
+    pub machine: String,
+    pub user: String,
+    pub shell: String,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

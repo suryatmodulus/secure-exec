@@ -72,6 +72,16 @@
 			"import": "./dist/sidecar-process.js",
 			"default": "./dist/sidecar-process.js"
 		},
+		"./sidecar-errors": {
+			"types": "./dist/sidecar-errors.d.ts",
+			"import": "./dist/sidecar-errors.js",
+			"default": "./dist/sidecar-errors.js"
+		},
+		"./sidecar-process": {
+			"types": "./dist/sidecar-process.d.ts",
+			"import": "./dist/sidecar-process.js",
+			"default": "./dist/sidecar-process.js"
+		},
 		"./test-runtime": {
 			"types": "./dist/test-runtime.d.ts",
 			"import": "./dist/test-runtime.js",

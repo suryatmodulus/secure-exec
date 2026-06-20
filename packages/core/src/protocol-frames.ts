@@ -185,10 +185,8 @@ export function toGeneratedProtocolFrame(
 	}
 }
 
-export function encodeBareProtocolFrame(frame: LiveProtocolFrame): Buffer {
-	return Buffer.from(
-		protocol.encodeProtocolFrame(toGeneratedProtocolFrame(frame)),
-	);
+export function encodeBareProtocolFrame(frame: LiveProtocolFrame): Uint8Array {
+	return protocol.encodeProtocolFrame(toGeneratedProtocolFrame(frame));
 }
 
 export function decodeBareProtocolFrame(
@@ -202,7 +200,7 @@ export function decodeBareProtocolFrame(
 export function encodeProtocolFramePayload(
 	frame: LiveProtocolFrame,
 	codec: ProtocolFramePayloadCodec,
-): Buffer {
+): Uint8Array {
 	if (codec === "json") {
 		return encodeJsonFramePayload(frame);
 	}

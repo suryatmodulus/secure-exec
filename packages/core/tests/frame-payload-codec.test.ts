@@ -4,6 +4,9 @@ import {
 	encodeJsonFramePayload,
 } from "../src/frame-payload-codec.js";
 
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
 describe("frame payload codec helpers", () => {
 	test("encodes Uint8Array values as number arrays for JSON frames", () => {
 		const encoded = encodeJsonFramePayload({
@@ -13,7 +16,7 @@ describe("frame payload codec helpers", () => {
 			},
 		});
 
-		expect(JSON.parse(encoded.toString("utf8"))).toEqual({
+		expect(JSON.parse(textDecoder.decode(encoded))).toEqual({
 			payload: {
 				type: "process_output",
 				chunk: [1, 2, 3],
@@ -25,14 +28,13 @@ describe("frame payload codec helpers", () => {
 		const decoded = decodeJsonFramePayload<{
 			payload: { type: "process_output"; chunk: Uint8Array };
 		}>(
-			Buffer.from(
+			textEncoder.encode(
 				JSON.stringify({
 					payload: {
 						type: "process_output",
 						chunk: [4, 5, 6],
 					},
 				}),
-				"utf8",
 			),
 		);
 

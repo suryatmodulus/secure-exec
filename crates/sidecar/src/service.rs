@@ -19,17 +19,14 @@ use crate::extension::{
 use crate::filesystem::guest_filesystem_call as filesystem_guest_filesystem_call;
 use crate::limits::DEFAULT_ACP_STDOUT_BUFFER_BYTE_LIMIT;
 use crate::protocol::{
-    AuthenticatedResponse, CloseStdinRequest, DisposeReason, EventFrame, EventPayload,
-    ExecuteRequest, ExtEnvelope, FsPermissionScope, GuestFilesystemCallRequest,
-    GuestFilesystemResultResponse, JavascriptChildProcessSpawnOptions,
+    CloseStdinRequest, DisposeReason, EventFrame, EventPayload, ExecuteRequest, ExtEnvelope,
+    GuestFilesystemCallRequest, GuestFilesystemResultResponse, JavascriptChildProcessSpawnOptions,
     JavascriptChildProcessSpawnRequest, KillProcessRequest, OpenSessionRequest, OwnershipScope,
-    PatternPermissionRule, PatternPermissionScope, PermissionMode, PermissionsPolicy,
-    ProcessKilledResponse, ProcessStartedResponse, ProtocolSchema, RejectedResponse, RequestFrame,
-    RequestId, RequestPayload, ResponseFrame, ResponsePayload, SessionOpenedResponse,
-    SidecarRequestFrame, SidecarRequestPayload, SidecarResponseFrame, SidecarResponsePayload,
-    SidecarResponseTracker, SidecarResponseTrackerError, SignalDispositionAction,
-    SignalHandlerRegistration, StdinClosedResponse, StdinWrittenResponse, VmLifecycleEvent,
-    VmLifecycleState, WriteStdinRequest,
+    ProcessKilledResponse, ProcessStartedResponse, RequestFrame, RequestId, RequestPayload,
+    ResponseFrame, ResponsePayload, SidecarRequestFrame, SidecarRequestPayload,
+    SidecarResponseFrame, SidecarResponsePayload, SidecarResponseTracker,
+    SidecarResponseTrackerError, SignalDispositionAction, StdinClosedResponse,
+    StdinWrittenResponse, VmLifecycleState, WriteStdinRequest,
 };
 use crate::state::{
     ActiveExecutionEvent, BridgeError, ConnectionState, EventSinkTransport, JavascriptSocketFamily,
@@ -52,9 +49,23 @@ use secure_exec_execution::{
 use secure_exec_kernel::kernel::KernelError;
 use secure_exec_kernel::mount_plugin::{FileSystemPluginRegistry, PluginError};
 use secure_exec_kernel::permissions::{
-    permission_glob_matches, CommandAccessRequest, EnvAccessRequest, EnvironmentOperation,
-    NetworkAccessRequest, NetworkOperation, PermissionDecision,
+    CommandAccessRequest, EnvAccessRequest, EnvironmentOperation, NetworkAccessRequest,
+    NetworkOperation, PermissionDecision,
 };
+use secure_exec_sidecar_core::permissions::{
+    deny_all_policy, environment_permission_capability, evaluate_permissions_policy,
+    filesystem_permission_capability, network_permission_capability,
+    permission_mode_to_kernel_decision,
+};
+use secure_exec_sidecar_core::{
+    apply_process_signal_state_update, authenticated_response as shared_authenticated_response,
+    parse_process_signal_state_request, reject as shared_reject, request_dispatch_mode,
+    respond as shared_respond, route_request_payload, session_opened_response,
+    unsupported_host_callback_direction_dispatch, validate_authenticate_versions,
+    vm_lifecycle_event as shared_vm_lifecycle_event, AuthenticateVersionError, RequestDispatchMode,
+    RequestRoute,
+};
+use secure_exec_vm_config::PermissionsPolicy;
 // root_fs types moved to crate::vm
 use secure_exec_kernel::vfs::VfsError;
 use serde::Deserialize;
@@ -104,8 +115,19 @@ fn wire_protocol_error(error: crate::wire::ProtocolCodecError) -> SidecarError {
     SidecarError::InvalidState(format!("invalid generated wire protocol frame: {error}"))
 }
 
-// NativeSidecarConfig, DispatchResult, SidecarError moved to crate::state
-pub use crate::state::{DispatchResult, NativeSidecarConfig, SidecarError};
+fn wire_dispatch_result(
+    result: DispatchResult,
+) -> Result<crate::wire::WireDispatchResult, SidecarError> {
+    crate::wire::dispatch_result_from_compat(crate::wire::CompatDispatchResult {
+        response: result.response,
+        events: result.events,
+    })
+    .map_err(wire_protocol_error)
+}
+
+pub use secure_exec_sidecar_core::DispatchResult;
+// NativeSidecarConfig and SidecarError moved to crate::state
+pub use crate::state::{NativeSidecarConfig, SidecarError};
 
 // SharedBridge struct and Clone impl moved to crate::state
 
@@ -446,7 +468,7 @@ where
         match self.set_vm_permissions(vm_id, original_permissions) {
             Ok(()) => Ok(()),
             Err(restore_error) => {
-                let deny_all = PermissionsPolicy::deny_all();
+                let deny_all = deny_all_policy();
                 match self.set_vm_permissions(vm_id, &deny_all) {
                     Ok(()) => Err(SidecarError::InvalidState(format!(
                         "{context} failed: {operation_error}; restoring original permissions failed: {restore_error}; applied deny-all fallback"
@@ -483,245 +505,11 @@ where
     }
 }
 
-pub(crate) fn evaluate_permissions_policy(
-    permissions: &PermissionsPolicy,
-    domain: &str,
-    capability: &str,
-    resource: Option<&str>,
-) -> PermissionMode {
-    match domain {
-        "fs" => evaluate_fs_permission_scope(
-            permissions.fs.as_ref(),
-            capability_operation(capability, domain),
-            resource,
-        ),
-        "network" => evaluate_pattern_permission_scope(
-            permissions.network.as_ref(),
-            capability_operation(capability, domain),
-            resource,
-        ),
-        "child_process" => evaluate_pattern_permission_scope(
-            permissions.child_process.as_ref(),
-            capability_operation(capability, domain),
-            resource,
-        ),
-        "process" => evaluate_pattern_permission_scope(
-            permissions.process.as_ref(),
-            capability_operation(capability, domain),
-            resource,
-        ),
-        "env" => evaluate_pattern_permission_scope(
-            permissions.env.as_ref(),
-            capability_operation(capability, domain),
-            resource,
-        ),
-        "binding" => evaluate_pattern_permission_scope(
-            permissions.binding.as_ref(),
-            capability_operation(capability, domain),
-            resource,
-        ),
-        _ => PermissionMode::Deny,
-    }
-}
-
-fn evaluate_fs_permission_scope(
-    scope: Option<&FsPermissionScope>,
-    operation: &str,
-    resource: Option<&str>,
-) -> PermissionMode {
-    match scope {
-        Some(FsPermissionScope::PermissionMode(mode)) => mode.clone(),
-        Some(FsPermissionScope::FsPermissionRuleSet(rules)) => {
-            let mut mode = rules.default.clone().unwrap_or(PermissionMode::Deny);
-            for rule in &rules.rules {
-                if fs_rule_matches(rule, operation, resource) {
-                    mode = rule.mode.clone();
-                }
-            }
-            mode
-        }
-        None => PermissionMode::Deny,
-    }
-}
-
-fn evaluate_pattern_permission_scope(
-    scope: Option<&PatternPermissionScope>,
-    operation: &str,
-    resource: Option<&str>,
-) -> PermissionMode {
-    match scope {
-        Some(PatternPermissionScope::PermissionMode(mode)) => mode.clone(),
-        Some(PatternPermissionScope::PatternPermissionRuleSet(rules)) => {
-            let mut mode = rules.default.clone().unwrap_or(PermissionMode::Deny);
-            for rule in &rules.rules {
-                if pattern_rule_matches(rule, operation, resource) {
-                    mode = rule.mode.clone();
-                }
-            }
-            mode
-        }
-        None => PermissionMode::Deny,
-    }
-}
-
-fn fs_rule_matches(
-    rule: &crate::protocol::FsPermissionRule,
-    operation: &str,
-    resource: Option<&str>,
-) -> bool {
-    let operations_match = permission_operation_matches(&rule.operations, operation);
-    let paths_match = permission_resource_matches(&rule.paths, resource);
-    operations_match && paths_match
-}
-
-fn pattern_rule_matches(
-    rule: &PatternPermissionRule,
-    operation: &str,
-    resource: Option<&str>,
-) -> bool {
-    let operations_match = permission_operation_matches(&rule.operations, operation);
-    let patterns_match = permission_resource_matches(&rule.patterns, resource);
-    operations_match && patterns_match
-}
-
-fn permission_operation_matches(candidates: &[String], operation: &str) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| candidate == "*" || candidate == operation)
-}
-
-fn permission_resource_matches(patterns: &[String], resource: Option<&str>) -> bool {
-    resource.is_some_and(|value| {
-        patterns
-            .iter()
-            .any(|pattern| permission_glob_matches(pattern, value))
-    })
-}
-
 pub(crate) fn validate_permissions_policy(
     permissions: &PermissionsPolicy,
 ) -> Result<(), SidecarError> {
-    if let Some(scope) = permissions.fs.as_ref() {
-        validate_fs_permission_scope("fs", scope)?;
-    }
-    if let Some(scope) = permissions.network.as_ref() {
-        validate_pattern_permission_scope("network", scope)?;
-    }
-    if let Some(scope) = permissions.child_process.as_ref() {
-        validate_pattern_permission_scope("child_process", scope)?;
-    }
-    if let Some(scope) = permissions.process.as_ref() {
-        validate_pattern_permission_scope("process", scope)?;
-    }
-    if let Some(scope) = permissions.env.as_ref() {
-        validate_pattern_permission_scope("env", scope)?;
-    }
-    if let Some(scope) = permissions.binding.as_ref() {
-        validate_pattern_permission_scope("binding", scope)?;
-    }
-    Ok(())
-}
-
-fn validate_fs_permission_scope(
-    domain: &str,
-    scope: &FsPermissionScope,
-) -> Result<(), SidecarError> {
-    let FsPermissionScope::FsPermissionRuleSet(rule_set) = scope else {
-        return Ok(());
-    };
-
-    for (index, rule) in rule_set.rules.iter().enumerate() {
-        validate_permission_rule_field(
-            &rule.operations,
-            &format!("{domain}.rules[{index}].operations"),
-        )?;
-        validate_permission_rule_field(&rule.paths, &format!("{domain}.rules[{index}].paths"))?;
-    }
-
-    Ok(())
-}
-
-fn validate_pattern_permission_scope(
-    domain: &str,
-    scope: &PatternPermissionScope,
-) -> Result<(), SidecarError> {
-    let PatternPermissionScope::PatternPermissionRuleSet(rule_set) = scope else {
-        return Ok(());
-    };
-
-    for (index, rule) in rule_set.rules.iter().enumerate() {
-        validate_permission_rule_field(
-            &rule.operations,
-            &format!("{domain}.rules[{index}].operations"),
-        )?;
-        validate_permission_rule_field(
-            &rule.patterns,
-            &format!("{domain}.rules[{index}].patterns"),
-        )?;
-    }
-
-    Ok(())
-}
-
-fn validate_permission_rule_field(values: &[String], field: &str) -> Result<(), SidecarError> {
-    if values.is_empty() {
-        return Err(SidecarError::InvalidState(format!(
-            "invalid permissions policy: {field} must not be empty; use [\"*\"] for wildcard"
-        )));
-    }
-    Ok(())
-}
-
-fn capability_operation<'a>(capability: &'a str, domain: &str) -> &'a str {
-    capability
-        .strip_prefix(domain)
-        .and_then(|value| value.strip_prefix('.'))
-        .unwrap_or("")
-}
-
-fn permission_mode_to_kernel_decision(
-    mode: PermissionMode,
-    capability: &str,
-) -> PermissionDecision {
-    match mode {
-        PermissionMode::Allow => PermissionDecision::allow(),
-        PermissionMode::Ask => {
-            PermissionDecision::deny(format!("permission prompt required for {capability}"))
-        }
-        PermissionMode::Deny => PermissionDecision::deny(format!("blocked by {capability} policy")),
-    }
-}
-
-pub(crate) fn filesystem_permission_capability(access: FilesystemAccess) -> &'static str {
-    match access {
-        FilesystemAccess::Read => "fs.read",
-        FilesystemAccess::Write => "fs.write",
-        FilesystemAccess::Stat => "fs.stat",
-        FilesystemAccess::ReadDir => "fs.readdir",
-        FilesystemAccess::CreateDir => "fs.create_dir",
-        FilesystemAccess::Remove => "fs.rm",
-        FilesystemAccess::Rename => "fs.rename",
-        FilesystemAccess::Symlink => "fs.symlink",
-        FilesystemAccess::ReadLink => "fs.readlink",
-        FilesystemAccess::Chmod => "fs.chmod",
-        FilesystemAccess::Truncate => "fs.truncate",
-    }
-}
-
-fn network_permission_capability(operation: NetworkOperation) -> &'static str {
-    match operation {
-        NetworkOperation::Fetch => "network.fetch",
-        NetworkOperation::Http => "network.http",
-        NetworkOperation::Dns => "network.dns",
-        NetworkOperation::Listen => "network.listen",
-    }
-}
-
-fn environment_permission_capability(operation: EnvironmentOperation) -> &'static str {
-    match operation {
-        EnvironmentOperation::Read => "env.read",
-        EnvironmentOperation::Write => "env.write",
-    }
+    secure_exec_sidecar_core::permissions::validate_permissions_policy(permissions)
+        .map_err(|error| SidecarError::InvalidState(error.to_string()))
 }
 
 fn is_internal_runtime_command_request(request: &CommandAccessRequest) -> bool {
@@ -1283,11 +1071,7 @@ where
         request: RequestFrame,
     ) -> Result<DispatchResult, SidecarError> {
         let inside_runtime = tokio::runtime::Handle::try_current().is_ok();
-        if matches!(
-            request.payload,
-            RequestPayload::DisposeVm(_) | RequestPayload::Ext(_)
-        ) && !inside_runtime
-        {
+        if request_dispatch_mode(&request) == RequestDispatchMode::Async && !inside_runtime {
             return tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1315,7 +1099,7 @@ where
     ) -> Result<crate::wire::WireDispatchResult, SidecarError> {
         let request = crate::wire::request_frame_to_compat(request).map_err(wire_protocol_error)?;
         let result = self.dispatch_blocking(request)?;
-        crate::wire::dispatch_result_from_compat(result).map_err(wire_protocol_error)
+        wire_dispatch_result(result)
     }
 
     pub fn poll_event_blocking(
@@ -1390,69 +1174,55 @@ where
             });
         }
 
-        let result = match request.payload.clone() {
-            RequestPayload::Authenticate(payload) => {
+        let result = match route_request_payload(&request) {
+            RequestRoute::Authenticate(payload) => {
                 self.authenticate_connection(&request, payload).await
             }
-            RequestPayload::OpenSession(payload) => self.open_session(&request, payload).await,
-            RequestPayload::CreateVm(payload) => self.create_vm(&request, payload).await,
-            RequestPayload::DisposeVm(payload) => self.dispose_vm(&request, payload).await,
-            RequestPayload::BootstrapRootFilesystem(payload) => {
+            RequestRoute::OpenSession(payload) => self.open_session(&request, payload).await,
+            RequestRoute::CreateVm(payload) => self.create_vm(&request, payload).await,
+            RequestRoute::DisposeVm(payload) => self.dispose_vm(&request, payload).await,
+            RequestRoute::BootstrapRootFilesystem(payload) => {
                 self.bootstrap_root_filesystem(&request, payload.entries)
                     .await
             }
-            RequestPayload::ConfigureVm(payload) => self.configure_vm(&request, payload).await,
-            RequestPayload::RegisterHostCallbacks(payload) => {
+            RequestRoute::ConfigureVm(payload) => self.configure_vm(&request, payload).await,
+            RequestRoute::RegisterHostCallbacks(payload) => {
                 register_host_callbacks(self, &request, payload)
             }
-            RequestPayload::CreateLayer(payload) => self.create_layer(&request, payload).await,
-            RequestPayload::SealLayer(payload) => self.seal_layer(&request, payload).await,
-            RequestPayload::ImportSnapshot(payload) => {
-                self.import_snapshot(&request, payload).await
-            }
-            RequestPayload::ExportSnapshot(payload) => {
-                self.export_snapshot(&request, payload).await
-            }
-            RequestPayload::CreateOverlay(payload) => self.create_overlay(&request, payload).await,
-            RequestPayload::GuestFilesystemCall(payload) => {
+            RequestRoute::CreateLayer(payload) => self.create_layer(&request, payload).await,
+            RequestRoute::SealLayer(payload) => self.seal_layer(&request, payload).await,
+            RequestRoute::ImportSnapshot(payload) => self.import_snapshot(&request, payload).await,
+            RequestRoute::ExportSnapshot(payload) => self.export_snapshot(&request, payload).await,
+            RequestRoute::CreateOverlay(payload) => self.create_overlay(&request, payload).await,
+            RequestRoute::GuestFilesystemCall(payload) => {
                 self.guest_filesystem_call(&request, payload).await
             }
-            RequestPayload::SnapshotRootFilesystem(payload) => {
+            RequestRoute::GuestKernelCall(payload) => self.guest_kernel_call(&request, payload).await,
+            RequestRoute::SnapshotRootFilesystem(payload) => {
                 self.snapshot_root_filesystem(&request, payload).await
             }
-            RequestPayload::Execute(payload) => self.execute(&request, payload).await,
-            RequestPayload::WriteStdin(payload) => self.write_stdin(&request, payload).await,
-            RequestPayload::ResizePty(payload) => self.resize_pty(&request, payload).await,
-            RequestPayload::CloseStdin(payload) => self.close_stdin(&request, payload).await,
-            RequestPayload::KillProcess(payload) => self.kill_process(&request, payload).await,
-            RequestPayload::GetProcessSnapshot(payload) => {
+            RequestRoute::Execute(payload) => self.execute(&request, payload).await,
+            RequestRoute::WriteStdin(payload) => self.write_stdin(&request, payload).await,
+            RequestRoute::ResizePty(payload) => self.resize_pty(&request, payload).await,
+            RequestRoute::CloseStdin(payload) => self.close_stdin(&request, payload).await,
+            RequestRoute::KillProcess(payload) => self.kill_process(&request, payload).await,
+            RequestRoute::GetProcessSnapshot(payload) => {
                 self.get_process_snapshot(&request, payload).await
             }
-            RequestPayload::GetResourceSnapshot(payload) => {
+            RequestRoute::GetResourceSnapshot(payload) => {
                 self.get_resource_snapshot(&request, payload).await
             }
-            RequestPayload::FindListener(payload) => self.find_listener(&request, payload).await,
-            RequestPayload::FindBoundUdp(payload) => self.find_bound_udp(&request, payload).await,
-            RequestPayload::VmFetch(payload) => self.vm_fetch(&request, payload).await,
-            RequestPayload::GetSignalState(payload) => {
-                self.get_signal_state(&request, payload).await
-            }
-            RequestPayload::GetZombieTimerCount(payload) => {
+            RequestRoute::FindListener(payload) => self.find_listener(&request, payload).await,
+            RequestRoute::FindBoundUdp(payload) => self.find_bound_udp(&request, payload).await,
+            RequestRoute::VmFetch(payload) => self.vm_fetch(&request, payload).await,
+            RequestRoute::GetSignalState(payload) => self.get_signal_state(&request, payload).await,
+            RequestRoute::GetZombieTimerCount(payload) => {
                 self.get_zombie_timer_count(&request, payload).await
             }
-            RequestPayload::HostFilesystemCall(_)
-            | RequestPayload::PersistenceLoad(_)
-            | RequestPayload::PersistenceFlush(_) => Ok(DispatchResult {
-                response: self.reject(
-                    &request,
-                    "unsupported_direction",
-                    "host callback request categories are sidecar-to-host only in this scaffold",
-                ),
-                events: Vec::new(),
-            }),
-            RequestPayload::Ext(payload) => {
-                self.dispatch_extension_request(&request, payload).await
+            RequestRoute::UnsupportedHostCallbackDirection => {
+                Ok(unsupported_host_callback_direction_dispatch(&request))
             }
+            RequestRoute::Ext(payload) => self.dispatch_extension_request(&request, payload).await,
         };
 
         match result {
@@ -1471,7 +1241,7 @@ where
     ) -> Result<crate::wire::WireDispatchResult, SidecarError> {
         let request = crate::wire::request_frame_to_compat(request).map_err(wire_protocol_error)?;
         let result = self.dispatch(request).await?;
-        crate::wire::dispatch_result_from_compat(result).map_err(wire_protocol_error)
+        wire_dispatch_result(result)
     }
 
     pub async fn poll_event_wire(
@@ -1775,20 +1545,15 @@ where
             return Err(error);
         }
 
-        if payload.protocol_version != crate::wire::PROTOCOL_VERSION {
-            return Err(SidecarError::ProtocolVersionMismatch(format!(
-                "sidecar protocol version mismatch: expected {}, got {}",
-                crate::wire::PROTOCOL_VERSION,
-                payload.protocol_version
-            )));
-        }
-
-        let expected_bridge_version = secure_exec_bridge::bridge_contract().version;
-        if payload.bridge_version != expected_bridge_version {
-            return Err(SidecarError::BridgeVersionMismatch(format!(
-                "bridge contract version mismatch: expected {expected_bridge_version}, got {}",
-                payload.bridge_version
-            )));
+        if let Err(error) = validate_authenticate_versions(&payload) {
+            return Err(match error {
+                AuthenticateVersionError::ProtocolVersionMismatch(message) => {
+                    SidecarError::ProtocolVersionMismatch(message)
+                }
+                AuthenticateVersionError::BridgeVersionMismatch(message) => {
+                    SidecarError::BridgeVersionMismatch(message)
+                }
+            });
         }
 
         let connection_id = self.allocate_connection_id();
@@ -1800,14 +1565,11 @@ where
             },
         );
 
-        let response = self.response_with_ownership(
+        let response = shared_authenticated_response(
             request.request_id,
-            OwnershipScope::connection(&connection_id),
-            ResponsePayload::Authenticated(AuthenticatedResponse {
-                sidecar_id: self.config.sidecar_id.clone(),
-                connection_id,
-                max_frame_bytes: self.config.max_frame_bytes as u32,
-            }),
+            self.config.sidecar_id.clone(),
+            connection_id,
+            self.config.max_frame_bytes as u32,
         );
         Ok(DispatchResult {
             response,
@@ -1841,13 +1603,7 @@ where
             .insert(session_id.clone());
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::SessionOpened(SessionOpenedResponse {
-                    session_id,
-                    owner_connection_id: connection_id,
-                }),
-            ),
+            response: session_opened_response(request.request_id, connection_id, session_id),
             events: Vec::new(),
         })
     }
@@ -2226,38 +1982,8 @@ where
                     }
                 }
                 "process.signal_state" => {
-                    let signal = javascript_sync_rpc_arg_u32(
-                        &request.args,
-                        0,
-                        "process.signal_state signal",
-                    )?;
-                    let action = javascript_sync_rpc_arg_str(
-                        &request.args,
-                        1,
-                        "process.signal_state action",
-                    )?;
-                    let mask_json =
-                        javascript_sync_rpc_arg_str(&request.args, 2, "process.signal_state mask")?;
-                    let flags = javascript_sync_rpc_arg_u32(
-                        &request.args,
-                        3,
-                        "process.signal_state flags",
-                    )?;
-                    let mask: Vec<u32> = serde_json::from_str(mask_json).map_err(|error| {
-                        SidecarError::InvalidState(format!(
-                            "process.signal_state mask must be valid JSON: {error}"
-                        ))
-                    })?;
-                    let action = match action.trim().to_ascii_lowercase().as_str() {
-                        "default" => SignalDispositionAction::Default,
-                        "ignore" => SignalDispositionAction::Ignore,
-                        "user" => SignalDispositionAction::User,
-                        other => {
-                            return Err(SidecarError::InvalidState(format!(
-                                "unsupported process.signal_state action {other}"
-                            )));
-                        }
-                    };
+                    let (signal, registration) = parse_process_signal_state_request(&request.args)
+                        .map_err(|error| SidecarError::InvalidState(error.to_string()))?;
                     let Some(vm) = self.vms.get_mut(vm_id) else {
                         log_stale_process_event(
                             &self.bridge,
@@ -2267,31 +1993,12 @@ where
                         );
                         return Ok(());
                     };
-                    if action == SignalDispositionAction::Default && mask.is_empty() && flags == 0 {
-                        let remove_process_entry = vm
-                            .signal_states
-                            .get_mut(process_id)
-                            .map(|handlers| {
-                                handlers.remove(&signal);
-                                handlers.is_empty()
-                            })
-                            .unwrap_or(false);
-                        if remove_process_entry {
-                            vm.signal_states.remove(process_id);
-                        }
-                    } else {
-                        vm.signal_states
-                            .entry(process_id.to_owned())
-                            .or_default()
-                            .insert(
-                                signal,
-                                SignalHandlerRegistration {
-                                    action,
-                                    mask,
-                                    flags,
-                                },
-                            );
-                    }
+                    apply_process_signal_state_update(
+                        &mut vm.signal_states,
+                        process_id,
+                        signal,
+                        registration,
+                    );
                     Ok(Value::Null.into())
                 }
                 "net.http_request" => {
@@ -2711,36 +2418,16 @@ where
         }
     }
 
-    fn response_with_ownership(
-        &self,
-        request_id: RequestId,
-        ownership: OwnershipScope,
-        payload: ResponsePayload,
-    ) -> ResponseFrame {
-        ResponseFrame {
-            schema: ProtocolSchema::current(),
-            request_id,
-            ownership,
-            payload,
-        }
-    }
-
     pub(crate) fn respond(
         &self,
         request: &RequestFrame,
         payload: ResponsePayload,
     ) -> ResponseFrame {
-        self.response_with_ownership(request.request_id, request.ownership.clone(), payload)
+        shared_respond(request, payload)
     }
 
     fn reject(&self, request: &RequestFrame, code: &str, message: &str) -> ResponseFrame {
-        self.respond(
-            request,
-            ResponsePayload::Rejected(RejectedResponse {
-                code: code.to_owned(),
-                message: message.to_owned(),
-            }),
-        )
+        shared_reject(request, code, message)
     }
 
     pub fn queue_sidecar_request(
@@ -2888,10 +2575,7 @@ where
         vm_id: &str,
         state: VmLifecycleState,
     ) -> EventFrame {
-        EventFrame::new(
-            OwnershipScope::vm(connection_id, session_id, vm_id),
-            EventPayload::VmLifecycle(VmLifecycleEvent { state }),
-        )
+        shared_vm_lifecycle_event(connection_id, session_id, vm_id, state)
     }
 
     fn ensure_request_within_frame_limit(

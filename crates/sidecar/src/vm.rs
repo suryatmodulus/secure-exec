@@ -4,18 +4,15 @@
 //! Contains VM lifecycle methods on NativeSidecar<B> and associated helpers.
 
 use crate::bootstrap::{
-    apply_root_filesystem_entry, build_root_filesystem, discover_command_guest_paths,
-    root_snapshot_entries, root_snapshot_entry, root_snapshot_from_entries,
+    apply_root_filesystem_entry, discover_command_guest_paths, root_snapshot_entries,
+    root_snapshot_entry, root_snapshot_from_entries,
 };
 use crate::bridge::{bridge_permissions, MountPluginContext};
 use crate::protocol::{
     ConfigureVmRequest, CreateLayerRequest, CreateOverlayRequest, DisposeReason, EventFrame,
-    ExportSnapshotRequest, ImportSnapshotRequest, LayerCreatedResponse, LayerSealedResponse,
-    MountDescriptor, MountPluginDescriptor, OverlayCreatedResponse, PermissionsPolicy,
-    ResponsePayload, RootFilesystemDescriptor, RootFilesystemEntry, RootFilesystemEntryEncoding,
-    RootFilesystemLowerDescriptor, RootFilesystemMode, RootFilesystemSnapshotResponse,
-    SealLayerRequest, SnapshotExportedResponse, SnapshotImportedResponse,
-    SnapshotRootFilesystemRequest, VmConfiguredResponse, VmCreatedResponse, VmDisposedResponse,
+    ExportSnapshotRequest, ImportSnapshotRequest, MountDescriptor, MountPluginDescriptor,
+    RootFilesystemDescriptor, RootFilesystemEntry, RootFilesystemEntryEncoding,
+    RootFilesystemLowerDescriptor, SealLayerRequest, SnapshotRootFilesystemRequest,
     VmLifecycleState,
 };
 use crate::service::{
@@ -23,9 +20,9 @@ use crate::service::{
     normalize_path, plugin_error, root_filesystem_error, validate_permissions_policy, vfs_error,
 };
 use crate::state::{
-    BridgeError, VmConfiguration, VmDnsConfig, VmLayer, VmLayerStore, VmListenPolicy,
-    VmOverlayLayer, VmState, DISPOSE_VM_SIGKILL_GRACE, DISPOSE_VM_SIGTERM_GRACE,
-    EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND, PYTHON_COMMAND, WASM_COMMAND,
+    BridgeError, VmConfiguration, VmDnsConfig, VmListenPolicy, VmState, DISPOSE_VM_SIGKILL_GRACE,
+    DISPOSE_VM_SIGTERM_GRACE, EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND, PYTHON_COMMAND,
+    WASM_COMMAND,
 };
 use crate::{DispatchResult, NativeSidecar, NativeSidecarBridge, SidecarError};
 
@@ -42,9 +39,15 @@ use secure_exec_kernel::resource_accounting::ResourceLimits;
 use secure_exec_kernel::root_fs::{
     decode_snapshot_with_import_limits, encode_snapshot as encode_root_snapshot,
     is_supported_root_filesystem_snapshot_format, FilesystemEntryKind as KernelFilesystemEntryKind,
-    RootFileSystem, RootFilesystemDescriptor as KernelRootFilesystemDescriptor,
-    RootFilesystemImportLimits, RootFilesystemMode as KernelRootFilesystemMode,
-    RootFilesystemSnapshot, ROOT_FILESYSTEM_SNAPSHOT_FORMAT,
+    RootFilesystemImportLimits, ROOT_FILESYSTEM_SNAPSHOT_FORMAT,
+};
+use secure_exec_sidecar_core::permissions::{allow_all_policy, deny_all_policy};
+use secure_exec_sidecar_core::{
+    layer_created_response, layer_sealed_response, overlay_created_response,
+    protocol_root_filesystem_mode, root_filesystem_bootstrapped_response,
+    root_filesystem_protocol_descriptor_from_config, root_filesystem_snapshot_response,
+    snapshot_exported_response, snapshot_imported_response, vm_configured_response,
+    vm_created_response, vm_disposed_response, VmLayerStore,
 };
 use secure_exec_vm_config as vm_config;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -106,8 +109,6 @@ pub(crate) const DEFAULT_GUEST_PATH_ENV: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 #[cfg(test)]
 const KERNEL_COMMAND_STUB: &[u8] = b"#!/bin/sh\n# kernel command stub\n";
-pub(crate) const MAX_VM_LAYERS: usize = 256;
-
 // ---------------------------------------------------------------------------
 // NativeSidecar VM lifecycle methods
 // ---------------------------------------------------------------------------
@@ -134,12 +135,12 @@ where
             .map_err(|error| {
                 SidecarError::InvalidState(format!("invalid create VM config: {error}"))
             })?;
-        let root_filesystem = root_filesystem_from_config(&create_config.root_filesystem);
+        let root_filesystem =
+            root_filesystem_protocol_descriptor_from_config(&create_config.root_filesystem);
         let permissions_policy = create_config
             .permissions
-            .as_ref()
-            .map(permissions_policy_from_config)
-            .unwrap_or_else(PermissionsPolicy::deny_all);
+            .clone()
+            .unwrap_or_else(deny_all_policy);
         validate_permissions_policy(&permissions_policy)?;
 
         self.next_vm_id += 1;
@@ -155,7 +156,7 @@ where
         let resource_limits = limits.resources.clone();
         let dns = vm_dns_config_from_config(create_config.dns.as_ref())?;
         let listen_policy = vm_listen_policy_from_config(create_config.listen.as_ref())?;
-        let create_loopback_exempt_ports = create_config
+        let create_loopback_exempt_ports: BTreeSet<u16> = create_config
             .loopback_exempt_ports
             .iter()
             .copied()
@@ -167,7 +168,7 @@ where
         // Sidecar-owned bootstrap work still needs to reconcile command stubs and the root
         // filesystem before the guest-visible policy takes effect.
         self.bridge
-            .set_vm_permissions(&vm_id, &PermissionsPolicy::allow_all())?;
+            .set_vm_permissions(&vm_id, &allow_all_policy())?;
         let native_root = native_root_plugin_from_config(create_config.native_root.as_ref())?;
         let loaded_snapshot = if native_root.is_some() {
             None
@@ -195,6 +196,7 @@ where
             name_servers: dns.name_servers.clone(),
             overrides: dns.overrides.clone(),
         };
+        config.loopback_exempt_ports = create_loopback_exempt_ports.clone();
         let root_mount_table = if let Some(native_root) = native_root.as_ref() {
             build_native_root_mount_table(
                 &self.mount_plugins,
@@ -210,11 +212,12 @@ where
                 },
             )?
         } else {
-            MountTable::new(build_root_filesystem(
-                &root_filesystem,
+            secure_exec_sidecar_core::build_root_mount_table_with_loaded_snapshot(
+                &create_config.root_filesystem,
                 loaded_snapshot.as_ref(),
                 &resource_limits,
-            )?)
+            )
+            .map_err(|error| SidecarError::InvalidState(error.to_string()))?
         };
         config.resources = resource_limits;
         let mut kernel = KernelVm::new(root_mount_table, config);
@@ -266,10 +269,7 @@ where
                 create_loopback_exempt_ports,
                 guest_env,
                 requested_runtime: payload.runtime,
-                root_filesystem_mode: match root_filesystem.mode {
-                    RootFilesystemMode::Ephemeral => KernelRootFilesystemMode::Ephemeral,
-                    RootFilesystemMode::ReadOnly => KernelRootFilesystemMode::ReadOnly,
-                },
+                root_filesystem_mode: protocol_root_filesystem_mode(root_filesystem.mode),
                 guest_cwd,
                 cwd,
                 host_cwd,
@@ -324,10 +324,7 @@ where
 
         tracing::info!(target: "secure_exec_sidecar::perf", phase = "create_vm", elapsed_ms = __t.elapsed().as_millis() as u64, "vm phase");
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::VmCreated(VmCreatedResponse { vm_id }),
-            ),
+            response: vm_created_response(request, vm_id),
             events,
         })
     }
@@ -343,10 +340,7 @@ where
             .await?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::VmDisposed(VmDisposedResponse { vm_id }),
-            ),
+            response: vm_disposed_response(request, vm_id),
             events,
         })
     }
@@ -368,14 +362,7 @@ where
         }
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::RootFilesystemBootstrapped(
-                    crate::protocol::RootFilesystemBootstrappedResponse {
-                        entry_count: entries.len() as u32,
-                    },
-                ),
-            ),
+            response: root_filesystem_bootstrapped_response(request, entries.len() as u32),
             events: Vec::new(),
         })
     }
@@ -397,9 +384,10 @@ where
         let configured_permissions = payload
             .permissions
             .clone()
+            .map(crate::wire::permissions_policy_config_from_wire)
             .unwrap_or_else(|| original_permissions.clone());
         validate_permissions_policy(&configured_permissions)?;
-        bridge.set_vm_permissions(&vm_id, &PermissionsPolicy::allow_all())?;
+        bridge.set_vm_permissions(&vm_id, &allow_all_policy())?;
         let mut effective_mounts = payload.mounts.clone();
         append_module_access_mount(&mut effective_mounts, payload.module_access_cwd.as_ref())?;
         let reconfigure_result = reconcile_mounts(
@@ -428,6 +416,9 @@ where
                 ))
                 .map_err(kernel_error)?;
             vm.command_permissions = payload.command_permissions.clone().into_iter().collect();
+            let mut loopback_exempt_ports = vm.create_loopback_exempt_ports.clone();
+            loopback_exempt_ports.extend(payload.loopback_exempt_ports.iter().copied());
+            vm.kernel.set_loopback_exempt_ports(loopback_exempt_ports);
             vm.configuration = VmConfiguration {
                 mounts: effective_mounts.clone(),
                 software: payload.software.clone(),
@@ -457,7 +448,7 @@ where
                             .get_mut(&vm_id)
                             .expect("owned VM should exist")
                             .configuration
-                            .permissions = PermissionsPolicy::deny_all();
+                            .permissions = deny_all_policy();
                         return Err(rollback_error);
                     }
                 }
@@ -466,12 +457,10 @@ where
 
         tracing::info!(target: "secure_exec_sidecar::perf", phase = "configure_vm", elapsed_ms = __t.elapsed().as_millis() as u64, applied_mounts = effective_mounts.len() as u64, "vm phase");
         Ok(DispatchResult {
-            response: self.respond(
+            response: vm_configured_response(
                 request,
-                ResponsePayload::VmConfigured(VmConfiguredResponse {
-                    applied_mounts: effective_mounts.len() as u32,
-                    applied_software: payload.software.len() as u32,
-                }),
+                effective_mounts.len() as u32,
+                payload.software.len() as u32,
             ),
             events: Vec::new(),
         })
@@ -486,13 +475,13 @@ where
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
         let vm = self.vms.get_mut(&vm_id).expect("owned VM should exist");
-        let layer_id = vm.layers.create_writable_layer()?;
+        let layer_id = vm
+            .layers
+            .create_writable_layer()
+            .map_err(sidecar_core_error)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::LayerCreated(LayerCreatedResponse { layer_id }),
-            ),
+            response: layer_created_response(request, layer_id),
             events: Vec::new(),
         })
     }
@@ -506,13 +495,13 @@ where
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
         let vm = self.vms.get_mut(&vm_id).expect("owned VM should exist");
-        let layer_id = vm.layers.seal_layer(&payload.layer_id)?;
+        let layer_id = vm
+            .layers
+            .seal_layer(&payload.layer_id)
+            .map_err(sidecar_core_error)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::LayerSealed(LayerSealedResponse { layer_id }),
-            ),
+            response: layer_sealed_response(request, layer_id),
             events: Vec::new(),
         })
     }
@@ -526,16 +515,13 @@ where
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
         let vm = self.vms.get_mut(&vm_id).expect("owned VM should exist");
-        vm.layers.ensure_layer_capacity()?;
         let layer_id = vm
             .layers
-            .import_snapshot(root_snapshot_from_entries(&payload.entries)?)?;
+            .import_snapshot(root_snapshot_from_entries(&payload.entries)?)
+            .map_err(sidecar_core_error)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::SnapshotImported(SnapshotImportedResponse { layer_id }),
-            ),
+            response: snapshot_imported_response(request, layer_id),
             events: Vec::new(),
         })
     }
@@ -549,15 +535,16 @@ where
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
         let vm = self.vms.get_mut(&vm_id).expect("owned VM should exist");
-        let snapshot = vm.layers.export_snapshot(&payload.layer_id)?;
+        let snapshot = vm
+            .layers
+            .export_snapshot(&payload.layer_id)
+            .map_err(sidecar_core_error)?;
 
         Ok(DispatchResult {
-            response: self.respond(
+            response: snapshot_exported_response(
                 request,
-                ResponsePayload::SnapshotExported(SnapshotExportedResponse {
-                    layer_id: payload.layer_id,
-                    entries: root_snapshot_entries(&snapshot),
-                }),
+                payload.layer_id,
+                root_snapshot_entries(&snapshot),
             ),
             events: Vec::new(),
         })
@@ -572,20 +559,17 @@ where
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
         let vm = self.vms.get_mut(&vm_id).expect("owned VM should exist");
-        let layer_id = vm.layers.create_overlay_layer(
-            match payload.mode {
-                RootFilesystemMode::Ephemeral => KernelRootFilesystemMode::Ephemeral,
-                RootFilesystemMode::ReadOnly => KernelRootFilesystemMode::ReadOnly,
-            },
-            payload.upper_layer_id,
-            payload.lower_layer_ids,
-        )?;
+        let layer_id = vm
+            .layers
+            .create_overlay_layer(
+                protocol_root_filesystem_mode(payload.mode),
+                payload.upper_layer_id,
+                payload.lower_layer_ids,
+            )
+            .map_err(sidecar_core_error)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::OverlayCreated(OverlayCreatedResponse { layer_id }),
-            ),
+            response: overlay_created_response(request, layer_id),
             events: Vec::new(),
         })
     }
@@ -602,11 +586,9 @@ where
         let snapshot = vm.kernel.snapshot_root_filesystem().map_err(kernel_error)?;
 
         Ok(DispatchResult {
-            response: self.respond(
+            response: root_filesystem_snapshot_response(
                 request,
-                ResponsePayload::RootFilesystemSnapshot(RootFilesystemSnapshotResponse {
-                    entries: snapshot.entries.iter().map(root_snapshot_entry).collect(),
-                }),
+                snapshot.entries.iter().map(root_snapshot_entry).collect(),
             ),
             events: Vec::new(),
         })
@@ -796,165 +778,6 @@ where
 // ---------------------------------------------------------------------------
 // Free functions — VM lifecycle helpers
 // ---------------------------------------------------------------------------
-
-fn root_filesystem_from_config(
-    config: &vm_config::RootFilesystemConfig,
-) -> RootFilesystemDescriptor {
-    RootFilesystemDescriptor {
-        mode: match config.mode {
-            vm_config::RootFilesystemMode::Ephemeral => RootFilesystemMode::Ephemeral,
-            vm_config::RootFilesystemMode::ReadOnly => RootFilesystemMode::ReadOnly,
-        },
-        disable_default_base_layer: config.disable_default_base_layer,
-        lowers: config
-            .lowers
-            .iter()
-            .map(root_filesystem_lower_from_config)
-            .collect(),
-        bootstrap_entries: config
-            .bootstrap_entries
-            .iter()
-            .map(root_filesystem_entry_from_config)
-            .collect(),
-    }
-}
-
-fn root_filesystem_lower_from_config(
-    lower: &vm_config::RootFilesystemLowerDescriptor,
-) -> RootFilesystemLowerDescriptor {
-    match lower {
-        vm_config::RootFilesystemLowerDescriptor::Snapshot { entries } => {
-            RootFilesystemLowerDescriptor::SnapshotRootFilesystemLower(
-                crate::protocol::SnapshotRootFilesystemLower {
-                    entries: entries
-                        .iter()
-                        .map(root_filesystem_entry_from_config)
-                        .collect(),
-                },
-            )
-        }
-        vm_config::RootFilesystemLowerDescriptor::BundledBaseFilesystem => {
-            RootFilesystemLowerDescriptor::BundledBaseFilesystemLower
-        }
-    }
-}
-
-fn root_filesystem_entry_from_config(
-    entry: &vm_config::RootFilesystemEntry,
-) -> RootFilesystemEntry {
-    RootFilesystemEntry {
-        path: entry.path.clone(),
-        kind: match entry.kind {
-            vm_config::RootFilesystemEntryKind::File => {
-                crate::protocol::RootFilesystemEntryKind::File
-            }
-            vm_config::RootFilesystemEntryKind::Directory => {
-                crate::protocol::RootFilesystemEntryKind::Directory
-            }
-            vm_config::RootFilesystemEntryKind::Symlink => {
-                crate::protocol::RootFilesystemEntryKind::Symlink
-            }
-        },
-        mode: entry.mode,
-        uid: entry.uid,
-        gid: entry.gid,
-        content: entry.content.clone(),
-        encoding: entry.encoding.map(|encoding| match encoding {
-            vm_config::RootFilesystemEntryEncoding::Utf8 => RootFilesystemEntryEncoding::Utf8,
-            vm_config::RootFilesystemEntryEncoding::Base64 => RootFilesystemEntryEncoding::Base64,
-        }),
-        target: entry.target.clone(),
-        executable: entry.executable,
-    }
-}
-
-fn permissions_policy_from_config(config: &vm_config::PermissionsPolicy) -> PermissionsPolicy {
-    PermissionsPolicy {
-        fs: config.fs.as_ref().map(fs_permission_scope_from_config),
-        network: config
-            .network
-            .as_ref()
-            .map(pattern_permission_scope_from_config),
-        child_process: config
-            .child_process
-            .as_ref()
-            .map(pattern_permission_scope_from_config),
-        process: config
-            .process
-            .as_ref()
-            .map(pattern_permission_scope_from_config),
-        env: config
-            .env
-            .as_ref()
-            .map(pattern_permission_scope_from_config),
-        binding: config
-            .binding
-            .as_ref()
-            .map(pattern_permission_scope_from_config),
-    }
-}
-
-fn permission_mode_from_config(mode: vm_config::PermissionMode) -> crate::protocol::PermissionMode {
-    match mode {
-        vm_config::PermissionMode::Allow => crate::protocol::PermissionMode::Allow,
-        vm_config::PermissionMode::Ask => crate::protocol::PermissionMode::Ask,
-        vm_config::PermissionMode::Deny => crate::protocol::PermissionMode::Deny,
-    }
-}
-
-fn fs_permission_scope_from_config(
-    scope: &vm_config::FsPermissionScope,
-) -> crate::protocol::FsPermissionScope {
-    match scope {
-        vm_config::FsPermissionScope::Mode(mode) => {
-            crate::protocol::FsPermissionScope::PermissionMode(permission_mode_from_config(*mode))
-        }
-        vm_config::FsPermissionScope::Rules(rules) => {
-            crate::protocol::FsPermissionScope::FsPermissionRuleSet(
-                crate::protocol::FsPermissionRuleSet {
-                    default: rules.default.map(permission_mode_from_config),
-                    rules: rules
-                        .rules
-                        .iter()
-                        .map(|rule| crate::protocol::FsPermissionRule {
-                            mode: permission_mode_from_config(rule.mode),
-                            operations: rule.operations.clone(),
-                            paths: rule.paths.clone(),
-                        })
-                        .collect(),
-                },
-            )
-        }
-    }
-}
-
-fn pattern_permission_scope_from_config(
-    scope: &vm_config::PatternPermissionScope,
-) -> crate::protocol::PatternPermissionScope {
-    match scope {
-        vm_config::PatternPermissionScope::Mode(mode) => {
-            crate::protocol::PatternPermissionScope::PermissionMode(permission_mode_from_config(
-                *mode,
-            ))
-        }
-        vm_config::PatternPermissionScope::Rules(rules) => {
-            crate::protocol::PatternPermissionScope::PatternPermissionRuleSet(
-                crate::protocol::PatternPermissionRuleSet {
-                    default: rules.default.map(permission_mode_from_config),
-                    rules: rules
-                        .rules
-                        .iter()
-                        .map(|rule| crate::protocol::PatternPermissionRule {
-                            mode: permission_mode_from_config(rule.mode),
-                            operations: rule.operations.clone(),
-                            patterns: rule.patterns.clone(),
-                        })
-                        .collect(),
-                },
-            )
-        }
-    }
-}
 
 fn native_root_plugin_from_config(
     config: Option<&vm_config::NativeRootFilesystemConfig>,
@@ -1389,206 +1212,8 @@ fn append_module_access_symlink_mount(
     Ok(())
 }
 
-impl VmLayerStore {
-    fn ensure_layer_capacity(&self) -> Result<(), SidecarError> {
-        if self.layers.len() >= MAX_VM_LAYERS {
-            return Err(SidecarError::InvalidState(format!(
-                "VM layer limit exceeded: limit is {MAX_VM_LAYERS}"
-            )));
-        }
-        Ok(())
-    }
-
-    fn allocate_layer_id(&mut self) -> Result<String, SidecarError> {
-        let layer_id = format!("layer-{}", self.next_layer_id);
-        self.next_layer_id = self
-            .next_layer_id
-            .checked_add(1)
-            .ok_or_else(|| SidecarError::InvalidState(String::from("VM layer id overflow")))?;
-        Ok(layer_id)
-    }
-
-    fn create_writable_layer(&mut self) -> Result<String, SidecarError> {
-        self.ensure_layer_capacity()?;
-        let filesystem = new_writable_layer()?;
-        let layer_id = self.allocate_layer_id()?;
-        self.layers
-            .insert(layer_id.clone(), VmLayer::Writable(filesystem));
-        Ok(layer_id)
-    }
-
-    fn seal_layer(&mut self, layer_id: &str) -> Result<String, SidecarError> {
-        let snapshot = match self.layers.get_mut(layer_id) {
-            Some(VmLayer::Writable(filesystem)) => {
-                filesystem.snapshot().map_err(root_filesystem_error)?
-            }
-            Some(VmLayer::Snapshot(_)) | Some(VmLayer::Overlay(_)) => {
-                return Err(SidecarError::InvalidState(format!(
-                    "layer {layer_id} is not writable"
-                )));
-            }
-            None => {
-                return Err(SidecarError::InvalidState(format!(
-                    "unknown layer: {layer_id}"
-                )));
-            }
-        };
-        let sealed_layer_id = self.allocate_layer_id()?;
-        match self
-            .layers
-            .remove(layer_id)
-            .expect("layer should still exist after snapshot")
-        {
-            VmLayer::Writable(_) => {}
-            VmLayer::Snapshot(_) | VmLayer::Overlay(_) => {
-                return Err(SidecarError::InvalidState(format!(
-                    "layer {layer_id} is not writable"
-                )));
-            }
-        }
-        self.layers
-            .insert(sealed_layer_id.clone(), VmLayer::Snapshot(snapshot));
-        Ok(sealed_layer_id)
-    }
-
-    fn import_snapshot(
-        &mut self,
-        snapshot: RootFilesystemSnapshot,
-    ) -> Result<String, SidecarError> {
-        self.ensure_layer_capacity()?;
-        let layer_id = self.allocate_layer_id()?;
-        self.layers
-            .insert(layer_id.clone(), VmLayer::Snapshot(snapshot));
-        Ok(layer_id)
-    }
-
-    fn export_snapshot(&mut self, layer_id: &str) -> Result<RootFilesystemSnapshot, SidecarError> {
-        materialize_vm_layer_snapshot(self, layer_id)
-    }
-
-    fn create_overlay_layer(
-        &mut self,
-        mode: KernelRootFilesystemMode,
-        upper_layer_id: Option<String>,
-        lower_layer_ids: Vec<String>,
-    ) -> Result<String, SidecarError> {
-        self.ensure_layer_capacity()?;
-        for layer_id in &lower_layer_ids {
-            if !self.layers.contains_key(layer_id) {
-                return Err(SidecarError::InvalidState(format!(
-                    "unknown lower layer: {layer_id}"
-                )));
-            }
-        }
-        if let Some(layer_id) = upper_layer_id.as_ref() {
-            if !self.layers.contains_key(layer_id) {
-                return Err(SidecarError::InvalidState(format!(
-                    "unknown upper layer: {layer_id}"
-                )));
-            }
-        }
-
-        let layer_id = self.allocate_layer_id()?;
-        self.layers.insert(
-            layer_id.clone(),
-            VmLayer::Overlay(VmOverlayLayer {
-                mode,
-                upper_layer_id,
-                lower_layer_ids,
-            }),
-        );
-        Ok(layer_id)
-    }
-}
-
-fn new_writable_layer() -> Result<RootFileSystem, SidecarError> {
-    RootFileSystem::from_descriptor(KernelRootFilesystemDescriptor {
-        mode: KernelRootFilesystemMode::Ephemeral,
-        disable_default_base_layer: true,
-        lowers: Vec::new(),
-        bootstrap_entries: Vec::new(),
-    })
-    .map_err(root_filesystem_error)
-}
-
-fn materialize_vm_layer_snapshot(
-    layers: &mut VmLayerStore,
-    layer_id: &str,
-) -> Result<RootFilesystemSnapshot, SidecarError> {
-    materialize_vm_layer_snapshot_inner(layers, layer_id, &mut std::collections::BTreeSet::new())
-}
-
-fn materialize_vm_layer_snapshot_inner(
-    layers: &mut VmLayerStore,
-    layer_id: &str,
-    active: &mut std::collections::BTreeSet<String>,
-) -> Result<RootFilesystemSnapshot, SidecarError> {
-    if !active.insert(layer_id.to_owned()) {
-        return Err(SidecarError::InvalidState(format!(
-            "layer graph cycle detected at {layer_id}"
-        )));
-    }
-
-    let result = if let Some(VmLayer::Snapshot(snapshot)) = layers.layers.get(layer_id) {
-        Ok(snapshot.clone())
-    } else if let Some(VmLayer::Overlay(overlay)) = layers.layers.get(layer_id) {
-        let overlay = overlay.clone();
-        let lowers = overlay
-            .lower_layer_ids
-            .iter()
-            .map(|lower_id| materialize_vm_layer_snapshot_inner(layers, lower_id, active))
-            .collect::<Result<Vec<_>, _>>()?;
-        let bootstrap_entries = match overlay.upper_layer_id.as_deref() {
-            Some(upper_layer_id) => dedupe_overlay_bootstrap_entries(
-                &lowers,
-                materialize_vm_layer_snapshot_inner(layers, upper_layer_id, active)?.entries,
-            ),
-            None => Vec::new(),
-        };
-        let mut root = RootFileSystem::from_descriptor(KernelRootFilesystemDescriptor {
-            mode: overlay.mode,
-            disable_default_base_layer: true,
-            lowers,
-            bootstrap_entries,
-        })
-        .map_err(root_filesystem_error)?;
-        root.snapshot().map_err(root_filesystem_error)
-    } else if let Some(VmLayer::Writable(filesystem)) = layers.layers.get_mut(layer_id) {
-        filesystem.snapshot().map_err(root_filesystem_error)
-    } else {
-        Err(SidecarError::InvalidState(format!(
-            "unknown layer: {layer_id}"
-        )))
-    };
-
-    active.remove(layer_id);
-    result
-}
-
-fn dedupe_overlay_bootstrap_entries(
-    lowers: &[RootFilesystemSnapshot],
-    upper_entries: Vec<secure_exec_kernel::root_fs::FilesystemEntry>,
-) -> Vec<secure_exec_kernel::root_fs::FilesystemEntry> {
-    let mut lower_paths = lowers
-        .iter()
-        .flat_map(|snapshot| snapshot.entries.iter().map(|entry| entry.path.clone()))
-        .collect::<std::collections::BTreeSet<_>>();
-
-    upper_entries
-        .into_iter()
-        .filter(|entry| {
-            if lower_paths.contains(&entry.path)
-                && matches!(
-                    entry.kind,
-                    secure_exec_kernel::root_fs::FilesystemEntryKind::Directory
-                )
-            {
-                return false;
-            }
-            lower_paths.insert(entry.path.clone());
-            true
-        })
-        .collect()
+fn sidecar_core_error(error: secure_exec_sidecar_core::SidecarCoreError) -> SidecarError {
+    SidecarError::InvalidState(error.to_string())
 }
 
 fn resolve_guest_cwd(value: Option<&String>) -> String {

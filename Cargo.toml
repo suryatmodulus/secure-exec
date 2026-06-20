@@ -5,6 +5,9 @@ members = [
     "crates/kernel",
     "crates/vfs",
     "crates/secure-exec-vfs",
+    "crates/build-support",
+    "crates/sidecar-protocol",
+    "crates/sidecar-core",
     "crates/execution",
     "crates/secure-exec-client",
     "crates/sidecar",
@@ -22,7 +25,10 @@ repository = "https://github.com/rivet-dev/secure-exec"
 
 [workspace.dependencies]
 secure-exec-bridge = { path = "crates/bridge", version = "0.3.0-rc.1" }
+secure-exec-build-support = { path = "crates/build-support", version = "0.3.0-rc.1" }
 secure-exec-kernel = { path = "crates/kernel", version = "0.3.0-rc.1" }
+secure-exec-sidecar-protocol = { path = "crates/sidecar-protocol", version = "0.3.0-rc.1" }
+secure-exec-sidecar-core = { path = "crates/sidecar-core", version = "0.3.0-rc.1" }
 secure-exec-execution = { path = "crates/execution", version = "0.3.0-rc.1" }
 secure-exec-vm-config = { path = "crates/vm-config", version = "0.3.0-rc.1" }
 secure-exec-v8-runtime = { path = "crates/v8-runtime", version = "0.3.0-rc.1" }

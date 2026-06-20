@@ -120,6 +120,12 @@ export type LiveRequestPayload =
 			type: "snapshot_root_filesystem";
 	  }
 	| {
+			type: "guest_kernel_call";
+			execution_id: string;
+			operation: string;
+			payload: ArrayBuffer;
+	  }
+	| {
 			type: "guest_filesystem_call";
 			operation: LiveGuestFilesystemOperation;
 			path: string;
@@ -358,6 +364,15 @@ export function toGeneratedRequestPayload(
 					mtimeMs: toGeneratedOptionalU64(payload.mtime_ms),
 					len: toGeneratedOptionalU64(payload.len),
 					offset: toGeneratedOptionalU64(payload.offset),
+				},
+			};
+		case "guest_kernel_call":
+			return {
+				tag: "GuestKernelCallRequest",
+				val: {
+					executionId: payload.execution_id,
+					operation: payload.operation,
+					payload: payload.payload,
 				},
 			};
 		case "snapshot_root_filesystem":

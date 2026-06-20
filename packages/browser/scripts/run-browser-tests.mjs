@@ -186,9 +186,6 @@ function ensureBrowserRuntimeLibraries() {
 }
 
 function main() {
-	run("pnpm", ["--dir", "../playground", "run", "setup-vendor"]);
-	run("pnpm", ["--dir", "../playground", "build:assets"]);
-
 	const extraLibraryDirs = ensureBrowserRuntimeLibraries();
 	const env = {
 		...process.env,

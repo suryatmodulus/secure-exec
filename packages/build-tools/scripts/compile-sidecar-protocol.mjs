@@ -9,7 +9,7 @@ const repoRoot = path.resolve(buildToolsPackageDir, "../..");
 const corePackageDir = path.join(repoRoot, "packages", "core");
 const schemaPath = path.join(
 	repoRoot,
-	"crates/sidecar/protocol/secure_exec_sidecar_v1.bare",
+	"crates/sidecar-protocol/protocol/secure_exec_sidecar_v1.bare",
 );
 const outputPath = path.join(corePackageDir, "src/generated-protocol.ts");
 

@@ -4,6 +4,8 @@ import {
 	StdioSidecarProcess,
 } from "./process.js";
 import { SidecarProtocolClient } from "./protocol-client.js";
+import type { SidecarProcessTransport } from "./sidecar-client.js";
+import { registerSidecarProcessSpawnFactory } from "./sidecar-process.js";
 import type {
 	LiveEventFrame,
 	LiveResponseFrame,
@@ -43,7 +45,7 @@ type ResolvedStdioSidecarProtocolClientOptions = Required<
 	>
 >;
 
-export class StdioSidecarProtocolClient {
+export class StdioSidecarProtocolClient implements SidecarProcessTransport {
 	readonly child: StdioSidecarProcess["child"];
 	private readonly sidecarProcess: StdioSidecarProcess;
 	private readonly protocolClient: SidecarProtocolClient;
@@ -198,3 +200,7 @@ export class StdioSidecarProtocolClient {
 		});
 	}
 }
+
+registerSidecarProcessSpawnFactory((options) =>
+	StdioSidecarProtocolClient.spawn(options),
+);

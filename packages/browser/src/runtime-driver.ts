@@ -1,28 +1,44 @@
+import type { ProtocolFramePayloadCodec } from "@secure-exec/core/protocol-frames";
+import type { CreateVmConfig } from "@secure-exec/core/vm-config";
+import {
+	type BrowserChildProcessPollEvent,
+	decodeChildProcessInput,
+	encodeChildProcessBytes,
+	parseChildProcessSpawnRequest,
+} from "./child-process-bridge.js";
+import type { ConvergedServicer } from "./converged-driver-setup.js";
 import { getBrowserSystemDriverOptions } from "./driver.js";
+import { base64ToBytes, toUint8Array } from "./encoding.js";
 import type {
+	CommandExecutor,
 	ExecOptions,
 	ExecResult,
 	NetworkAdapter,
 	NodeRuntimeDriver,
 	NodeRuntimeDriverFactory,
+	Permissions,
+	PtyOpenResult,
 	RunResult,
 	RuntimeDriverOptions,
 	StdioHook,
 	TimingMitigation,
-	VirtualFileSystem,
 } from "./runtime.js";
 import {
-	createFsStub,
 	createNetworkStub,
-	loadFile,
-	mkdir,
-	resolveModule,
+	filterEnv,
+	wrapCommandExecutor,
 } from "./runtime.js";
+import {
+	applyProcessSignalStateUpdate,
+	type BrowserSignalRegistration,
+	parseProcessSignalStateArgs,
+} from "./signals.js";
 import {
 	assertBrowserSyncBridgeSupport,
 	type BrowserSyncBridgePayload,
 	type BrowserWorkerSyncRequestMessage,
 	createBrowserSyncBridgePayload,
+	isBrowserWorkerSyncOperation,
 	SYNC_BRIDGE_KIND_BINARY,
 	SYNC_BRIDGE_KIND_JSON,
 	SYNC_BRIDGE_KIND_NONE,
@@ -44,18 +60,41 @@ import type {
 	BrowserWorkerOutboundMessage,
 	BrowserWorkerRequestMessage,
 	BrowserWorkerResponseMessage,
+	BrowserWorkerPtyOpenedMessage,
 	BrowserWorkerStdioMessage,
-	SerializedPermissions,
 } from "./worker-protocol.js";
 
 export interface BrowserRuntimeDriverFactoryOptions {
 	workerUrl?: URL | string;
+	// When provided, guest sync-bridge syscalls are serviced by the converged
+	// wasm kernel (fs/net/dns/module) instead of the legacy in-process TS kernel,
+	// with the remaining families falling back to legacy. The setup module is
+	// imported dynamically so the unbundled legacy load never pulls in its
+	// bundled-only `@secure-exec/core` imports.
+	convergedSidecar?: ConvergedSidecarFactoryOptions;
+}
+
+export interface ConvergedSidecarHandle {
+	pushFrame(frame: Uint8Array): Uint8Array;
+	// Sets the execution id the sidecar's execution host bridge echoes for the
+	// next `execute`; omitted when the sidecar has no execution host bridge
+	// (then guest net/dgram are unavailable but fs/module still converge).
+	setNextExecutionId?(executionId: string): void;
+}
+
+export interface ConvergedSidecarFactoryOptions {
+	loadSidecar(): Promise<ConvergedSidecarHandle>;
+	config: CreateVmConfig;
+	codec?: ProtocolFramePayloadCodec;
+	onFsReadDenied?: () => void;
 }
 
 type PendingRequest = {
 	resolve(value: unknown): void;
 	reject(reason: unknown): void;
 	hook?: StdioHook;
+	onPtyOpen?: (pty: PtyOpenResult) => void;
+	executionId?: string;
 };
 
 type SyncBridgeResponse =
@@ -63,6 +102,26 @@ type SyncBridgeResponse =
 	| { kind: typeof SYNC_BRIDGE_KIND_TEXT; value: string }
 	| { kind: typeof SYNC_BRIDGE_KIND_BINARY; value: Uint8Array }
 	| { kind: typeof SYNC_BRIDGE_KIND_JSON; value: unknown };
+
+type BrowserChildProcessSession = {
+	executionId: string;
+	process: ReturnType<CommandExecutor["spawn"]>;
+	events: BrowserChildProcessPollEvent[];
+	exited: boolean;
+};
+
+type BrowserNetworkPermission = NonNullable<
+	RuntimeDriverOptions["system"]["permissions"]
+>["network"];
+
+type BrowserSyncBridgeHost = {
+	commandExecutor: CommandExecutor;
+	networkAdapter: NetworkAdapter;
+	childProcessSessions: Map<number, BrowserChildProcessSession>;
+	signalStates: Map<string, Map<number, BrowserSignalRegistration>>;
+	allocateChildProcessSessionId(): number;
+	networkPermission?: BrowserNetworkPermission;
+};
 
 const DEFAULT_BROWSER_TIMING_MITIGATION: TimingMitigation = "freeze";
 
@@ -79,20 +138,19 @@ const BROWSER_OPTION_VALIDATORS = [
 	},
 ];
 
-function serializePermissions(
-	permissions?: RuntimeDriverOptions["system"]["permissions"],
-): SerializedPermissions | undefined {
-	if (!permissions) {
-		return undefined;
+// Permission predicates are consumed only on the trusted main thread (here and
+// in `wrapCommandExecutor`); they are never serialized to or evaluated in the
+// untrusted guest worker. The kernel is the sole enforcement point for fs/net.
+// The one thing the worker needs is an already-filtered env, so apply the env
+// predicate to a process config on this side before it crosses the boundary.
+function filterProcessConfigEnv<T extends { env?: Record<string, string> }>(
+	processConfig: T,
+	permissions?: Permissions,
+): T {
+	if (!permissions?.env || !processConfig.env) {
+		return processConfig;
 	}
-	const serialize = (fn?: unknown) =>
-		typeof fn === "function" ? fn.toString() : undefined;
-	return {
-		fs: serialize(permissions.fs),
-		network: serialize(permissions.network),
-		childProcess: serialize(permissions.childProcess),
-		env: serialize(permissions.env),
-	};
+	return { ...processConfig, env: filterEnv(processConfig.env, permissions) };
 }
 
 function resolveWorkerUrl(workerUrl?: URL | string): URL {
@@ -114,16 +172,32 @@ function createWorkerControlToken(): string {
 
 function toBrowserWorkerExecOptions(
 	options?: ExecOptions,
+	permissions?: Permissions,
 ): BrowserWorkerExecOptions | undefined {
 	if (!options) {
 		return undefined;
 	}
 	return {
 		filePath: options.filePath,
-		env: options.env,
+		// Filter per-exec env on the trusted main thread before it reaches the
+		// guest worker (the worker no longer re-applies the env permission).
+		env:
+			options.env && permissions?.env
+				? filterEnv(options.env, permissions)
+				: options.env,
 		cwd: options.cwd,
 		stdin: options.stdin,
+		stdioPty: options.stdioPty
+			? {
+					open: options.stdioPty.open,
+					slaveFd: options.stdioPty.slaveFd,
+					columns: options.stdioPty.columns,
+					rows: options.stdioPty.rows,
+				}
+			: undefined,
 		timingMitigation: options.timingMitigation,
+		persistent: options.persistent,
+		streamingStdin: options.streamingStdin,
 	};
 }
 
@@ -158,6 +232,12 @@ function isStdioMessage(
 	return message.type === "stdio";
 }
 
+function isPtyOpenedMessage(
+	message: BrowserWorkerOutboundMessage,
+): message is BrowserWorkerPtyOpenedMessage {
+	return message.type === "pty-opened";
+}
+
 function isResponseMessage(
 	message: BrowserWorkerOutboundMessage,
 ): message is BrowserWorkerResponseMessage {
@@ -168,12 +248,6 @@ function isSyncRequestMessage(
 	message: BrowserWorkerOutboundMessage,
 ): message is BrowserWorkerSyncRequestMessage {
 	return message.type === "sync-request";
-}
-
-function createSyncBridgeFilesystem(
-	options: RuntimeDriverOptions,
-): VirtualFileSystem {
-	return options.system.filesystem ?? createFsStub();
 }
 
 function throwBridgePayloadTooLarge(
@@ -188,17 +262,19 @@ function throwBridgePayloadTooLarge(
 	throw error;
 }
 
-function toUint8Array(value: unknown): Uint8Array {
-	if (value instanceof Uint8Array) {
-		return value;
+async function waitForChildProcessEvent(
+	session: BrowserChildProcessSession,
+	waitMs: number,
+): Promise<BrowserChildProcessPollEvent | null> {
+	const deadline = Date.now() + Math.max(0, waitMs);
+	while (
+		session.events.length === 0 &&
+		!session.exited &&
+		Date.now() < deadline
+	) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
-	if (ArrayBuffer.isView(value)) {
-		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-	}
-	if (value instanceof ArrayBuffer) {
-		return new Uint8Array(value);
-	}
-	return new TextEncoder().encode(String(value));
+	return session.events.shift() ?? null;
 }
 
 function createSyncBridgeResponseBytes(
@@ -220,110 +296,145 @@ function createSyncBridgeResponseBytes(
 }
 
 async function handleSyncBridgeOperation(
-	filesystem: VirtualFileSystem,
+	host: BrowserSyncBridgeHost,
 	message: BrowserWorkerSyncRequestMessage,
 ): Promise<SyncBridgeResponse> {
 	switch (message.operation) {
-		case "fs.readFile":
-			return {
-				kind: SYNC_BRIDGE_KIND_TEXT,
-				value: await filesystem.readTextFile(String(message.args[0])),
-			};
-		case "fs.writeFile":
-			await filesystem.writeFile(
-				String(message.args[0]),
-				String(message.args[1] ?? ""),
+		case "child_process.spawn": {
+			const request = parseChildProcessSpawnRequest(
+				message.args[0],
+				"child_process.spawn request",
 			);
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.readFileBinary":
-			return {
-				kind: SYNC_BRIDGE_KIND_BINARY,
-				value: await filesystem.readFile(String(message.args[0])),
+			const { command, args } = request;
+			const options = request.options ?? {};
+			const sessionId = host.allocateChildProcessSessionId();
+			const events: BrowserChildProcessPollEvent[] = [];
+			const process = host.commandExecutor.spawn(command, args, {
+				cwd: options.cwd,
+				env: options.env,
+				onStdout: (data) => {
+					events.push({
+						type: "stdout",
+						data: encodeChildProcessBytes(data),
+					});
+				},
+				onStderr: (data) => {
+					events.push({
+						type: "stderr",
+						data: encodeChildProcessBytes(data),
+					});
+				},
+			});
+			const session: BrowserChildProcessSession = {
+				executionId: message.executionId,
+				process,
+				events,
+				exited: false,
 			};
-		case "fs.writeFileBinary":
-			await filesystem.writeFile(
-				String(message.args[0]),
-				toUint8Array(message.args[1]),
-			);
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.readDir":
-			return {
-				kind: SYNC_BRIDGE_KIND_JSON,
-				value: await filesystem.readDirWithTypes(String(message.args[0])),
-			};
-		case "fs.createDir":
-			await filesystem.createDir(String(message.args[0]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.mkdir":
-			await mkdir(filesystem, String(message.args[0]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.rmdir":
-			await filesystem.removeDir(String(message.args[0]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.exists":
-			return {
-				kind: SYNC_BRIDGE_KIND_JSON,
-				value: await filesystem.exists(String(message.args[0])),
-			};
-		case "fs.stat":
-			return {
-				kind: SYNC_BRIDGE_KIND_JSON,
-				value: await filesystem.stat(String(message.args[0])),
-			};
-		case "fs.lstat":
-			return {
-				kind: SYNC_BRIDGE_KIND_JSON,
-				value: await filesystem.lstat(String(message.args[0])),
-			};
-		case "fs.unlink":
-			await filesystem.removeFile(String(message.args[0]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.rename":
-			await filesystem.rename(String(message.args[0]), String(message.args[1]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.realpath":
-			return {
-				kind: SYNC_BRIDGE_KIND_TEXT,
-				value: await filesystem.realpath(String(message.args[0])),
-			};
-		case "fs.readlink":
-			return {
-				kind: SYNC_BRIDGE_KIND_TEXT,
-				value: await filesystem.readlink(String(message.args[0])),
-			};
-		case "fs.symlink":
-			await filesystem.symlink(
-				String(message.args[0]),
-				String(message.args[1]),
-			);
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.link":
-			await filesystem.link(String(message.args[0]), String(message.args[1]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.chmod":
-			await filesystem.chmod(String(message.args[0]), Number(message.args[1]));
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "fs.truncate":
-			await filesystem.truncate(
-				String(message.args[0]),
-				Number(message.args[1]),
-			);
-			return { kind: SYNC_BRIDGE_KIND_NONE };
-		case "module.resolve": {
-			const resolved = await resolveModule(
-				String(message.args[0]),
-				String(message.args[1]),
-				filesystem,
-			);
-			return resolved === null
-				? { kind: SYNC_BRIDGE_KIND_NONE }
-				: { kind: SYNC_BRIDGE_KIND_TEXT, value: resolved };
+			void process
+				.wait()
+				.then((code) => {
+					session.exited = true;
+					session.events.push({ type: "exit", exitCode: code, signal: null });
+				})
+				.catch(() => {
+					session.exited = true;
+					session.events.push({ type: "exit", exitCode: 1, signal: null });
+				});
+			host.childProcessSessions.set(sessionId, session);
+			return { kind: SYNC_BRIDGE_KIND_JSON, value: sessionId };
 		}
-		case "module.loadFile": {
-			const source = await loadFile(String(message.args[0]), filesystem);
-			return source === null
-				? { kind: SYNC_BRIDGE_KIND_NONE }
-				: { kind: SYNC_BRIDGE_KIND_TEXT, value: source };
+		case "child_process.poll": {
+			const sessionId = Number(message.args[0]);
+			const waitMs = Number(message.args[1] ?? 0);
+			const session = host.childProcessSessions.get(sessionId);
+			if (!session || session.executionId !== message.executionId) {
+				return { kind: SYNC_BRIDGE_KIND_JSON, value: null };
+			}
+			const event = await waitForChildProcessEvent(session, waitMs);
+			if (event?.type === "exit" && session.events.length === 0) {
+				host.childProcessSessions.delete(sessionId);
+			}
+			return { kind: SYNC_BRIDGE_KIND_JSON, value: event };
+		}
+		case "child_process.write_stdin": {
+			const sessionId = Number(message.args[0]);
+			const session = host.childProcessSessions.get(sessionId);
+			if (!session || session.executionId !== message.executionId) {
+				throw new Error(`unknown child_process session ${sessionId}`);
+			}
+			session?.process.writeStdin(toUint8Array(message.args[1]));
+			return { kind: SYNC_BRIDGE_KIND_NONE };
+		}
+		case "child_process.close_stdin": {
+			const sessionId = Number(message.args[0]);
+			const session = host.childProcessSessions.get(sessionId);
+			if (!session || session.executionId !== message.executionId) {
+				throw new Error(`unknown child_process session ${sessionId}`);
+			}
+			session.process.closeStdin();
+			return { kind: SYNC_BRIDGE_KIND_NONE };
+		}
+		case "child_process.kill": {
+			const sessionId = Number(message.args[0]);
+			const signal = Number(message.args[1]);
+			const session = host.childProcessSessions.get(sessionId);
+			if (!session || session.executionId !== message.executionId) {
+				throw new Error(`unknown child_process session ${sessionId}`);
+			}
+			session.process.kill(signal);
+			return { kind: SYNC_BRIDGE_KIND_NONE };
+		}
+		case "child_process.spawn_sync": {
+			const request = parseChildProcessSpawnRequest(
+				message.args[0],
+				"child_process.spawn_sync request",
+			);
+			const { command, args } = request;
+			const options = request.options ?? {};
+			const stdoutChunks: Uint8Array[] = [];
+			const stderrChunks: Uint8Array[] = [];
+			const proc = host.commandExecutor.spawn(command, args, {
+				cwd: options.cwd,
+				env: options.env,
+				onStdout: (data) => stdoutChunks.push(data),
+				onStderr: (data) => stderrChunks.push(data),
+			});
+			const input = decodeChildProcessInput(options.input);
+			if (input !== undefined) {
+				proc.writeStdin(input);
+			}
+			proc.closeStdin();
+			const exitCode = await proc.wait();
+			const decoder = new TextDecoder();
+			return {
+				kind: SYNC_BRIDGE_KIND_TEXT,
+				value: JSON.stringify({
+					stdout: stdoutChunks.map((chunk) => decoder.decode(chunk)).join(""),
+					stderr: stderrChunks.map((chunk) => decoder.decode(chunk)).join(""),
+					code: exitCode,
+				}),
+			};
+		}
+		case "process.signal_state": {
+			const { signal, registration } = parseProcessSignalStateArgs(
+				message.args,
+			);
+			applyProcessSignalStateUpdate(
+				host.signalStates,
+				message.executionId,
+				signal,
+				registration,
+			);
+			return { kind: SYNC_BRIDGE_KIND_NONE };
+		}
+		case "network.fetch": {
+			const url = String(message.args[0] ?? "");
+			const options = (message.args[1] ?? {}) as Parameters<
+				NetworkAdapter["fetch"]
+			>[1];
+			const result = await host.networkAdapter.fetch(url, options);
+			return { kind: SYNC_BRIDGE_KIND_JSON, value: result };
 		}
 		default:
 			throw new Error(
@@ -339,12 +450,26 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 	private readonly defaultOnStdio?: StdioHook;
 	private readonly defaultTimingMitigation: TimingMitigation;
 	private readonly networkAdapter: NetworkAdapter;
+	private readonly commandExecutor: CommandExecutor;
 	private readonly syncBridge: BrowserSyncBridgePayload;
-	private readonly syncFilesystem: VirtualFileSystem;
+	private readonly childProcessSessions = new Map<
+		number,
+		BrowserChildProcessSession
+	>();
+	private readonly signalStates = new Map<
+		string,
+		Map<number, BrowserSignalRegistration>
+	>();
 	private readonly ready: Promise<void>;
 	private readonly encoder = new TextEncoder();
 	private nextId = 1;
+	private nextExecutionId = 1;
+	private nextChildProcessSessionId = 1;
 	private disposed = false;
+	private readonly networkPermission?: BrowserNetworkPermission;
+	private readonly permissions?: Permissions;
+	private convergedServicer?: ConvergedServicer;
+	private readonly convergedReady?: Promise<void>;
 
 	constructor(
 		options: RuntimeDriverOptions,
@@ -363,8 +488,17 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			options.runtime.process.timingMitigation ??
 			DEFAULT_BROWSER_TIMING_MITIGATION;
 		this.networkAdapter = options.system.network ?? createNetworkStub();
+		this.networkPermission = options.system.permissions?.network;
+		this.permissions = options.system.permissions;
+		this.commandExecutor = wrapCommandExecutor(
+			options.system.commandExecutor ?? {
+				spawn() {
+					throw new Error("ENOSYS: child_process.spawn is not supported");
+				},
+			},
+			options.system.permissions,
+		);
 		this.syncBridge = createBrowserSyncBridgePayload(options.payloadLimits);
-		this.syncFilesystem = createSyncBridgeFilesystem(options);
 		this.worker = new Worker(resolveWorkerUrl(factoryOptions.workerUrl), {
 			type: "module",
 		});
@@ -373,9 +507,11 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 
 		const browserSystemOptions = getBrowserSystemDriverOptions(options.system);
 		const initPayload: BrowserWorkerInitPayload = {
-			processConfig: options.runtime.process,
+			processConfig: filterProcessConfigEnv(
+				options.runtime.process,
+				options.system.permissions,
+			),
 			osConfig: options.runtime.os,
-			permissions: serializePermissions(options.system.permissions),
 			filesystem: browserSystemOptions.filesystem,
 			networkEnabled: browserSystemOptions.networkEnabled,
 			timingMitigation: this.defaultTimingMitigation,
@@ -385,6 +521,29 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 
 		this.ready = this.callWorker("init", initPayload).then(() => undefined);
 		this.ready.catch(() => undefined);
+
+		if (factoryOptions.convergedSidecar) {
+			this.convergedReady = this.setupConvergedSidecar(
+				factoryOptions.convergedSidecar,
+			);
+			this.convergedReady.catch(() => undefined);
+		}
+	}
+
+	private async setupConvergedSidecar(
+		options: ConvergedSidecarFactoryOptions,
+	): Promise<void> {
+		const [{ createConvergedServicer }, sidecar] = await Promise.all([
+			import("./converged-driver-setup.js"),
+			options.loadSidecar(),
+		]);
+		this.convergedServicer = createConvergedServicer({
+			pushFrame: sidecar.pushFrame,
+			config: options.config,
+			codec: options.codec,
+			setNextExecutionId: sidecar.setNextExecutionId?.bind(sidecar),
+			onFsReadDenied: options.onFsReadDenied,
+		});
 	}
 
 	get network(): Pick<NetworkAdapter, "fetch" | "dnsLookup" | "httpRequest"> {
@@ -427,8 +586,30 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			return;
 		}
 
+		if (isPtyOpenedMessage(message)) {
+			const pending = this.pending.get(message.requestId);
+			if (pending?.executionId !== message.executionId) {
+				return;
+			}
+			try {
+				pending.onPtyOpen?.({
+					masterFd: message.masterFd,
+					slaveFd: message.slaveFd,
+					path: message.path,
+					columns: message.columns,
+					rows: message.rows,
+				});
+			} catch {
+				// Ignore host callback errors so the guest execution can continue.
+			}
+			return;
+		}
+
 		if (isStdioMessage(message)) {
 			const pending = this.pending.get(message.requestId);
+			if (pending?.executionId !== message.executionId) {
+				return;
+			}
 			const hook = pending?.hook ?? this.defaultOnStdio;
 			if (!hook) {
 				return;
@@ -450,6 +631,9 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			return;
 		}
 		this.pending.delete(message.id);
+		if (pending.executionId) {
+			this.cleanupExecutionState(pending.executionId);
+		}
 
 		if (message.ok) {
 			pending.resolve(message.result);
@@ -470,9 +654,59 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 		const signal = new Int32Array(this.syncBridge.signalBuffer);
 		const data = new Uint8Array(this.syncBridge.dataBuffer);
 		try {
-			const response = await handleSyncBridgeOperation(
-				this.syncFilesystem,
-				message,
+			if (
+				!this.hasPendingExecutionRequest(
+					message.processRequestId,
+					message.executionId,
+				)
+			) {
+				throw new Error(
+					`Browser runtime sync bridge request for unknown execution ${message.executionId}`,
+				);
+			}
+			if (!isBrowserWorkerSyncOperation(message.operation)) {
+				throw new Error(
+					`Unsupported browser sync bridge operation: ${String(message.operation)}`,
+				);
+			}
+			const legacyServicer = (operation: string, args: readonly unknown[]) =>
+				handleSyncBridgeOperation(
+					{
+						commandExecutor: this.commandExecutor,
+						networkAdapter: this.networkAdapter,
+						childProcessSessions: this.childProcessSessions,
+						signalStates: this.signalStates,
+						allocateChildProcessSessionId: () =>
+							this.allocateChildProcessSessionId(),
+						networkPermission: this.networkPermission,
+					},
+					{
+						...message,
+						operation: operation as typeof message.operation,
+						args: [...args],
+					},
+				);
+			// Converged-only: every guest syscall is serviced by the wasm kernel via
+			// the converged servicer. The legacy in-process TS kernel is gone; the
+			// `legacyServicer` survives ONLY as the converged router's fallback for
+			// host capabilities (child_process.* / process.signal_state), never as a
+			// standalone guest-syscall path.
+			if (this.convergedReady === undefined) {
+				throw new Error(
+					"Browser runtime requires a converged wasm sidecar; the legacy in-process kernel has been removed",
+				);
+			}
+			await this.convergedReady;
+			if (!this.convergedServicer) {
+				throw new Error(
+					"Converged sidecar servicer is unavailable after setup",
+				);
+			}
+			const response = await this.convergedServicer.route(
+				message.executionId,
+				message.operation,
+				message.args,
+				legacyServicer,
 			);
 			const bytes = createSyncBridgeResponseBytes(response, this.encoder);
 			if (bytes.byteLength > data.byteLength) {
@@ -533,6 +767,9 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 		const entries = Array.from(this.pending.values());
 		this.pending.clear();
 		for (const pending of entries) {
+			if (pending.executionId) {
+				this.cleanupExecutionState(pending.executionId);
+			}
 			pending.reject(error);
 		}
 	}
@@ -547,6 +784,31 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			this.worker.onerror = null;
 		} catch {
 			// Ignore host Worker implementations with non-writable event hooks.
+		}
+	}
+
+	private allocateExecutionId(): string {
+		return `exec-${this.nextExecutionId++}`;
+	}
+
+	private allocateChildProcessSessionId(): number {
+		return this.nextChildProcessSessionId++;
+	}
+
+	private hasPendingExecutionRequest(
+		requestId: number,
+		executionId: string,
+	): boolean {
+		const pending = this.pending.get(requestId);
+		return pending?.executionId === executionId;
+	}
+
+	private cleanupExecutionState(executionId: string): void {
+		this.signalStates.delete(executionId);
+		for (const [sessionId, session] of this.childProcessSessions) {
+			if (session.executionId === executionId) {
+				this.childProcessSessions.delete(sessionId);
+			}
 		}
 	}
 
@@ -573,13 +835,40 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			}
 		}
 		this.resetSyncBridgeState();
+		this.signalStates.clear();
 		this.rejectAllPending(error);
+	}
+
+	// Fire-and-forget control message (no response expected) — for streaming stdin.
+	private postControl(
+		fields:
+			| { type: "write-stdin"; executionId: string; data: string }
+			| { type: "end-stdin"; executionId: string }
+			| {
+					type: "resize-pty";
+					executionId: string;
+					columns: number;
+					rows: number;
+			  },
+	): void {
+		const id = this.nextId++;
+		try {
+			this.worker.postMessage({
+				controlToken: this.controlToken,
+				id,
+				...fields,
+			} as BrowserWorkerRequestMessage);
+		} catch {
+			// Worker gone / disposed — nothing to do.
+		}
 	}
 
 	private callWorker<T>(
 		type: BrowserWorkerRequestMessage["type"],
 		payload?: unknown,
 		hook?: StdioHook,
+		executionId?: string,
+		onPtyOpen?: (pty: PtyOpenResult) => void,
 	): Promise<T> {
 		if (this.disposed) {
 			return Promise.reject(new Error("Browser runtime has been disposed"));
@@ -600,11 +889,20 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 					} as BrowserWorkerRequestMessage);
 
 		return new Promise<T>((resolve, reject) => {
-			this.pending.set(id, { resolve, reject, hook });
+			this.pending.set(id, {
+				resolve,
+				reject,
+				hook,
+				executionId,
+				onPtyOpen,
+			});
 			try {
 				this.worker.postMessage(message);
 			} catch (error) {
 				this.pending.delete(id);
+				if (executionId) {
+					this.cleanupExecutionState(executionId);
+				}
 				reject(error);
 			}
 		});
@@ -616,14 +914,17 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 	): Promise<RunResult<T>> {
 		await this.ready;
 		const hook = this.defaultOnStdio;
+		const executionId = this.allocateExecutionId();
 		return this.callWorker<RunResult<T>>(
 			"run",
 			{
+				executionId,
 				code,
 				filePath,
 				captureStdio: Boolean(hook),
 			},
 			hook,
+			executionId,
 		);
 	}
 
@@ -631,15 +932,110 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 		validateBrowserExecOptions(options);
 		await this.ready;
 		const hook = options?.onStdio ?? this.defaultOnStdio;
+		const executionId = this.allocateExecutionId();
+		// Hand the execution id to the caller BEFORE awaiting completion so it can drive
+		// streaming stdin (writeStdin/endStdin) while the program runs.
+		options?.onStart?.(executionId);
 		return this.callWorker<ExecResult>(
 			"exec",
 			{
+				executionId,
 				code,
-				options: toBrowserWorkerExecOptions(options),
+				options: toBrowserWorkerExecOptions(options, this.permissions),
 				captureStdio: Boolean(hook),
 			},
 			hook,
+			executionId,
+			options?.stdioPty?.onOpen,
 		);
+	}
+
+	/** Feed stdin to a running `streamingStdin` execution. */
+	writeStdin(executionId: string, data: string): void {
+		if (this.disposed) return;
+		this.postControl({ type: "write-stdin", executionId, data });
+	}
+
+	/** End stdin for a running `streamingStdin` execution (the program sees EOF). */
+	endStdin(executionId: string): void {
+		if (this.disposed) return;
+		this.postControl({ type: "end-stdin", executionId });
+	}
+
+	private async routePty(
+		executionId: string,
+		operation: "pty.read" | "pty.write" | "pty.resize" | "pty.close",
+		args: readonly unknown[],
+	): Promise<SyncBridgeResponse> {
+		await this.ready;
+		if (this.convergedReady === undefined) {
+			throw new Error("PTY operations require a converged wasm sidecar");
+		}
+		await this.convergedReady;
+		if (!this.convergedServicer) {
+			throw new Error("Converged sidecar servicer is unavailable after setup");
+		}
+		return this.convergedServicer.route(
+			executionId,
+			operation,
+			args,
+			async () => {
+				throw new Error(`legacy PTY fallback is not available for ${operation}`);
+			},
+		);
+	}
+
+	async writePty(
+		executionId: string,
+		fd: number,
+		data: string | Uint8Array,
+	): Promise<number> {
+		const response = await this.routePty(executionId, "pty.write", [
+			{ fd, data: toUint8Array(data) },
+		]);
+		if (response.kind !== SYNC_BRIDGE_KIND_JSON) {
+			throw new Error(`Expected JSON response from pty.write, received ${response.kind}`);
+		}
+		return Number((response.value as { written?: unknown }).written ?? 0);
+	}
+
+	async readPty(
+		executionId: string,
+		fd: number,
+		options: { maxBytes?: number; timeoutMs?: number } = {},
+	): Promise<Uint8Array | null> {
+		const response = await this.routePty(executionId, "pty.read", [
+			{
+				fd,
+				maxBytes: options.maxBytes,
+				timeoutMs: options.timeoutMs,
+			},
+		]);
+		if (response.kind !== SYNC_BRIDGE_KIND_JSON) {
+			throw new Error(`Expected JSON response from pty.read, received ${response.kind}`);
+		}
+		const data = (response.value as { data?: unknown }).data;
+		return typeof data === "string" ? base64ToBytes(data) : null;
+	}
+
+	async resizePty(
+		executionId: string,
+		fd: number,
+		size: { columns: number; rows: number },
+	): Promise<void> {
+		await this.routePty(executionId, "pty.resize", [
+			{ fd, cols: size.columns, rows: size.rows },
+		]);
+		this.postControl({
+			type: "resize-pty",
+			executionId,
+			columns: size.columns,
+			rows: size.rows,
+		});
+	}
+
+	async closePty(executionId: string, fd: number): Promise<void> {
+		await this.routePty(executionId, "pty.close", [{ fd }]);
 	}
 
 	async dispatchExtensionRequest(
@@ -663,8 +1059,46 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 		});
 	}
 
+	/**
+	 * Snapshot the converged VM root filesystem (writable changes) so callers can
+	 * persist them to host storage across runtimes. Returns null in legacy mode.
+	 */
+	async snapshotConvergedRootFilesystem(): Promise<ReturnType<
+		ConvergedServicer["snapshotRootFilesystem"]
+	> | null> {
+		if (this.convergedReady === undefined) {
+			return null;
+		}
+		await this.convergedReady;
+		return this.convergedServicer?.snapshotRootFilesystem() ?? null;
+	}
+
 	async terminate(): Promise<void> {
 		this.dispose();
+	}
+
+	signalPendingExecution(signal = 15): boolean {
+		if (this.disposed) {
+			return false;
+		}
+		const pending = Array.from(this.pending.values()).find(
+			(entry) => entry.executionId,
+		);
+		if (!pending?.executionId) {
+			return false;
+		}
+		const id = this.nextId++;
+		const message: BrowserWorkerRequestMessage = {
+			controlToken: this.controlToken,
+			id,
+			type: "signal",
+			payload: {
+				executionId: pending.executionId,
+				signal,
+			},
+		};
+		this.worker.postMessage(message);
+		return true;
 	}
 }
 

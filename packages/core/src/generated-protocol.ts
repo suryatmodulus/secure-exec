@@ -1461,6 +1461,7 @@ export enum GuestFilesystemOperation {
     Utimes = "Utimes",
     Truncate = "Truncate",
     Pread = "Pread",
+    Pwrite = "Pwrite",
 }
 
 export function readGuestFilesystemOperation(bc: bare.ByteCursor): GuestFilesystemOperation {
@@ -1507,6 +1508,8 @@ export function readGuestFilesystemOperation(bc: bare.ByteCursor): GuestFilesyst
             return GuestFilesystemOperation.Truncate
         case 19:
             return GuestFilesystemOperation.Pread
+        case 20:
+            return GuestFilesystemOperation.Pwrite
         default: {
             bc.offset = offset
             throw new bare.BareError(offset, "invalid tag")
@@ -1596,6 +1599,10 @@ export function writeGuestFilesystemOperation(bc: bare.ByteCursor, x: GuestFiles
             bare.writeU8(bc, 19)
             break
         }
+        case GuestFilesystemOperation.Pwrite: {
+            bare.writeU8(bc, 20)
+            break
+        }
     }
 }
 
@@ -1650,6 +1657,26 @@ export function writeGuestFilesystemCallRequest(bc: bare.ByteCursor, x: GuestFil
     write17(bc, x.mtimeMs)
     write17(bc, x.len)
     write17(bc, x.offset)
+}
+
+export type GuestKernelCallRequest = {
+    readonly executionId: string
+    readonly operation: string
+    readonly payload: ArrayBuffer
+}
+
+export function readGuestKernelCallRequest(bc: bare.ByteCursor): GuestKernelCallRequest {
+    return {
+        executionId: bare.readString(bc),
+        operation: bare.readString(bc),
+        payload: bare.readData(bc),
+    }
+}
+
+export function writeGuestKernelCallRequest(bc: bare.ByteCursor, x: GuestKernelCallRequest): void {
+    bare.writeString(bc, x.executionId)
+    bare.writeString(bc, x.operation)
+    bare.writeData(bc, x.payload)
 }
 
 export type SnapshotRootFilesystemRequest = null
@@ -2009,7 +2036,6 @@ export type RequestPayload =
     | { readonly tag: "SnapshotRootFilesystemRequest"; readonly val: SnapshotRootFilesystemRequest }
     | { readonly tag: "ExecuteRequest"; readonly val: ExecuteRequest }
     | { readonly tag: "WriteStdinRequest"; readonly val: WriteStdinRequest }
-    | { readonly tag: "ResizePtyRequest"; readonly val: ResizePtyRequest }
     | { readonly tag: "CloseStdinRequest"; readonly val: CloseStdinRequest }
     | { readonly tag: "KillProcessRequest"; readonly val: KillProcessRequest }
     | { readonly tag: "GetProcessSnapshotRequest"; readonly val: GetProcessSnapshotRequest }
@@ -2022,6 +2048,8 @@ export type RequestPayload =
     | { readonly tag: "PersistenceFlushRequest"; readonly val: PersistenceFlushRequest }
     | { readonly tag: "VmFetchRequest"; readonly val: VmFetchRequest }
     | { readonly tag: "ExtEnvelope"; readonly val: ExtEnvelope }
+    | { readonly tag: "GuestKernelCallRequest"; readonly val: GuestKernelCallRequest }
+    | { readonly tag: "ResizePtyRequest"; readonly val: ResizePtyRequest }
     | { readonly tag: "GetResourceSnapshotRequest"; readonly val: GetResourceSnapshotRequest }
 
 export function readRequestPayload(bc: bare.ByteCursor): RequestPayload {
@@ -2061,32 +2089,34 @@ export function readRequestPayload(bc: bare.ByteCursor): RequestPayload {
         case 15:
             return { tag: "WriteStdinRequest", val: readWriteStdinRequest(bc) }
         case 16:
-            return { tag: "ResizePtyRequest", val: readResizePtyRequest(bc) }
-        case 17:
             return { tag: "CloseStdinRequest", val: readCloseStdinRequest(bc) }
-        case 18:
+        case 17:
             return { tag: "KillProcessRequest", val: readKillProcessRequest(bc) }
-        case 19:
+        case 18:
             return { tag: "GetProcessSnapshotRequest", val: null }
-        case 20:
+        case 19:
             return { tag: "FindListenerRequest", val: readFindListenerRequest(bc) }
-        case 21:
+        case 20:
             return { tag: "FindBoundUdpRequest", val: readFindBoundUdpRequest(bc) }
-        case 22:
+        case 21:
             return { tag: "GetSignalStateRequest", val: readGetSignalStateRequest(bc) }
-        case 23:
+        case 22:
             return { tag: "GetZombieTimerCountRequest", val: null }
-        case 24:
+        case 23:
             return { tag: "HostFilesystemCallRequest", val: readHostFilesystemCallRequest(bc) }
-        case 25:
+        case 24:
             return { tag: "PersistenceLoadRequest", val: readPersistenceLoadRequest(bc) }
-        case 26:
+        case 25:
             return { tag: "PersistenceFlushRequest", val: readPersistenceFlushRequest(bc) }
-        case 27:
+        case 26:
             return { tag: "VmFetchRequest", val: readVmFetchRequest(bc) }
-        case 28:
+        case 27:
             return { tag: "ExtEnvelope", val: readExtEnvelope(bc) }
+        case 28:
+            return { tag: "GuestKernelCallRequest", val: readGuestKernelCallRequest(bc) }
         case 29:
+            return { tag: "ResizePtyRequest", val: readResizePtyRequest(bc) }
+        case 30:
             return { tag: "GetResourceSnapshotRequest", val: null }
         default: {
             bc.offset = offset
@@ -2175,71 +2205,76 @@ export function writeRequestPayload(bc: bare.ByteCursor, x: RequestPayload): voi
             writeWriteStdinRequest(bc, x.val)
             break
         }
-        case "ResizePtyRequest": {
-            bare.writeU8(bc, 16)
-            writeResizePtyRequest(bc, x.val)
-            break
-        }
         case "CloseStdinRequest": {
-            bare.writeU8(bc, 17)
+            bare.writeU8(bc, 16)
             writeCloseStdinRequest(bc, x.val)
             break
         }
         case "KillProcessRequest": {
-            bare.writeU8(bc, 18)
+            bare.writeU8(bc, 17)
             writeKillProcessRequest(bc, x.val)
             break
         }
         case "GetProcessSnapshotRequest": {
-            bare.writeU8(bc, 19)
+            bare.writeU8(bc, 18)
             break
         }
         case "FindListenerRequest": {
-            bare.writeU8(bc, 20)
+            bare.writeU8(bc, 19)
             writeFindListenerRequest(bc, x.val)
             break
         }
         case "FindBoundUdpRequest": {
-            bare.writeU8(bc, 21)
+            bare.writeU8(bc, 20)
             writeFindBoundUdpRequest(bc, x.val)
             break
         }
         case "GetSignalStateRequest": {
-            bare.writeU8(bc, 22)
+            bare.writeU8(bc, 21)
             writeGetSignalStateRequest(bc, x.val)
             break
         }
         case "GetZombieTimerCountRequest": {
-            bare.writeU8(bc, 23)
+            bare.writeU8(bc, 22)
             break
         }
         case "HostFilesystemCallRequest": {
-            bare.writeU8(bc, 24)
+            bare.writeU8(bc, 23)
             writeHostFilesystemCallRequest(bc, x.val)
             break
         }
         case "PersistenceLoadRequest": {
-            bare.writeU8(bc, 25)
+            bare.writeU8(bc, 24)
             writePersistenceLoadRequest(bc, x.val)
             break
         }
         case "PersistenceFlushRequest": {
-            bare.writeU8(bc, 26)
+            bare.writeU8(bc, 25)
             writePersistenceFlushRequest(bc, x.val)
             break
         }
         case "VmFetchRequest": {
-            bare.writeU8(bc, 27)
+            bare.writeU8(bc, 26)
             writeVmFetchRequest(bc, x.val)
             break
         }
         case "ExtEnvelope": {
-            bare.writeU8(bc, 28)
+            bare.writeU8(bc, 27)
             writeExtEnvelope(bc, x.val)
             break
         }
-        case "GetResourceSnapshotRequest": {
+        case "GuestKernelCallRequest": {
+            bare.writeU8(bc, 28)
+            writeGuestKernelCallRequest(bc, x.val)
+            break
+        }
+        case "ResizePtyRequest": {
             bare.writeU8(bc, 29)
+            writeResizePtyRequest(bc, x.val)
+            break
+        }
+        case "GetResourceSnapshotRequest": {
+            bare.writeU8(bc, 30)
             break
         }
     }
@@ -2510,33 +2545,72 @@ export function writeGuestFilesystemStat(bc: bare.ByteCursor, x: GuestFilesystem
     bare.writeU32(bc, x.gid)
 }
 
-function read23(bc: bare.ByteCursor): readonly string[] | null {
-    return bare.readBool(bc) ? read6(bc) : null
+export type GuestDirEntry = {
+    readonly name: string
+    readonly isDirectory: boolean
+    readonly isSymbolicLink: boolean
 }
 
-function write23(bc: bare.ByteCursor, x: readonly string[] | null): void {
-    bare.writeBool(bc, x != null)
-    if (x != null) {
-        write6(bc, x)
+export function readGuestDirEntry(bc: bare.ByteCursor): GuestDirEntry {
+    return {
+        name: bare.readString(bc),
+        isDirectory: bare.readBool(bc),
+        isSymbolicLink: bare.readBool(bc),
     }
 }
 
-function read24(bc: bare.ByteCursor): GuestFilesystemStat | null {
+export function writeGuestDirEntry(bc: bare.ByteCursor, x: GuestDirEntry): void {
+    bare.writeString(bc, x.name)
+    bare.writeBool(bc, x.isDirectory)
+    bare.writeBool(bc, x.isSymbolicLink)
+}
+
+function read23(bc: bare.ByteCursor): readonly GuestDirEntry[] {
+    const len = bare.readUintSafe(bc)
+    if (len === 0) {
+        return []
+    }
+    const result = [readGuestDirEntry(bc)]
+    for (let i = 1; i < len; i++) {
+        result[i] = readGuestDirEntry(bc)
+    }
+    return result
+}
+
+function write23(bc: bare.ByteCursor, x: readonly GuestDirEntry[]): void {
+    bare.writeUintSafe(bc, x.length)
+    for (let i = 0; i < x.length; i++) {
+        writeGuestDirEntry(bc, x[i])
+    }
+}
+
+function read24(bc: bare.ByteCursor): readonly GuestDirEntry[] | null {
+    return bare.readBool(bc) ? read23(bc) : null
+}
+
+function write24(bc: bare.ByteCursor, x: readonly GuestDirEntry[] | null): void {
+    bare.writeBool(bc, x != null)
+    if (x != null) {
+        write23(bc, x)
+    }
+}
+
+function read25(bc: bare.ByteCursor): GuestFilesystemStat | null {
     return bare.readBool(bc) ? readGuestFilesystemStat(bc) : null
 }
 
-function write24(bc: bare.ByteCursor, x: GuestFilesystemStat | null): void {
+function write25(bc: bare.ByteCursor, x: GuestFilesystemStat | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writeGuestFilesystemStat(bc, x)
     }
 }
 
-function read25(bc: bare.ByteCursor): boolean | null {
+function read26(bc: bare.ByteCursor): boolean | null {
     return bare.readBool(bc) ? bare.readBool(bc) : null
 }
 
-function write25(bc: bare.ByteCursor, x: boolean | null): void {
+function write26(bc: bare.ByteCursor, x: boolean | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         bare.writeBool(bc, x)
@@ -2548,7 +2622,7 @@ export type GuestFilesystemResultResponse = {
     readonly path: string
     readonly content: string | null
     readonly encoding: RootFilesystemEntryEncoding | null
-    readonly entries: readonly string[] | null
+    readonly entries: readonly GuestDirEntry[] | null
     readonly stat: GuestFilesystemStat | null
     readonly exists: boolean | null
     readonly target: string | null
@@ -2560,9 +2634,9 @@ export function readGuestFilesystemResultResponse(bc: bare.ByteCursor): GuestFil
         path: bare.readString(bc),
         content: read0(bc),
         encoding: read3(bc),
-        entries: read23(bc),
-        stat: read24(bc),
-        exists: read25(bc),
+        entries: read24(bc),
+        stat: read25(bc),
+        exists: read26(bc),
         target: read0(bc),
     }
 }
@@ -2572,10 +2646,24 @@ export function writeGuestFilesystemResultResponse(bc: bare.ByteCursor, x: Guest
     bare.writeString(bc, x.path)
     write0(bc, x.content)
     write3(bc, x.encoding)
-    write23(bc, x.entries)
-    write24(bc, x.stat)
-    write25(bc, x.exists)
+    write24(bc, x.entries)
+    write25(bc, x.stat)
+    write26(bc, x.exists)
     write0(bc, x.target)
+}
+
+export type GuestKernelResultResponse = {
+    readonly payload: ArrayBuffer
+}
+
+export function readGuestKernelResultResponse(bc: bare.ByteCursor): GuestKernelResultResponse {
+    return {
+        payload: bare.readData(bc),
+    }
+}
+
+export function writeGuestKernelResultResponse(bc: bare.ByteCursor, x: GuestKernelResultResponse): void {
+    bare.writeData(bc, x.payload)
 }
 
 export type RootFilesystemSnapshotResponse = {
@@ -2714,11 +2802,11 @@ export function writeProcessSnapshotStatus(bc: bare.ByteCursor, x: ProcessSnapsh
     }
 }
 
-function read26(bc: bare.ByteCursor): i32 | null {
+function read27(bc: bare.ByteCursor): i32 | null {
     return bare.readBool(bc) ? bare.readI32(bc) : null
 }
 
-function write26(bc: bare.ByteCursor, x: i32 | null): void {
+function write27(bc: bare.ByteCursor, x: i32 | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         bare.writeI32(bc, x)
@@ -2751,7 +2839,7 @@ export function readProcessSnapshotEntry(bc: bare.ByteCursor): ProcessSnapshotEn
         args: read6(bc),
         cwd: bare.readString(bc),
         status: readProcessSnapshotStatus(bc),
-        exitCode: read26(bc),
+        exitCode: read27(bc),
     }
 }
 
@@ -2766,10 +2854,10 @@ export function writeProcessSnapshotEntry(bc: bare.ByteCursor, x: ProcessSnapsho
     write6(bc, x.args)
     bare.writeString(bc, x.cwd)
     writeProcessSnapshotStatus(bc, x.status)
-    write26(bc, x.exitCode)
+    write27(bc, x.exitCode)
 }
 
-function read27(bc: bare.ByteCursor): readonly ProcessSnapshotEntry[] {
+function read28(bc: bare.ByteCursor): readonly ProcessSnapshotEntry[] {
     const len = bare.readUintSafe(bc)
     if (len === 0) {
         return []
@@ -2781,7 +2869,7 @@ function read27(bc: bare.ByteCursor): readonly ProcessSnapshotEntry[] {
     return result
 }
 
-function write27(bc: bare.ByteCursor, x: readonly ProcessSnapshotEntry[]): void {
+function write28(bc: bare.ByteCursor, x: readonly ProcessSnapshotEntry[]): void {
     bare.writeUintSafe(bc, x.length)
     for (let i = 0; i < x.length; i++) {
         writeProcessSnapshotEntry(bc, x[i])
@@ -2794,12 +2882,12 @@ export type ProcessSnapshotResponse = {
 
 export function readProcessSnapshotResponse(bc: bare.ByteCursor): ProcessSnapshotResponse {
     return {
-        processes: read27(bc),
+        processes: read28(bc),
     }
 }
 
 export function writeProcessSnapshotResponse(bc: bare.ByteCursor, x: ProcessSnapshotResponse): void {
-    write27(bc, x.processes)
+    write28(bc, x.processes)
 }
 
 export type QueueSnapshotEntry = {
@@ -2831,7 +2919,7 @@ export function writeQueueSnapshotEntry(bc: bare.ByteCursor, x: QueueSnapshotEnt
     bare.writeU64(bc, x.fillPercent)
 }
 
-function read28(bc: bare.ByteCursor): readonly QueueSnapshotEntry[] {
+function read29(bc: bare.ByteCursor): readonly QueueSnapshotEntry[] {
     const len = bare.readUintSafe(bc)
     if (len === 0) {
         return []
@@ -2843,7 +2931,7 @@ function read28(bc: bare.ByteCursor): readonly QueueSnapshotEntry[] {
     return result
 }
 
-function write28(bc: bare.ByteCursor, x: readonly QueueSnapshotEntry[]): void {
+function write29(bc: bare.ByteCursor, x: readonly QueueSnapshotEntry[]): void {
     bare.writeUintSafe(bc, x.length)
     for (let i = 0; i < x.length; i++) {
         writeQueueSnapshotEntry(bc, x[i])
@@ -2884,7 +2972,7 @@ export function readResourceSnapshotResponse(bc: bare.ByteCursor): ResourceSnaps
         socketConnections: bare.readU64(bc),
         socketBufferedBytes: bare.readU64(bc),
         socketDatagramQueueLen: bare.readU64(bc),
-        queueSnapshots: read28(bc),
+        queueSnapshots: read29(bc),
     }
 }
 
@@ -2903,7 +2991,7 @@ export function writeResourceSnapshotResponse(bc: bare.ByteCursor, x: ResourceSn
     bare.writeU64(bc, x.socketConnections)
     bare.writeU64(bc, x.socketBufferedBytes)
     bare.writeU64(bc, x.socketDatagramQueueLen)
-    write28(bc, x.queueSnapshots)
+    write29(bc, x.queueSnapshots)
 }
 
 export type SocketStateEntry = {
@@ -2929,11 +3017,11 @@ export function writeSocketStateEntry(bc: bare.ByteCursor, x: SocketStateEntry):
     write0(bc, x.path)
 }
 
-function read29(bc: bare.ByteCursor): SocketStateEntry | null {
+function read30(bc: bare.ByteCursor): SocketStateEntry | null {
     return bare.readBool(bc) ? readSocketStateEntry(bc) : null
 }
 
-function write29(bc: bare.ByteCursor, x: SocketStateEntry | null): void {
+function write30(bc: bare.ByteCursor, x: SocketStateEntry | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writeSocketStateEntry(bc, x)
@@ -2946,12 +3034,12 @@ export type ListenerSnapshotResponse = {
 
 export function readListenerSnapshotResponse(bc: bare.ByteCursor): ListenerSnapshotResponse {
     return {
-        listener: read29(bc),
+        listener: read30(bc),
     }
 }
 
 export function writeListenerSnapshotResponse(bc: bare.ByteCursor, x: ListenerSnapshotResponse): void {
-    write29(bc, x.listener)
+    write30(bc, x.listener)
 }
 
 export type BoundUdpSnapshotResponse = {
@@ -2960,12 +3048,12 @@ export type BoundUdpSnapshotResponse = {
 
 export function readBoundUdpSnapshotResponse(bc: bare.ByteCursor): BoundUdpSnapshotResponse {
     return {
-        socket: read29(bc),
+        socket: read30(bc),
     }
 }
 
 export function writeBoundUdpSnapshotResponse(bc: bare.ByteCursor, x: BoundUdpSnapshotResponse): void {
-    write29(bc, x.socket)
+    write30(bc, x.socket)
 }
 
 export enum SignalDispositionAction {
@@ -3028,7 +3116,7 @@ export function writeSignalHandlerRegistration(bc: bare.ByteCursor, x: SignalHan
     bare.writeU32(bc, x.flags)
 }
 
-function read30(bc: bare.ByteCursor): ReadonlyMap<u32, SignalHandlerRegistration> {
+function read31(bc: bare.ByteCursor): ReadonlyMap<u32, SignalHandlerRegistration> {
     const len = bare.readUintSafe(bc)
     const result = new Map<u32, SignalHandlerRegistration>()
     for (let i = 0; i < len; i++) {
@@ -3043,7 +3131,7 @@ function read30(bc: bare.ByteCursor): ReadonlyMap<u32, SignalHandlerRegistration
     return result
 }
 
-function write30(bc: bare.ByteCursor, x: ReadonlyMap<u32, SignalHandlerRegistration>): void {
+function write31(bc: bare.ByteCursor, x: ReadonlyMap<u32, SignalHandlerRegistration>): void {
     bare.writeUintSafe(bc, x.size)
     for (const kv of x) {
         bare.writeU32(bc, kv[0])
@@ -3059,13 +3147,13 @@ export type SignalStateResponse = {
 export function readSignalStateResponse(bc: bare.ByteCursor): SignalStateResponse {
     return {
         processId: bare.readString(bc),
-        handlers: read30(bc),
+        handlers: read31(bc),
     }
 }
 
 export function writeSignalStateResponse(bc: bare.ByteCursor, x: SignalStateResponse): void {
     bare.writeString(bc, x.processId)
-    write30(bc, x.handlers)
+    write31(bc, x.handlers)
 }
 
 export type ZombieTimerCountResponse = {
@@ -3204,7 +3292,6 @@ export type ResponsePayload =
     | { readonly tag: "RootFilesystemSnapshotResponse"; readonly val: RootFilesystemSnapshotResponse }
     | { readonly tag: "ProcessStartedResponse"; readonly val: ProcessStartedResponse }
     | { readonly tag: "StdinWrittenResponse"; readonly val: StdinWrittenResponse }
-    | { readonly tag: "PtyResizedResponse"; readonly val: PtyResizedResponse }
     | { readonly tag: "StdinClosedResponse"; readonly val: StdinClosedResponse }
     | { readonly tag: "ProcessKilledResponse"; readonly val: ProcessKilledResponse }
     | { readonly tag: "ProcessSnapshotResponse"; readonly val: ProcessSnapshotResponse }
@@ -3219,6 +3306,8 @@ export type ResponsePayload =
     | { readonly tag: "RejectedResponse"; readonly val: RejectedResponse }
     | { readonly tag: "VmFetchResponse"; readonly val: VmFetchResponse }
     | { readonly tag: "ExtEnvelope"; readonly val: ExtEnvelope }
+    | { readonly tag: "GuestKernelResultResponse"; readonly val: GuestKernelResultResponse }
+    | { readonly tag: "PtyResizedResponse"; readonly val: PtyResizedResponse }
     | { readonly tag: "ResourceSnapshotResponse"; readonly val: ResourceSnapshotResponse }
 
 export function readResponsePayload(bc: bare.ByteCursor): ResponsePayload {
@@ -3258,36 +3347,38 @@ export function readResponsePayload(bc: bare.ByteCursor): ResponsePayload {
         case 15:
             return { tag: "StdinWrittenResponse", val: readStdinWrittenResponse(bc) }
         case 16:
-            return { tag: "PtyResizedResponse", val: readPtyResizedResponse(bc) }
-        case 17:
             return { tag: "StdinClosedResponse", val: readStdinClosedResponse(bc) }
-        case 18:
+        case 17:
             return { tag: "ProcessKilledResponse", val: readProcessKilledResponse(bc) }
-        case 19:
+        case 18:
             return { tag: "ProcessSnapshotResponse", val: readProcessSnapshotResponse(bc) }
-        case 20:
+        case 19:
             return { tag: "ListenerSnapshotResponse", val: readListenerSnapshotResponse(bc) }
-        case 21:
+        case 20:
             return { tag: "BoundUdpSnapshotResponse", val: readBoundUdpSnapshotResponse(bc) }
-        case 22:
+        case 21:
             return { tag: "SignalStateResponse", val: readSignalStateResponse(bc) }
-        case 23:
+        case 22:
             return { tag: "ZombieTimerCountResponse", val: readZombieTimerCountResponse(bc) }
-        case 24:
+        case 23:
             return { tag: "FilesystemResultResponse", val: readFilesystemResultResponse(bc) }
-        case 25:
+        case 24:
             return { tag: "PermissionDecisionResponse", val: readPermissionDecisionResponse(bc) }
-        case 26:
+        case 25:
             return { tag: "PersistenceStateResponse", val: readPersistenceStateResponse(bc) }
-        case 27:
+        case 26:
             return { tag: "PersistenceFlushedResponse", val: readPersistenceFlushedResponse(bc) }
-        case 28:
+        case 27:
             return { tag: "RejectedResponse", val: readRejectedResponse(bc) }
-        case 29:
+        case 28:
             return { tag: "VmFetchResponse", val: readVmFetchResponse(bc) }
-        case 30:
+        case 29:
             return { tag: "ExtEnvelope", val: readExtEnvelope(bc) }
+        case 30:
+            return { tag: "GuestKernelResultResponse", val: readGuestKernelResultResponse(bc) }
         case 31:
+            return { tag: "PtyResizedResponse", val: readPtyResizedResponse(bc) }
+        case 32:
             return { tag: "ResourceSnapshotResponse", val: readResourceSnapshotResponse(bc) }
         default: {
             bc.offset = offset
@@ -3378,83 +3469,88 @@ export function writeResponsePayload(bc: bare.ByteCursor, x: ResponsePayload): v
             writeStdinWrittenResponse(bc, x.val)
             break
         }
-        case "PtyResizedResponse": {
-            bare.writeU8(bc, 16)
-            writePtyResizedResponse(bc, x.val)
-            break
-        }
         case "StdinClosedResponse": {
-            bare.writeU8(bc, 17)
+            bare.writeU8(bc, 16)
             writeStdinClosedResponse(bc, x.val)
             break
         }
         case "ProcessKilledResponse": {
-            bare.writeU8(bc, 18)
+            bare.writeU8(bc, 17)
             writeProcessKilledResponse(bc, x.val)
             break
         }
         case "ProcessSnapshotResponse": {
-            bare.writeU8(bc, 19)
+            bare.writeU8(bc, 18)
             writeProcessSnapshotResponse(bc, x.val)
             break
         }
         case "ListenerSnapshotResponse": {
-            bare.writeU8(bc, 20)
+            bare.writeU8(bc, 19)
             writeListenerSnapshotResponse(bc, x.val)
             break
         }
         case "BoundUdpSnapshotResponse": {
-            bare.writeU8(bc, 21)
+            bare.writeU8(bc, 20)
             writeBoundUdpSnapshotResponse(bc, x.val)
             break
         }
         case "SignalStateResponse": {
-            bare.writeU8(bc, 22)
+            bare.writeU8(bc, 21)
             writeSignalStateResponse(bc, x.val)
             break
         }
         case "ZombieTimerCountResponse": {
-            bare.writeU8(bc, 23)
+            bare.writeU8(bc, 22)
             writeZombieTimerCountResponse(bc, x.val)
             break
         }
         case "FilesystemResultResponse": {
-            bare.writeU8(bc, 24)
+            bare.writeU8(bc, 23)
             writeFilesystemResultResponse(bc, x.val)
             break
         }
         case "PermissionDecisionResponse": {
-            bare.writeU8(bc, 25)
+            bare.writeU8(bc, 24)
             writePermissionDecisionResponse(bc, x.val)
             break
         }
         case "PersistenceStateResponse": {
-            bare.writeU8(bc, 26)
+            bare.writeU8(bc, 25)
             writePersistenceStateResponse(bc, x.val)
             break
         }
         case "PersistenceFlushedResponse": {
-            bare.writeU8(bc, 27)
+            bare.writeU8(bc, 26)
             writePersistenceFlushedResponse(bc, x.val)
             break
         }
         case "RejectedResponse": {
-            bare.writeU8(bc, 28)
+            bare.writeU8(bc, 27)
             writeRejectedResponse(bc, x.val)
             break
         }
         case "VmFetchResponse": {
-            bare.writeU8(bc, 29)
+            bare.writeU8(bc, 28)
             writeVmFetchResponse(bc, x.val)
             break
         }
         case "ExtEnvelope": {
-            bare.writeU8(bc, 30)
+            bare.writeU8(bc, 29)
             writeExtEnvelope(bc, x.val)
             break
         }
-        case "ResourceSnapshotResponse": {
+        case "GuestKernelResultResponse": {
+            bare.writeU8(bc, 30)
+            writeGuestKernelResultResponse(bc, x.val)
+            break
+        }
+        case "PtyResizedResponse": {
             bare.writeU8(bc, 31)
+            writePtyResizedResponse(bc, x.val)
+            break
+        }
+        case "ResourceSnapshotResponse": {
+            bare.writeU8(bc, 32)
             writeResourceSnapshotResponse(bc, x.val)
             break
         }
@@ -3828,11 +3924,11 @@ export function writeSidecarRequestFrame(bc: bare.ByteCursor, x: SidecarRequestF
     writeSidecarRequestPayload(bc, x.payload)
 }
 
-function read31(bc: bare.ByteCursor): JsonUtf8 | null {
+function read32(bc: bare.ByteCursor): JsonUtf8 | null {
     return bare.readBool(bc) ? readJsonUtf8(bc) : null
 }
 
-function write31(bc: bare.ByteCursor, x: JsonUtf8 | null): void {
+function write32(bc: bare.ByteCursor, x: JsonUtf8 | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writeJsonUtf8(bc, x)
@@ -3848,14 +3944,14 @@ export type HostCallbackResultResponse = {
 export function readHostCallbackResultResponse(bc: bare.ByteCursor): HostCallbackResultResponse {
     return {
         invocationId: bare.readString(bc),
-        result: read31(bc),
+        result: read32(bc),
         error: read0(bc),
     }
 }
 
 export function writeHostCallbackResultResponse(bc: bare.ByteCursor, x: HostCallbackResultResponse): void {
     bare.writeString(bc, x.invocationId)
-    write31(bc, x.result)
+    write32(bc, x.result)
     write0(bc, x.error)
 }
 
@@ -3868,14 +3964,14 @@ export type JsBridgeResultResponse = {
 export function readJsBridgeResultResponse(bc: bare.ByteCursor): JsBridgeResultResponse {
     return {
         callId: bare.readString(bc),
-        result: read31(bc),
+        result: read32(bc),
         error: read0(bc),
     }
 }
 
 export function writeJsBridgeResultResponse(bc: bare.ByteCursor, x: JsBridgeResultResponse): void {
     bare.writeString(bc, x.callId)
-    write31(bc, x.result)
+    write32(bc, x.result)
     write0(bc, x.error)
 }
 

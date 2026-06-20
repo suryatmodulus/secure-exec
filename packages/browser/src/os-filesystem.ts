@@ -429,14 +429,24 @@ export class InMemoryFileSystem implements VirtualFileSystem {
 			throw new Error(`ELOOP: too many levels of symbolic links, '${path}'`);
 		}
 		const normalized = normalizePath(path);
-		const entry = this.entries.get(normalized);
-		if (!entry) return normalized;
-		if (entry.type === "symlink") {
-			const target = entry.target.startsWith("/")
-				? entry.target
-				: `${dirname(normalized)}/${entry.target}`;
-			return this.resolvePath(target, depth + 1);
+		if (normalized === "/") {
+			return "/";
 		}
+
+		const parts = normalized.split("/").filter(Boolean);
+		let current = "";
+		for (let index = 0; index < parts.length; index++) {
+			current = normalizePath(`${current}/${parts[index]}`);
+			const entry = this.entries.get(current);
+			if (entry?.type === "symlink") {
+				const target = entry.target.startsWith("/")
+					? entry.target
+					: `${dirname(current)}/${entry.target}`;
+				const rest = parts.slice(index + 1).join("/");
+				return this.resolvePath(rest ? `${target}/${rest}` : target, depth + 1);
+			}
+		}
+
 		return normalized;
 	}
 

@@ -1,29 +1,36 @@
 use crate::protocol::{
-    HostCallbackRequest, HostCallbacksRegisteredResponse, PermissionMode, PermissionsPolicy,
-    RegisterHostCallbacksRequest, RequestFrame, ResponsePayload,
+    HostCallbackRequest, HostCallbacksRegisteredResponse, RegisterHostCallbacksRequest,
+    RequestFrame, ResponsePayload,
 };
-use crate::service::{evaluate_permissions_policy, kernel_error, normalize_path, DispatchResult};
+use crate::service::{kernel_error, normalize_path, DispatchResult};
 use crate::state::{BridgeError, VmState, TOOL_DRIVER_NAME};
 use crate::{NativeSidecar, NativeSidecarBridge, SidecarError};
 use secure_exec_kernel::command_registry::CommandDriver;
+use secure_exec_sidecar_core::permissions::{
+    allow_all_policy, deny_all_policy, evaluate_permissions_policy,
+};
+use secure_exec_sidecar_core::tools::{
+    ensure_command_aliases_available as core_ensure_command_aliases_available,
+    ensure_toolkit_name_available as core_ensure_toolkit_name_available,
+    ensure_toolkit_registry_capacity as core_ensure_toolkit_registry_capacity,
+    registered_tool_command_names,
+    validate_toolkit_registration as core_validate_toolkit_registration, ToolRegistrationError,
+    DEFAULT_TOOL_TIMEOUT_MS,
+};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use secure_exec_sidecar_core::tools::{
+    MAX_REGISTERED_TOOLKITS, MAX_REGISTERED_TOOLS_PER_VM, MAX_TOOLS_PER_TOOLKIT,
+    MAX_TOOL_DESCRIPTION_LENGTH, MAX_TOOL_EXAMPLES_PER_TOOL, MAX_TOOL_EXAMPLE_INPUT_BYTES,
+    MAX_TOOL_SCHEMA_BYTES, MAX_TOOL_SCHEMA_DEPTH, MAX_TOOL_TIMEOUT_MS,
+};
+use secure_exec_vm_config::PermissionMode;
 use serde_json::{json, Map, Number, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
-pub(crate) const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
-pub(crate) const MAX_REGISTERED_TOOLKITS: usize = 64;
-pub(crate) const MAX_REGISTERED_TOOLS_PER_VM: usize = 256;
-pub(crate) const MAX_TOOLS_PER_TOOLKIT: usize = 64;
-pub(crate) const MAX_TOOLKIT_NAME_LENGTH: usize = 64;
-pub(crate) const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub(crate) const MAX_TOOL_DESCRIPTION_LENGTH: usize = 200;
-pub(crate) const MAX_TOOL_SCHEMA_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_TOOL_SCHEMA_DEPTH: usize = 32;
-pub(crate) const MAX_TOOL_EXAMPLES_PER_TOOL: usize = 16;
-pub(crate) const MAX_TOOL_EXAMPLE_INPUT_BYTES: usize = 4 * 1024;
 #[derive(Debug)]
 pub(crate) enum ToolCommandResolution {
     Invoke {
@@ -66,7 +73,7 @@ where
     };
     sidecar
         .bridge
-        .set_vm_permissions(&vm_id, &PermissionsPolicy::allow_all())?;
+        .set_vm_permissions(&vm_id, &allow_all_policy())?;
     let registration_result = (|| -> Result<_, SidecarError> {
         let vm = sidecar.vms.get_mut(&vm_id).expect("owned VM should exist");
         ensure_toolkit_name_available(&vm.toolkits, &registered_name)?;
@@ -95,7 +102,7 @@ where
             ) {
                 Ok(()) => return Err(error),
                 Err(rollback_error) => {
-                    vm.configuration.permissions = PermissionsPolicy::deny_all();
+                    vm.configuration.permissions = deny_all_policy();
                     return Err(rollback_error);
                 }
             }
@@ -574,300 +581,37 @@ fn ensure_toolkit_name_available(
     toolkits: &BTreeMap<String, RegisterHostCallbacksRequest>,
     toolkit_name: &str,
 ) -> Result<(), SidecarError> {
-    if toolkits.contains_key(toolkit_name) {
-        return Err(SidecarError::Conflict(format!(
-            "toolkit already registered: {toolkit_name}"
-        )));
-    }
-    Ok(())
+    core_ensure_toolkit_name_available(toolkits, toolkit_name).map_err(tool_registration_error)
 }
 
 fn ensure_command_aliases_available(
     toolkits: &BTreeMap<String, RegisterHostCallbacksRequest>,
     payload: &RegisterHostCallbacksRequest,
 ) -> Result<(), SidecarError> {
-    let requested_command_aliases = payload.command_aliases.iter().collect::<BTreeSet<_>>();
-    let requested_registry_aliases = payload
-        .registry_command_aliases
-        .iter()
-        .collect::<BTreeSet<_>>();
-    for toolkit in toolkits.values() {
-        for alias in &toolkit.command_aliases {
-            if requested_command_aliases.contains(alias)
-                || requested_registry_aliases.contains(alias)
-            {
-                return Err(SidecarError::Conflict(format!(
-                    "host callback command alias already registered: {alias}"
-                )));
-            }
-        }
-        for alias in &toolkit.registry_command_aliases {
-            if requested_command_aliases.contains(alias) {
-                return Err(SidecarError::Conflict(format!(
-                    "host callback command alias already registered: {alias}"
-                )));
-            }
-        }
-    }
-    Ok(())
+    core_ensure_command_aliases_available(toolkits, payload).map_err(tool_registration_error)
 }
 
 fn ensure_toolkit_registry_capacity(
     toolkits: &BTreeMap<String, RegisterHostCallbacksRequest>,
     payload: &RegisterHostCallbacksRequest,
 ) -> Result<(), SidecarError> {
-    if toolkits.len() >= MAX_REGISTERED_TOOLKITS {
-        return Err(SidecarError::InvalidState(format!(
-            "VM already has {} registered toolkits, max is {MAX_REGISTERED_TOOLKITS}",
-            toolkits.len()
-        )));
-    }
-
-    let registered_tools = toolkits
-        .values()
-        .map(|toolkit| toolkit.callbacks.len())
-        .sum::<usize>();
-    let total_tools = registered_tools
-        .checked_add(payload.callbacks.len())
-        .ok_or_else(|| {
-            SidecarError::InvalidState(String::from("registered host callback count overflow"))
-        })?;
-    if total_tools > MAX_REGISTERED_TOOLS_PER_VM {
-        return Err(SidecarError::InvalidState(format!(
-            "VM would have {total_tools} registered host callbacks, max is {MAX_REGISTERED_TOOLS_PER_VM}"
-        )));
-    }
-
-    Ok(())
+    core_ensure_toolkit_registry_capacity(toolkits, payload).map_err(tool_registration_error)
 }
 
 fn tool_command_names(vm: &VmState) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut commands = Vec::new();
-    for toolkit in vm.toolkits.values() {
-        for alias in toolkit
-            .registry_command_aliases
-            .iter()
-            .chain(toolkit.command_aliases.iter())
-        {
-            if seen.insert(alias.clone()) {
-                commands.push(alias.clone());
-            }
-        }
-    }
-    commands
-}
-
-fn validate_toolkit_name(name: &str) -> Result<(), SidecarError> {
-    if name.len() > MAX_TOOLKIT_NAME_LENGTH {
-        return Err(SidecarError::InvalidState(format!(
-            "invalid toolkit name {name}; max length is {MAX_TOOLKIT_NAME_LENGTH}"
-        )));
-    }
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-    {
-        return Err(SidecarError::InvalidState(format!(
-            "invalid toolkit name {name}; expected lowercase alphanumeric characters plus hyphens"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_tool_name(name: &str) -> Result<(), SidecarError> {
-    if name.len() > MAX_TOOL_NAME_LENGTH {
-        return Err(SidecarError::InvalidState(format!(
-            "invalid tool name {name}; max length is {MAX_TOOL_NAME_LENGTH}"
-        )));
-    }
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-    {
-        return Err(SidecarError::InvalidState(format!(
-            "invalid tool name {name}; expected lowercase alphanumeric characters plus hyphens"
-        )));
-    }
-    Ok(())
+    registered_tool_command_names(&vm.toolkits)
 }
 
 fn validate_toolkit_registration(
     payload: &RegisterHostCallbacksRequest,
 ) -> Result<(), SidecarError> {
-    validate_toolkit_name(&payload.name)?;
-    if payload.description.is_empty() {
-        return Err(SidecarError::InvalidState(format!(
-            "toolkit {} is missing a description",
-            payload.name
-        )));
-    }
-    validate_description_length(
-        &format!("Toolkit \"{}\"", payload.name),
-        &payload.description,
-    )?;
-    validate_command_aliases("command alias", &payload.command_aliases)?;
-    validate_command_aliases("registry command alias", &payload.registry_command_aliases)?;
-    for alias in &payload.command_aliases {
-        if payload.registry_command_aliases.contains(alias) {
-            return Err(SidecarError::InvalidState(format!(
-                "host callback command alias must not also be a registry command alias: {alias}"
-            )));
-        }
-    }
-    if payload.callbacks.is_empty() {
-        return Err(SidecarError::InvalidState(format!(
-            "toolkit {} must define at least one tool",
-            payload.name
-        )));
-    }
-    if payload.callbacks.len() > MAX_TOOLS_PER_TOOLKIT {
-        return Err(SidecarError::InvalidState(format!(
-            "toolkit {} defines {} tools, max is {MAX_TOOLS_PER_TOOLKIT}",
-            payload.name,
-            payload.callbacks.len()
-        )));
-    }
-    for (tool_name, tool) in &payload.callbacks {
-        validate_tool_name(tool_name)?;
-        if tool.description.is_empty() {
-            return Err(SidecarError::InvalidState(format!(
-                "tool {} in toolkit {} is missing a description",
-                tool_name, payload.name
-            )));
-        }
-        validate_description_length(
-            &format!("Tool \"{}/{}\"", payload.name, tool_name),
-            &tool.description,
-        )?;
-        let tool_input_schema: Value =
-            serde_json::from_str(&tool.input_schema).map_err(|error| {
-                SidecarError::InvalidState(format!(
-                    "Tool \"{}/{}\" input schema is invalid JSON: {error}",
-                    payload.name, tool_name
-                ))
-            })?;
-        validate_tool_schema_shape(
-            &format!("Tool \"{}/{}\" input schema", payload.name, tool_name),
-            &tool_input_schema,
-        )?;
-        if let Some(timeout_ms) = tool.timeout_ms {
-            if timeout_ms > MAX_TOOL_TIMEOUT_MS {
-                return Err(SidecarError::InvalidState(format!(
-                    "Tool \"{}/{}\" timeout is {timeout_ms}ms, max is {MAX_TOOL_TIMEOUT_MS}ms",
-                    payload.name, tool_name
-                )));
-            }
-        }
-        if tool.examples.len() > MAX_TOOL_EXAMPLES_PER_TOOL {
-            return Err(SidecarError::InvalidState(format!(
-                "Tool \"{}/{}\" defines {} examples, max is {MAX_TOOL_EXAMPLES_PER_TOOL}",
-                payload.name,
-                tool_name,
-                tool.examples.len()
-            )));
-        }
-        for (index, example) in tool.examples.iter().enumerate() {
-            validate_description_length(
-                &format!("Tool \"{}/{}\" example {index}", payload.name, tool_name),
-                &example.description,
-            )?;
-            let example_input: Value = serde_json::from_str(&example.input).map_err(|error| {
-                SidecarError::InvalidState(format!(
-                    "Tool \"{}/{}\" example {index} input is invalid JSON: {error}",
-                    payload.name, tool_name
-                ))
-            })?;
-            validate_json_byte_length(
-                &format!(
-                    "Tool \"{}/{}\" example {index} input",
-                    payload.name, tool_name
-                ),
-                &example_input,
-                MAX_TOOL_EXAMPLE_INPUT_BYTES,
-            )?;
-        }
-    }
-    Ok(())
+    core_validate_toolkit_registration(payload).map_err(tool_registration_error)
 }
 
-fn validate_command_aliases(label: &str, aliases: &[String]) -> Result<(), SidecarError> {
-    let mut seen = BTreeSet::new();
-    for alias in aliases {
-        validate_command_alias(label, alias)?;
-        if !seen.insert(alias) {
-            return Err(SidecarError::InvalidState(format!(
-                "duplicate host callback {label}: {alias}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_command_alias(label: &str, alias: &str) -> Result<(), SidecarError> {
-    if alias.is_empty()
-        || alias == "."
-        || alias == ".."
-        || alias.contains('/')
-        || alias.contains('\0')
-    {
-        return Err(SidecarError::InvalidState(format!(
-            "invalid host callback {label}: {alias:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_description_length(label: &str, description: &str) -> Result<(), SidecarError> {
-    if description.len() > MAX_TOOL_DESCRIPTION_LENGTH {
-        return Err(SidecarError::InvalidState(format!(
-            "{label} description is {} characters, max is {MAX_TOOL_DESCRIPTION_LENGTH}",
-            description.len()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_tool_schema_shape(label: &str, schema: &Value) -> Result<(), SidecarError> {
-    validate_json_byte_length(label, schema, MAX_TOOL_SCHEMA_BYTES)?;
-    validate_json_depth(label, schema, 0)
-}
-
-fn validate_json_byte_length(label: &str, value: &Value, limit: usize) -> Result<(), SidecarError> {
-    let length = serde_json::to_vec(value)
-        .map_err(|error| SidecarError::InvalidState(format!("{label} is invalid JSON: {error}")))?
-        .len();
-    if length > limit {
-        return Err(SidecarError::InvalidState(format!(
-            "{label} is {length} bytes, max is {limit}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_json_depth(label: &str, value: &Value, depth: usize) -> Result<(), SidecarError> {
-    if depth > MAX_TOOL_SCHEMA_DEPTH {
-        return Err(SidecarError::InvalidState(format!(
-            "{label} exceeds max JSON depth {MAX_TOOL_SCHEMA_DEPTH}"
-        )));
-    }
-
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
-        Value::Array(values) => {
-            for value in values {
-                validate_json_depth(label, value, depth + 1)?;
-            }
-            Ok(())
-        }
-        Value::Object(object) => {
-            for value in object.values() {
-                validate_json_depth(label, value, depth + 1)?;
-            }
-            Ok(())
-        }
+fn tool_registration_error(error: ToolRegistrationError) -> SidecarError {
+    match error {
+        ToolRegistrationError::InvalidState(message) => SidecarError::InvalidState(message),
+        ToolRegistrationError::Conflict(message) => SidecarError::Conflict(message),
     }
 }
 

@@ -2,9 +2,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[path = "build_support.rs"]
-mod v8_bridge_build;
-
 /// Large Pyodide runtime assets are excluded from the published crate (see the
 /// `exclude` list in Cargo.toml) to keep it under the registry size limit.
 /// During in-tree (workspace) builds they are copied from `assets/pyodide/`.
@@ -34,7 +31,7 @@ fn main() {
     // Declare the cfg used to gate Python availability so `cargo` does not warn
     // about an unexpected cfg name.
     println!("cargo:rustc-check-cfg=cfg(secure_exec_pyodide_unavailable)");
-    v8_bridge_build::build_v8_bridge(&manifest_dir, &out_dir);
+    secure_exec_build_support::build_v8_bridge(&manifest_dir, &out_dir);
     stage_pyodide_assets(&manifest_dir, &out_dir);
 }
 

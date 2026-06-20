@@ -1,6 +1,9 @@
 import type { Readable, Writable } from "node:stream";
 import { PendingResponseRegistry } from "./correlation.js";
-import { StdioFrameTransport } from "./frame-stream.js";
+import {
+	type FrameTransport,
+	StdioFrameTransport,
+} from "./frame-stream.js";
 
 export type ClassifiedFrame<TResponseFrame, TEventFrame, TSidecarRequestFrame> =
 	| {
@@ -24,8 +27,9 @@ export interface FrameRpcTransportOptions<
 	TEventFrame,
 	TSidecarRequestFrame,
 > {
-	stdin: Writable;
-	stdout: Readable;
+	frameTransport?: FrameTransport<TReadFrame, TWriteFrame>;
+	stdin?: Writable;
+	stdout?: Readable;
 	encodeFrame: (frame: TWriteFrame) => Uint8Array;
 	decodeFrame: (payload: Uint8Array) => TReadFrame;
 	classifyFrame: (
@@ -40,7 +44,7 @@ export class FrameRpcTransport<
 	TEventFrame,
 	TSidecarRequestFrame,
 > {
-	private readonly frameTransport: StdioFrameTransport<TReadFrame, TWriteFrame>;
+	private readonly frameTransport: FrameTransport<TReadFrame, TWriteFrame>;
 	private readonly pendingResponses =
 		new PendingResponseRegistry<TResponseFrame>();
 	private readonly eventListeners = new Set<(event: TEventFrame) => void>();
@@ -57,12 +61,21 @@ export class FrameRpcTransport<
 			TSidecarRequestFrame
 		>,
 	) {
-		this.frameTransport = new StdioFrameTransport<TReadFrame, TWriteFrame>({
-			stdin: options.stdin,
-			stdout: options.stdout,
-			encodeFrame: options.encodeFrame,
-			decodeFrame: options.decodeFrame,
-		});
+		if (options.frameTransport) {
+			this.frameTransport = options.frameTransport;
+		} else {
+			if (!options.stdin || !options.stdout) {
+				throw new Error(
+					"FrameRpcTransport requires either frameTransport or stdin/stdout streams",
+				);
+			}
+			this.frameTransport = new StdioFrameTransport<TReadFrame, TWriteFrame>({
+				stdin: options.stdin,
+				stdout: options.stdout,
+				encodeFrame: options.encodeFrame,
+				decodeFrame: options.decodeFrame,
+			});
+		}
 		this.frameTransport.onFrame((frame) => {
 			this.dispatchFrame(options.classifyFrame(frame));
 		});

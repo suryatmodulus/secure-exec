@@ -8,6 +8,7 @@ pub mod device_layer;
 pub mod dns;
 pub mod fd_table;
 pub mod kernel;
+pub mod network_policy;
 pub mod permissions;
 pub mod pipe_manager;
 pub mod poll;

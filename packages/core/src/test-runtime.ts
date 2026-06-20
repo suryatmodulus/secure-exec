@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as posixPath from "node:path/posix";
 import { fileURLToPath } from "node:url";
+import "./native-client.js";
 import {
 	type AuthenticatedSession,
 	type CreatedVm,

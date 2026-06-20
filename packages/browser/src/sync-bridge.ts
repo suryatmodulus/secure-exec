@@ -21,28 +21,72 @@ export const SYNC_BRIDGE_MIN_DATA_BYTES = 64 * 1024;
 export const SYNC_BRIDGE_PAYLOAD_LIMIT_ERROR_CODE =
 	"ERR_SANDBOX_PAYLOAD_TOO_LARGE";
 
+export const BROWSER_SYNC_BRIDGE_OPERATIONS = [
+	"fs.readFile",
+	"fs.writeFile",
+	"fs.readFileBinary",
+	"fs.writeFileBinary",
+	"fs.pread",
+	"fs.pwrite",
+	"fs.readDir",
+	"fs.createDir",
+	"fs.mkdir",
+	"fs.rmdir",
+	"fs.exists",
+	"fs.stat",
+	"fs.lstat",
+	"fs.unlink",
+	"fs.rename",
+	"fs.realpath",
+	"fs.readlink",
+	"fs.symlink",
+	"fs.link",
+	"fs.chmod",
+	"fs.truncate",
+	"module.resolve",
+	"module.loadFile",
+	"module.format",
+	"module.batchResolve",
+	"child_process.spawn",
+	"child_process.poll",
+	"child_process.write_stdin",
+	"child_process.close_stdin",
+	"child_process.kill",
+	"child_process.spawn_sync",
+	"process.signal_state",
+	"network.fetch",
+	"dgram.create",
+	"dgram.bind",
+	"dgram.recv",
+	"dgram.send",
+	"dgram.close",
+	"dgram.address",
+	"dgram.setBufferSize",
+	"dgram.getBufferSize",
+	"pty.open",
+	"pty.read",
+	"pty.write",
+	"pty.close",
+	"pty.resize",
+	"pty.setForegroundPgid",
+	"pty.tcgetattr",
+	"pty.tcsetattr",
+] as const;
+
+const BROWSER_SYNC_BRIDGE_OPERATION_SET = new Set<string>(
+	BROWSER_SYNC_BRIDGE_OPERATIONS,
+);
+
 export type BrowserWorkerSyncOperation =
-	| "fs.readFile"
-	| "fs.writeFile"
-	| "fs.readFileBinary"
-	| "fs.writeFileBinary"
-	| "fs.readDir"
-	| "fs.createDir"
-	| "fs.mkdir"
-	| "fs.rmdir"
-	| "fs.exists"
-	| "fs.stat"
-	| "fs.lstat"
-	| "fs.unlink"
-	| "fs.rename"
-	| "fs.realpath"
-	| "fs.readlink"
-	| "fs.symlink"
-	| "fs.link"
-	| "fs.chmod"
-	| "fs.truncate"
-	| "module.resolve"
-	| "module.loadFile";
+	(typeof BROWSER_SYNC_BRIDGE_OPERATIONS)[number];
+
+export function isBrowserWorkerSyncOperation(
+	value: unknown,
+): value is BrowserWorkerSyncOperation {
+	return (
+		typeof value === "string" && BROWSER_SYNC_BRIDGE_OPERATION_SET.has(value)
+	);
+}
 
 export interface BrowserSyncBridgeBuffers {
 	signalBuffer: SharedArrayBuffer;
@@ -56,6 +100,8 @@ export interface BrowserSyncBridgePayload extends BrowserSyncBridgeBuffers {
 export interface BrowserWorkerSyncRequestMessage {
 	type: "sync-request";
 	controlToken: string;
+	executionId: string;
+	processRequestId: number;
 	requestId: number;
 	operation: BrowserWorkerSyncOperation;
 	args: unknown[];

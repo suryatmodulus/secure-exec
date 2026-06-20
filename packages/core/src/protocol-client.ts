@@ -7,6 +7,7 @@ import {
 	type LiveSidecarEventSelector,
 } from "./event-buffer.js";
 import { FrameRpcTransport } from "./frame-rpc.js";
+import type { FrameTransport } from "./frame-stream.js";
 import {
 	HostProtocolFrameFactory,
 	classifySidecarWrittenProtocolFrame,
@@ -25,8 +26,12 @@ import type { LiveOwnershipScope } from "./ownership.js";
 import type { LiveRequestPayload } from "./request-payloads.js";
 
 export interface SidecarProtocolClientOptions {
-	stdin: Writable;
-	stdout: Readable;
+	frameTransport?: FrameTransport<
+		LiveResponseFrame | LiveEventFrame | LiveSidecarRequestFrame,
+		LiveProtocolFrame
+	>;
+	stdin?: Writable;
+	stdout?: Readable;
 	frameTimeoutMs: number;
 	eventBufferCapacity: number;
 	payloadCodec?: ProtocolFramePayloadCodec;
@@ -70,6 +75,7 @@ export class SidecarProtocolClient {
 			LiveEventFrame,
 			LiveSidecarRequestFrame
 		>({
+			frameTransport: options.frameTransport,
 			stdin: options.stdin,
 			stdout: options.stdout,
 			encodeFrame: (frame) =>

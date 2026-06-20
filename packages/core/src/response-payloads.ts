@@ -24,6 +24,13 @@ import {
 	type LiveSocketStateEntry,
 } from "./state.js";
 
+/** A directory child with its file type, from `read_dir` (no extra lstat). */
+export interface LiveGuestDirEntry {
+	name: string;
+	isDirectory: boolean;
+	isSymbolicLink: boolean;
+}
+
 export interface LiveSignalHandlerRegistration {
 	action: LiveSignalDispositionAction;
 	mask: number[];
@@ -114,10 +121,14 @@ export type LiveResponsePayload =
 			path: string;
 			content?: string;
 			encoding?: LiveRootFilesystemEntryEncoding;
-			entries?: string[];
+			entries?: LiveGuestDirEntry[];
 			stat?: LiveGuestFilesystemStat;
 			exists?: boolean;
 			target?: string;
+	  }
+	| {
+			type: "guest_kernel_result";
+			payload: ArrayBuffer;
 	  }
 	| {
 			type: "root_filesystem_snapshot";
@@ -274,13 +285,24 @@ export function fromGeneratedResponsePayload(
 						}
 					: {}),
 				...(payload.val.entries !== null
-					? { entries: [...payload.val.entries] }
+					? {
+							entries: payload.val.entries.map((entry) => ({
+								name: entry.name,
+								isDirectory: entry.isDirectory,
+								isSymbolicLink: entry.isSymbolicLink,
+							})),
+						}
 					: {}),
 				...(payload.val.stat !== null
 					? { stat: fromGeneratedGuestFilesystemStat(payload.val.stat) }
 					: {}),
 				...(payload.val.exists !== null ? { exists: payload.val.exists } : {}),
 				...(payload.val.target !== null ? { target: payload.val.target } : {}),
+			};
+		case "GuestKernelResultResponse":
+			return {
+				type: "guest_kernel_result",
+				payload: payload.val.payload,
 			};
 		case "RootFilesystemSnapshotResponse":
 			return {

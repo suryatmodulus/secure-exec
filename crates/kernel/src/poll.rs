@@ -1,7 +1,8 @@
 use crate::socket_table::SocketId;
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PollEvents(u16);
