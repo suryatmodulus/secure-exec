@@ -3147,7 +3147,7 @@ where
                         guest_runtime: wasm_guest_runtime,
                     })
                     .map_err(wasm_error)?;
-                (ActiveExecution::Wasm(execution), env)
+                (ActiveExecution::Wasm(Box::new(execution)), env)
             }
         };
         let child_pid = execution.child_pid();
@@ -5370,7 +5370,7 @@ where
                             guest_runtime: wasm_guest_runtime,
                         })
                         .map_err(wasm_error)?;
-                    ActiveExecution::Wasm(execution)
+                    ActiveExecution::Wasm(Box::new(execution))
                 }
                 GuestRuntimeKind::Python => {
                     unreachable!("python child_process execution is rejected")
@@ -5763,7 +5763,7 @@ where
                             guest_runtime: wasm_guest_runtime,
                         })
                         .map_err(wasm_error)?;
-                    ActiveExecution::Wasm(execution)
+                    ActiveExecution::Wasm(Box::new(execution))
                 }
                 GuestRuntimeKind::Python => {
                     unreachable!("python child_process execution is rejected")
