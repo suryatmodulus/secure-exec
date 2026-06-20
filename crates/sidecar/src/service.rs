@@ -1,14 +1,14 @@
 use crate::bridge::{build_mount_plugin_registry, MountPluginContext};
 pub(crate) use crate::execution::{
-    build_javascript_socket_path_context, canonical_signal_name, error_code,
-    ignore_stale_javascript_sync_rpc_response, javascript_sync_rpc_arg_i32,
-    javascript_sync_rpc_arg_str, javascript_sync_rpc_arg_u32, javascript_sync_rpc_arg_u32_optional,
-    javascript_sync_rpc_arg_u64, javascript_sync_rpc_arg_u64_optional,
-    javascript_sync_rpc_bytes_arg, javascript_sync_rpc_bytes_value, javascript_sync_rpc_encoding,
-    javascript_sync_rpc_error_code, javascript_sync_rpc_option_bool,
-    javascript_sync_rpc_option_u32, parse_signal,
+    build_javascript_socket_path_context, canonical_signal_name, dispatch_loopback_http_request,
+    error_code, format_tcp_resource, ignore_stale_javascript_sync_rpc_response,
+    javascript_sync_rpc_arg_i32, javascript_sync_rpc_arg_str, javascript_sync_rpc_arg_u32,
+    javascript_sync_rpc_arg_u32_optional, javascript_sync_rpc_arg_u64,
+    javascript_sync_rpc_arg_u64_optional, javascript_sync_rpc_bytes_arg,
+    javascript_sync_rpc_bytes_value, javascript_sync_rpc_encoding, javascript_sync_rpc_error_code,
+    javascript_sync_rpc_option_bool, javascript_sync_rpc_option_u32, parse_signal,
     sanitize_javascript_child_process_internal_bootstrap_env, service_javascript_sync_rpc,
-    vm_network_resource_counts, JavascriptSyncRpcServiceRequest,
+    vm_network_resource_counts, JavascriptSyncRpcServiceRequest, LoopbackHttpDispatchRequest,
 };
 use crate::extension::{
     Extension, ExtensionBufferedProcessOutput, ExtensionContext, ExtensionFuture, ExtensionHost,
@@ -125,6 +125,20 @@ struct LegacyJavascriptChildProcessSpawnOptions {
     timeout: Option<u64>,
     #[serde(default, rename = "killSignal")]
     kill_signal: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JavascriptHttpLoopbackRequest {
+    process_id: String,
+    server_id: u64,
+    host: String,
+    port: u16,
+    request: String,
+}
+
+fn is_javascript_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
 }
 
 pub(crate) fn parse_javascript_child_process_spawn_request(
@@ -794,6 +808,14 @@ impl JavascriptSocketPathContext {
         self.tcp_loopback_guest_to_host_ports
             .get(&(family, port))
             .copied()
+    }
+
+    pub(crate) fn http_loopback_target(
+        &self,
+        family: JavascriptSocketFamily,
+        port: u16,
+    ) -> Option<&crate::state::JavascriptHttpLoopbackTarget> {
+        self.http_loopback_targets.get(&(family, port))
     }
 
     pub(crate) fn translate_udp_loopback_port(
@@ -2053,6 +2075,83 @@ where
                         );
                 }
                 Ok(Value::Null)
+            }
+            "net.http_request" => {
+                let payload = request
+                    .args
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| {
+                        SidecarError::InvalidState(String::from(
+                            "net.http_request requires a request payload",
+                        ))
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<JavascriptHttpLoopbackRequest>(value).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "invalid net.http_request payload: {error}"
+                                ))
+                            },
+                        )
+                    })?;
+                if !is_javascript_loopback_host(&payload.host) {
+                    return Err(SidecarError::Execution(format!(
+                        "EACCES: HTTP loopback request requires a loopback host, got {}",
+                        payload.host
+                    )));
+                }
+                self.bridge.require_network_access(
+                    vm_id,
+                    NetworkOperation::Http,
+                    format_tcp_resource(&payload.host, payload.port),
+                )?;
+                let Some(vm) = self.vms.get_mut(vm_id) else {
+                    log_stale_process_event(
+                        &self.bridge,
+                        vm_id,
+                        process_id,
+                        "javascript sync RPC net.http_request",
+                    );
+                    return Ok(());
+                };
+                let resource_limits = vm.kernel.resource_limits().clone();
+                let socket_paths = build_javascript_socket_path_context(vm)?;
+                let target_is_current =
+                    [JavascriptSocketFamily::Ipv4, JavascriptSocketFamily::Ipv6]
+                        .iter()
+                        .any(|family| {
+                            socket_paths
+                                .http_loopback_target(*family, payload.port)
+                                .is_some_and(|target| {
+                                    target.process_id == payload.process_id
+                                        && target.server_id == payload.server_id
+                                })
+                        });
+                if !target_is_current {
+                    return Err(SidecarError::InvalidState(format!(
+                        "unknown HTTP loopback target {}:{} for server {} in process {}",
+                        payload.host, payload.port, payload.server_id, payload.process_id
+                    )));
+                }
+                let Some(target_process) = vm.active_processes.get_mut(&payload.process_id) else {
+                    return Err(SidecarError::InvalidState(format!(
+                        "unknown HTTP loopback process {}",
+                        payload.process_id
+                    )));
+                };
+                dispatch_loopback_http_request(LoopbackHttpDispatchRequest {
+                    bridge: &self.bridge,
+                    vm_id,
+                    dns: &vm.dns,
+                    socket_paths: &socket_paths,
+                    kernel: &mut vm.kernel,
+                    process: target_process,
+                    resource_limits: &resource_limits,
+                    server_id: payload.server_id,
+                    request_json: &payload.request,
+                })
+                .map(Value::String)
             }
             _ => {
                 let Some(vm) = self.vms.get_mut(vm_id) else {

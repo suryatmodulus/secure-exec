@@ -77,6 +77,12 @@ export const siteConfig = {
 				// { slug: "docs/process-isolation", attrs: { "data-icon": "box" } },
 			],
 		},
+		{
+			label: "Architecture",
+			items: [
+				{ slug: "docs/architecture/networking", attrs: { "data-icon": "network" } },
+			],
+		},
 		// {
 		// 	label: "Reference",
 		// 	items: [

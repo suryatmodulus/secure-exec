@@ -24,7 +24,7 @@ import {
   createWasmVmRuntime,
   createNodeRuntime,
 } from "../helpers.js";
-import type { Kernel, VirtualFileSystem } from "../helpers.js";
+import type { Kernel, Permissions, VirtualFileSystem } from "../helpers.js";
 
 export {
   AF_INET,
@@ -45,7 +45,7 @@ export {
   createWasmVmRuntime,
   createNodeRuntime,
 } from "../helpers.js";
-export type { Kernel, VirtualFileSystem } from "../helpers.js";
+export type { Kernel, Permissions, VirtualFileSystem } from "../helpers.js";
 
 export interface IntegrationKernelResult {
   kernel: Kernel;
@@ -57,6 +57,7 @@ export interface IntegrationKernelOptions {
   runtimes?: ("wasmvm" | "node")[];
   loopbackExemptPorts?: number[];
   commandDirs?: string[];
+  permissions?: Permissions;
 }
 
 /**
@@ -74,6 +75,7 @@ export async function createIntegrationKernel(
   const kernel = createKernel({
     filesystem: vfs,
     loopbackExemptPorts: options?.loopbackExemptPorts,
+    permissions: options?.permissions,
   });
 
   if (runtimes.includes("wasmvm")) {

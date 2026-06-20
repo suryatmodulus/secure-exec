@@ -8,6 +8,9 @@
  *      VM and fetches it - the request and response stay entirely within the
  *      kernel socket table (hermetic, no real host network).
  *   2. With the default (network denied), the same outbound fetch is blocked.
+ *   3. Host loopback is separate from VM loopback: even with network "allow",
+ *      a guest can reach a host loopback service only when the host port is in
+ *      loopbackExemptPorts.
  *
  * Run with:
  *   SECURE_EXEC_SIDECAR_BIN=../../../target/debug/secure-exec-sidecar \
@@ -15,6 +18,8 @@
  */
 
 import { NodeRuntime } from "secure-exec";
+import { createServer as createHttpServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
 // Guest program: start a loopback HTTP server, then fetch it. Both the listen
 // and the fetch go through the kernel socket table.
@@ -61,7 +66,64 @@ const denied = await NodeRuntime.create();
 try {
 	const result = await denied.exec(GUEST);
 	console.log("[network denied] exitCode:", result.exitCode);
-	console.log("[network denied] stderr:", JSON.stringify(result.stderr.trim()));
+	console.log(
+		"[network denied] stderr:",
+		JSON.stringify(result.stderr.trim().split("\n")[0]),
+	);
 } finally {
 	await denied.dispose();
+}
+
+// 3. Host loopback access: network "allow" is not enough to reach real host
+// loopback. The host must explicitly exempt the host port too.
+const hostServer = createHttpServer((req, res) => {
+	res.writeHead(200, { "content-type": "text/plain" });
+	res.end("host-ok:" + req.url);
+});
+await new Promise<void>((resolve) => {
+	hostServer.listen(0, "127.0.0.1", resolve);
+});
+const hostPort = (hostServer.address() as AddressInfo).port;
+
+const HOST_FETCH_GUEST = `
+try {
+	const response = await fetch("http://127.0.0.1:${hostPort}/from-guest");
+	console.log(response.status + ":" + await response.text());
+} catch (error) {
+	console.log(error.cause?.code || error.code || error.name);
+	process.exit(2);
+}
+`;
+
+try {
+	const blockedHostLoopback = await NodeRuntime.create({
+		permissions: { network: "allow" },
+	});
+	try {
+		const result = await blockedHostLoopback.exec(HOST_FETCH_GUEST);
+		console.log("[host loopback blocked] exitCode:", result.exitCode);
+		console.log(
+			"[host loopback blocked] stdout:",
+			JSON.stringify(result.stdout.trim()),
+		);
+	} finally {
+		await blockedHostLoopback.dispose();
+	}
+
+	const allowedHostLoopback = await NodeRuntime.create({
+		permissions: { network: "allow" },
+		loopbackExemptPorts: [hostPort],
+	});
+	try {
+		const result = await allowedHostLoopback.exec(HOST_FETCH_GUEST);
+		console.log("[host loopback allowed] exitCode:", result.exitCode);
+		console.log(
+			"[host loopback allowed] stdout:",
+			JSON.stringify(result.stdout.trim()),
+		);
+	} finally {
+		await allowedHostLoopback.dispose();
+	}
+} finally {
+	await new Promise<void>((resolve) => hostServer.close(() => resolve()));
 }

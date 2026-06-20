@@ -340,10 +340,18 @@ pub(crate) struct JavascriptSocketPathContext {
     pub(crate) listen_policy: VmListenPolicy,
     pub(crate) loopback_exempt_ports: BTreeSet<u16>,
     pub(crate) tcp_loopback_guest_to_host_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
+    pub(crate) http_loopback_targets:
+        BTreeMap<(JavascriptSocketFamily, u16), JavascriptHttpLoopbackTarget>,
     pub(crate) udp_loopback_guest_to_host_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
     pub(crate) udp_loopback_host_to_guest_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
     pub(crate) used_tcp_guest_ports: BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
     pub(crate) used_udp_guest_ports: BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JavascriptHttpLoopbackTarget {
+    pub(crate) process_id: String,
+    pub(crate) server_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

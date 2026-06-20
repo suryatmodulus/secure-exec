@@ -7,12 +7,15 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** Directory containing WASM command binaries built from Rust. */
 export const COMMANDS_DIR = resolve(
-  __dirname,
-  "../native/target/wasm32-wasip1/release/commands",
+	process.env.SECURE_EXEC_WASM_COMMANDS_DIR ??
+		resolve(__dirname, "../native/target/wasm32-wasip1/release/commands"),
 );
 
 /** Directory containing C-compiled WASM binaries. */
-export const C_BUILD_DIR = resolve(__dirname, "../native/c/build/");
+export const C_BUILD_DIR = resolve(
+	process.env.SECURE_EXEC_C_WASM_COMMANDS_DIR ??
+		resolve(__dirname, "../native/c/build/"),
+);
 
 /** Whether the main WASM command binaries are available (includes 'sh'). */
 export const hasWasmBinaries =

@@ -1758,6 +1758,7 @@ ykAheWCsAteSEWVc0w==\n\
             let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..64 {
+                pump_sibling_internal_process_events(sidecar, vm_id, process_id);
                 let next_event = {
                     let vm = sidecar.vms.get_mut(vm_id).expect("active vm");
                     vm.active_processes.get_mut(process_id).and_then(|process| {
@@ -1796,6 +1797,7 @@ ykAheWCsAteSEWVc0w==\n\
                 sidecar
                     .handle_execution_event(vm_id, process_id, event)
                     .expect("handle process event");
+                pump_sibling_internal_process_events(sidecar, vm_id, process_id);
             }
 
             (
@@ -1803,6 +1805,113 @@ ykAheWCsAteSEWVc0w==\n\
                 process_stream_to_string(&stderr),
                 exit_code,
             )
+        }
+
+        fn pump_sibling_internal_process_events(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            target_process_id: &str,
+        ) {
+            for _ in 0..64 {
+                let process_ids = sidecar
+                    .vms
+                    .get(vm_id)
+                    .map(|vm| vm.active_processes.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let mut progressed = false;
+
+                for process_id in process_ids {
+                    if process_id == target_process_id {
+                        continue;
+                    }
+                    let event = {
+                        let Some(vm) = sidecar.vms.get_mut(vm_id) else {
+                            continue;
+                        };
+                        let Some(process) = vm.active_processes.get_mut(&process_id) else {
+                            continue;
+                        };
+                        if let Some(event) = process.pending_execution_events.pop_front() {
+                            Some(event)
+                        } else {
+                            process
+                                .execution
+                                .poll_event_blocking(Duration::from_millis(10))
+                                .expect("poll sibling process event")
+                        }
+                    };
+                    let Some(event) = event else {
+                        continue;
+                    };
+
+                    if matches!(
+                        event,
+                        ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                            | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                            | ActiveExecutionEvent::SignalState { .. }
+                    ) {
+                        sidecar
+                            .handle_execution_event(vm_id, &process_id, event)
+                            .expect("handle sibling internal process event");
+                        progressed = true;
+                    } else if let Some(process) = sidecar
+                        .vms
+                        .get_mut(vm_id)
+                        .and_then(|vm| vm.active_processes.get_mut(&process_id))
+                    {
+                        process
+                            .queue_pending_execution_event(event)
+                            .expect("requeue sibling public process event");
+                    }
+                }
+
+                if !progressed {
+                    break;
+                }
+            }
+        }
+
+        fn wait_for_process_stdout_contains(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            process_id: &str,
+            needle: &str,
+        ) -> String {
+            let mut stdout = Vec::new();
+            for _ in 0..64 {
+                let next_event = {
+                    let vm = sidecar.vms.get_mut(vm_id).expect("active vm");
+                    vm.active_processes.get_mut(process_id).and_then(|process| {
+                        if let Some(event) = process.pending_execution_events.pop_front() {
+                            Some(event)
+                        } else {
+                            process
+                                .execution
+                                .poll_event_blocking(Duration::from_secs(5))
+                                .expect("poll process event")
+                        }
+                    })
+                };
+                let Some(event) = next_event else {
+                    panic!("process {process_id} disappeared before writing {needle:?}");
+                };
+                if let ActiveExecutionEvent::Stdout(chunk) = &event {
+                    append_process_stream_chunk(&mut stdout, chunk, process_id, "stdout");
+                    if process_stream_to_string(&stdout).contains(needle) {
+                        sidecar
+                            .handle_execution_event(vm_id, process_id, event)
+                            .expect("handle process event");
+                        return process_stream_to_string(&stdout);
+                    }
+                }
+                if let ActiveExecutionEvent::Exited(code) = &event {
+                    panic!("process {process_id} exited with {code} before writing {needle:?}");
+                }
+                sidecar
+                    .handle_execution_event(vm_id, process_id, event)
+                    .expect("handle process event");
+            }
+            panic!("process {process_id} did not write {needle:?}");
         }
 
         fn wasm_stdout_module(message: &str) -> Vec<u8> {
@@ -3367,11 +3476,17 @@ ykAheWCsAteSEWVc0w==\n\
 
             // Two distinct guest exec processes in one VM.
             let server_cwd = temp_dir("secure-exec-sidecar-js-cross-exec-server-cwd");
-            write_fixture(&server_cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                "setInterval(() => {}, 1000);",
+            );
             start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-server");
 
             let client_cwd = temp_dir("secure-exec-sidecar-js-cross-exec-client-cwd");
-            write_fixture(&client_cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
+            write_fixture(
+                &client_cwd.join("entry.mjs"),
+                "setInterval(() => {}, 1000);",
+            );
             start_fake_javascript_process(&mut sidecar, &vm_id, &client_cwd, "proc-client");
 
             // Process A (server) listens on loopback.
@@ -12622,6 +12737,80 @@ console.log(JSON.stringify(summary));
             );
         }
 
+        fn javascript_http_socket_backed_server_rejects_oversized_incomplete_headers() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-http-oversized-incomplete-header");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+import net from "node:net";
+
+let requests = 0;
+const server = http.createServer((_req, res) => {
+  requests += 1;
+  res.end("unexpected");
+});
+
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(3000, "127.0.0.1", resolve);
+});
+
+const result = await new Promise((resolve, reject) => {
+  const client = net.connect({ host: "127.0.0.1", port: 3000 });
+  let data = "";
+  let error = null;
+  client.setEncoding("latin1");
+  client.on("data", (chunk) => {
+    data += chunk;
+    if (data.startsWith("HTTP/1.1 400 Bad Request")) {
+      client.destroy();
+      resolve({ data, error, requests });
+    }
+  });
+  client.on("error", (err) => {
+    error = err.code || err.name || String(err);
+  });
+  client.on("close", () => {
+    resolve({ data, error, requests });
+  });
+  client.on("connect", () => {
+    client.write("GET / HTTP/1.1\r\nX-Oversized: " + "a".repeat(70 * 1024));
+  });
+  setTimeout(() => reject(new Error("client did not close")), 5000);
+});
+
+await new Promise((resolve) => server.close(resolve));
+console.log(JSON.stringify(result || { data: "", error: "missing-result", requests }));
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-http-oversized-header");
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let parsed: Value =
+                serde_json::from_str(stdout.trim()).expect("parse oversized header JSON");
+            assert!(
+                parsed["data"]
+                    .as_str()
+                    .is_some_and(|data| data.starts_with("HTTP/1.1 400 Bad Request")),
+                "stdout: {stdout}"
+            );
+            assert_eq!(parsed["requests"], Value::from(0));
+        }
+
         #[test]
         fn request_frame_limit_counts_generated_wire_overhead() {
             let sidecar = create_test_sidecar_with_config(NativeSidecarConfig {
@@ -13607,6 +13796,797 @@ console.log(JSON.stringify(summary));
                 Value::String(String::from("/data"))
             );
         }
+
+        #[test]
+        fn javascript_fetch_reaches_http_server_in_parallel_guest_process() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-js-cross-process-server-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const server = http.createServer((req, res) => {
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    body += chunk;
+  });
+  req.on("end", () => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end(`${req.method}:${req.url}:${body}`);
+  });
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let client_cwd = temp_dir("secure-exec-sidecar-js-cross-process-client-cwd");
+            write_fixture(
+                &client_cwd.join("entry.mjs"),
+                r#"
+const response = await fetch("http://127.0.0.1:3000/from-client", {
+  method: "POST",
+  body: "hello",
+});
+
+console.log(JSON.stringify({
+  status: response.status,
+  body: await response.text(),
+}));
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &client_cwd, "proc-js-client");
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let parsed: Value =
+                serde_json::from_str(stdout.trim()).expect("parse client fetch JSON");
+            assert_eq!(parsed["status"], Value::from(200));
+            assert_eq!(
+                parsed["body"],
+                Value::String(String::from("POST:/from-client:hello"))
+            );
+        }
+
+        fn vm_network_counts(
+            sidecar: &NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+        ) -> NetworkResourceCounts {
+            let vm = sidecar.vms.get(vm_id).expect("vm state");
+            vm_network_resource_counts(vm)
+        }
+
+        fn assert_network_counts_unchanged(
+            before: NetworkResourceCounts,
+            after: NetworkResourceCounts,
+        ) {
+            assert_eq!(after.sockets, before.sockets, "socket count changed");
+            assert_eq!(
+                after.connections, before.connections,
+                "connection count changed"
+            );
+        }
+
+        fn dispatch_host_vm_fetch(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            request_id: secure_exec_sidecar::protocol::RequestId,
+            connection_id: &str,
+            session_id: &str,
+            vm_id: &str,
+            port: u16,
+            path: &str,
+            body: Option<&str>,
+        ) -> Result<DispatchResult, SidecarError> {
+            sidecar.dispatch_blocking(request(
+                request_id,
+                OwnershipScope::vm(connection_id, session_id, vm_id),
+                RequestPayload::VmFetch(crate::protocol::VmFetchRequest {
+                    port,
+                    method: if body.is_some() {
+                        String::from("POST")
+                    } else {
+                        String::from("GET")
+                    },
+                    path: String::from(path),
+                    headers_json: String::from(r#"{"content-type":"text/plain"}"#),
+                    body: body.map(String::from),
+                }),
+            ))
+        }
+
+        fn rejected_response_message(result: DispatchResult) -> String {
+            match result.response.payload {
+                ResponsePayload::Rejected(rejected) => rejected.message,
+                other => panic!("expected rejected response, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn vm_fetch_missing_kernel_tcp_listener_does_not_open_host_network() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            let before = vm_network_counts(&sidecar, &vm_id);
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                900,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/missing",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("missing listener should reject vm.fetch");
+            assert!(
+                rejected.contains("could not find a guest HTTP listener on port 3000"),
+                "unexpected error: {rejected}"
+            );
+            let after = vm_network_counts(&sidecar, &vm_id);
+            assert_network_counts_unchanged(before, after);
+        }
+
+        fn vm_fetch_reaches_javascript_http_server_over_kernel_tcp() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-server-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const server = http.createServer((req, res) => {
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    body += chunk;
+  });
+  req.on("end", () => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end(`${req.method}:${req.url}:${body}`);
+  });
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let process = sidecar
+                .vms
+                .get(&vm_id)
+                .and_then(|vm| vm.active_processes.get("proc-js-server"))
+                .expect("server process");
+            assert!(
+                process.http_servers.is_empty(),
+                "http.createServer should not register a legacy object-mode HTTP server",
+            );
+            assert!(
+                process
+                    .tcp_listeners
+                    .values()
+                    .any(|listener| listener.kernel_socket_id.is_some()),
+                "http.createServer should register a kernel TCP listener",
+            );
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    1,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::VmFetch(crate::protocol::VmFetchRequest {
+                        port: 3000,
+                        method: String::from("POST"),
+                        path: String::from("/from-host"),
+                        headers_json: String::from(r#"{"content-type":"text/plain"}"#),
+                        body: Some(String::from("hello")),
+                    }),
+                ))
+                .expect("host fetch reaches guest HTTP server");
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+
+            match response.response.payload {
+                ResponsePayload::VmFetchResult(result) => {
+                    let parsed: Value =
+                        serde_json::from_str(&result.response_json).expect("parse fetch response");
+                    assert_eq!(parsed["status"], Value::from(200));
+                    assert_eq!(
+                        parsed["body"],
+                        Value::String(
+                            base64::engine::general_purpose::STANDARD
+                                .encode("POST:/from-host:hello")
+                        )
+                    );
+                    assert_eq!(
+                        parsed["bodyEncoding"],
+                        Value::String(String::from("base64"))
+                    );
+                }
+                other => panic!("unexpected vm_fetch response payload: {other:?}"),
+            }
+        }
+
+        fn vm_fetch_kernel_tcp_decodes_chunked_response_body() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-chunked-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.write("hello ");
+  res.write("chunked");
+  res.end();
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let response = dispatch_host_vm_fetch(
+                &mut sidecar,
+                907,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/chunked",
+                None,
+            )
+            .expect("host fetch reaches chunked guest HTTP server");
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+
+            match response.response.payload {
+                ResponsePayload::VmFetchResult(result) => {
+                    let parsed: Value =
+                        serde_json::from_str(&result.response_json).expect("parse fetch response");
+                    assert_eq!(parsed["status"], Value::from(200));
+                    assert_eq!(
+                        parsed["bodyEncoding"],
+                        Value::String(String::from("base64"))
+                    );
+                    let body = base64::engine::general_purpose::STANDARD
+                        .decode(parsed["body"].as_str().expect("base64 response body"))
+                        .expect("decode response body");
+                    assert_eq!(body, b"hello chunked");
+                    assert!(
+                        !body.windows(3).any(|window| window == b"\r\n6"),
+                        "chunk framing leaked into decoded body: {body:?}"
+                    );
+                }
+                other => panic!("unexpected vm_fetch response payload: {other:?}"),
+            }
+        }
+
+        fn vm_fetch_kernel_tcp_rejects_chunked_with_content_length() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-chunked-cl-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import net from "node:net";
+
+const server = net.createServer((socket) => {
+  socket.end(
+    "HTTP/1.1 200 OK\r\n" +
+      "Transfer-Encoding: chunked\r\n" +
+      "Content-Length: 5\r\n" +
+      "\r\n" +
+      "5\r\nhello\r\n0\r\n\r\n"
+  );
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                908,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/invalid",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("invalid chunked response should reject vm.fetch");
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+
+            assert!(
+                rejected.contains("Transfer-Encoding: chunked")
+                    && rejected.contains("Content-Length"),
+                "unexpected error: {rejected}"
+            );
+        }
+
+        fn vm_fetch_kernel_tcp_socket_cap_failure_closes_no_extra_resources() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(String::from("resource.max_sockets"), String::from("1"))]),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-cap-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const server = http.createServer((_req, res) => {
+  res.end("ok");
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let before = vm_network_counts(&sidecar, &vm_id);
+            assert_eq!(before.sockets, 1, "server listener should own one socket");
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                901,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/cap",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("vm.fetch should honor socket cap before creating client socket");
+            assert!(
+                rejected.contains("EAGAIN: maximum socket count reached"),
+                "unexpected error: {rejected}"
+            );
+            let after = vm_network_counts(&sidecar, &vm_id);
+            assert_network_counts_unchanged(before, after);
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+        }
+
+        fn vm_fetch_kernel_tcp_oversized_response_closes_client_socket() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-oversized-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                format!(
+                    r#"
+import http from "node:http";
+
+const body = "x".repeat({});
+const server = http.createServer((_req, res) => {{
+  res.writeHead(200, {{ "content-type": "text/plain" }});
+  res.end(body);
+}});
+
+server.listen(3000, "127.0.0.1", () => {{
+  console.log("READY");
+}});
+
+await new Promise(() => {{}});
+"#,
+                    crate::wire::DEFAULT_MAX_FRAME_BYTES + 1
+                ),
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let before = vm_network_counts(&sidecar, &vm_id);
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                902,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/oversized",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("oversized vm.fetch response should be rejected");
+            assert!(
+                rejected.contains("vm.fetch raw response buffer is"),
+                "unexpected error: {rejected}"
+            );
+            let after = vm_network_counts(&sidecar, &vm_id);
+            assert_eq!(
+                after.sockets,
+                before.sockets + 1,
+                "host-fetch client socket should close, leaving only the server's accepted socket"
+            );
+            assert!(
+                after.connections <= before.connections + 1,
+                "host-fetch client connection leaked: before={before:?} after={after:?}"
+            );
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+        }
+
+        fn vm_fetch_kernel_tcp_honors_configured_response_limit() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(
+                    String::from("limits.http.max_fetch_response_bytes"),
+                    String::from("512"),
+                )]),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-config-limit-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const body = "x".repeat(1024);
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end(body);
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let before = vm_network_counts(&sidecar, &vm_id);
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                905,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/configured-limit",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("configured response limit should reject vm.fetch");
+            assert!(
+                rejected.contains("vm.fetch payload is") && rejected.contains("limit is 512"),
+                "unexpected error: {rejected}"
+            );
+            let after = vm_network_counts(&sidecar, &vm_id);
+            assert!(
+                after.sockets <= before.sockets + 1,
+                "host-fetch client socket leaked: before={before:?} after={after:?}"
+            );
+            assert!(
+                after.connections <= before.connections + 1,
+                "host-fetch client connection leaked: before={before:?} after={after:?}"
+            );
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+        }
+
+        fn vm_fetch_kernel_tcp_malformed_response_closes_client_socket() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-malformed-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import net from "node:net";
+
+const server = net.createServer((socket) => {
+  socket.end("not-http\r\n\r\n");
+});
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let before = vm_network_counts(&sidecar, &vm_id);
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                906,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/malformed",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("malformed response should reject vm.fetch");
+            assert!(
+                rejected.contains("invalid vm.fetch HTTP response status line"),
+                "unexpected error: {rejected}"
+            );
+            let after = vm_network_counts(&sidecar, &vm_id);
+            assert!(
+                after.sockets <= before.sockets + 1,
+                "host-fetch client socket leaked: before={before:?} after={after:?}"
+            );
+            assert!(
+                after.connections <= before.connections + 1,
+                "host-fetch client connection leaked: before={before:?} after={after:?}"
+            );
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+        }
+
+        fn vm_fetch_kernel_tcp_timeout_closes_client_socket() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-timeout-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const server = http.createServer(() => new Promise(() => {}));
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let before = vm_network_counts(&sidecar, &vm_id);
+            std::env::set_var("SECURE_EXEC_TEST_HTTP_LOOPBACK_REQUEST_TIMEOUT_MS", "100");
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                904,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/timeout",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("stalled vm.fetch should reject after timeout");
+            std::env::remove_var("SECURE_EXEC_TEST_HTTP_LOOPBACK_REQUEST_TIMEOUT_MS");
+            assert!(
+                rejected.contains("vm.fetch timed out waiting for kernel TCP HTTP response"),
+                "unexpected error: {rejected}"
+            );
+            let after = vm_network_counts(&sidecar, &vm_id);
+            assert_eq!(
+                after.sockets,
+                before.sockets + 1,
+                "host-fetch client socket should close, leaving only the server's stalled accepted socket"
+            );
+            assert!(
+                after.connections <= before.connections + 1,
+                "host-fetch client connection leaked: before={before:?} after={after:?}"
+            );
+
+            sidecar
+                .kill_process_internal(&vm_id, "proc-js-server", "SIGKILL")
+                .expect("kill javascript server process");
+        }
+
+        fn vm_fetch_kernel_tcp_target_exit_cleans_up_process_resources() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let server_cwd = temp_dir("secure-exec-sidecar-host-fetch-js-target-exit-cwd");
+            write_fixture(
+                &server_cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const server = http.createServer(() => new Promise(() => {}));
+
+server.listen(3000, "127.0.0.1", () => {
+  console.log("READY");
+  setTimeout(() => {
+    throw new Error("target exited during vm.fetch");
+  }, 10);
+});
+
+await new Promise(() => {});
+"#,
+            );
+            start_fake_javascript_process(&mut sidecar, &vm_id, &server_cwd, "proc-js-server");
+            wait_for_process_stdout_contains(&mut sidecar, &vm_id, "proc-js-server", "READY");
+
+            let rejected = dispatch_host_vm_fetch(
+                &mut sidecar,
+                903,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                3000,
+                "/exit",
+                None,
+            )
+            .map(rejected_response_message)
+            .expect("target exit should reject vm.fetch");
+            assert!(
+                rejected.contains("vm.fetch target exited before responding (exit code 1)"),
+                "unexpected error: {rejected}"
+            );
+
+            let vm = sidecar.vms.get(&vm_id).expect("vm state");
+            assert!(
+                !vm.active_processes.contains_key("proc-js-server"),
+                "target process should be cleaned up after exit"
+            );
+            let after = vm_network_resource_counts(vm);
+            assert_eq!(after.sockets, 0, "target exit should close sockets");
+            assert_eq!(after.connections, 0, "target exit should close connections");
+        }
+
         fn javascript_https_rpc_requests_and_serves_over_guest_tls() {
             assert_node_available();
 
@@ -14747,6 +15727,7 @@ console.log(JSON.stringify(summary));
                 listen_policy: VmListenPolicy::default(),
                 loopback_exempt_ports: BTreeSet::new(),
                 tcp_loopback_guest_to_host_ports: BTreeMap::new(),
+                http_loopback_targets: BTreeMap::new(),
                 udp_loopback_guest_to_host_ports: BTreeMap::new(),
                 udp_loopback_host_to_guest_ports: BTreeMap::new(),
                 used_tcp_guest_ports: BTreeMap::new(),
@@ -15910,6 +16891,7 @@ console.log(JSON.stringify({
             javascript_http2_server_respond_records_pending_response();
             javascript_http_rpc_requests_gets_and_serves_over_guest_net();
             javascript_fetch_posts_to_guest_loopback_http_server();
+            javascript_fetch_reaches_http_server_in_parallel_guest_process();
             javascript_https_rpc_requests_and_serves_over_guest_tls();
             javascript_net_rpc_listens_accepts_connections_and_reports_listener_state();
             javascript_net_rpc_reports_connection_counts_and_enforces_backlog();
@@ -15981,6 +16963,56 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn aad_http_socket_backed_server_rejects_oversized_incomplete_headers() {
+            run_isolated_service_test("http-oversized-incomplete-header");
+        }
+
+        #[test]
+        fn aae_vm_fetch_reaches_javascript_http_server_over_kernel_tcp() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-success");
+        }
+
+        #[test]
+        fn aaf_vm_fetch_kernel_tcp_decodes_chunked_response_body() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-chunked");
+        }
+
+        #[test]
+        fn aag_vm_fetch_kernel_tcp_rejects_chunked_with_content_length() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-chunked-content-length");
+        }
+
+        #[test]
+        fn aah_vm_fetch_kernel_tcp_socket_cap_failure_closes_no_extra_resources() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-socket-cap");
+        }
+
+        #[test]
+        fn aai_vm_fetch_kernel_tcp_oversized_response_closes_client_socket() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-oversized");
+        }
+
+        #[test]
+        fn aaj_vm_fetch_kernel_tcp_honors_configured_response_limit() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-configured-limit");
+        }
+
+        #[test]
+        fn aak_vm_fetch_kernel_tcp_malformed_response_closes_client_socket() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-malformed");
+        }
+
+        #[test]
+        fn aal_vm_fetch_kernel_tcp_timeout_closes_client_socket() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-timeout");
+        }
+
+        #[test]
+        fn aam_vm_fetch_kernel_tcp_target_exit_cleans_up_process_resources() {
+            run_isolated_service_test("vm-fetch-kernel-tcp-target-exit");
+        }
+
+        #[test]
         fn __service_isolated_runner() {
             let Ok(test_name) = std::env::var(ISOLATED_SERVICE_TEST_ENV) else {
                 return;
@@ -15992,6 +17024,36 @@ console.log(JSON.stringify({
                 }
                 "http2-file-response" => {
                     javascript_http2_settings_pause_push_and_file_response_surfaces_work();
+                }
+                "http-oversized-incomplete-header" => {
+                    javascript_http_socket_backed_server_rejects_oversized_incomplete_headers();
+                }
+                "vm-fetch-kernel-tcp-success" => {
+                    vm_fetch_reaches_javascript_http_server_over_kernel_tcp();
+                }
+                "vm-fetch-kernel-tcp-chunked" => {
+                    vm_fetch_kernel_tcp_decodes_chunked_response_body();
+                }
+                "vm-fetch-kernel-tcp-chunked-content-length" => {
+                    vm_fetch_kernel_tcp_rejects_chunked_with_content_length();
+                }
+                "vm-fetch-kernel-tcp-socket-cap" => {
+                    vm_fetch_kernel_tcp_socket_cap_failure_closes_no_extra_resources();
+                }
+                "vm-fetch-kernel-tcp-oversized" => {
+                    vm_fetch_kernel_tcp_oversized_response_closes_client_socket();
+                }
+                "vm-fetch-kernel-tcp-configured-limit" => {
+                    vm_fetch_kernel_tcp_honors_configured_response_limit();
+                }
+                "vm-fetch-kernel-tcp-malformed" => {
+                    vm_fetch_kernel_tcp_malformed_response_closes_client_socket();
+                }
+                "vm-fetch-kernel-tcp-timeout" => {
+                    vm_fetch_kernel_tcp_timeout_closes_client_socket();
+                }
+                "vm-fetch-kernel-tcp-target-exit" => {
+                    vm_fetch_kernel_tcp_target_exit_cleans_up_process_resources();
                 }
                 other => panic!("unknown isolated service test {other}"),
             }

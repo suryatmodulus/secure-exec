@@ -1560,6 +1560,7 @@ pub(crate) const SYNC_BRIDGE_FNS: &[&str] = &[
     "_networkHttp2StreamRespondWithFileRaw",
     "_networkHttp2ServerRespondRaw",
     "_networkHttpServerRespondRaw",
+    "_networkHttpServerRequestRaw",
     "_upgradeSocketWriteRaw",
     "_upgradeSocketEndRaw",
     "_upgradeSocketDestroyRaw",
