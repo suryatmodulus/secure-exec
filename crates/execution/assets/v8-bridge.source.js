@@ -3584,6 +3584,11 @@ var __bridge = (() => {
       rationale: "Host network bridge reference for sandbox HTTP server responses."
     },
     {
+      name: "_networkHttpServerRequestRaw",
+      classification: "hardened",
+      rationale: "Host network bridge reference for sandbox HTTP loopback requests."
+    },
+    {
       name: "_networkHttpServerWaitRaw",
       classification: "hardened",
       rationale: "Host network bridge reference for sandbox HTTP server lifetime tracking."
@@ -9970,8 +9975,73 @@ var __bridge = (() => {
   var UndiciRequest = undiciRequestModule?.Request ?? undiciRequestModule?.default ?? undiciRequestModule;
   var UndiciResponse = undiciResponseModule?.Response ?? undiciResponseModule?.default ?? undiciResponseModule;
   var setUndiciGlobalDispatcher = undiciGlobalModule?.setGlobalDispatcher;
-  if (typeof globalThis[Symbol.for("undici.globalDispatcher.1")] === "undefined" && typeof setUndiciGlobalDispatcher === "function" && typeof UndiciAgent === "function") {
-    setUndiciGlobalDispatcher(new UndiciAgent());
+  var getUndiciGlobalDispatcher = undiciGlobalModule?.getGlobalDispatcher;
+  var secureExecUndiciDispatcher = null;
+  function createSecureExecUndiciDispatcher() {
+    return new UndiciAgent({
+      connect(options, callback) {
+        try {
+          let protocol = options?.protocol === "https:" || options?.protocol === "https" ? "https:" : "http:";
+          let hostname = options?.hostname || options?.host || options?.servername || "localhost";
+          let port = options?.port;
+          if (options?.origin) {
+            const origin = new URL(String(options.origin));
+            protocol = origin.protocol === "https:" ? "https:" : "http:";
+            hostname = origin.hostname || hostname;
+            port = origin.port || port;
+          }
+          if (typeof hostname === "string" && hostname.startsWith("[") && hostname.endsWith("]")) {
+            hostname = hostname.slice(1, -1);
+          }
+          const socket = createHttpRequestSocket({
+            protocol,
+            hostname,
+            host: hostname,
+            port: port ? Number(port) : protocol === "https:" ? 443 : 80,
+            servername: options?.servername || hostname,
+            rejectUnauthorized: options?.rejectUnauthorized
+          });
+          const readyEvent = socketReadyEventNameForProtocol(protocol);
+          let settled = false;
+          const cleanup = () => {
+            socket.off?.(readyEvent, onReady);
+            socket.removeListener?.(readyEvent, onReady);
+            socket.off?.("error", onError);
+            socket.removeListener?.("error", onError);
+          };
+          const onReady = () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback(null, socket);
+          };
+          const onError = (error) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback(error instanceof Error ? error : new Error(String(error)));
+          };
+          socket.once(readyEvent, onReady);
+          socket.once("error", onError);
+          return socket;
+        } catch (error) {
+          callback(error instanceof Error ? error : new Error(String(error)));
+          return null;
+        }
+      }
+    });
+  }
+  function getSecureExecUndiciDispatcher() {
+    if (!secureExecUndiciDispatcher) {
+      secureExecUndiciDispatcher = createSecureExecUndiciDispatcher();
+    }
+    return secureExecUndiciDispatcher;
+  }
+  if (typeof setUndiciGlobalDispatcher === "function" && typeof UndiciAgent === "function") {
+    const currentDispatcher = typeof getUndiciGlobalDispatcher === "function" ? getUndiciGlobalDispatcher() : null;
+    if (currentDispatcher == null) {
+      setUndiciGlobalDispatcher(getSecureExecUndiciDispatcher());
+    }
   }
 
   // .agent/recovery/secure-exec/nodejs/src/bridge/network.ts
@@ -9990,6 +10060,8 @@ var __bridge = (() => {
     https: () => https
   });
   var MAX_HTTP_BODY_BYTES = 50 * 1024 * 1024;
+  var MAX_HTTP_REQUEST_HEADER_BYTES = 64 * 1024;
+  var MAX_HTTP_REQUEST_HEADERS = 2e3;
   var _fetchHandleCounter = 0;
   function serializeFetchHeaders(headers) {
     if (!headers) {
@@ -10076,8 +10148,12 @@ var __bridge = (() => {
     if (handleId) {
       _registerHandle?.(handleId, `fetch ${requestLabel}`);
     }
+    const fetchDispatcher = normalizedOptions.dispatcher == null && typeof getSecureExecUndiciDispatcher === "function" ? getSecureExecUndiciDispatcher() : null;
     try {
-      return await undiciFetch(resolvedInput, normalizedOptions);
+      return await undiciFetch(
+        resolvedInput,
+        fetchDispatcher ? { ...normalizedOptions, dispatcher: fetchDispatcher } : normalizedOptions
+      );
     } finally {
       if (handleId) {
         _unregisterHandle?.(handleId);
@@ -11050,7 +11126,7 @@ var __bridge = (() => {
       try {
         const normalizedHeaders = normalizeRequestHeaders(this._options.headers);
         const requestMethod = String(this._options.method || "GET").toUpperCase();
-        const bridgeBackedSocket = typeof socket?._socketId === "string" && socket._socketId.length > 0;
+        const bridgeBackedSocket = socket instanceof NetSocket || (typeof socket?._socketId === "string" && socket._socketId.length > 0) || (typeof socket?._socketId === "number" && socket._socketId > 0);
         // Bridge-backed sockets already speak kernel-routed byte streams, so route
         // HTTP requests through the raw serializer instead of undici's dispatcher.
         if (bridgeBackedSocket || socket?._loopbackServer || isRawSocketRequest(requestMethod, normalizedHeaders) || this._options.socketPath || this._agent?.keepAlive === true) {
@@ -11139,9 +11215,10 @@ var __bridge = (() => {
         headerPairs,
         bodyBuffer
       );
-      socket.write(requestBuffer);
       const timeoutMs = typeof this._options.timeout === "number" && this._options.timeout > 0 ? this._options.timeout : 3e4;
-      const response = await waitForRawHttpResponse(socket, requestMethod, timeoutMs);
+      const responsePromise = waitForRawHttpResponse(socket, requestMethod, timeoutMs);
+      socket.write(requestBuffer);
+      const response = await responsePromise;
       this.finished = true;
       this._clearTimeout();
       if (response.status === 101) {
@@ -12845,8 +12922,9 @@ var __bridge = (() => {
     }
     return parsed ?? 0;
   }
-  function parseChunkedBody(bodyBuffer) {
+  function parseChunkedBody(bodyBuffer, maxBodyBytes = MAX_HTTP_BODY_BYTES) {
     let offset = 0;
+    let totalBodyBytes = 0;
     const chunks = [];
     while (true) {
       const lineEnd = bodyBuffer.indexOf("\r\n", offset);
@@ -12868,6 +12946,9 @@ var __bridge = (() => {
       if (!Number.isSafeInteger(chunkSize) || chunkSize < 0) {
         return null;
       }
+      if (totalBodyBytes + chunkSize > maxBodyBytes) {
+        return null;
+      }
       const chunkStart = lineEnd + 2;
       const chunkEnd = chunkStart + chunkSize;
       const chunkTerminatorEnd = chunkEnd + 2;
@@ -12878,6 +12959,7 @@ var __bridge = (() => {
         return null;
       }
       if (chunkSize > 0) {
+        totalBodyBytes += chunkSize;
         chunks.push(bodyBuffer.subarray(chunkStart, chunkEnd));
         offset = chunkTerminatorEnd;
         continue;
@@ -12914,10 +12996,28 @@ var __bridge = (() => {
     }
     const headerEnd = buffer.indexOf("\r\n\r\n", requestStart);
     if (headerEnd === -1) {
+      if (buffer.length - requestStart > MAX_HTTP_REQUEST_HEADER_BYTES) {
+        return {
+          kind: "bad-request",
+          closeConnection: true
+        };
+      }
       return { kind: "incomplete" };
+    }
+    if (headerEnd - requestStart > MAX_HTTP_REQUEST_HEADER_BYTES) {
+      return {
+        kind: "bad-request",
+        closeConnection: true
+      };
     }
     const headerBlock = buffer.subarray(requestStart, headerEnd).toString("latin1");
     const [requestLine, ...headerLines] = headerBlock.split("\r\n");
+    if (headerLines.length > MAX_HTTP_REQUEST_HEADERS) {
+      return {
+        kind: "bad-request",
+        closeConnection: true
+      };
+    }
     const requestMatch = /^([A-Z]+)\s+(\S+)\s+HTTP\/(1)\.(0|1)$/.exec(requestLine);
     if (!requestMatch) {
       return {
@@ -13009,7 +13109,7 @@ var __bridge = (() => {
       bytesConsumed = headerEnd + 4 + parsedChunked.bytesConsumed;
     } else if (contentLength !== void 0) {
       const parsedContentLength = parseContentLengthHeader(contentLength);
-      if (parsedContentLength === null) {
+      if (parsedContentLength === null || parsedContentLength > MAX_HTTP_BODY_BYTES) {
         return {
           kind: "bad-request",
           closeConnection: true
@@ -13109,7 +13209,7 @@ var __bridge = (() => {
     const bodyBuffer = response.body == null ? Buffer.alloc(0) : response.bodyEncoding === "base64" ? Buffer.from(response.body, "base64") : Buffer.from(response.body, "utf8");
     const bodyAllowed = hasResponseBody(statusCode, request.method);
     const transferEncodingTokens = headers["transfer-encoding"] ? splitTransferEncodingTokens(joinHeaderValue(headers["transfer-encoding"])) : [];
-    const isChunked = transferEncodingTokens.includes("chunked");
+    let isChunked = transferEncodingTokens.includes("chunked");
     const hasExplicitContentLength = headers["content-length"] !== void 0;
     let closeConnection = requestWantsClose || response.connectionEnded === true || response.connectionReset === true;
     if (!bodyAllowed) {
@@ -13118,9 +13218,16 @@ var __bridge = (() => {
       }
       delete headers["content-length"];
     } else if (!isChunked && !hasExplicitContentLength) {
-      headers["content-length"] = String(bodyBuffer.length);
-      rawNameMap.set("content-length", "Content-Length");
-      order.push("content-length");
+      if (response.streamed === true) {
+        headers["transfer-encoding"] = "chunked";
+        rawNameMap.set("transfer-encoding", "Transfer-Encoding");
+        order.push("transfer-encoding");
+        isChunked = true;
+      } else {
+        headers["content-length"] = String(bodyBuffer.length);
+        rawNameMap.set("content-length", "Content-Length");
+        order.push("content-length");
+      }
     }
     if (closeConnection) {
       headers.connection = "close";
@@ -13358,6 +13465,7 @@ ${headerLines}\r
     _trailers = /* @__PURE__ */ new Map();
     _chunks = [];
     _chunksBytes = 0;
+    _streamed = false;
     _listeners = {};
     _closedPromise;
     _resolveClosed = null;
@@ -13555,16 +13663,21 @@ ${headerLines}\r
       this._headers.delete(lower);
       this._rawHeaderNames.delete(lower);
     }
-    write(chunk, encodingOrCallback, callback) {
+    _appendChunk(chunk, encoding, streamed) {
       if (chunk == null) return true;
-      this.headersSent = true;
-      const buf = typeof chunk === "string" ? Buffer.from(chunk, typeof encodingOrCallback === "string" ? encodingOrCallback : void 0) : chunk;
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, typeof encoding === "string" ? encoding : void 0) : chunk;
       if (this._chunksBytes + buf.byteLength > MAX_HTTP_BODY_BYTES) {
         throw new Error("ERR_HTTP_BODY_TOO_LARGE: response body exceeds " + MAX_HTTP_BODY_BYTES + " byte limit");
       }
       this._chunks.push(buf);
       this._chunksBytes += buf.byteLength;
+      this._streamed ||= streamed;
+      this.headersSent = true;
       this.outputSize += buf.byteLength;
+      return true;
+    }
+    write(chunk, encodingOrCallback, callback) {
+      this._appendChunk(chunk, typeof encodingOrCallback === "string" ? encodingOrCallback : void 0, true);
       const writeCallback = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
       if (typeof writeCallback === "function") {
         queueMicrotask(writeCallback);
@@ -13582,9 +13695,9 @@ ${headerLines}\r
       }
       if (chunk != null) {
         if (typeof chunk === "string" && typeof encodingOrCallback === "string") {
-          this.write(Buffer.from(chunk, encodingOrCallback));
+          this._appendChunk(chunk, encodingOrCallback, false);
         } else {
-          this.write(chunk);
+          this._appendChunk(chunk, void 0, false);
         }
       }
       this._finalize();
@@ -13740,7 +13853,8 @@ ${headerLines}\r
         trailers: serializedTrailers.length > 0 ? serializedTrailers : void 0,
         rawTrailers: rawTrailers.length > 0 ? rawTrailers : void 0,
         connectionEnded: this._connectionEnded,
-        connectionReset: this._connectionReset
+        connectionReset: this._connectionReset,
+        streamed: this._streamed
       };
     }
     _writeRaw(chunk, callback) {
@@ -13804,6 +13918,7 @@ ${headerLines}\r
     listening = false;
     _listeners = {};
     _serverId;
+    _netServer = null;
     _listenPromise = null;
     _address = null;
     _handleId = null;
@@ -13865,18 +13980,47 @@ ${headerLines}\r
       this._hostCloseWaitStarted = true;
     }
     async _start(port, hostname) {
-      if (typeof _networkHttpServerListenRaw === "undefined") {
+      if (typeof NetServer === "undefined") {
         throw new Error(
           "http.createServer requires kernel-backed network bridge support"
         );
       }
       debugBridgeNetwork("server listen start", this._serverId, port, hostname);
-      const resultJson = await _networkHttpServerListenRaw.apply(
-        void 0,
-        [JSON.stringify({ serverId: this._serverId, port, hostname })],
-        { result: { promise: true } }
-      );
-      this._finishStart(resultJson);
+      const netServer = new NetServer({ allowHalfOpen: true });
+      this._netServer = netServer;
+      netServer.on("connection", (socket) => {
+        this._emit("connection", socket);
+        attachHttpServerSocket(this, socket);
+      });
+      netServer.on("error", (error) => {
+        this._emit("error", error);
+      });
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          netServer.removeListener?.("listening", onListening);
+          netServer.removeListener?.("error", onError);
+        };
+        const onListening = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        };
+        const onError = (error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error instanceof Error ? error : new Error(String(error)));
+        };
+        netServer.once("listening", onListening);
+        netServer.once("error", onError);
+        netServer.listen(port ?? 0, hostname);
+      });
+      this._address = netServer.address();
+      this.listening = true;
+      this._startHostCloseWait();
+      debugBridgeNetwork("server listening", this._serverId, this._address);
     }
     listen(portOrCb, hostOrCb, cb) {
       const port = typeof portOrCb === "number" ? portOrCb : void 0;
@@ -13916,12 +14060,20 @@ ${headerLines}\r
           if (this._listenPromise) {
             await this._listenPromise;
           }
-          if (this.listening && typeof _networkHttpServerCloseRaw !== "undefined") {
-            debugBridgeNetwork("server close bridge call", this._serverId);
-            await _networkHttpServerCloseRaw.apply(void 0, [this._serverId], {
-              result: { promise: true }
+          const netServer = this._netServer;
+          if (this.listening && netServer) {
+            debugBridgeNetwork("server close net server", this._serverId);
+            await new Promise((resolve, reject) => {
+              netServer.close((error) => {
+                if (error) {
+                  reject(error);
+                } else {
+                  resolve();
+                }
+              });
             });
           }
+          this._netServer = null;
           this._completeClose();
           debugBridgeNetwork("server close complete", this._serverId);
           const callbacks = this._closeCallbacks.splice(0);
@@ -14302,6 +14454,162 @@ ${headerLines}\r
     } finally {
       server._endRequestDispatch();
     }
+  }
+  async function dispatchSocketBackedServerRequest(server, requestInput) {
+    const request = typeof requestInput === "string" ? JSON.parse(requestInput) : requestInput;
+    const incoming = new ServerIncomingMessage(request);
+    const outgoing = new ServerResponseBridge();
+    incoming.socket = outgoing.socket;
+    incoming.connection = outgoing.socket;
+    server._beginRequestDispatch();
+    try {
+      try {
+        const listenerResult = server._requestListener(incoming, outgoing);
+        if (incoming.rawBody && incoming.rawBody.length > 0) {
+          incoming.emit("data", incoming.rawBody);
+        }
+        incoming.emit("end");
+        await Promise.resolve(listenerResult);
+      } catch (err) {
+        outgoing.statusCode = 500;
+        try {
+          outgoing.end(err instanceof Error ? `Error: ${err.message}` : "Error");
+        } catch {
+          if (!outgoing.writableFinished) outgoing.end();
+        }
+      }
+      if (!outgoing.writableFinished) {
+        outgoing.end();
+      }
+      await outgoing.waitForClose();
+      let aborted = false;
+      return {
+        responseJson: JSON.stringify(outgoing.serialize()),
+        abortRequest: () => {
+          if (aborted) {
+            return;
+          }
+          aborted = true;
+          incoming._abort();
+        }
+      };
+    } finally {
+      server._endRequestDispatch();
+    }
+  }
+  function attachHttpServerSocket(server, socket) {
+    let buffer = Buffer.alloc(0);
+    let dispatchRunning = false;
+    let dispatchPending = false;
+    let ended = false;
+    let detached = false;
+    const cleanup = () => {
+      if (detached) {
+        return;
+      }
+      detached = true;
+      socket.off?.("data", onData);
+      socket.removeListener?.("data", onData);
+      socket.off?.("end", onEnd);
+      socket.removeListener?.("end", onEnd);
+      socket.off?.("close", onClose);
+      socket.removeListener?.("close", onClose);
+      socket.off?.("error", onError);
+      socket.removeListener?.("error", onError);
+    };
+    const scheduleDispatch = () => {
+      if (dispatchRunning) {
+        dispatchPending = true;
+        return;
+      }
+      dispatchRunning = true;
+      void processRequests().finally(() => {
+        dispatchRunning = false;
+        if (dispatchPending && !detached) {
+          dispatchPending = false;
+          scheduleDispatch();
+        } else {
+          dispatchPending = false;
+        }
+      });
+    };
+    const finishSocket = () => {
+      cleanup();
+      if (!socket.destroyed && !socket._writableEnded) {
+        socket.end();
+      }
+    };
+    const onData = (chunk) => {
+      const payload = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      buffer = buffer.length === 0 ? payload : Buffer.concat([buffer, payload]);
+      scheduleDispatch();
+    };
+    const onEnd = () => {
+      ended = true;
+      if (buffer.length === 0) {
+        cleanup();
+        return;
+      }
+      scheduleDispatch();
+    };
+    const onClose = () => {
+      cleanup();
+    };
+    const onError = () => {
+      cleanup();
+    };
+    async function processRequests() {
+      let closeAfterDrain = false;
+      while (!detached && !socket.destroyed) {
+        const parsed = parseLoopbackRequestBuffer(buffer, server);
+        if (parsed.kind === "incomplete") {
+          if (ended && buffer.length > 0) {
+            socket.write(createBadRequestResponseBuffer());
+            finishSocket();
+          }
+          return;
+        }
+        if (parsed.kind === "bad-request") {
+          socket.write(createBadRequestResponseBuffer());
+          finishSocket();
+          buffer = Buffer.alloc(0);
+          return;
+        }
+        buffer = buffer.subarray(parsed.bytesConsumed);
+        if (parsed.upgradeHead) {
+          cleanup();
+          const incoming = new ServerIncomingMessage(parsed.request);
+          incoming.socket = socket;
+          incoming.connection = socket;
+          server._emit("upgrade", incoming, socket, parsed.upgradeHead);
+          return;
+        }
+        const { responseJson } = await dispatchSocketBackedServerRequest(server, parsed.request);
+        if (detached || socket.destroyed) {
+          return;
+        }
+        const response = JSON.parse(responseJson);
+        // Keep-alive for socket-backed HTTP servers is intentionally deferred:
+        // pipelined bytes already in `buffer` drain, then this connection closes.
+        // Revisit when the bridge owns full Node-compatible request lifecycle
+        // timers and per-socket request limits.
+        const serialized = serializeLoopbackResponse(response, parsed.request, true);
+        if (!closeAfterDrain && serialized.payload.length > 0) {
+          socket.write(serialized.payload);
+        }
+        if (serialized.closeConnection) {
+          closeAfterDrain = true;
+          if (buffer.length === 0) {
+            finishSocket();
+            return;
+          }
+        }
+      }
+    }
+    socket.on("data", onData);
+    socket.once("end", onEnd);
+    socket.once("close", onClose);
+    socket.once("error", onError);
   }
   function dispatchSocketRequest(event, serverId, requestJson, headBase64, socketId) {
     const server = serverInstances.get(serverId);
@@ -17168,7 +17476,10 @@ ${headerLines}\r
         socketId: handle
       };
     }
-    if (typeof handle === "object" && typeof handle.socketId === "string") {
+    if (typeof handle === "object" && (typeof handle.socketId === "string" || typeof handle.socketId === "number")) {
+      return handle;
+    }
+    if (typeof handle === "object" && handle.loopbackHttpTarget) {
       return handle;
     }
     throw new Error("net.connect bridge returned an invalid socket handle");
@@ -17531,18 +17842,6 @@ ${headerLines}\r
       this.remotePort = path ? void 0 : port;
       this.remotePath = path;
       this.pending = false;
-      const loopbackServer = !path && isLoopbackRequestHost(host) ? findLoopbackHttpServerByPort(port) : null;
-      if (loopbackServer) {
-        this._loopbackServer = loopbackServer;
-        this._connected = true;
-        this.connecting = false;
-        queueMicrotask(() => {
-          this._touchTimeout();
-          this._emitNet("connect");
-          this._emitNet("ready");
-        });
-        return this;
-      }
       let handle;
       try {
         handle = normalizeNetSocketHandle(_netSocketConnectRaw.applySync(
@@ -17556,6 +17855,18 @@ ${headerLines}\r
           if (!this.destroyed) {
             this.destroy(error);
           }
+        });
+        return this;
+      }
+      if (handle.loopbackHttpTarget) {
+        this._loopbackHttpTarget = handle.loopbackHttpTarget;
+        this._applySocketInfo(handle);
+        this._connected = true;
+        this.connecting = false;
+        queueMicrotask(() => {
+          this._touchTimeout();
+          this._emitNet("connect");
+          this._emitNet("ready");
         });
         return this;
       }
@@ -17582,7 +17893,7 @@ ${headerLines}\r
       } else {
         buf = Buffer.from(data);
       }
-      if (this._loopbackServer) {
+      if (this._loopbackServer || this._loopbackHttpTarget) {
         debugBridgeNetwork("socket write loopback", this._socketId, buf.length);
         this.bytesWritten += buf.length;
         if (this._loopbackUpgradeSocket) {
@@ -17632,7 +17943,7 @@ ${headerLines}\r
           }
         }
       });
-      if (this._loopbackServer) {
+      if (this._loopbackServer || this._loopbackHttpTarget) {
         if (this._loopbackUpgradeSocket) {
           queueMicrotask(() => {
             this._loopbackUpgradeSocket?._pushEnd();
@@ -17665,10 +17976,11 @@ ${headerLines}\r
         clearTimeout(this._bridgeReadPollTimer);
         this._bridgeReadPollTimer = null;
       }
-      if (this._loopbackServer) {
+      if (this._loopbackServer || this._loopbackHttpTarget) {
         this._loopbackUpgradeSocket?.destroy(error);
         this._loopbackUpgradeSocket = null;
         this._loopbackServer = null;
+        this._loopbackHttpTarget = null;
         if (error) {
           this._emitNet("error", error);
         }
@@ -17803,7 +18115,7 @@ ${headerLines}\r
       if (this._timeoutTimer && typeof this._timeoutTimer.ref === "function") {
         this._timeoutTimer.ref();
       }
-      if (!this.destroyed && this._connected && !this._loopbackServer && !this._bridgeReadLoopRunning) {
+      if (!this.destroyed && this._connected && !this._loopbackServer && !this._loopbackHttpTarget && !this._bridgeReadLoopRunning) {
         void this._pumpBridgeReads();
       }
       return this;
@@ -18079,7 +18391,7 @@ ${headerLines}\r
       }
     }
     _dispatchLoopbackHttpRequest() {
-      if (!this._loopbackServer || this.destroyed) {
+      if ((!this._loopbackServer && !this._loopbackHttpTarget) || this.destroyed) {
         return;
       }
       if (this._loopbackDispatchRunning) {
@@ -18099,8 +18411,9 @@ ${headerLines}\r
     }
     async _processLoopbackHttpRequests() {
       let closeAfterDrain = false;
-      while (this._loopbackServer && !this.destroyed) {
-        const parsed = parseLoopbackRequestBuffer(this._loopbackBuffer, this._loopbackServer);
+      while ((this._loopbackServer || this._loopbackHttpTarget) && !this.destroyed) {
+        const parserServer = this._loopbackServer ?? { listenerCount: () => 0 };
+        const parsed = parseLoopbackRequestBuffer(this._loopbackBuffer, parserServer);
         if (parsed.kind === "incomplete") {
           if (closeAfterDrain) {
             this._closeLoopbackReadable();
@@ -18120,9 +18433,20 @@ ${headerLines}\r
           this._dispatchLoopbackUpgrade(parsed.request, parsed.upgradeHead);
           return;
         }
-        const {
-          responseJson
-        } = await dispatchLoopbackServerRequest(this._loopbackServer, parsed.request);
+        let responseJson;
+        if (this._loopbackHttpTarget) {
+          if (typeof _networkHttpServerRequestRaw === "undefined") {
+            throw new Error("HTTP loopback bridge is not available");
+          }
+          responseJson = _networkHttpServerRequestRaw.applySync(void 0, [{
+            ...this._loopbackHttpTarget,
+            request: JSON.stringify(parsed.request)
+          }]);
+        } else {
+          ({
+            responseJson
+          } = await dispatchLoopbackServerRequest(this._loopbackServer, parsed.request));
+        }
         const response = JSON.parse(responseJson);
         const serialized = serializeLoopbackResponse(response, parsed.request, parsed.closeConnection);
         if (!closeAfterDrain && serialized.payload.length > 0) {
@@ -18535,18 +18859,6 @@ ${headerLines}\r
   };
   function NetServerCallable(optionsOrListener, maybeListener) {
     return new NetServer(optionsOrListener, maybeListener);
-  }
-  function findLoopbackHttpServerByPort(port) {
-    for (const server of serverInstances.values()) {
-      if (!server.listening) {
-        continue;
-      }
-      const address = server.address();
-      if (address && typeof address === "object" && address.port === port) {
-        return server;
-      }
-    }
-    return null;
   }
   var netModule = {
     BlockList,

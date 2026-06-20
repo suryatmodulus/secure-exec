@@ -34,17 +34,17 @@ use crate::state::{
     ActiveSqliteStatement, ActiveTcpListener, ActiveTcpSocket, ActiveTlsState, ActiveTlsStream,
     ActiveUdpSocket, ActiveUnixListener, ActiveUnixSocket, BridgeError, ExitedProcessSnapshot,
     Http2BridgeEvent, Http2RuntimeSnapshot, Http2SessionCommand, Http2SessionSnapshot,
-    Http2SocketSnapshot, JavascriptSocketFamily, JavascriptSocketPathContext,
-    JavascriptTcpListenerEvent, JavascriptTcpSocketEvent, JavascriptTlsBridgeOptions,
-    JavascriptTlsClientHello, JavascriptTlsDataValue, JavascriptTlsMaterial, JavascriptUdpFamily,
-    JavascriptUdpSocketEvent, JavascriptUnixListenerEvent, NetworkResourceCounts, PendingTcpSocket,
-    PendingUnixSocket, ProcNetEntry, ProcessEventEnvelope, ResolvedChildProcessExecution,
-    ResolvedTcpConnectAddr, SharedBridge, SharedSidecarRequestClient, SidecarKernel,
-    SocketQueryKind, ToolExecution, VmDnsConfig, VmListenPolicy, VmState,
-    DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME, EXECUTION_SANDBOX_ROOT_ENV,
-    JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV, MAPPED_HOST_FD_START, PYTHON_COMMAND,
-    TOOL_DRIVER_NAME, VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND,
-    WASM_STDIO_SYNC_RPC_ENV,
+    Http2SocketSnapshot, JavascriptHttpLoopbackTarget, JavascriptSocketFamily,
+    JavascriptSocketPathContext, JavascriptTcpListenerEvent, JavascriptTcpSocketEvent,
+    JavascriptTlsBridgeOptions, JavascriptTlsClientHello, JavascriptTlsDataValue,
+    JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
+    JavascriptUnixListenerEvent, NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket,
+    ProcNetEntry, ProcessEventEnvelope, ResolvedChildProcessExecution, ResolvedTcpConnectAddr,
+    SharedBridge, SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution,
+    VmDnsConfig, VmListenPolicy, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
+    EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV,
+    MAPPED_HOST_FD_START, PYTHON_COMMAND, TOOL_DRIVER_NAME,
+    VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
 };
 use crate::tools::{
     format_tool_failure_output, is_tool_command, normalized_tool_command_name,
@@ -157,10 +157,23 @@ const DEFAULT_SCRYPT_COST: u64 = 16_384;
 const DEFAULT_SCRYPT_BLOCK_SIZE: u32 = 8;
 const DEFAULT_SCRYPT_PARALLELIZATION: u32 = 1;
 const SQLITE_JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
+const HTTP_LOOPBACK_REQUEST_TIMEOUT_MS_ENV: &str =
+    "SECURE_EXEC_TEST_HTTP_LOOPBACK_REQUEST_TIMEOUT_MS";
 
 trait Http2AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> Http2AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+fn http_loopback_request_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var(HTTP_LOOPBACK_REQUEST_TIMEOUT_MS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(HTTP_LOOPBACK_REQUEST_TIMEOUT)
+    })
+}
 
 const DEFAULT_ALLOWED_NODE_BUILTINS: &[&str] = &[
     "assert",
@@ -931,6 +944,18 @@ struct LoopbackHttpResponseWaitRequest<'a, B> {
     process: &'a mut ActiveProcess,
     resource_limits: &'a ResourceLimits,
     request_key: (u64, u64),
+}
+
+pub(crate) struct LoopbackHttpDispatchRequest<'a, B> {
+    pub(crate) bridge: &'a SharedBridge<B>,
+    pub(crate) vm_id: &'a str,
+    pub(crate) dns: &'a VmDnsConfig,
+    pub(crate) socket_paths: &'a JavascriptSocketPathContext,
+    pub(crate) kernel: &'a mut SidecarKernel,
+    pub(crate) process: &'a mut ActiveProcess,
+    pub(crate) resource_limits: &'a ResourceLimits,
+    pub(crate) server_id: u64,
+    pub(crate) request_json: &'a str,
 }
 
 struct JavascriptDgramSyncRpcServiceRequest<'a, B> {
@@ -3400,6 +3425,41 @@ where
             reject_unauthorized: None,
         };
         let headers = parse_http_header_collection(&options.headers, "vm.fetch headers")?;
+        let target_process_id = find_kernel_http_listener_process(vm, payload.port);
+        if let Some(target_process_id) = target_process_id {
+            let max_fetch_response_bytes = vm.limits.http.max_fetch_response_bytes;
+            let response_json = match dispatch_kernel_http_fetch(
+                &self.bridge,
+                &vm_id,
+                vm,
+                &target_process_id,
+                payload.port,
+                &target_path,
+                &options,
+                &headers,
+                max_fetch_response_bytes,
+            ) {
+                Ok(response_json) => response_json,
+                Err(error) => {
+                    if let Some(exit_code) = kernel_http_fetch_target_exit_code(&error) {
+                        let _ = vm;
+                        self.finish_active_process_exit(&vm_id, &target_process_id, exit_code)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let response = self.respond(
+                request,
+                ResponsePayload::VmFetchResult(VmFetchResponse { response_json }),
+            );
+            ensure_vm_fetch_response_frame_within_limit(&response, self.config.max_frame_bytes)?;
+
+            return Ok(DispatchResult {
+                response,
+                events: Vec::new(),
+            });
+        }
+
         let Some((target_process_id, server_id)) =
             vm.active_processes
                 .iter()
@@ -3427,27 +3487,7 @@ where
                 ))
             })?;
         let request_json = serialize_http_loopback_request(&request_url, &options, &headers)?;
-        let request_id = {
-            let server = process.http_servers.get_mut(&server_id).ok_or_else(|| {
-                SidecarError::InvalidState(format!(
-                    "vm.fetch target server disappeared: {server_id}"
-                ))
-            })?;
-            server.next_request_id += 1;
-            server.next_request_id
-        };
-        process
-            .pending_http_requests
-            .insert((server_id, request_id), None);
-        process.execution.send_javascript_stream_event(
-            "http_request",
-            json!({
-                "serverId": server_id,
-                "requestId": request_id,
-                "request": request_json,
-            }),
-        )?;
-        let response_json = wait_for_loopback_http_response(LoopbackHttpResponseWaitRequest {
+        let response_json = dispatch_loopback_http_request(LoopbackHttpDispatchRequest {
             bridge: &self.bridge,
             vm_id: &vm_id,
             dns: &vm.dns,
@@ -3455,7 +3495,8 @@ where
             kernel: &mut vm.kernel,
             process,
             resource_limits: &resource_limits,
-            request_key: (server_id, request_id),
+            server_id,
+            request_json: &request_json,
         })?;
 
         let response = self.respond(
@@ -3763,13 +3804,21 @@ where
                         continue;
                     };
 
-                    self.queue_pending_process_event(ProcessEventEnvelope {
-                        connection_id: connection_id.clone(),
-                        session_id: session_id.clone(),
-                        vm_id: vm_id.clone(),
-                        process_id: process_id.clone(),
-                        event,
-                    })?;
+                    if Self::internal_execution_event(&event) {
+                        // These events are sidecar work items, not client-facing
+                        // process events. Handle them immediately so a sibling
+                        // process can service sync RPCs while another request
+                        // waits on VM-local networking.
+                        self.handle_execution_event(&vm_id, &process_id, event)?;
+                    } else {
+                        self.queue_pending_process_event(ProcessEventEnvelope {
+                            connection_id: connection_id.clone(),
+                            session_id: session_id.clone(),
+                            vm_id: vm_id.clone(),
+                            process_id: process_id.clone(),
+                            event,
+                        })?;
+                    }
                     emitted_any = true;
                     emitted_this_pass = true;
                 }
@@ -3785,6 +3834,15 @@ where
         }
 
         Ok(emitted_any)
+    }
+
+    fn internal_execution_event(event: &ActiveExecutionEvent) -> bool {
+        matches!(
+            event,
+            ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                | ActiveExecutionEvent::SignalState { .. }
+        )
     }
 
     fn recover_closed_root_runtime_process_event(
@@ -10051,6 +10109,25 @@ fn find_socket_state_entry(
 
             match kind {
                 SocketQueryKind::TcpListener => {
+                    for server in process.http_servers.values() {
+                        let local_addr = server.guest_local_addr;
+                        let local_host = local_addr.ip().to_string();
+                        if !socket_host_matches(request.host.as_deref(), &local_host) {
+                            continue;
+                        }
+                        if let Some(port) = request.port {
+                            if local_addr.port() != port {
+                                continue;
+                            }
+                        }
+                        return Ok(Some(SocketStateEntry {
+                            process_id: process_id.to_owned(),
+                            host: Some(local_host),
+                            port: Some(local_addr.port()),
+                            path: None,
+                        }));
+                    }
+
                     for listener in process.tcp_listeners.values() {
                         if listener.kernel_socket_id.is_some() {
                             continue;
@@ -10472,8 +10549,13 @@ pub(crate) fn vm_network_resource_counts(vm: &VmState) -> NetworkResourceCounts 
 
 fn collect_javascript_socket_port_state(
     kernel: &SidecarKernel,
+    process_id: &str,
     process: &ActiveProcess,
     tcp_guest_to_host: &mut BTreeMap<(JavascriptSocketFamily, u16), u16>,
+    http_loopback_targets: &mut BTreeMap<
+        (JavascriptSocketFamily, u16),
+        JavascriptHttpLoopbackTarget,
+    >,
     udp_guest_to_host: &mut BTreeMap<(JavascriptSocketFamily, u16), u16>,
     udp_host_to_guest: &mut BTreeMap<(JavascriptSocketFamily, u16), u16>,
     used_tcp_ports: &mut BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
@@ -10504,12 +10586,20 @@ fn collect_javascript_socket_port_state(
         record_tcp_listener(local_addr, local_addr.port());
     }
 
-    for server in process.http_servers.values() {
+    for (server_id, server) in &process.http_servers {
         let host_port = match server.listener.local_addr() {
             Ok(addr) => addr.port(),
             Err(_) => continue,
         };
         record_tcp_listener(server.guest_local_addr, host_port);
+        let family = JavascriptSocketFamily::from_ip(server.guest_local_addr.ip());
+        http_loopback_targets.insert(
+            (family, server.guest_local_addr.port()),
+            JavascriptHttpLoopbackTarget {
+                process_id: process_id.to_owned(),
+                server_id: *server_id,
+            },
+        );
     }
 
     if let Ok(http2) = process.http2.shared.lock() {
@@ -10564,11 +10654,14 @@ fn collect_javascript_socket_port_state(
         }
     }
 
-    for child in process.child_processes.values() {
+    for (child_process_id, child) in &process.child_processes {
+        let child_id = format!("{process_id}/{child_process_id}");
         collect_javascript_socket_port_state(
             kernel,
+            &child_id,
             child,
             tcp_guest_to_host,
+            http_loopback_targets,
             udp_guest_to_host,
             udp_host_to_guest,
             used_tcp_ports,
@@ -10583,15 +10676,18 @@ pub(crate) fn build_javascript_socket_path_context(
     let mut loopback_exempt_ports = vm.create_loopback_exempt_ports.clone();
     loopback_exempt_ports.extend(vm.configuration.loopback_exempt_ports.iter().copied());
     let mut tcp_loopback_guest_to_host_ports = BTreeMap::new();
+    let mut http_loopback_targets = BTreeMap::new();
     let mut udp_loopback_guest_to_host_ports = BTreeMap::new();
     let mut udp_loopback_host_to_guest_ports = BTreeMap::new();
     let mut used_tcp_guest_ports = BTreeMap::new();
     let mut used_udp_guest_ports = BTreeMap::new();
-    for process in vm.active_processes.values() {
+    for (process_id, process) in &vm.active_processes {
         collect_javascript_socket_port_state(
             &vm.kernel,
+            process_id,
             process,
             &mut tcp_loopback_guest_to_host_ports,
+            &mut http_loopback_targets,
             &mut udp_loopback_guest_to_host_ports,
             &mut udp_loopback_host_to_guest_ports,
             &mut used_tcp_guest_ports,
@@ -10604,6 +10700,7 @@ pub(crate) fn build_javascript_socket_path_context(
         listen_policy: vm.listen_policy,
         loopback_exempt_ports,
         tcp_loopback_guest_to_host_ports,
+        http_loopback_targets,
         udp_loopback_guest_to_host_ports,
         udp_loopback_host_to_guest_ports,
         used_tcp_guest_ports,
@@ -11561,12 +11658,10 @@ where
             SidecarError::Execution(format!("failed to resolve TCP address {host}:{port}"))
         })?;
     let family = JavascriptSocketFamily::from_ip(ip);
-    let use_kernel_loopback =
-        is_loopback_ip(ip) && context.translate_tcp_loopback_port(family, port).is_some();
+    let translated_loopback_port = context.translate_tcp_loopback_port(family, port);
+    let use_kernel_loopback = is_loopback_ip(ip) && translated_loopback_port == Some(port);
     let actual_port = if is_loopback_ip(ip) {
-        context
-            .translate_tcp_loopback_port(family, port)
-            .unwrap_or(port)
+        translated_loopback_port.unwrap_or(port)
     } else {
         port
     };
@@ -16232,6 +16327,596 @@ fn http_request_target(url: &Url) -> String {
     )
 }
 
+fn find_kernel_http_listener_process(vm: &VmState, port: u16) -> Option<String> {
+    vm.active_processes
+        .iter()
+        .find_map(|(process_id, process)| {
+            process.tcp_listeners.values().find_map(|listener| {
+                let socket_id = listener.kernel_socket_id?;
+                let record = vm.kernel.socket_get(socket_id)?;
+                let local_addr = record
+                    .local_address()
+                    .and_then(|address| resolve_tcp_bind_addr(address.host(), address.port()).ok())
+                    .unwrap_or_else(|| listener.guest_local_addr());
+                if local_addr.port() == port && is_vm_local_http_listener_addr(local_addr.ip()) {
+                    Some(process_id.to_owned())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn is_vm_local_http_listener_addr(ip: IpAddr) -> bool {
+    ip.is_loopback() || ip.is_unspecified()
+}
+
+fn serialize_kernel_http_fetch_request(
+    port: u16,
+    path: &str,
+    options: &JavascriptHttpRequestOptions,
+    headers: &HttpHeaderCollection,
+) -> Vec<u8> {
+    let method = options.method.as_deref().unwrap_or("GET");
+    let mut lines = vec![format!("{method} {path} HTTP/1.1")];
+    let mut has_host = false;
+    let mut has_connection = false;
+    let mut has_content_length = false;
+    for (name, values) in &headers.normalized {
+        match name.as_str() {
+            "host" => has_host = true,
+            "connection" => has_connection = true,
+            "content-length" => has_content_length = true,
+            _ => {}
+        }
+        lines.push(format!("{name}: {}", values.join(", ")));
+    }
+    if !has_host {
+        lines.push(format!("Host: 127.0.0.1:{port}"));
+    }
+    if !has_connection {
+        lines.push(String::from("Connection: close"));
+    }
+    let body = options.body.as_deref().unwrap_or("").as_bytes();
+    if !has_content_length && !body.is_empty() {
+        lines.push(format!("Content-Length: {}", body.len()));
+    }
+    lines.push(String::new());
+    lines.push(String::new());
+
+    let mut request = lines.join("\r\n").into_bytes();
+    request.extend_from_slice(body);
+    request
+}
+
+fn parse_kernel_http_fetch_response(
+    buffer: &[u8],
+    peer_closed: bool,
+    url: &str,
+) -> Result<Option<String>, SidecarError> {
+    let Some(header_end) = find_http_header_end(buffer) else {
+        return Ok(None);
+    };
+    let header_bytes = &buffer[..header_end];
+    let head = String::from_utf8_lossy(header_bytes);
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let mut status_parts = status_line.splitn(3, ' ');
+    let version = status_parts.next().unwrap_or_default();
+    if !version.starts_with("HTTP/") {
+        return Err(SidecarError::Execution(format!(
+            "invalid vm.fetch HTTP response status line: {status_line}"
+        )));
+    }
+    let status = status_parts
+        .next()
+        .ok_or_else(|| {
+            SidecarError::Execution(format!(
+                "invalid vm.fetch HTTP response status line: {status_line}"
+            ))
+        })?
+        .parse::<u16>()
+        .map_err(|error| {
+            SidecarError::Execution(format!(
+                "invalid vm.fetch HTTP response status code in {status_line:?}: {error}"
+            ))
+        })?;
+    let status_text = status_parts.next().unwrap_or_default();
+    let mut headers = Vec::new();
+    let mut raw_headers = Vec::new();
+    let mut content_length = None;
+    let mut transfer_encoding_values = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(SidecarError::Execution(format!(
+                "invalid vm.fetch HTTP response header line: {line}"
+            )));
+        };
+        let value = value.trim().to_owned();
+        let normalized = name.to_ascii_lowercase();
+        if normalized == "content-length" {
+            content_length = Some(value.parse::<usize>().map_err(|error| {
+                SidecarError::Execution(format!(
+                    "invalid vm.fetch Content-Length header {value:?}: {error}"
+                ))
+            })?);
+        } else if normalized == "transfer-encoding" {
+            transfer_encoding_values.push(value.clone());
+        }
+        headers.push(json!([normalized, value.clone()]));
+        raw_headers.push(Value::String(name.to_owned()));
+        raw_headers.push(Value::String(value));
+    }
+
+    let body_start = header_end + 4;
+    let transfer_encoding = transfer_encoding_tokens(&transfer_encoding_values);
+    let is_chunked = transfer_encoding.iter().any(|token| token == "chunked");
+    let body = if is_chunked {
+        if content_length.is_some() {
+            return Err(SidecarError::Execution(String::from(
+                "vm.fetch HTTP response cannot include both Transfer-Encoding: chunked and Content-Length",
+            )));
+        }
+        if transfer_encoding.len() != 1 {
+            return Err(SidecarError::Execution(format!(
+                "unsupported vm.fetch Transfer-Encoding: {}",
+                transfer_encoding.join(", ")
+            )));
+        }
+        let Some(decoded) = decode_kernel_http_chunked_body(&buffer[body_start..])? else {
+            return Ok(None);
+        };
+        decoded
+    } else if !transfer_encoding.is_empty() {
+        return Err(SidecarError::Execution(format!(
+            "unsupported vm.fetch Transfer-Encoding: {}",
+            transfer_encoding.join(", ")
+        )));
+    } else if let Some(content_length) = content_length {
+        let body_end = body_start.saturating_add(content_length);
+        if buffer.len() < body_end {
+            return Ok(None);
+        }
+        buffer[body_start..body_end].to_vec()
+    } else if peer_closed {
+        buffer[body_start..].to_vec()
+    } else {
+        return Ok(None);
+    };
+
+    serde_json::to_string(&json!({
+        "status": status,
+        "statusText": status_text,
+        "headers": headers,
+        "rawHeaders": raw_headers,
+        "body": base64::engine::general_purpose::STANDARD.encode(&body),
+        "bodyEncoding": "base64",
+        "url": url,
+    }))
+    .map(Some)
+    .map_err(|error| SidecarError::Execution(format!("ERR_AGENT_OS_NODE_SYNC_RPC: {error}")))
+}
+
+fn find_http_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn find_crlf(buffer: &[u8], start: usize) -> Option<usize> {
+    buffer
+        .get(start..)?
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|offset| start + offset)
+}
+
+fn transfer_encoding_tokens(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn decode_kernel_http_chunked_body(buffer: &[u8]) -> Result<Option<Vec<u8>>, SidecarError> {
+    let mut offset = 0;
+    let mut body = Vec::new();
+    loop {
+        let Some(line_end) = find_crlf(buffer, offset) else {
+            return Ok(None);
+        };
+        let size_line = std::str::from_utf8(&buffer[offset..line_end]).map_err(|error| {
+            SidecarError::Execution(format!(
+                "invalid vm.fetch chunk size line encoding: {error}"
+            ))
+        })?;
+        let size_part = size_line.split(';').next().unwrap_or_default();
+        if size_part.is_empty() || !size_part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SidecarError::Execution(format!(
+                "invalid vm.fetch chunk size line: {size_line:?}"
+            )));
+        }
+        let chunk_size = usize::from_str_radix(size_part, 16).map_err(|error| {
+            SidecarError::Execution(format!(
+                "invalid vm.fetch chunk size {size_part:?}: {error}"
+            ))
+        })?;
+        let chunk_start = line_end + 2;
+        let chunk_end = chunk_start
+            .checked_add(chunk_size)
+            .ok_or_else(|| SidecarError::Execution(String::from("vm.fetch chunk size overflow")))?;
+        if chunk_size > 0 {
+            let chunk_terminator_end = chunk_end.checked_add(2).ok_or_else(|| {
+                SidecarError::Execution(String::from("vm.fetch chunk terminator overflow"))
+            })?;
+            if chunk_terminator_end > buffer.len() {
+                return Ok(None);
+            }
+            if buffer.get(chunk_end..chunk_terminator_end) != Some(b"\r\n") {
+                return Err(SidecarError::Execution(String::from(
+                    "invalid vm.fetch chunk terminator",
+                )));
+            }
+            body.extend_from_slice(&buffer[chunk_start..chunk_end]);
+            offset = chunk_terminator_end;
+            continue;
+        }
+
+        if buffer.get(chunk_start..chunk_start + 2) == Some(b"\r\n") {
+            return Ok(Some(body));
+        }
+        let Some(trailer_end) = find_http_header_end(&buffer[chunk_start..]) else {
+            return Ok(None);
+        };
+        let trailer_bytes = &buffer[chunk_start..chunk_start + trailer_end];
+        let trailers = String::from_utf8_lossy(trailer_bytes);
+        for line in trailers.split("\r\n") {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(' ') || line.starts_with('\t') || !line.contains(':') {
+                return Err(SidecarError::Execution(format!(
+                    "invalid vm.fetch chunk trailer line: {line}"
+                )));
+            }
+        }
+        return Ok(Some(body));
+    }
+}
+
+fn kernel_http_fetch_target_exit_code(error: &SidecarError) -> Option<i32> {
+    let SidecarError::Execution(message) = error else {
+        return None;
+    };
+    message
+        .strip_prefix("vm.fetch target exited before responding (exit code ")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
+}
+
+fn service_host_fetch_target_event<B>(
+    bridge: &SharedBridge<B>,
+    vm_id: &str,
+    dns: &VmDnsConfig,
+    socket_paths: &JavascriptSocketPathContext,
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+    resource_limits: &ResourceLimits,
+    wait: Duration,
+) -> Result<bool, SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    let Some(event) = process
+        .execution
+        .poll_event_blocking(wait)
+        .map_err(|error| SidecarError::Execution(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+
+    match event {
+        ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
+            let network_counts = process.network_resource_counts();
+            let response = service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
+                bridge,
+                vm_id,
+                dns,
+                socket_paths,
+                kernel,
+                process,
+                sync_request: &request,
+                resource_limits,
+                network_counts,
+            });
+            match response {
+                Ok(result) => process
+                    .execution
+                    .respond_javascript_sync_rpc_success(request.id, result)
+                    .or_else(ignore_stale_javascript_sync_rpc_response)?,
+                Err(error) => process
+                    .execution
+                    .respond_javascript_sync_rpc_error(
+                        request.id,
+                        javascript_sync_rpc_error_code(&error),
+                        error.to_string(),
+                    )
+                    .or_else(ignore_stale_javascript_sync_rpc_response)?,
+            }
+        }
+        ActiveExecutionEvent::Exited(code) => {
+            return Err(SidecarError::Execution(format!(
+                "vm.fetch target exited before responding (exit code {code})"
+            )));
+        }
+        other => {
+            process.queue_pending_execution_event(other)?;
+        }
+    }
+    Ok(true)
+}
+
+fn drain_host_fetch_target_events<B>(
+    bridge: &SharedBridge<B>,
+    vm_id: &str,
+    vm: &mut VmState,
+    target_process_id: &str,
+    socket_paths: &JavascriptSocketPathContext,
+    resource_limits: &ResourceLimits,
+) -> Result<(), SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    for _ in 0..32 {
+        let dns = vm.dns.clone();
+        let Some(process) = vm.active_processes.get_mut(target_process_id) else {
+            break;
+        };
+        let serviced = service_host_fetch_target_event(
+            bridge,
+            vm_id,
+            &dns,
+            socket_paths,
+            &mut vm.kernel,
+            process,
+            resource_limits,
+            Duration::from_millis(1),
+        )?;
+        if !serviced {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_kernel_http_fetch<B>(
+    bridge: &SharedBridge<B>,
+    vm_id: &str,
+    vm: &mut VmState,
+    target_process_id: &str,
+    port: u16,
+    path: &str,
+    options: &JavascriptHttpRequestOptions,
+    headers: &HttpHeaderCollection,
+    max_fetch_response_bytes: usize,
+) -> Result<String, SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    let socket_paths = build_javascript_socket_path_context(vm)?;
+    let family = JavascriptSocketFamily::Ipv4;
+    let local_port = allocate_guest_listen_port(
+        0,
+        family,
+        &socket_paths.used_tcp_guest_ports,
+        socket_paths.listen_policy,
+    )?;
+    let resource_limits = vm.kernel.resource_limits().clone();
+    let network_counts = vm_network_resource_counts(vm);
+    check_network_resource_limit(
+        resource_limits.max_sockets,
+        network_counts.sockets,
+        2,
+        "socket",
+    )?;
+    check_network_resource_limit(
+        resource_limits.max_connections,
+        network_counts.connections,
+        2,
+        "connection",
+    )?;
+
+    let kernel_pid = vm
+        .active_processes
+        .get(target_process_id)
+        .ok_or_else(|| {
+            SidecarError::InvalidState(format!(
+                "vm.fetch target process disappeared: {target_process_id}"
+            ))
+        })?
+        .kernel_pid;
+    let socket_id = vm
+        .kernel
+        .socket_create(EXECUTION_DRIVER_NAME, kernel_pid, SocketSpec::tcp())
+        .map_err(kernel_error)?;
+
+    let result = dispatch_kernel_http_fetch_with_socket(
+        bridge,
+        vm_id,
+        vm,
+        target_process_id,
+        kernel_pid,
+        socket_id,
+        local_port,
+        port,
+        path,
+        options,
+        headers,
+        &socket_paths,
+        &resource_limits,
+        max_fetch_response_bytes,
+    );
+    let close_result = vm
+        .kernel
+        .socket_close(EXECUTION_DRIVER_NAME, kernel_pid, socket_id)
+        .map_err(kernel_error);
+    let cleanup_result = if result.is_err() {
+        drain_host_fetch_target_events(
+            bridge,
+            vm_id,
+            vm,
+            target_process_id,
+            &socket_paths,
+            &resource_limits,
+        )
+    } else {
+        Ok(())
+    };
+    match (result, close_result) {
+        (Ok(response), Ok(())) => cleanup_result.map(|()| response),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_kernel_http_fetch_with_socket<B>(
+    bridge: &SharedBridge<B>,
+    vm_id: &str,
+    vm: &mut VmState,
+    target_process_id: &str,
+    kernel_pid: u32,
+    socket_id: SocketId,
+    local_port: u16,
+    port: u16,
+    path: &str,
+    options: &JavascriptHttpRequestOptions,
+    headers: &HttpHeaderCollection,
+    socket_paths: &JavascriptSocketPathContext,
+    resource_limits: &ResourceLimits,
+    max_fetch_response_bytes: usize,
+) -> Result<String, SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    vm.kernel
+        .socket_bind_inet(
+            EXECUTION_DRIVER_NAME,
+            kernel_pid,
+            socket_id,
+            InetSocketAddress::new("127.0.0.1", local_port),
+        )
+        .map_err(kernel_error)?;
+    vm.kernel
+        .socket_connect_inet_loopback(
+            EXECUTION_DRIVER_NAME,
+            kernel_pid,
+            socket_id,
+            InetSocketAddress::new("127.0.0.1", port),
+        )
+        .map_err(kernel_error)?;
+
+    let request_bytes = serialize_kernel_http_fetch_request(port, path, options, headers);
+    vm.kernel
+        .socket_write(EXECUTION_DRIVER_NAME, kernel_pid, socket_id, &request_bytes)
+        .map_err(kernel_error)?;
+
+    let mut response_buffer = Vec::new();
+    let mut peer_closed = false;
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let deadline = Instant::now() + http_loopback_request_timeout();
+    loop {
+        if let Some(response) =
+            parse_kernel_http_fetch_response(&response_buffer, peer_closed, &url)?
+        {
+            ensure_vm_fetch_response_within_limit(&response, "vm.fetch", max_fetch_response_bytes)?;
+            return Ok(response);
+        }
+        if Instant::now() >= deadline {
+            let preview = String::from_utf8_lossy(&response_buffer);
+            return Err(SidecarError::Execution(format!(
+                "vm.fetch timed out waiting for kernel TCP HTTP response ({} buffered bytes: {:?})",
+                response_buffer.len(),
+                preview.chars().take(200).collect::<String>()
+            )));
+        }
+
+        {
+            let dns = vm.dns.clone();
+            let process = vm
+                .active_processes
+                .get_mut(target_process_id)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "vm.fetch target process disappeared: {target_process_id}"
+                    ))
+                })?;
+            service_host_fetch_target_event(
+                bridge,
+                vm_id,
+                &dns,
+                socket_paths,
+                &mut vm.kernel,
+                process,
+                resource_limits,
+                Duration::from_millis(5),
+            )?;
+        }
+
+        let poll = vm
+            .kernel
+            .poll_targets(
+                EXECUTION_DRIVER_NAME,
+                kernel_pid,
+                vec![PollTargetEntry::socket(
+                    socket_id,
+                    POLLIN | POLLHUP | POLLERR,
+                )],
+                5,
+            )
+            .map_err(kernel_error)?;
+        let revents = poll
+            .targets
+            .first()
+            .map(|entry| entry.revents)
+            .unwrap_or_else(PollEvents::empty);
+        if revents.intersects(POLLERR) {
+            return Err(SidecarError::Execution(String::from(
+                "vm.fetch kernel TCP socket reported POLLERR",
+            )));
+        }
+        if revents.intersects(POLLIN) {
+            match vm
+                .kernel
+                .socket_read(EXECUTION_DRIVER_NAME, kernel_pid, socket_id, 64 * 1024)
+            {
+                Ok(Some(bytes)) if !bytes.is_empty() => {
+                    response_buffer.extend(bytes);
+                    ensure_vm_fetch_raw_response_buffer_within_limit(
+                        response_buffer.len(),
+                        "vm.fetch",
+                    )?;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => peer_closed = true,
+                Err(error) if error.code() == "EAGAIN" => {}
+                Err(error) => return Err(kernel_error(error)),
+            }
+        }
+        if revents.intersects(POLLHUP) {
+            peer_closed = true;
+        }
+    }
+}
+
 fn outbound_http_response_json(url: &Url, response: ureq::Response) -> Result<Value, SidecarError> {
     let status = response.status();
     let status_text = response.status_text().to_owned();
@@ -16371,7 +17056,7 @@ where
         resource_limits,
         request_key,
     } = request;
-    let deadline = Instant::now() + HTTP_LOOPBACK_REQUEST_TIMEOUT;
+    let deadline = Instant::now() + http_loopback_request_timeout();
     loop {
         if let Some(response) = process
             .pending_http_requests
@@ -16440,14 +17125,75 @@ where
     }
 }
 
+pub(crate) fn dispatch_loopback_http_request<B>(
+    request: LoopbackHttpDispatchRequest<'_, B>,
+) -> Result<String, SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    let LoopbackHttpDispatchRequest {
+        bridge,
+        vm_id,
+        dns,
+        socket_paths,
+        kernel,
+        process,
+        resource_limits,
+        server_id,
+        request_json,
+    } = request;
+    let request_id = {
+        let server = process.http_servers.get_mut(&server_id).ok_or_else(|| {
+            SidecarError::InvalidState(format!("HTTP target server disappeared: {server_id}"))
+        })?;
+        server.next_request_id += 1;
+        server.next_request_id
+    };
+    process
+        .pending_http_requests
+        .insert((server_id, request_id), None);
+    process.execution.send_javascript_stream_event(
+        "http_request",
+        json!({
+            "serverId": server_id,
+            "requestId": request_id,
+            "request": request_json,
+        }),
+    )?;
+    wait_for_loopback_http_response(LoopbackHttpResponseWaitRequest {
+        bridge,
+        vm_id,
+        dns,
+        socket_paths,
+        kernel,
+        process,
+        resource_limits,
+        request_key: (server_id, request_id),
+    })
+}
+
 fn ensure_vm_fetch_response_within_limit(
     response_json: &str,
     operation: &str,
+    limit: usize,
 ) -> Result<(), SidecarError> {
     let size = response_json.len();
+    if size > limit {
+        return Err(SidecarError::Execution(format!(
+            "{operation} payload is {size} bytes, limit is {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_vm_fetch_raw_response_buffer_within_limit(
+    size: usize,
+    operation: &str,
+) -> Result<(), SidecarError> {
     if size > VM_FETCH_BUFFER_LIMIT_BYTES {
         return Err(SidecarError::Execution(format!(
-            "{operation} payload is {size} bytes, limit is {VM_FETCH_BUFFER_LIMIT_BYTES}"
+            "{operation} raw response buffer is {size} bytes, limit is {VM_FETCH_BUFFER_LIMIT_BYTES}"
         )));
     }
     Ok(())
@@ -18664,7 +19410,11 @@ where
             )?;
             let response_json =
                 javascript_sync_rpc_arg_str(&request.args, 2, "net.http2_server_respond payload")?;
-            ensure_vm_fetch_response_within_limit(response_json, "net.http2_server_respond")?;
+            ensure_vm_fetch_response_within_limit(
+                response_json,
+                "net.http2_server_respond",
+                VM_FETCH_BUFFER_LIMIT_BYTES,
+            )?;
             serde_json::from_str::<Value>(response_json).map_err(|error| {
                 SidecarError::Execution(format!(
                     "net.http2_server_respond payload must be valid JSON: {error}"
@@ -19205,7 +19955,11 @@ where
                 javascript_sync_rpc_arg_u64(&request.args, 1, "net.http_respond request id")?;
             let response_json =
                 javascript_sync_rpc_arg_str(&request.args, 2, "net.http_respond payload")?;
-            ensure_vm_fetch_response_within_limit(response_json, "net.http_respond")?;
+            ensure_vm_fetch_response_within_limit(
+                response_json,
+                "net.http_respond",
+                VM_FETCH_BUFFER_LIMIT_BYTES,
+            )?;
             serde_json::from_str::<Value>(response_json).map_err(|error| {
                 SidecarError::Execution(format!(
                     "net.http_respond payload must be valid JSON: {error}"
@@ -19325,6 +20079,43 @@ where
                     NetworkOperation::Http,
                     format_tcp_resource(host, port),
                 )?;
+                if is_loopback_socket_host(host) {
+                    let families = [JavascriptSocketFamily::Ipv4, JavascriptSocketFamily::Ipv6];
+                    if let Some((family, target)) = families.iter().find_map(|family| {
+                        socket_paths
+                            .http_loopback_target(*family, port)
+                            .map(|target| (*family, target))
+                    }) {
+                        if let Some((reservation_id, reservation)) = local_reservation {
+                            process
+                                .tcp_port_reservations
+                                .insert(reservation_id, reservation);
+                        }
+                        let remote_address = match family {
+                            JavascriptSocketFamily::Ipv4 => "127.0.0.1",
+                            JavascriptSocketFamily::Ipv6 => "::1",
+                        };
+                        return Ok(json!({
+                            "loopbackHttpTarget": {
+                                "processId": target.process_id.clone(),
+                                "serverId": target.server_id,
+                                "host": remote_address,
+                                "port": port,
+                            },
+                            "localAddress": match family {
+                                JavascriptSocketFamily::Ipv4 => "127.0.0.1",
+                                JavascriptSocketFamily::Ipv6 => "::1",
+                            },
+                            "localPort": payload.local_port.unwrap_or(0),
+                            "remoteAddress": remote_address,
+                            "remotePort": port,
+                            "remoteFamily": match family {
+                                JavascriptSocketFamily::Ipv4 => "IPv4",
+                                JavascriptSocketFamily::Ipv6 => "IPv6",
+                            },
+                        }));
+                    }
+                }
                 let connect_result = ActiveTcpSocket::connect(ActiveTcpConnectRequest {
                     bridge,
                     kernel,
