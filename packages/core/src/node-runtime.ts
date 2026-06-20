@@ -28,7 +28,7 @@ import type {
 	KernelBootTiming,
 	Permissions,
 } from "./test-runtime.js";
-import type { Sidecar } from "./sidecar-client.js";
+import type { SidecarProcess } from "./sidecar-process.js";
 import {
 	createInMemoryFileSystem,
 	createKernel,
@@ -148,7 +148,7 @@ export interface NodeRuntimeCreateOptions {
 	 * the default shared sidecar behavior. When provided, the runtime owns only
 	 * its VM and leaves sidecar process disposal to the caller.
 	 */
-	sidecar?: Sidecar;
+	sidecar?: SidecarProcess;
 	/** Receives coarse boot phase timings for benchmarks and diagnostics. */
 	onBootTiming?: (timing: NodeRuntimeBootTiming) => void;
 	/**
@@ -483,6 +483,30 @@ export interface NodeRuntimeRunResult<T = unknown> {
 let nextProgramId = 0;
 let nextResidentRequestId = 0;
 
+/**
+ * Guest preamble exposing `globalThis.callHostTool(name, input?)`: an ergonomic
+ * async wrapper over the host-tool invocation path. It runs the registered tool
+ * as the guest would by hand (`<tool> --json <input>` through
+ * `node:child_process`), so it inherits every security property of that path:
+ * the `tool` permission scope, the tool's input-schema validation, and the
+ * host-side handler all still apply. It adds no new trust surface; it only
+ * removes the manual `execFile`/JSON boilerplate so guest and agent code can do
+ * `const out = await callHostTool("add", { a, b })`. The value is a single line
+ * so it shifts guest source line numbers by at most one in stack traces.
+ *
+ * Note: the tool still runs through a guest process. Eliminating that spawn would
+ * require a dedicated async guest-to-host tool channel (the synchronous sync-RPC
+ * path cannot be used: it runs on the sidecar's main sync-RPC thread and a host
+ * round-trip would block it); that is a separate, test-gated change.
+ */
+const HOST_TOOL_PREAMBLE =
+	`globalThis.callHostTool = (name, input = {}) => import("node:child_process").then(({ execFile }) => new Promise((resolve, reject) => { execFile(name, [name, "--json", JSON.stringify(input)], { maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => { if (error) { reject(new Error(String(stderr || "").trim() || error.message)); return; } const text = String(stdout ?? "").trim(); let reply; try { reply = text ? JSON.parse(text) : undefined; } catch { reject(new Error("host tool returned invalid JSON: " + text)); return; } if (reply && reply.ok === false) { reject(new Error(reply.error || "host tool failed")); return; } resolve(reply && typeof reply === "object" && "result" in reply ? reply.result : reply); }); }));`;
+
+/** Prepend the host-tool helper preamble to guest program source. */
+function withHostToolPreamble(code: string): string {
+	return `${HOST_TOOL_PREAMBLE}\n${code}`;
+}
+
 const RESIDENT_READY_PREFIX = "__SECURE_EXEC_RESIDENT_READY__";
 const RESIDENT_RESULT_PREFIX = "__SECURE_EXEC_RESIDENT_RESULT__";
 
@@ -617,7 +641,7 @@ export class NodeRuntime {
 		options: NodeRuntimeExecOptions = {},
 	): Promise<NodeRuntimeExecResult> {
 		const programPath = `/tmp/secure-exec-program-${nextProgramId++}.mjs`;
-		await this.kernel.writeFile(programPath, code);
+		await this.kernel.writeFile(programPath, withHostToolPreamble(code));
 		return this.runProgram(programPath, options);
 	}
 
@@ -736,7 +760,7 @@ export class NodeRuntime {
 		options: NodeRuntimeSpawnOptions = {},
 	): Promise<NodeRuntimeProcess> {
 		const programPath = `/tmp/secure-exec-program-${nextProgramId++}.mjs`;
-		await this.kernel.writeFile(programPath, code);
+		await this.kernel.writeFile(programPath, withHostToolPreamble(code));
 		const proc = this.kernel.spawn("node", [programPath], {
 			env: options.env,
 			cwd: options.cwd,
@@ -790,6 +814,7 @@ export class NodeRuntime {
 		// statements inside a function and make them a SyntaxError.
 		const wrapped = [
 			`import { writeFileSync as __writeFileSync } from "node:fs";`,
+			HOST_TOOL_PREAMBLE,
 			`globalThis.__return = (value) => {`,
 			`  __writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(value === undefined ? null : value));`,
 			`};`,
@@ -907,7 +932,14 @@ export class NodeRuntime {
 				throw toAbortError(signal);
 			}
 
-			const match = this.findListener(query);
+			// Await a fresh lookup rather than reading the synchronous cache,
+			// which starts null and would otherwise let this loop poll a stale
+			// null even after the listener is up (issue #92).
+			const match = (await this.kernel.socketTable.findListenerAsync({
+				port: query.port,
+				...(query.host !== undefined ? { host: query.host } : {}),
+				...(query.path !== undefined ? { path: query.path } : {}),
+			})) as NodeRuntimeListener | null;
 			if (match) {
 				return match;
 			}

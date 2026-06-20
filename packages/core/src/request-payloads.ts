@@ -24,12 +24,14 @@ import {
 } from "./permissions.js";
 import {
 	toGeneratedDisposeReason,
+	toGeneratedFilesystemOperation,
 	toGeneratedGuestFilesystemOperation,
 	toGeneratedGuestRuntimeKind,
 	toGeneratedRootFilesystemEntryEncoding,
 	toGeneratedRootFilesystemMode,
 	toGeneratedWasmPermissionTier,
 	type LiveDisposeReason,
+	type LiveFilesystemOperation,
 	type LiveGuestFilesystemOperation,
 	type LiveGuestRuntimeKind,
 	type LiveRootFilesystemMode,
@@ -187,6 +189,21 @@ export type LiveRequestPayload =
 	  }
 	| {
 			type: "get_zombie_timer_count";
+	  }
+	| {
+			type: "host_filesystem_call";
+			operation: LiveFilesystemOperation;
+			path: string;
+			payload_size_bytes: number;
+	  }
+	| {
+			type: "persistence_load";
+			key: string;
+	  }
+	| {
+			type: "persistence_flush";
+			key: string;
+			payload_size_bytes: number;
 	  }
 	| {
 			type: "ext";
@@ -408,6 +425,28 @@ export function toGeneratedRequestPayload(
 			};
 		case "get_zombie_timer_count":
 			return { tag: "GetZombieTimerCountRequest", val: null };
+		case "host_filesystem_call":
+			return {
+				tag: "HostFilesystemCallRequest",
+				val: {
+					operation: toGeneratedFilesystemOperation(payload.operation),
+					path: payload.path,
+					payloadSizeBytes: BigInt(payload.payload_size_bytes),
+				},
+			};
+		case "persistence_load":
+			return {
+				tag: "PersistenceLoadRequest",
+				val: { key: payload.key },
+			};
+		case "persistence_flush":
+			return {
+				tag: "PersistenceFlushRequest",
+				val: {
+					key: payload.key,
+					payloadSizeBytes: BigInt(payload.payload_size_bytes),
+				},
+			};
 		case "ext":
 			return {
 				tag: "ExtEnvelope",

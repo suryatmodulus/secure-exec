@@ -149,13 +149,7 @@ const rt = await NodeRuntime.create({
 });
 ```
 
-For finer control, a scope can be a rule set: a `default` mode plus an ordered list of `rules` evaluated in order.
-
-- `default`: `"allow"` or `"deny"`, applied when no rule matches.
-- Each rule has a `mode` (`"allow"` or `"deny"`) and matchers.
-- `fs` rules match on `operations` and `paths` (path/glob patterns).
-- All other scopes match on `operations` and `patterns`.
-- Use `["*"]` as a wildcard for any operation or pattern.
+For finer control, a scope can be a rule set: a `default` mode plus an ordered list of `rules` evaluated in order, where the first matching rule wins. The `fs` scope matches rules by path and every other scope matches by pattern. For the exhaustive type shape (the rule fields, the `["*"]` wildcard, and how denied operations surface as `EACCES`), see [`Permissions`](/docs/sdks/typescript#permissions) in the TypeScript SDK reference.
 
 ```ts
 // fs: allow by default, but deny anything under /vault.

@@ -23,13 +23,12 @@ const rt = await NodeRuntime.create({
         properties: { city: { type: "string" } },
         required: ["city"],
       },
-			handler: (input: unknown) => {
-				const { city } = input as { city: string };
-				const table: Record<string, { temp_f: number }> = {
-					"San Francisco": { temp_f: 61 },
-					Tokyo: { temp_f: 75 },
-				};
-				return table[city] ?? { temp_f: null };
+      handler: ({ city }: { city: string }) => {
+        const table: Record<string, { temp_f: number }> = {
+          "San Francisco": { temp_f: 61 },
+          Tokyo: { temp_f: 75 },
+        };
+        return table[city] ?? { temp_f: null };
       },
     },
     calculate: {
@@ -39,38 +38,25 @@ const rt = await NodeRuntime.create({
         properties: { expression: { type: "string" } },
         required: ["expression"],
       },
-			handler: (input: unknown) => {
-				const { expression } = input as { expression: string };
-				return { result: Number(eval(expression)) };
-			},
+      handler: ({ expression }: { expression: string }) => {
+        return { result: Number(eval(expression)) };
+      },
     },
   },
 });
 
 // Imagine this string was written by the LLM. It chains three host-tool calls
 // with real control flow (Promise.all, arithmetic, branching) in one execution,
-// then hands a single structured result back to the host.
-//
-// Each tool is a guest command: the guest invokes it by name with
-// `--json <input>` and reads the host handler's JSON result back from stdout.
+// then hands a single structured result back to the host. callHostTool resolves
+// with the host handler's return value.
 const llmGeneratedCode = `
-import { execFileSync } from "node:child_process";
-
-function callTool(name, input) {
-  const out = execFileSync(name, [name, "--json", JSON.stringify(input)]);
-  // The host replies with { ok, result }; unwrap the handler's return value.
-  const reply = JSON.parse(out.toString());
-  if (!reply.ok) throw new Error(reply.error ?? "tool failed");
-  return reply.result;
-}
-
 const [sf, tokyo] = await Promise.all([
-  callTool("get-weather", { city: "San Francisco" }),
-  callTool("get-weather", { city: "Tokyo" }),
+  callHostTool("get-weather", { city: "San Francisco" }),
+  callHostTool("get-weather", { city: "Tokyo" }),
 ]);
 
 const diffF = Math.abs(sf.temp_f - tokyo.temp_f);
-const diffC = callTool("calculate", { expression: \`\${diffF} * 5 / 9\` });
+const diffC = await callHostTool("calculate", { expression: \`\${diffF} * 5 / 9\` });
 
 console.log("chained 3 tool calls in one sandbox execution");
 

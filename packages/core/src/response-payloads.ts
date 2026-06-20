@@ -7,9 +7,11 @@ import { fromGeneratedExtEnvelope, type LiveExtEnvelope } from "./ext.js";
 import type * as protocol from "./generated-protocol.js";
 import { bigIntToSafeNumber } from "./numbers.js";
 import {
+	fromGeneratedFilesystemOperation,
 	fromGeneratedGuestFilesystemOperation,
 	fromGeneratedRootFilesystemEntryEncoding,
 	fromGeneratedSignalDispositionAction,
+	type LiveFilesystemOperation,
 	type LiveGuestFilesystemOperation,
 	type LiveSignalDispositionAction,
 } from "./protocol-maps.js";
@@ -140,6 +142,23 @@ export type LiveResponsePayload =
 	| {
 			type: "zombie_timer_count";
 			count: number;
+	  }
+	| {
+			type: "filesystem_result";
+			operation: LiveFilesystemOperation;
+			status: string;
+			payload_size_bytes: number;
+	  }
+	| {
+			type: "persistence_state";
+			key: string;
+			found: boolean;
+			payload_size_bytes: number;
+	  }
+	| {
+			type: "persistence_flushed";
+			key: string;
+			committed_bytes: number;
 	  }
 	| {
 			type: "rejected";
@@ -294,21 +313,38 @@ export function fromGeneratedResponsePayload(
 				),
 			};
 		case "FilesystemResultResponse":
-			throw new Error(
-				"unsupported bare response payload tag: filesystem_result",
-			);
+			return {
+				type: "filesystem_result",
+				operation: fromGeneratedFilesystemOperation(payload.val.operation),
+				status: payload.val.status,
+				payload_size_bytes: bigIntToSafeNumber(
+					payload.val.payloadSizeBytes,
+					"filesystem_result.payload_size_bytes",
+				),
+			};
 		case "PermissionDecisionResponse":
 			throw new Error(
 				"unsupported bare response payload tag: permission_decision",
 			);
 		case "PersistenceStateResponse":
-			throw new Error(
-				"unsupported bare response payload tag: persistence_state",
-			);
+			return {
+				type: "persistence_state",
+				key: payload.val.key,
+				found: payload.val.found,
+				payload_size_bytes: bigIntToSafeNumber(
+					payload.val.payloadSizeBytes,
+					"persistence_state.payload_size_bytes",
+				),
+			};
 		case "PersistenceFlushedResponse":
-			throw new Error(
-				"unsupported bare response payload tag: persistence_flushed",
-			);
+			return {
+				type: "persistence_flushed",
+				key: payload.val.key,
+				committed_bytes: bigIntToSafeNumber(
+					payload.val.committedBytes,
+					"persistence_flushed.committed_bytes",
+				),
+			};
 		case "RejectedResponse":
 			return {
 				type: "rejected",

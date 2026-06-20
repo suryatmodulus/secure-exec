@@ -5,7 +5,7 @@ description: Sandboxed code reads and writes a fully virtual filesystem that liv
 
 Every VM boots with a **virtual filesystem (VFS)** that lives entirely inside the kernel. Guest code uses the normal Node `fs` APIs, but none of that I/O touches the host disk. The guest sees an ordinary POSIX filesystem; the host sees nothing.
 
-This page covers the VFS model: isolation, the data-exchange APIs that cross the boundary, and the mount and storage backends behind it. For day-to-day reading, writing, and listing from guest code, see [Filesystem & Mounts](/docs/features/filesystem).
+This page covers the VFS model: isolation and the data-exchange APIs that cross the boundary. For day-to-day reading, writing, and listing from guest code, see [Filesystem](/docs/features/filesystem). To project host directories or remote storage into the VFS, see [Filesystem Mounts](/docs/features/filesystem-mounts).
 
 ## The model
 
@@ -97,39 +97,9 @@ const bytes = await rt.readFile("/home/user/out.txt");   // Promise<Uint8Array>
 
 Guest programs that need stdin or live output use the exec options instead: `rt.exec`/`rt.run` accept `{ env, cwd, stdin, timeout, signal, onStdout, onStderr }`, and `rt.spawn` returns a live handle for long-running guests. See [Child Processes](/docs/features/child-processes) and [Output Capture](/docs/features/output-capture) for those.
 
-## Host directory mounts
+## Mounts and storage backends
 
-Project a real host directory into the VFS, Docker-style, with `create({ mounts })`. This is the one host-backed backend wired directly into `NodeRuntime`.
-
-```ts
-const rt = await NodeRuntime.create({
-	mounts: [
-		{
-			guestPath: "/home/user/project/node_modules/typescript",
-			hostPath: "/abs/path/to/node_modules/typescript",
-			readOnly: true, // default; pass false to allow guest writes
-		},
-	],
-});
-```
-
-Each mount is a `HostDirectoryMount`:
-
-- **`guestPath`**: absolute guest path the directory appears at.
-- **`hostPath`**: absolute host directory to project.
-- **`readOnly`**: read-only by default; `false` allows guest writes.
-
-Files are read **lazily** through the VFS as the guest accesses them, so large trees (a `node_modules` package, a repo checkout) project without copying their bytes up front. The guest sees only the mounted subtree, never the wider host filesystem. For a runnable example see [Mounting host directories](/docs/features/filesystem#mounting-host-directories).
-
-## Remote and cloud backends
-
-Beyond host mounts, a guest path can be backed by a remote or cloud store. Each backend ships as its own package and returns a mount descriptor that is attached at the lower-level VM mount layer (not through a `create()` flag). Guest code reads and writes the mount as an ordinary POSIX directory.
-
-- **`@secure-exec/s3`** (`createS3Backend`): backs a mount with an Amazon S3 bucket.
-- **`@secure-exec/google-drive`** (`createGoogleDriveBackend`): backs a mount with Google Drive.
-- **`@secure-exec/sandbox`** (`createSandboxFs`): backs a mount with a remote sandbox-agent host, scoping guest filesystem operations under a base path.
-
-These are real Secure Exec capabilities driven through the protocol-level mount plumbing. The kernel can also layer a writable overlay over a read-only base so guest writes land in the overlay and the base is never mutated; overlays are configured at the mount layer rather than through a `create()` option.
+A guest path can be backed by a real host directory (Docker-style, via `create({ mounts })`) or by a remote or cloud store (Amazon S3, Google Drive, sandbox-agent). Mounts are read-only by default and the guest sees only the mounted subtree, never the wider host filesystem. See [Filesystem Mounts](/docs/features/filesystem-mounts) for usage and the available backends.
 
 ## Notes
 

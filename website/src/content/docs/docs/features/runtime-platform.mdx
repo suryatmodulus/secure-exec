@@ -1,16 +1,18 @@
 ---
 title: Runtime & Platform
-description: The host environment guest code sees (the full Node.js surface today), plus the platform ladder (node, browser, neutral, bare) the kernel models.
+description: Customize the host environment guest code sees (the full Node.js surface today), plus the platform ladder (node, browser, neutral, bare) the kernel models.
 ---
+import { LinkCard } from '@astrojs/starlight/components';
 
-Guest JavaScript runs with the **full Node.js emulation surface**: the `process`
-and `Buffer` globals, the `node:*` builtin modules, npm module resolution, and a
-virtualized Node process identity. This is what `NodeRuntime` boots, and today it
-is the only platform Secure Exec exposes.
-
-Guest code runs inside a kernel-backed V8 isolate with zero host escapes. Even
-with the full Node surface available, every syscall (filesystem, network, child
+`NodeRuntime.create()` shapes the host environment guest code sees before it
+boots, and the kernel models that environment as a ladder of platforms (`node`,
+`browser`, `neutral`, `bare`). Guest code always runs inside a kernel-backed V8
+isolate with zero host escapes: every syscall (filesystem, network, child
 process) goes through the kernel, never the real host.
+
+This page covers the customization surface: seeding and selecting the host
+environment, then the `moduleResolution` and `allowedBuiltins` knobs the wire
+config exposes. Start by probing the default `node` surface:
 
 ```ts
 import { NodeRuntime } from "secure-exec";
@@ -122,30 +124,11 @@ const bytes = await rt.readFile("/root/late.json"); // Uint8Array
 await rt.registerTools({ now: { description: "epoch ms", handler: () => Date.now() } });
 ```
 
-### Running and driving guest programs
+### Driving a guest dev server from the host
 
-- `rt.exec(code, options)` runs an ESM program to completion, returns `{ stdout, stderr, exitCode }`.
-- `rt.run<T>(code, options)` runs a program that calls `globalThis.__return(value)` and decodes it as `result.value` (plus `stdout`/`stderr`/`exitCode`).
-- `rt.spawn(code, options)` starts a long-running guest and returns a live `NodeRuntimeProcess` (`pid`, `writeStdin`, `closeStdin`, `kill`, `wait`, `exitCode`).
-- `rt.fetch(port, input)` drives an HTTP request from the host into a guest listener and returns `{ status, statusText, headers, body }`, even with egress denied.
-- `rt.waitForListener(query, options)` / `rt.findListener(query)` resolve guest TCP listeners by `port`/`host`/`path`.
-
-`exec`, `run`, and `spawn` accept the same per-run options:
-
-```ts
-const controller = new AbortController();
-const result = await rt.exec(source, {
-	env: { EXTRA: "1" },                  // merged over VM env
-	cwd: "/tmp",
-	stdin: "piped to the program",        // string | Uint8Array
-	timeout: 5000,                        // kill after N ms
-	signal: controller.signal,            // abort -> SIGTERM, call rejects AbortError
-	onStdout: (chunk) => process.stdout.write(chunk), // Uint8Array chunks, live
-	onStderr: (chunk) => process.stderr.write(chunk),
-});
-```
-
-Host-to-guest dev-server pattern:
+Spawn a long-running guest, wait for it to listen, then drive an HTTP request
+into it from the host. This works even with egress denied, because the request
+flows through the kernel socket table rather than the real host network:
 
 ```ts
 const server = await rt.spawn(`
@@ -157,6 +140,16 @@ const res = await rt.fetch(listener.port ?? 3000, { path: "/" });
 server.kill();
 await server.wait();
 ```
+
+For the full set of run methods (`exec`/`run`/`spawn`/`fetch`/`waitForListener`)
+and their per-run options (`env`, `cwd`, `stdin`, `timeout`, `signal`,
+`onStdout`/`onStderr`), see the TypeScript SDK reference:
+
+<LinkCard
+	title="NodeRuntime run methods and options"
+	description="Full signatures for exec/run/spawn/fetch/waitForListener and the shared per-run options."
+	href="/docs/sdks/typescript"
+/>
 
 ## The platform ladder
 
@@ -196,9 +189,23 @@ not a `create()` option you can pass.
 
 ## `moduleResolution`: how imports resolve
 
-An independent axis of the wire config (any combination with `platform` is
-valid). Like esbuild, the default is full Node resolution even for non-`node`
-platforms, which is exactly what `NodeRuntime` uses.
+`moduleResolution` is an independent axis of the `jsRuntime` config (any
+combination with `platform` is valid). Set it alongside `platform` to lock down
+how `import`/`require` specifiers resolve:
+
+```ts
+const config: CreateVmConfig = {
+	// …
+	jsRuntime: {
+		platform: "node",
+		moduleResolution: "relative", // only relative/absolute paths resolve from the VFS
+	},
+};
+```
+
+With `moduleResolution: "relative"`, `import "./util.js"` resolves from the
+virtual filesystem, while a bare `import "lodash"` or a `node:*` builtin import
+fails. The default is full Node resolution, which is what `NodeRuntime` boots:
 
 | `moduleResolution` | `import "pkg"` | `import "./x.js"` | `node:*` |
 |---|:---:|:---:|:---:|
@@ -215,13 +222,29 @@ absolute path; `node:*` follows the platform / `allowedBuiltins`.)
 
 ## `allowedBuiltins`: restrict Node builtins (node platform only)
 
-When `platform` is `node`, narrow which `node:*` builtin modules guest code may
-import:
+`allowedBuiltins` narrows which `node:*` builtin modules guest code may import.
+Set it on the `jsRuntime` config to allow exactly the builtins a script needs:
 
-- **omitted**: the engine default allow-list (what `NodeRuntime` uses).
-- **`[]`**: deny **all** builtins.
-- **`["path", "fs"]`**: allow exactly these (a root name like `fs` also covers `node:fs/promises`).
+```ts
+const config: CreateVmConfig = {
+	// …
+	jsRuntime: {
+		platform: "node",
+		allowedBuiltins: ["path", "fs"], // only these resolve; everything else is denied
+	},
+};
+```
 
-`allowedBuiltins` is only meaningful under `platform: "node"`; the other
-platforms deny all `node:*` builtins regardless. Unknown builtin names are
+With `allowedBuiltins: ["path", "fs"]`, `import("node:path")` and
+`import("node:fs/promises")` succeed (a root name like `fs` also covers its
+subpaths), while `import("node:child_process")` is rejected. Omitting
+`allowedBuiltins` keeps the engine default allow-list (what `NodeRuntime` uses);
+`[]` denies all builtins. It is only valid under `platform: "node"`; the other
+platforms deny all `node:*` builtins regardless, and unknown builtin names are
 rejected.
+
+<LinkCard
+	title="CreateVmConfig.jsRuntime full shape"
+	description="The complete jsRuntime config (platform, moduleResolution, allowedBuiltins) and the rest of CreateVmConfig."
+	href="/docs/sdks/typescript"
+/>

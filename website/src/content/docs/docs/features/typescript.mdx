@@ -96,53 +96,15 @@ type check success: false
 OK: TypeScript compiled and type-checked inside the sandbox.
 ```
 
-## `createTypeScriptTools(options?)`
+Each diagnostic is structured (`code`, `category`, `message`, and a `line`/`column` when available), and `success` is `false` whenever any diagnostic is an error, so you can branch on results without parsing compiler text.
 
-Returns the four in-sandbox tools below. Each call boots a fresh VM, runs the compiler in the guest, and disposes the VM. Options (all optional):
+## Compile a tsconfig.json project
 
-- `compilerPackageDir`: host directory of the `typescript` package to project. Defaults to the `typescript` resolved from this package.
-- `compilerGuestDir`: guest mount path for the compiler. Defaults to `/root/node_modules/typescript`.
-- `files: Record<string, string | Uint8Array>`: files to seed into the VM (e.g. a `tsconfig.json` or sources), keyed by absolute guest path.
-- `mounts: HostDirectoryMount[]`: host directories to project into the VM, Docker-style (lazy reads).
-- `permissions`: VM permission policy (same shape as `NodeRuntime.create`).
-- `env: Record<string, string>`: environment variables for the guest compiler.
-
-## Tools
+To compile a whole project, seed a `tsconfig.json` and its sources with `files` (keyed by absolute guest path), then call `compileProject`. You can also project host directories into the VM with `mounts` instead of inlining them.
 
 ```ts
-const tools = createTypeScriptTools();
+import { createTypeScriptTools } from "@secure-exec/typescript";
 
-// Single source string
-await tools.compileSource({ sourceText, compilerOptions?, filePath?, cwd?, configFilePath? });
-await tools.typecheckSource({ sourceText, ... });
-
-// tsconfig.json project (uses files/mounts seeded above)
-await tools.compileProject({ cwd?, configFilePath? });
-await tools.typecheckProject({ cwd?, configFilePath? });
-```
-
-- **`compileSource(options)`** → `{ success, diagnostics, outputText?, sourceMapText? }`. `outputText` is the emitted JavaScript, ready to run with `NodeRuntime`.
-- **`typecheckSource(options)`** → `{ success, diagnostics }`. Type-checks without emitting.
-- **`compileProject(options?)`** → `{ success, diagnostics, emitSkipped, emittedFiles }`. Emits into the VM filesystem.
-- **`typecheckProject(options?)`** → `{ success, diagnostics }`.
-
-`SourceCompilerOptions`:
-
-- `sourceText` (required): the TypeScript to compile or check.
-- `filePath?`: virtual path the source appears at. Defaults to a temp `.ts` file.
-- `cwd?`: working directory inside the VM. Defaults to `/root`.
-- `configFilePath?`: a `tsconfig.json` whose `compilerOptions` are applied.
-- `compilerOptions?`: inline compiler options in tsc JSON spelling. Defaults are `target: ES2022`, `module: ESNext`.
-
-`ProjectCompilerOptions`: `cwd?` (defaults to `/root`) and `configFilePath?` (defaults to the `tsconfig.json` found from `cwd`).
-
-Every diagnostic is structured: `{ code, category, message, filePath?, line?, column? }`, where `category` is `"error" | "warning" | "suggestion" | "message"`. `success` is `false` when any diagnostic is an error.
-
-## Compiling a project
-
-Seed a `tsconfig.json` and sources with `files`, or project a host directory with `mounts`:
-
-```ts
 const tools = createTypeScriptTools({
   files: {
     "/root/tsconfig.json": JSON.stringify({
@@ -153,24 +115,30 @@ const tools = createTypeScriptTools({
   },
 });
 
-const result = await tools.compileProject({ cwd: "/root" });
-// result.emittedFiles -> paths written into the VM filesystem
+// Compile every file the tsconfig includes, emitting into the VM filesystem.
+const compiled = await tools.compileProject({ cwd: "/root" });
+console.log("project compiled:", compiled.success);
+console.log("emitted:", compiled.emittedFiles);
+
+// Or type-check only, without emitting any output.
+const checked = await tools.typecheckProject({ cwd: "/root" });
+console.log("project type-checks:", checked.success);
 ```
 
-`compileProject` emits into the VM's virtual filesystem. To pull emitted output back to the host, run the same compile manually on a `NodeRuntime` and read the files with `rt.readFile`.
+`compileProject` emits into the VM's virtual filesystem (`emittedFiles` lists the paths written). To pull that output back to the host, run the compile on a `NodeRuntime` directly and read the files with `rt.readFile`.
 
-## Bounding compiler runs
+## Bounding untrusted compiles
 
-`compileSource`/`typecheckSource` manage their own VM, so to bound an *untrusted* compile yourself, run the emitted output (or your own compiler driver) on a `NodeRuntime` and pass `exec`/`run` options:
+`compileSource`/`typecheckSource` manage their own VM, so the compile is already contained. To put a wall-clock bound on running the *emitted* output (or your own compiler driver), run it on a `NodeRuntime` with a `timeout` or `AbortSignal`:
 
 ```ts
+const emitted = await tools.compileSource({ sourceText });
+
 const rt = await NodeRuntime.create();
 try {
-  // Bound the run: abort after 5s, or via an AbortSignal.
-  const out = await rt.exec(compiled.outputText ?? "", {
+  const out = await rt.exec(emitted.outputText ?? "", {
     timeout: 5_000,
     signal: AbortSignal.timeout(10_000),
-    onStdout: (chunk) => process.stdout.write(chunk),
   });
   console.log(out.exitCode);
 } finally {
@@ -178,4 +146,6 @@ try {
 }
 ```
 
-`exec`/`run` options: `{ env, cwd, stdin, timeout, signal, onStdout, onStderr }`. On `timeout` or `signal` abort the guest process is killed inside the VM (`SIGTERM`), so a runaway compile can never hang the host.
+On timeout or abort the guest process is killed inside the VM, so a runaway compile can never hang the host.
+
+For the full `createTypeScriptTools` options, tool signatures, and result shapes, see the [TypeScript SDK reference](/docs/sdks/typescript).

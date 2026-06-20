@@ -30,6 +30,7 @@ import {
 } from "./permissions.js";
 import { SIDECAR_PROTOCOL_SCHEMA } from "./protocol-schema.js";
 import type {
+	LiveFilesystemOperation,
 	LiveGuestRuntimeKind,
 	LiveWasmPermissionTier,
 } from "./protocol-maps.js";
@@ -236,7 +237,22 @@ export interface SidecarProjectedModuleDescriptor {
 	entrypoint: string;
 }
 
-export class Sidecar {
+export interface SidecarFilesystemResult {
+	operation: LiveFilesystemOperation;
+	status: string;
+	payloadSizeBytes: number;
+}
+export interface SidecarPersistenceState {
+	key: string;
+	found: boolean;
+	payloadSizeBytes: number;
+}
+export interface SidecarPersistenceFlushed {
+	key: string;
+	committedBytes: number;
+}
+
+export class SidecarProcess {
 	private readonly protocolClient: StdioSidecarProtocolClient;
 
 	private constructor(protocolClient: StdioSidecarProtocolClient) {
@@ -245,7 +261,7 @@ export class Sidecar {
 
 	static spawn(
 		options: SidecarSpawnOptions = {},
-	): Sidecar {
+	): SidecarProcess {
 		const protocolClient = StdioSidecarProtocolClient.spawn({
 			command: options.command,
 			args: options.args ?? [],
@@ -258,7 +274,7 @@ export class Sidecar {
 			disposedErrorMessage: "native sidecar disposed",
 			payloadCodec: options.payloadCodec ?? "bare",
 		});
-		return new Sidecar(protocolClient);
+		return new SidecarProcess(protocolClient);
 	}
 
 	setSidecarRequestHandler(handler: SidecarRequestHandler | null): void {
@@ -1217,6 +1233,43 @@ export class Sidecar {
 		return {
 			count: response.payload.count,
 		};
+	}
+
+	async hostFilesystemCall(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+		request: { operation: LiveFilesystemOperation; path: string; payloadSizeBytes: number },
+	): Promise<SidecarFilesystemResult> {
+		const response = await this.sendRequest({
+			ownership: { scope: "vm", connection_id: session.connectionId, session_id: session.sessionId, vm_id: vm.vmId },
+			payload: { type: "host_filesystem_call", operation: request.operation, path: request.path, payload_size_bytes: request.payloadSizeBytes },
+		});
+		if (response.payload.type !== "filesystem_result") {
+			throw new Error(`unexpected host_filesystem_call response: ${response.payload.type}`);
+		}
+		return { operation: response.payload.operation, status: response.payload.status, payloadSizeBytes: response.payload.payload_size_bytes };
+	}
+
+	async persistenceLoad(session: AuthenticatedSession, key: string): Promise<SidecarPersistenceState> {
+		const response = await this.sendRequest({
+			ownership: { scope: "session", connection_id: session.connectionId, session_id: session.sessionId },
+			payload: { type: "persistence_load", key },
+		});
+		if (response.payload.type !== "persistence_state") {
+			throw new Error(`unexpected persistence_load response: ${response.payload.type}`);
+		}
+		return { key: response.payload.key, found: response.payload.found, payloadSizeBytes: response.payload.payload_size_bytes };
+	}
+
+	async persistenceFlush(session: AuthenticatedSession, request: { key: string; payloadSizeBytes: number }): Promise<SidecarPersistenceFlushed> {
+		const response = await this.sendRequest({
+			ownership: { scope: "session", connection_id: session.connectionId, session_id: session.sessionId },
+			payload: { type: "persistence_flush", key: request.key, payload_size_bytes: request.payloadSizeBytes },
+		});
+		if (response.payload.type !== "persistence_flushed") {
+			throw new Error(`unexpected persistence_flush response: ${response.payload.type}`);
+		}
+		return { key: response.payload.key, committedBytes: response.payload.committed_bytes };
 	}
 
 	async waitForEvent(

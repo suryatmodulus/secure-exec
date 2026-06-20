@@ -46,30 +46,20 @@ stderr: "oops from the sandbox\n"
 
 `process.exit(3)` is why `exitCode` is `3`.
 
-## Result shape
-
-`exec()` resolves to `NodeRuntimeExecResult`:
+`run()` adds one more field. It resolves to the same `stdout`, `stderr`, and `exitCode`, plus a decoded `value` the guest hands back by calling `globalThis.__return(value)`:
 
 ```ts
-interface NodeRuntimeExecResult {
-	stdout: string;
-	stderr: string;
-	exitCode: number;
-}
+const { value, exitCode } = await rt.run(`
+	const sum = [1, 2, 3].reduce((a, b) => a + b, 0);
+	globalThis.__return({ sum });
+`);
+
+console.log(exitCode, value); // 0 { sum: 6 }
 ```
 
-`run()` resolves to `NodeRuntimeRunResult<T>`: the same three fields plus a decoded `value`:
+`value` is the JSON-decoded argument passed to `__return()`. It is only populated when `exitCode === 0` and the guest actually called `__return()`; otherwise it is `undefined`, while `stdout`, `stderr`, and `exitCode` are still captured.
 
-```ts
-interface NodeRuntimeRunResult<T = unknown> {
-	value?: T;       // JSON-decoded value the guest passed to __return()
-	stdout: string;
-	stderr: string;
-	exitCode: number;
-}
-```
-
-`value` is only populated when `exitCode === 0` and the guest called `globalThis.__return(value)`; otherwise it is `undefined`.
+See [the TypeScript SDK reference](/docs/sdks/typescript) for the full result and option shapes.
 
 ## Streaming output
 
@@ -93,21 +83,9 @@ const { stdout, exitCode } = await rt.exec(
 // stdout still holds the complete buffered output after the run.
 ```
 
-## Exec options
+## Feeding input and cancelling
 
-`exec()`, `run()`, and `spawn()` accept `NodeRuntimeExecOptions`:
-
-```ts
-interface NodeRuntimeExecOptions {
-	env?: Record<string, string>;          // merged over the VM env
-	cwd?: string;                          // working directory for this run
-	stdin?: string | Uint8Array;           // piped to the guest's stdin
-	timeout?: number;                      // abort after N milliseconds
-	signal?: AbortSignal;                  // cancel from the outside (SIGTERM)
-	onStdout?: (chunk: Uint8Array) => void;
-	onStderr?: (chunk: Uint8Array) => void;
-}
-```
+`exec()`, `run()`, and `spawn()` take the same options object. Beyond the streaming hooks above, the common ones are `stdin` to pipe input in, `signal` to cancel, plus `env`, `cwd`, and `timeout`. The [TypeScript SDK reference](/docs/sdks/typescript) lists them all.
 
 Feed input and read everything back as buffered strings:
 

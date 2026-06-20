@@ -1,12 +1,15 @@
 ---
 title: SDK Overview
-description: Guided tour of the secure-exec API surface.
+description: A map of the secure-exec SDK, linking to each feature guide.
 ---
 
-import { Tabs, TabItem, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A tour of the `NodeRuntime` class, the entry point for booting a VM and running
-guest JavaScript end-to-end.
+`NodeRuntime` is the entry point: it boots a virtualized VM and runs guest
+JavaScript end to end. This page is a map of what the SDK can do. Each section
+shows a quick example and links to the feature guide for the full detail, and to
+the [TypeScript SDK reference](/docs/sdks/typescript) for exact signatures and
+option shapes.
 
 ## Install
 
@@ -33,222 +36,207 @@ guest JavaScript end-to-end.
   </TabItem>
 </Tabs>
 
-## Create a runtime
+## Your first run
 
-`NodeRuntime.create(options?)` boots a VM and returns a ready-to-use runtime.
-All options are optional.
+Boot a runtime with `NodeRuntime.create()`, run some guest code, and dispose it.
+Every `create()` option is optional.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
-const rt = await NodeRuntime.create({
-  env: { GREETING: "hello from the VM env" },
-  cwd: "/home/user",
-});
+const rt = await NodeRuntime.create();
+try {
+  const { stdout } = await rt.exec("console.log('hi', 1 + 1)");
+  console.log(stdout);
+} finally {
+  await rt.dispose();
+}
 ```
 
 *[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/sdk-overview)*
 
-Every `create()` option:
-
-- `env`: environment variables visible to guest processes.
-- `cwd`: initial working directory for guests. Defaults to `/home/user`.
-- `permissions`: capability policy, merged over a secure default that denies
-  network access. See [Permissions](#permissions).
-- `files`: seed files into the VM filesystem before boot, keyed by absolute
-  guest path. Values are `string | Uint8Array`. Parent dirs are created as needed.
-- `mounts`: project host directories into the VM, Docker-style and read lazily.
-- `tools`: register host-side tools the guest can invoke as shell commands.
-- `commandsDir`: override the directory of WASM command binaries (the guest
-  `sh`). Defaults to the in-repo build or `SECURE_EXEC_WASM_COMMANDS_DIR`.
-- `loopbackExemptPorts`: guest ports allowed to accept non-loopback connections.
-
-```ts
-const rt = await NodeRuntime.create({
-  // Seed bytes into the in-memory VFS.
-  files: { "/home/user/data.json": '{"ok":true}' },
-  // Mount a host dir, lazily and read-only by default.
-  mounts: [
-    {
-      guestPath: "/home/user/node_modules/typescript",
-      hostPath: "/abs/path/node_modules/typescript",
-      readOnly: true,
-    },
-  ],
-});
-```
+Read more in the [TypeScript SDK reference](/docs/sdks/typescript) for every `create()` option and method signature.
 
 ## Execute code
 
-Two methods run sandboxed code. Guest `code` runs as an ES module, so `import`
-and top-level `await` both work.
-
-`exec()` runs code and captures `stdout`, `stderr`, and `exitCode`:
-
-```ts
-const execResult = await rt.exec(`
-  import os from "node:os";
-  console.log("platform:", os.platform());
-  console.error("greeting:", process.env.GREETING);
-`);
-// { stdout: string, stderr: string, exitCode: number }
-```
-
-`run<T>()` additionally decodes a JSON-serializable `value`. The guest calls
-`globalThis.__return(value)`; if it never does, `value` is `undefined`:
+`exec()` runs guest code as an ES module and captures `stdout` / `stderr` /
+`exitCode`; `run<T>()` also decodes a value the guest returns via
+`globalThis.__return(value)`.
 
 ```ts
-const runResult = await rt.run<{ sum: number }>(`
+const { stdout } = await rt.exec(`console.log(2 + 2)`);
+const { value } = await rt.run<{ sum: number }>(`
   globalThis.__return({ sum: 2 + 40 });
 `);
-console.log(runResult.value?.sum); // 42
-// { value?: T, stdout, stderr, exitCode }
+console.log(value?.sum); // 42
 ```
 
-## Per-run options
+Read more about [Executing Code](/docs/features/executing-code) and [Output Capture](/docs/features/output-capture).
 
-`exec()` and `run()` accept the same per-call options:
+## Long-running processes
 
-- `env`: extra env merged over the VM env.
-- `cwd`: working directory for this run.
-- `stdin`: `string | Uint8Array` piped to the guest's stdin.
-- `timeout`: abort the run after N milliseconds.
-- `signal`: an `AbortSignal`; on abort the guest process is killed (kernel
-  delivers `SIGTERM`) and the call rejects with the abort reason.
-- `onStdout` / `onStderr`: `(chunk: Uint8Array) => void`, called per chunk as
-  output is produced. The full output is still returned in the result.
-
-```ts
-const result = await rt.run<string>(
-  `
-  let input = "";
-  for await (const chunk of process.stdin) input += chunk;
-  globalThis.__return(input.trim().toUpperCase());
-  `,
-  {
-    stdin: "piped through stdin",
-    timeout: 10_000,
-    onStdout: (chunk) => process.stdout.write(new TextDecoder().decode(chunk)),
-  },
-);
-```
-
-```ts
-// Cancel an in-flight run from the outside.
-const controller = new AbortController();
-const pending = rt.exec("while (true) {}", { signal: controller.signal });
-controller.abort();
-await pending.catch((err) => err.name); // "AbortError"
-```
-
-## Spawn a long-running process
-
-`spawn()` starts a guest program and returns a live `NodeRuntimeProcess` handle
-immediately, without waiting for it to exit. Use it for dev servers and other
-guests that do not run to completion. It takes the same per-run options.
+`spawn()` starts a guest program (for example a dev server) and returns a live
+handle you can stream, signal, and await, without waiting for it to exit.
 
 ```ts
 const server = await rt.spawn(`
   import http from "node:http";
   http.createServer((_, res) => res.end("ok")).listen(3000);
 `);
-
-server.pid;                       // guest process id
-server.exitCode;                  // number once exited, else null
-server.writeStdin("data");        // feed stdin
-server.closeStdin();              // signal end-of-input
-server.kill("SIGTERM");           // signal name or number; defaults to SIGTERM
-await server.wait();              // resolves with the exit code
+// ... later
+server.kill();
+await server.wait();
 ```
 
-## Drive HTTP into the VM (host to guest)
+Read more about [Child Processes](/docs/features/child-processes).
 
-`fetch(port, input)` sends an HTTP request to a guest server listening inside
-the VM and reads the response back on the host. The request never leaves the VM,
-so it works even when guest network egress is denied.
+## Resident runner
+
+For tight loops of small snippets (an eval loop, a REPL), `createResidentRunner()`
+keeps one guest process alive so repeated `exec` calls skip per-run startup and
+run in about a millisecond.
 
 ```ts
-const res = await rt.fetch(3000, {
-  method: "POST",                 // defaults to "GET"
-  path: "/api/users?limit=10",
-  headers: { "content-type": "application/json" },
-  body: '{"name":"ada"}',         // string | Uint8Array
-});
-// { status, statusText, headers, body }; headers lower-cased, body UTF-8 text
-console.log(res.status, res.body);
+const runner = await rt.createResidentRunner();
+const a = await runner.exec("console.log(1 + 1)");
+const b = await runner.exec("console.log(2 + 2)");
+await runner.dispose();
 ```
 
-## Host tools
+Read more about [Resident Runner](/docs/features/resident-runner).
 
-Register host-side tools the guest invokes as named shell commands. The guest
-invocation round-trips back to the host `handler`, whose return value is
-delivered to the guest. Provide tools at `create()`, or add them to a live
-runtime with `registerTools()`.
+## Filesystem
+
+The guest sees a fully virtualized in-memory filesystem; the host filesystem is
+never exposed. Read and write the VFS from the host, seed files at boot, and
+project host directories with mounts.
 
 ```ts
-await rt.registerTools({
-  add: {
-    description: "Add two numbers",
-    inputSchema: {
-      type: "object",
-      properties: { a: { type: "number" }, b: { type: "number" } },
-      required: ["a", "b"],
-    },
-    handler: ({ a, b }: { a: number; b: number }) => ({ sum: a + b }),
-  },
-});
-
-await rt.exec(`
-  import { execFileSync } from "node:child_process";
-  const out = execFileSync("add", ["add", "--json", JSON.stringify({ a: 2, b: 3 })]);
-  console.log(out.toString());
-`);
+await rt.writeFile("/home/user/out.txt", "hello");
+const bytes = await rt.readFile("/home/user/out.txt");
+console.log(new TextDecoder().decode(bytes)); // "hello"
 ```
 
-- Tools passed to `create({ tools })` auto-grant the `tool` permission scope when
-  you set no `tool` policy of your own.
-- When registering on a live runtime, ensure the `tool` scope is granted (e.g.
-  `permissions: { tool: "allow" }` on `create()`).
+Read more about [Filesystem](/docs/features/filesystem) and [Filesystem Mounts](/docs/features/filesystem-mounts).
 
-## Read and write VM files
+## NPM and modules
 
-Move bytes in and out of the VM's virtual filesystem after boot. The host
-filesystem is never touched.
-
-```ts
-await rt.writeFile("/home/user/out.txt", "hello");  // string | Uint8Array
-const bytes = await rt.readFile("/home/user/out.txt"); // Uint8Array
-console.log(new TextDecoder().decode(bytes));
-```
-
-## Permissions
-
-The `permissions` option controls what guest code can access. It defaults to a
-secure policy that denies network access while leaving the `fs`, `childProcess`,
-`process`, and `env` scopes enabled. Your policy is merged over that default, so
-a partial policy works: `{ network: "allow" }` grants the network while keeping
-the execution essentials in place. Scopes are `fs`, `network`, `childProcess`,
-`process`, `env`, and `tool`, each set to `"allow"`, `"deny"`, or a rule set.
-
-Because Secure Exec runs each program as a guest `node` process, `childProcess`
-must stay allowed for `exec()` / `run()` to work. The snippet below restates the
-secure baseline explicitly:
+Guest `import` / `require` resolve real npm packages from a `node_modules` you
+project into the VM, with naive Node resolution over that filesystem.
 
 ```ts
 const rt = await NodeRuntime.create({
-  permissions: {
-    fs: "allow",
-    childProcess: "allow",
-    network: "deny",
+  nodeModules: "/abs/path/to/project/node_modules",
+});
+await rt.exec(`
+  import isNumber from "is-number";
+  console.log(isNumber(42)); // true
+`);
+```
+
+Read more about [NPM & Module Loading](/docs/features/module-loading).
+
+## Networking
+
+Guest `fetch` and sockets run through the kernel socket table under the network
+policy. Drive HTTP into a guest server with `rt.fetch(port, input)`, which works
+even when guest egress is denied.
+
+```ts
+const res = await rt.fetch(3000, { path: "/health" });
+console.log(res.status, res.body);
+```
+
+Read more about [Networking](/docs/features/networking).
+
+## Host tools
+
+Expose host-side functions the guest calls with the `callHostTool(name, input)`
+global. The handler runs on the host, so you give untrusted code a curated
+capability surface without granting the underlying access.
+
+```ts
+const rt = await NodeRuntime.create({
+  tools: {
+    add: {
+      description: "Add two numbers",
+      inputSchema: {
+        type: "object",
+        properties: { a: { type: "number" }, b: { type: "number" } },
+        required: ["a", "b"],
+      },
+      handler: ({ a, b }: { a: number; b: number }) => ({ sum: a + b }),
+    },
   },
+});
+await rt.exec(`
+  const { sum } = await callHostTool("add", { a: 2, b: 3 });
+  console.log(sum); // 5
+`);
+```
+
+Read more about [Host Tools](/docs/features/host-tools).
+
+## Permissions
+
+The policy is secure by default: network access is denied while the virtualized
+scopes stay enabled. Your policy merges over that default, so a partial policy
+works.
+
+```ts
+const rt = await NodeRuntime.create({
+  permissions: { network: "allow" },
 });
 ```
 
-See [Permissions](/docs/features/permissions) for the full policy shape.
+Read more about [Permissions](/docs/features/permissions).
+
+## Resource limits
+
+Bound how long a guest can run with `timeout` and an `AbortSignal`; the VM also
+enforces memory and CPU limits.
+
+```ts
+// A runaway loop is killed once the budget elapses.
+const result = await rt.exec(`while (true) {}`, { timeout: 1000 });
+console.log(result.exitCode); // non-zero: the guest was killed
+```
+
+Read more about [Resource Limits](/docs/features/resource-limits).
+
+## Runtime and platform
+
+Shape the host environment presented to guest JavaScript, starting with the env
+and working directory the guest sees.
+
+```ts
+const rt = await NodeRuntime.create({
+  env: { NODE_ENV: "production" },
+  cwd: "/home/user",
+});
+```
+
+Read more about [Runtime & Platform](/docs/features/runtime-platform).
+
+## TypeScript
+
+Compile and type-check TypeScript inside the sandbox with the in-VM compiler
+tools.
+
+```ts
+import { createTypeScriptTools } from "@secure-exec/typescript";
+
+const tools = createTypeScriptTools();
+const { outputText } = await tools.compileSource({
+  sourceText: "const x: number = 1 + 1;",
+});
+```
+
+Read more about [TypeScript](/docs/features/typescript).
 
 ## Clean up
 
-Always release the VM and underlying sidecar when done:
+Always release the VM and its sidecar when done:
 
 ```ts
 await rt.dispose();

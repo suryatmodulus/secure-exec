@@ -6,14 +6,38 @@ import { LinkCard } from '@astrojs/starlight/components';
 
 <LinkCard title="Example on GitHub" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-networking" description="Runnable example for network access control." />
 
-<LinkCard title="WASM Interop Example" href="https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-networking-wasm" description="Runnable example for WASM to JS, JS to WASM, host to WASM, and WASM to host HTTP." />
-
-Guest `fetch()`, `node:http`, and raw sockets all flow through the kernel socket table. Guest code cannot open real host sockets directly. Host loopback access is available only for explicitly exempted ports and still goes through the VM networking policy.
+Guest `fetch()`, `node:http`, and raw sockets all flow through the kernel socket table. Guest code never touches the real host network.
 
 - `network: "deny"` (the default) blocks all guest sockets and outbound requests.
 - `network: "allow"` lets guest code open sockets and make outbound requests.
 - `network: { default, rules }` matches request patterns to allow or deny.
 - Permissions merge over a secure default, so name only the scope you change: `{ network: "allow" }`. The default already grants the fs/childProcess/process/env scopes the runtime needs.
+
+## Networking model
+
+The kernel socket table is the single chokepoint for all guest networking. Every guest `listen`, `connect`, and `fetch()` is brokered through it, and no real host socket is ever opened on the guest's behalf. There is nowhere for guest code to reach the host network around the kernel: a raw socket, an `http` server, an outbound `fetch`, and a DNS lookup all resolve to the same in-VM table.
+
+For how that transport is built (the layers from kernel socket table up to the guest bridge, and how host, JavaScript, and WASM traffic share it), see [Networking architecture](/docs/architecture/networking). This section covers the parts you configure.
+
+### Loopback-only by default
+
+Guest listeners are reachable only over loopback (`127.0.0.1` / `::1`) inside the VM. Binding to `0.0.0.0` or `::` does not widen this: the kernel normalizes the unspecified address down to loopback, so the listener still answers only on loopback. A connection that originates outside the loopback interface, and targets a port the VM does not own, is refused with an `EACCES` error noting that the port is not exempt.
+
+This confinement is independent of the permission policy. Even with `network: "allow"`, a guest server stays loopback-only unless you explicitly exempt its port.
+
+### Three distinct layers
+
+People often conflate three separate controls. They stack, and a request must pass all three that apply to it:
+
+1. **Permission policy** (`network.listen` / `network.connect`). Decides whether the guest may open a listener or initiate an outbound connection at all. This is the `network: "deny" | "allow" | { default, rules }` setting above. A blocked operation fails with `blocked by network.listen policy` or `blocked by network.connect policy`.
+2. **Loopback confinement.** Decides who may reach an already-permitted guest listener. By default, only loopback inside the VM; `loopbackExemptPorts` loosens it per port.
+3. **DNS / egress allowlist.** Constrains where permitted outbound connections may go. The kernel filters resolved addresses, blocking outbound access to restricted ranges, so an allowed `connect` can still be refused by destination.
+
+`loopbackExemptPorts` belongs to layer 2 only. It is a trusted isolation-policy, per-port whitelist that *loosens* the default loopback confinement (for example, exposing an in-VM dev server beyond loopback). It is not an egress control and does not grant the guest any outbound reach; layers 1 and 3 still apply.
+
+### Host-to-guest requests bypass egress, not the table
+
+`rt.fetch` and `rt.waitForListener` drive requests from the host *into* a guest listener through the socket table. Because the request terminates at the guest's loopback listener and never leaves the VM, it works even when guest egress (layer 3) or outbound `connect` (layer 1) is denied. It still goes through the same kernel socket table as everything else.
 
 ## Guest fetch + network permission
 
@@ -21,8 +45,6 @@ The guest below starts a loopback HTTP server inside the VM and fetches it. With
 
 ```ts
 import { NodeRuntime } from "secure-exec";
-import { createServer as createHttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
 
 // Guest program: start a loopback HTTP server, then fetch it. Both the listen
 // and the fetch go through the kernel socket table.
@@ -67,66 +89,9 @@ const denied = await NodeRuntime.create();
 try {
 	const result = await denied.exec(GUEST);
 	console.log("[network denied] exitCode:", result.exitCode);
-	console.log(
-		"[network denied] stderr:",
-		JSON.stringify(result.stderr.trim().split("\n")[0]),
-	);
+	console.log("[network denied] stderr:", JSON.stringify(result.stderr.trim()));
 } finally {
 	await denied.dispose();
-}
-
-// 3. Host loopback access: network "allow" is not enough to reach real host
-// loopback. The host must explicitly exempt the host port too.
-const hostServer = createHttpServer((req, res) => {
-	res.writeHead(200, { "content-type": "text/plain" });
-	res.end("host-ok:" + req.url);
-});
-await new Promise<void>((resolve) => {
-	hostServer.listen(0, "127.0.0.1", resolve);
-});
-const hostPort = (hostServer.address() as AddressInfo).port;
-
-const HOST_FETCH_GUEST = `
-try {
-	const response = await fetch("http://127.0.0.1:${hostPort}/from-guest");
-	console.log(response.status + ":" + await response.text());
-} catch (error) {
-	console.log(error.cause?.code || error.code || error.name);
-	process.exit(2);
-}
-`;
-
-try {
-	const blockedHostLoopback = await NodeRuntime.create({
-		permissions: { network: "allow" },
-	});
-	try {
-		const result = await blockedHostLoopback.exec(HOST_FETCH_GUEST);
-		console.log("[host loopback blocked] exitCode:", result.exitCode);
-		console.log(
-			"[host loopback blocked] stdout:",
-			JSON.stringify(result.stdout.trim()),
-		);
-	} finally {
-		await blockedHostLoopback.dispose();
-	}
-
-	const allowedHostLoopback = await NodeRuntime.create({
-		permissions: { network: "allow" },
-		loopbackExemptPorts: [hostPort],
-	});
-	try {
-		const result = await allowedHostLoopback.exec(HOST_FETCH_GUEST);
-		console.log("[host loopback allowed] exitCode:", result.exitCode);
-		console.log(
-			"[host loopback allowed] stdout:",
-			JSON.stringify(result.stdout.trim()),
-		);
-	} finally {
-		await allowedHostLoopback.dispose();
-	}
-} finally {
-	await new Promise<void>((resolve) => hostServer.close(() => resolve()));
 }
 ```
 
@@ -140,17 +105,13 @@ Running it prints:
 [network allowed] stderr: ""
 [network denied] exitCode: 1
 [network denied] stderr: "Error: EACCES: EACCES: permission denied, tcp://127.0.0.1:0: blocked by network.listen policy"
-[host loopback blocked] exitCode: 2
-[host loopback blocked] stdout: "EACCES"
-[host loopback allowed] exitCode: 0
-[host loopback allowed] stdout: "200:host-ok:/from-guest"
 ```
 
 When a request is denied, the guest operation fails with an `EACCES` error naming the policy that blocked it (for example `blocked by network.listen policy` or `blocked by network.connect policy`).
 
 ## Pattern-based gating
 
-The `network` permission accepts `"allow"`, `"deny"`, or a rule set. A rule set has a `default` mode plus a list of `rules`, each with a `mode` and `patterns`:
+Instead of a flat `"allow"` / `"deny"`, the `network` permission also accepts a rule set: a `default` mode plus per-pattern overrides, so you can allow most destinations and deny a few (or vice versa).
 
 ```ts
 const rt = await NodeRuntime.create({
@@ -163,14 +124,14 @@ const rt = await NodeRuntime.create({
 });
 ```
 
+For the full rule-set type and how the policy resolves, see [Permissions](/docs/features/permissions) and the [TypeScript SDK reference](/docs/sdks/typescript).
+
 ## Host to guest proxy with `rt.fetch`
 
-`rt.fetch(port, input)` drives an HTTP request into a guest server listening inside the VM and reads the response back on the host. The request never leaves the VM (it connects to the guest's loopback listener through the kernel socket table), so it works even when guest network egress is denied.
+`rt.fetch(port, input)` drives an HTTP request into a guest server listening inside the VM and reads the response back on the host.
 
 ```ts
-const rt = await NodeRuntime.create({
-	permissions: { network: "allow" },
-});
+const rt = await NodeRuntime.create();
 
 // Start a long-running guest server with spawn() and get a live handle back.
 const server = await rt.spawn(`
@@ -188,11 +149,7 @@ await server.wait();
 await rt.dispose();
 ```
 
-`rt.fetch(port, input)` takes the request `path` (required) plus optional `method` (default `GET`), `headers`, and a `string | Uint8Array` `body`. It resolves with `status`, `statusText`, lower-cased `headers`, and the `body` decoded as UTF-8 text.
-
-### WASM and JavaScript interop
-
-WASM commands and guest JavaScript share the same VM socket table. The WASM interop example starts a JS HTTP server and reaches it from a WASM HTTP client, starts a WASM HTTP server and reaches it from JS `fetch()`, drives host `vmFetch` into the WASM server, then reaches a host loopback fixture from WASM through an explicit `loopbackExemptPorts` entry. It uses the same checked-in `http_get` and `http_server` WASM fixtures as the cross-runtime test matrix.
+For the full `rt.fetch` request options and response shape, see the [TypeScript SDK reference](/docs/sdks/typescript).
 
 ### Waiting for a guest listener
 
@@ -200,6 +157,8 @@ Drive a request into a guest server only once it is accepting connections:
 
 - `rt.waitForListener(query)`: block until a listener matches the `port` (optionally narrowed by `host`/`path`), then resolve with it. See [SDK Overview](/docs/sdk-overview) for `timeoutMs`/`signal`/`pollIntervalMs`.
 - `rt.findListener(query)`: one-shot, non-blocking lookup; returns the match or `null`.
+
+Both can currently return `null` for a live loopback listener (a known bug), so treat them as best-effort today. If you know the guest server is up, `rt.fetch` works regardless of what the lookup reports.
 
 ```ts
 const listener = await rt.waitForListener({ port: 3000 });

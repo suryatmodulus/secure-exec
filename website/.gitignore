@@ -1,0 +1,3 @@
+
+# Generated TSDoc output (regenerate with: pnpm --dir website docs:gen:ts)
+typedoc-out/

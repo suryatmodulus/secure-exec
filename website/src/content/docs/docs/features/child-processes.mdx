@@ -67,6 +67,19 @@ const rt = await NodeRuntime.create({
 
 <Aside type="note">Child processes always run inside the kernel. Guest code cannot reach a real host process or host binary; `node:child_process` only sees the commands the VM mounts.</Aside>
 
+### Where the commands come from
+
+The guest `sh` and the coreutils it drives ship as WASM binaries. The kernel cannot spawn any guest process without them, so they are mounted through the WASM runtime at boot. This is how `node:child_process` and the shell work inside the VM with no host processes ever involved.
+
+The `commandsDir` create option overrides where those WASM command binaries are loaded from. When unset, the runtime resolves a directory using the first match in this order:
+
+1. an explicit `commandsDir` option,
+2. the `SECURE_EXEC_WASM_COMMANDS_DIR` environment variable,
+3. the in-repo build output (`registry/native/target/wasm32-wasip1/release/commands`), present only in developer checkouts,
+4. the commands vendored into the installed `@secure-exec/core` package (published installs).
+
+The in-repo build output wins over the bundled copy so local edits are picked up without re-vendoring; a fresh `npm install` has no in-repo path and falls through to the vendored commands. See the [TypeScript SDK reference](/docs/sdks/typescript) for the full create-option shape.
+
 ## Long-running guests with rt.spawn
 
 `rt.exec` runs to completion and returns captured output. `rt.spawn(code)` returns a live handle immediately while the guest keeps running. It is the building block for dev servers and other long-lived guests.
@@ -85,16 +98,7 @@ const exitCode = await proc.wait();
 console.log(proc.pid, exitCode);
 ```
 
-`rt.spawn(code, options?)` returns a `NodeRuntimeProcess`:
-
-- `pid: number`: the guest process id.
-- `writeStdin(data: string | Uint8Array): void`: write to the guest's stdin.
-- `closeStdin(): void`: close stdin, signalling end-of-input.
-- `kill(signal?): void`: send a signal. Defaults to `SIGTERM`; accepts a name (`"SIGKILL"`) or a raw number.
-- `wait(): Promise<number>`: resolve with the exit code once the process terminates.
-- `exitCode: number | null`: the exit code, or `null` while running.
-
-`NodeRuntimeSpawnOptions` matches the exec options: `env`, `cwd`, `stdin`, `timeout`, `signal`, `onStdout`, `onStderr`. Stream output by passing `onStdout` / `onStderr`, which receive raw `Uint8Array` chunks:
+The handle exposes `pid`, `writeStdin` / `closeStdin`, `kill`, `wait`, and `exitCode`; see the [TypeScript SDK reference](/docs/sdks/typescript) for the full `NodeRuntimeProcess` and `NodeRuntimeSpawnOptions` shapes. Stream output by passing `onStdout` / `onStderr`, which receive raw `Uint8Array` chunks:
 
 ```ts
 const proc = await rt.spawn("setInterval(() => console.log('tick'), 100)", {

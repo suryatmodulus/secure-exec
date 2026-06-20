@@ -11,7 +11,7 @@ import {
 	type LocalCompatMount,
 	NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
 	NativeSidecarKernelProxy,
-	Sidecar,
+	SidecarProcess,
 	type RootFilesystemEntry,
 	type SidecarRegisteredHostCallbackDefinition,
 	type SidecarRequestFrame,
@@ -485,6 +485,7 @@ export interface Kernel extends KernelInterface {
 	readonly socketTable: {
 		hasHostNetworkAdapter(): boolean;
 		findListener(_request: unknown): unknown | null;
+		findListenerAsync(_request: unknown): Promise<unknown | null>;
 		findBoundUdp(_request: unknown): unknown | null;
 	};
 	readonly processTable: {
@@ -2087,7 +2088,7 @@ async function snapshotFilesystemEntries(
 }
 
 async function materializeSnapshotEntriesIntoVm(
-	client: Sidecar,
+	client: SidecarProcess,
 	session: AuthenticatedSession,
 	vm: CreatedVm,
 	entries: RootFilesystemEntry[],
@@ -2491,7 +2492,7 @@ class NativeKernel implements Kernel {
 	readonly timerTable = {};
 	readonly vfs: VirtualFileSystem;
 
-	private client: Sidecar | null = null;
+	private client: SidecarProcess | null = null;
 	private session: AuthenticatedSession | null = null;
 	private vm: CreatedVm | null = null;
 	private proxy: NativeSidecarKernelProxy | null = null;
@@ -2522,7 +2523,7 @@ class NativeKernel implements Kernel {
 			permissions?: Permissions;
 			env?: Record<string, string>;
 			cwd?: string;
-			sidecar?: Sidecar;
+			sidecar?: SidecarProcess;
 			onBootTiming?: (timing: KernelBootTiming) => void;
 			hostNetworkAdapter?: unknown;
 			loopbackExemptPorts?: number[];
@@ -2543,6 +2544,16 @@ class NativeKernel implements Kernel {
 				port?: number;
 				path?: string;
 			}) => this.proxy?.findListener(request) ?? null,
+			findListenerAsync: async (request: {
+				host?: string;
+				port?: number;
+				path?: string;
+			}) => {
+				if (this.proxy?.findListenerAsync) {
+					return this.proxy.findListenerAsync(request);
+				}
+				return this.proxy?.findListener(request) ?? null;
+			},
 			findBoundUdp: (request: { host?: string; port?: number }) =>
 				this.proxy?.findBoundUdp(request) ?? null,
 		};
@@ -3008,7 +3019,7 @@ class NativeKernel implements Kernel {
 		const client =
 			this.options.sidecar ??
 			this.measureSyncBoot("sidecar_spawn", () =>
-				Sidecar.spawn({
+				SidecarProcess.spawn({
 					cwd: REPO_ROOT,
 					command: ensureNativeSidecarBinary(),
 					args: [],
@@ -3142,7 +3153,7 @@ export function createKernel(options: {
 	permissions?: Permissions;
 	env?: Record<string, string>;
 	cwd?: string;
-	sidecar?: Sidecar;
+	sidecar?: SidecarProcess;
 	onBootTiming?: (timing: KernelBootTiming) => void;
 	maxProcesses?: number;
 	hostNetworkAdapter?: unknown;

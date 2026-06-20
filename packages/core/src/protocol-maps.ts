@@ -35,6 +35,14 @@ export type LiveGuestFilesystemOperation =
 	| "utimes"
 	| "truncate"
 	| "pread";
+export type LiveFilesystemOperation =
+	| "read"
+	| "write"
+	| "stat"
+	| "read_dir"
+	| "mkdir"
+	| "remove"
+	| "rename";
 export type LiveVmLifecycleState =
 	| "creating"
 	| "ready"
@@ -178,6 +186,48 @@ export function toGeneratedGuestFilesystemOperation(
 			return protocol.GuestFilesystemOperation.Truncate;
 		case "pread":
 			return protocol.GuestFilesystemOperation.Pread;
+	}
+}
+
+export function toGeneratedFilesystemOperation(
+	operation: LiveFilesystemOperation,
+): protocol.FilesystemOperation {
+	switch (operation) {
+		case "read":
+			return protocol.FilesystemOperation.Read;
+		case "write":
+			return protocol.FilesystemOperation.Write;
+		case "stat":
+			return protocol.FilesystemOperation.Stat;
+		case "read_dir":
+			return protocol.FilesystemOperation.ReadDir;
+		case "mkdir":
+			return protocol.FilesystemOperation.Mkdir;
+		case "remove":
+			return protocol.FilesystemOperation.Remove;
+		case "rename":
+			return protocol.FilesystemOperation.Rename;
+	}
+}
+
+export function fromGeneratedFilesystemOperation(
+	operation: protocol.FilesystemOperation,
+): LiveFilesystemOperation {
+	switch (operation) {
+		case protocol.FilesystemOperation.Read:
+			return "read";
+		case protocol.FilesystemOperation.Write:
+			return "write";
+		case protocol.FilesystemOperation.Stat:
+			return "stat";
+		case protocol.FilesystemOperation.ReadDir:
+			return "read_dir";
+		case protocol.FilesystemOperation.Mkdir:
+			return "mkdir";
+		case protocol.FilesystemOperation.Remove:
+			return "remove";
+		case protocol.FilesystemOperation.Rename:
+			return "rename";
 	}
 }
 

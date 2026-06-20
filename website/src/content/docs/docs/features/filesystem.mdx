@@ -1,15 +1,16 @@
 ---
-title: Filesystem & Mounts
-description: Filesystem backends for sandboxed code.
+title: Filesystem
+description: Read and write the VM's virtual filesystem from guest code and the host.
 ---
 import { Aside } from '@astrojs/starlight/components';
 
-Every VM gets a virtual filesystem that lives entirely inside the kernel. Guest code reads and writes it through the standard Node `fs` module.
+Every VM gets a virtual filesystem that lives entirely inside the kernel. Guest code reads and writes it through the standard Node `fs` module, and writes never touch the host disk.
 
-- `NodeRuntime.create()` boots an isolated in-memory filesystem. Guest writes never touch the host disk.
+- `NodeRuntime.create()` boots an isolated in-memory filesystem.
 - Seed initial bytes with `create({ files })`.
-- Project real host directories with `create({ mounts })`, Docker-style.
 - Read and write the VFS from the host with `rt.writeFile` / `rt.readFile`.
+
+This page covers reading, writing, and seeding files. For the conceptual model and host isolation guarantees, see [Virtual Filesystem](/docs/features/virtual-filesystem). To project a real host directory into the VM, see [Filesystem Mounts](/docs/features/filesystem-mounts).
 
 ## Reading and Writing Files
 
@@ -98,79 +99,14 @@ await rt.exec(`
 
 The bytes are copied into the VM's in-memory filesystem; the host filesystem is never exposed to the guest.
 
-## Mounting host directories (`create({ mounts })`)
-
-Project a real host directory into the VM, Docker-style. Each mount makes a host directory readable at a guest path.
-
-- `guestPath`: absolute guest path the directory appears at.
-- `hostPath`: absolute host directory to project.
-- `readOnly`: mount read-only. Defaults to `true`; pass `false` to allow guest writes.
-
-The guest sees only the mounted subtree, never the wider host filesystem. Files are read lazily through the VFS, so large trees (for example a `node_modules` package such as the TypeScript compiler) are projected without copying their bytes up front.
-
-```ts
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { NodeRuntime } from "secure-exec";
-
-// A real directory on the host containing greeting.txt ("value-from-host").
-const hostDir = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "host-data",
-);
-
-const mounted = await NodeRuntime.create({
-  mounts: [
-    {
-      guestPath: "/mnt/host-data",
-      hostPath: hostDir,
-      readOnly: true,
-    },
-  ],
-});
-
-try {
-  const { stdout, stderr, exitCode } = await mounted.exec(`
-    import { readFileSync, readdirSync } from "node:fs";
-
-    const entries = readdirSync("/mnt/host-data");
-    const greeting = readFileSync("/mnt/host-data/greeting.txt", "utf8");
-
-    console.log("mounted contents:", JSON.stringify(entries));
-    console.log("guest read host file:", greeting.trim());
-  `);
-
-  console.log("[mount] exitCode:", exitCode);
-  if (stderr.trim()) console.log("[mount] guest stderr:", stderr.trim());
-  console.log("[mount] guest stdout:");
-  console.log(stdout.trim());
-} finally {
-  await mounted.dispose();
-}
-```
-
-*[See Full Example](https://github.com/rivet-dev/secure-exec/tree/main/examples/docs/feat-filesystem)*
-
-Output:
-
-```
-[mount] exitCode: 0
-[mount] guest stdout:
-mounted contents: ["greeting.txt"]
-guest read host file: value-from-host
-```
-
-Host directory mounts are one of several filesystem backends. For overlay filesystems and remote storage backends (such as Amazon S3 and Google Drive), see [Custom and host-backed filesystems](/docs/features/virtual-filesystem#custom-and-host-backed-filesystems).
-
 ## When to use each
 
 | Need | Use |
 |---|---|
 | Isolated scratch space | `NodeRuntime.create()` (default) |
 | Inject fixed bytes before boot | `create({ files })` |
-| Expose a real host directory | `create({ mounts })` |
 | Write/read the VFS from the host | `rt.writeFile` / `rt.readFile` |
+| Expose a real host directory | `create({ mounts })`, see [Filesystem Mounts](/docs/features/filesystem-mounts) |
 
 ## Standard Node `fs` API
 
@@ -190,3 +126,5 @@ Guest code uses Node's built-in `node:fs` module, backed by the virtual filesyst
 | Rename a file or directory | `renameSync(oldPath, newPath)` |
 
 The async `node:fs/promises` variants are available too. Present normal Linux filesystem semantics to your tools and run them unmodified.
+
+For the full option and type shapes (`create()` options, `writeFile`/`readFile` signatures), see the [TypeScript SDK reference](/docs/sdks/typescript).

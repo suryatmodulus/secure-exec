@@ -20,12 +20,12 @@ import type {
 	AuthenticatedSession,
 	CreatedVm,
 	GuestFilesystemStat,
-	Sidecar,
+	SidecarProcess,
 	SidecarMountDescriptor,
 	SidecarProcessSnapshotEntry,
 	SidecarSignalHandlerRegistration,
 	SidecarSocketStateEntry,
-} from "./sidecar-client.js";
+} from "./sidecar-process.js";
 
 export interface PlainMountConfig {
 	path: string;
@@ -310,7 +310,7 @@ interface TrackedProcessEntry {
 }
 
 interface NativeSidecarKernelProxyOptions {
-	client: Sidecar;
+	client: SidecarProcess;
 	session: AuthenticatedSession;
 	vm: CreatedVm;
 	disposeClient?: boolean;
@@ -331,7 +331,7 @@ export class NativeSidecarKernelProxy {
 	readonly processes = new Map<number, ProcessInfo>();
 	private readonly defaultExecCwd: string | undefined;
 
-	private readonly client: Sidecar;
+	private readonly client: SidecarProcess;
 	private readonly disposeClient: boolean;
 	private readonly session: AuthenticatedSession;
 	private readonly vm: CreatedVm;
@@ -1303,6 +1303,37 @@ export class NativeSidecarKernelProxy {
 				),
 			});
 		}
+		return this.listenerLookups.get(key)?.value ?? null;
+	}
+
+	/**
+	 * Await a fresh listener lookup instead of reading the synchronous cache.
+	 *
+	 * {@link findListener} returns whatever value the background refresh has
+	 * populated so far, which starts `null`. Callers that poll (for example
+	 * `waitForListener`) can otherwise keep observing that stale `null` even once
+	 * the listener exists. This variant reuses an in-flight refresh when present,
+	 * otherwise starts one, awaits it, and returns the freshly resolved value.
+	 */
+	async findListenerAsync(request: {
+		host?: string;
+		port?: number;
+		path?: string;
+	}): Promise<KernelSocketSnapshot | null> {
+		const key = socketLookupKey("listener", request);
+		const existing = this.listenerLookups.get(key);
+		const pending =
+			existing?.pending ??
+			this.refreshSocketLookup(this.listenerLookups, key, () =>
+				this.client.findListener(this.session, this.vm, request),
+			);
+		if (!existing?.pending) {
+			this.listenerLookups.set(key, {
+				value: existing?.value ?? null,
+				pending,
+			});
+		}
+		await pending;
 		return this.listenerLookups.get(key)?.value ?? null;
 	}
 
@@ -2284,11 +2315,11 @@ export type {
 	SidecarSessionState,
 	SidecarSignalHandlerRegistration,
 	SidecarSocketStateEntry,
-} from "./sidecar-client.js";
+} from "./sidecar-process.js";
 export {
 	NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
-	Sidecar,
+	SidecarProcess,
 	SidecarEventBufferOverflow,
 	SidecarProcessError,
 	SidecarProcessExited,
-} from "./sidecar-client.js";
+} from "./sidecar-process.js";

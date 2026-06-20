@@ -34,7 +34,7 @@ export const siteConfig = {
 			{ title: "Quickstart", href: "/docs/quickstart", icon: "rocket", description: "Install and run your first sandboxed execution in a few minutes." },
 			{ title: "SDK Overview", href: "/docs/sdk-overview", icon: "terminal", description: "The programmatic API for driving the runtime from Node or the browser." },
 			{ title: "Features", href: "/docs/features/typescript", icon: "layers", description: "TypeScript, permissions, filesystem, networking, child processes, and more." },
-			// { title: "API Reference", href: "/docs/api-reference", icon: "book", description: "Full reference for the runtime API." },
+			// { title: "SDKs", href: "/docs/sdks/typescript", icon: "book", description: "TypeScript and Rust SDK reference." },
 		],
 	},
 
@@ -50,6 +50,15 @@ export const siteConfig = {
 			items: [
 				{ slug: "docs/quickstart", attrs: { "data-icon": "rocket" } },
 				{ slug: "docs/sdk-overview", attrs: { "data-icon": "terminal" } },
+				{ slug: "docs/security", attrs: { "data-icon": "lock" } },
+				{
+					label: "SDKs",
+					collapsed: true,
+					items: [
+						{ slug: "docs/sdks/typescript", attrs: { "data-icon": "fileCode" } },
+						{ slug: "docs/sdks/rust", attrs: { "data-icon": "code" } },
+					],
+				},
 			],
 		},
 		{
@@ -64,48 +73,48 @@ export const siteConfig = {
 		{
 			label: "Features",
 			items: [
+				{ slug: "docs/features/executing-code", attrs: { "data-icon": "play" } },
 				{ slug: "docs/features/typescript", attrs: { "data-icon": "fileCode" } },
 				{ slug: "docs/features/permissions", attrs: { "data-icon": "shield" } },
 				{ slug: "docs/features/filesystem", attrs: { "data-icon": "folder" } },
 				{ slug: "docs/features/virtual-filesystem", attrs: { "data-icon": "folderTree" } },
+				{ slug: "docs/features/filesystem-mounts", attrs: { "data-icon": "folderTree" } },
 				{ slug: "docs/features/networking", attrs: { "data-icon": "network" } },
 				{ slug: "docs/features/module-loading", attrs: { "data-icon": "package" } },
 				{ slug: "docs/features/runtime-platform", attrs: { "data-icon": "code" } },
 				{ slug: "docs/features/output-capture", attrs: { "data-icon": "scroll" } },
+				{ slug: "docs/features/resident-runner", attrs: { "data-icon": "zap" } },
 				{ slug: "docs/features/resource-limits", attrs: { "data-icon": "gauge" } },
 				{ slug: "docs/features/child-processes", attrs: { "data-icon": "split" } },
-				// { slug: "docs/process-isolation", attrs: { "data-icon": "box" } },
+				{ slug: "docs/features/host-tools", attrs: { "data-icon": "wrench" } },
+				{ slug: "docs/process-isolation", attrs: { "data-icon": "box" } },
 			],
 		},
 		{
-			label: "Architecture",
+			label: "Reference",
 			items: [
-				{ slug: "docs/architecture/networking", attrs: { "data-icon": "network" } },
+				{ slug: "docs/nodejs-compatibility", attrs: { "data-icon": "check" } },
+				{ slug: "docs/benchmarks", attrs: { "data-icon": "gauge" } },
+				{
+					label: "Comparison",
+					items: [
+						{ slug: "docs/comparison/sandbox", attrs: { "data-icon": "gitCompare" } },
+						{ slug: "docs/comparison/cloudflare-workers", attrs: { "data-icon": "gitCompare" } },
+					],
+				},
+				{
+					label: "Advanced",
+					items: [
+						{ slug: "docs/cost-evaluation", attrs: { "data-icon": "dollar" } },
+						{ slug: "docs/runtime-modes", attrs: { "data-icon": "blocks" } },
+						{ slug: "docs/architecture", attrs: { "data-icon": "blocks" } },
+						{ slug: "docs/architecture/networking", attrs: { "data-icon": "network" } },
+						{ slug: "docs/wasm-posix-extensions", attrs: { "data-icon": "package" } },
+						{ slug: "docs/security-model", attrs: { "data-icon": "lock" } },
+					],
+				},
 			],
 		},
-		// {
-		// 	label: "Reference",
-		// 	items: [
-		// 		{ slug: "docs/api-reference", attrs: { "data-icon": "book" } },
-		// 		{ slug: "docs/nodejs-compatibility", attrs: { "data-icon": "check" } },
-		// 		{ slug: "docs/benchmarks" },
-		// 		{
-		// 			label: "Comparison",
-		// 			items: [
-		// 				{ slug: "docs/comparison/sandbox", attrs: { "data-icon": "gitCompare" } },
-		// 				{ slug: "docs/comparison/cloudflare-workers", attrs: { "data-icon": "gitCompare" } },
-		// 			],
-		// 		},
-		// 		{
-		// 			label: "Advanced",
-		// 			items: [
-		// 				{ slug: "docs/cost-evaluation", attrs: { "data-icon": "dollar" } },
-		// 				{ slug: "docs/architecture", attrs: { "data-icon": "blocks" } },
-		// 				{ slug: "docs/security-model", attrs: { "data-icon": "lock" } },
-		// 			],
-		// 		},
-		// 	],
-		// },
 	],
 };
 

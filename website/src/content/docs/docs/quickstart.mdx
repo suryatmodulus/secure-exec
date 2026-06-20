@@ -99,24 +99,15 @@ import { Tabs, TabItem, Steps, CardGrid, LinkCard } from '@astrojs/starlight/com
 
 4. **Configure permissions (optional)**
 
-   Guest code is **deny-by-default**: the sandbox has no network access until you opt in (the filesystem and processes are fully virtualized and never touch the host). Pass a `permissions` policy to `NodeRuntime.create()` to open up capabilities. It merges over the secure default, so you only specify what you want to change. The full set of scopes, shown here all set to `"allow"`:
+   Guest code is **deny-by-default** for network access. Pass a `permissions` policy to `NodeRuntime.create()` to opt in; it merges over the secure default, so you only specify what you want to change:
 
    ```ts
    const runtime = await NodeRuntime.create({
-     permissions: {
-       // Virtualized and enabled by default (these never touch the host):
-       fs: "allow",           // the in-VM filesystem
-       childProcess: "allow", // spawning processes inside the VM
-       process: "allow",      // process info (pid, cwd, ...)
-       env: "allow",          // environment variables
-       // Denied by default - opt in explicitly:
-       network: "allow",      // outbound network access
-       tool: "allow",         // host callbacks
-     },
+     permissions: { network: "allow" },
    });
    ```
 
-   Set any scope to `"deny"` to lock it down. See [Permissions](/docs/features/permissions) to learn more.
+   See [Permissions](/docs/features/permissions) for the full scope list and merge semantics.
 </Steps>
 
 ## Next steps

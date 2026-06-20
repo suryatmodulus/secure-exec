@@ -75,22 +75,18 @@ A single `NodeRuntime` instance can run many programs. Each `run()` / `exec()` c
 
 ## Sandboxing untrusted code
 
-By default `NodeRuntime.create()` runs with an allow-all policy so guest programs work without extra setup. To restrict what untrusted code can do, pass a `permissions` policy. Each capability (`fs`, `network`, `childProcess`, `process`, `env`) accepts either `"allow"` / `"deny"` or a rule set. For example, to run untrusted code with no network access:
+`NodeRuntime.create()` denies network by default and allows the virtualized `fs`, `childProcess`, `process`, and `env` scopes; any `permissions` you pass merges over that default, so an omitted scope keeps its default rather than being denied. Pass a partial policy (for example `{ network: "allow" }` to opt into the network, or a rule set on `fs` to tighten filesystem access) to adjust individual scopes.
 
 ```ts
 import { NodeRuntime } from "secure-exec";
 
+// network is already denied by default; this opts it back in while the other
+// scopes keep their defaults.
 const rt = await NodeRuntime.create({
-  permissions: {
-    fs: "allow",
-    network: "deny",
-    childProcess: "allow",
-    process: "allow",
-    env: "allow",
-  },
+  permissions: { network: "allow" },
 });
 ```
 
-When you pass a `permissions` object, any capability you omit defaults to `"deny"`. `NodeRuntime` executes the guest with `node` as a child process inside the VM, so keep `childProcess` allowed (denying it blocks the runtime itself) and tighten `fs`, `network`, and `env` to sandbox the untrusted code.
+<LinkCard title="Permissions" href="/docs/features/permissions" description="The full policy model: scopes, rule sets, and how partial policies merge over the secure default." />
 
 You can also constrain the run with `env` and `cwd` on `NodeRuntime.create()`, and `env`, `cwd`, `stdin`, and `timeout` on each `run()` / `exec()` call.

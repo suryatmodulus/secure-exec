@@ -59,24 +59,11 @@ resolved node:os via require -> linux
 
 <Aside type="note">Resolution runs inside the kernel against the guest's virtual filesystem. The guest only sees what is present there; mounting host `node_modules` (below) makes those packages part of that filesystem so they resolve like any other guest module.</Aside>
 
-## node_modules resolution
-
-When a guest filesystem contains `node_modules`, the resolver matches naive Node.js resolution over it, Docker-style:
-
-- ancestor `node_modules` walk from the importing module up to the root,
-- `package.json` `exports`/`imports` and conditions,
-- `realpath`/symlink following.
-
-No package-manager-specific heuristics: pnpm/yarn layouts resolve because the VFS exposes their symlinks, not because the resolver special-cases them.
-
 ## Loading real npm packages
 
 Put package bytes on the guest filesystem, then let the in-kernel resolver walk them. Two ways to project them:
 
-- `create({ mounts })`: project a host directory, Docker-style. Read lazily as the guest accesses files, so a large tree (e.g. the TypeScript compiler) is projected without copying it up front. Preferred for real `node_modules` trees. Each mount:
-  - `guestPath`: absolute guest path the directory appears at.
-  - `hostPath`: absolute host directory to project.
-  - `readOnly`: read-only mount (default `true`; pass `false` to allow guest writes).
+- `create({ mounts })`: a mount projects a host directory onto the guest filesystem, Docker-style, read lazily so a large tree (e.g. the TypeScript compiler) is projected without copying it up front. Preferred for real `node_modules` trees. See the snippet below for field usage, and [the TypeScript SDK reference](/docs/sdks/typescript) for the full mount shape.
 - `create({ files })` or `rt.writeFile` / `rt.readFile`: write bytes directly into the VM when you want to seed files instead of projecting a host tree.
 
 Either way the host filesystem is never exposed; the guest sees only the mounted subtree or the bytes you write.
@@ -143,7 +130,48 @@ loaded real npm package -> /tmp/node_modules/is-number/index.js
 {"from":"/tmp/node_modules/is-number/index.js","isNumber(42)":true,"isNumber(\"3.14\")":true,"isNumber(\"nope\")":false,"sameModule":true}
 ```
 
-### Seeding files directly
+### Mounting a whole node_modules tree
+
+When you already have a host-installed `node_modules` directory, `create({ nodeModules })` projects the entire tree in one call instead of wiring up a `mounts` entry per package. The guest's `import`/`require` then resolve every package inside it the way Node would over a real filesystem.
+
+`nodeModules` projects a whole host `node_modules` tree, read-only, defaulting to `/tmp/node_modules` (where the resolution walk begins for a program run by `exec()` / `run()`, since each program is written under `/tmp`). The snippet below uses the string shorthand; for the full shape (string or object, custom `guestPath`) see [the TypeScript SDK reference](/docs/sdks/typescript).
+
+```ts
+import { createRequire } from "node:module";
+import { NodeRuntime } from "secure-exec";
+
+// Resolve this project's own node_modules directory on the host.
+const require = createRequire(import.meta.url);
+const hostNodeModules = require
+  .resolve("is-number")
+  .replace(/[/\\]is-number[/\\].*$/, "");
+
+const rt = await NodeRuntime.create({
+  // Shorthand: mounts the whole tree at /tmp/node_modules.
+  nodeModules: hostNodeModules,
+});
+
+try {
+  await rt.exec(`
+    import isNumber from "is-number";
+    console.log("isNumber(42) ->", isNumber(42));
+  `);
+} finally {
+  await rt.dispose();
+}
+```
+
+## node_modules resolution
+
+When a guest filesystem contains `node_modules`, the resolver matches naive Node.js resolution over it, Docker-style:
+
+- ancestor `node_modules` walk from the importing module up to the root,
+- `package.json` `exports`/`imports` and conditions,
+- `realpath`/symlink following.
+
+No package-manager-specific heuristics: pnpm/yarn layouts resolve because the VFS exposes their symlinks, not because the resolver special-cases them.
+
+## Seeding files directly
 
 When you don't have a host directory to mount, write bytes into the VM:
 
