@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/yq",
+  "name": "@agentos-software/yq",
   "type": "wasm",
   "description": "yq YAML/JSON processor",
   "aptName": "yq",

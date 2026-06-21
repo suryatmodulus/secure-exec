@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/tar",
+  "name": "@agentos-software/tar",
   "type": "wasm",
   "description": "GNU tar archiver",
   "aptName": "tar",

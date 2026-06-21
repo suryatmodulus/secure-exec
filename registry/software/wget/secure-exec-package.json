@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/wget",
+  "name": "@agentos-software/wget",
   "type": "wasm",
   "description": "GNU wget HTTP client",
   "aptName": "wget",

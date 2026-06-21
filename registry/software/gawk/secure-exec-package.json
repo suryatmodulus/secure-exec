@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/gawk",
+  "name": "@agentos-software/gawk",
   "type": "wasm",
   "description": "GNU awk text processing",
   "aptName": "gawk",

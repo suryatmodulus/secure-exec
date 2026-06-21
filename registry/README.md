@@ -9,13 +9,13 @@ Non-software packages, including filesystem drivers like S3 and Google Drive plu
 Install individual packages:
 
 ```bash
-npm install @agent-os-pkgs/coreutils @agent-os-pkgs/grep
+npm install @agentos-software/coreutils @agentos-software/grep
 ```
 
 Or use a meta-package for a complete set:
 
 ```bash
-npm install @agent-os-pkgs/common
+npm install @agentos-software/common
 ```
 
 ## Usage
@@ -23,8 +23,8 @@ npm install @agent-os-pkgs/common
 Each package exports a descriptor with command metadata and a `commandDir` path pointing to the WASM binaries:
 
 ```typescript
-import coreutils from "@agent-os-pkgs/coreutils";
-import grep from "@agent-os-pkgs/grep";
+import coreutils from "@agentos-software/coreutils";
+import grep from "@agentos-software/grep";
 
 export const software = [coreutils, grep];
 ```
@@ -46,35 +46,35 @@ Node.js agent and tool packages that are projected into the VM via the ModuleAcc
 
 | Package | apt Equivalent | Description | Source | Combined Size | Gzipped |
 |---------|---------------|-------------|--------|---------------|---------|
-| `@agent-os-pkgs/codex` | codex | OpenAI Codex integration (codex, codex-exec) | rust | 274 KiB | 118 KiB |
-| `@agent-os-pkgs/coreutils` | coreutils | GNU coreutils: sh, cat, ls, cp, sort, and 80+ commands | rust | 51.4 MiB | 23.5 MiB |
-| `@agent-os-pkgs/curl` | curl | curl-compatible HTTP client | rust | - | - |
-| `@agent-os-pkgs/diffutils` | diffutils | GNU diffutils (diff) | rust | 120 KiB | 54.0 KiB |
-| `@agent-os-pkgs/fd` | fd-find | fd fast file finder | rust | 901 KiB | 328 KiB |
-| `@agent-os-pkgs/file` | file | file type detection | rust | 117 KiB | 49.9 KiB |
-| `@agent-os-pkgs/findutils` | findutils | GNU findutils (find, xargs) | rust | 950 KiB | 348 KiB |
-| `@agent-os-pkgs/gawk` | gawk | GNU awk text processing | rust | 1.11 MiB | 432 KiB |
-| `@agent-os-pkgs/git` | git | git version control (planned) *(planned)* | rust | - | - |
-| `@agent-os-pkgs/grep` | grep | GNU grep pattern matching (grep, egrep, fgrep) | rust | 2.59 MiB | 956 KiB |
-| `@agent-os-pkgs/gzip` | gzip | GNU gzip compression (gzip, gunzip, zcat) | rust | 391 KiB | 194 KiB |
-| `@agent-os-pkgs/jq` | jq | jq JSON processor | rust | 699 KiB | 298 KiB |
-| `@agent-os-pkgs/make` | make | GNU make build tool (planned) *(planned)* | rust | - | - |
-| `@agent-os-pkgs/ripgrep` | ripgrep | ripgrep fast recursive search | rust | 912 KiB | 330 KiB |
-| `@agent-os-pkgs/sed` | sed | GNU sed stream editor | rust | 1.19 MiB | 455 KiB |
-| `@agent-os-pkgs/sqlite3` | sqlite3 | SQLite3 command-line interface | c | - | - |
-| `@agent-os-pkgs/tar` | tar | GNU tar archiver | rust | 178 KiB | 85.4 KiB |
-| `@agent-os-pkgs/tree` | tree | tree directory listing | rust | 65.8 KiB | 30.0 KiB |
-| `@agent-os-pkgs/unzip` | unzip | unzip archive extraction | c | 63.0 KiB | 29.0 KiB |
-| `@agent-os-pkgs/wget` | wget | GNU wget HTTP client | c | - | - |
-| `@agent-os-pkgs/yq` | yq | yq YAML/JSON processor | rust | 972 KiB | 411 KiB |
-| `@agent-os-pkgs/zip` | zip | zip archive creation | c | 78.8 KiB | 33.6 KiB |
+| `@agentos-software/codex` | codex | OpenAI Codex integration (codex, codex-exec) | rust | 274 KiB | 118 KiB |
+| `@agentos-software/coreutils` | coreutils | GNU coreutils: sh, cat, ls, cp, sort, and 80+ commands | rust | 51.4 MiB | 23.5 MiB |
+| `@agentos-software/curl` | curl | curl-compatible HTTP client | rust | - | - |
+| `@agentos-software/diffutils` | diffutils | GNU diffutils (diff) | rust | 120 KiB | 54.0 KiB |
+| `@agentos-software/fd` | fd-find | fd fast file finder | rust | 901 KiB | 328 KiB |
+| `@agentos-software/file` | file | file type detection | rust | 117 KiB | 49.9 KiB |
+| `@agentos-software/findutils` | findutils | GNU findutils (find, xargs) | rust | 950 KiB | 348 KiB |
+| `@agentos-software/gawk` | gawk | GNU awk text processing | rust | 1.11 MiB | 432 KiB |
+| `@agentos-software/git` | git | git version control (planned) *(planned)* | rust | - | - |
+| `@agentos-software/grep` | grep | GNU grep pattern matching (grep, egrep, fgrep) | rust | 2.59 MiB | 956 KiB |
+| `@agentos-software/gzip` | gzip | GNU gzip compression (gzip, gunzip, zcat) | rust | 391 KiB | 194 KiB |
+| `@agentos-software/jq` | jq | jq JSON processor | rust | 699 KiB | 298 KiB |
+| `@agentos-software/make` | make | GNU make build tool (planned) *(planned)* | rust | - | - |
+| `@agentos-software/ripgrep` | ripgrep | ripgrep fast recursive search | rust | 912 KiB | 330 KiB |
+| `@agentos-software/sed` | sed | GNU sed stream editor | rust | 1.19 MiB | 455 KiB |
+| `@agentos-software/sqlite3` | sqlite3 | SQLite3 command-line interface | c | - | - |
+| `@agentos-software/tar` | tar | GNU tar archiver | rust | 178 KiB | 85.4 KiB |
+| `@agentos-software/tree` | tree | tree directory listing | rust | 65.8 KiB | 30.0 KiB |
+| `@agentos-software/unzip` | unzip | unzip archive extraction | c | 63.0 KiB | 29.0 KiB |
+| `@agentos-software/wget` | wget | GNU wget HTTP client | c | - | - |
+| `@agentos-software/yq` | yq | yq YAML/JSON processor | rust | 972 KiB | 411 KiB |
+| `@agentos-software/zip` | zip | zip archive creation | c | 78.8 KiB | 33.6 KiB |
 
 ### Meta-Packages
 
 | Package | Description | Includes |
 |---------|-------------|----------|
-| `@agent-os-pkgs/build-essential` | Build-essential WASM command set (standard + make + git + curl) | standard, make, git, curl |
-| `@agent-os-pkgs/common` | Common WASM command set (coreutils + sed + grep + gawk + findutils + diffutils + tar + gzip) | coreutils, sed, grep, gawk, findutils, diffutils, tar, gzip |
+| `@agentos-software/build-essential` | Build-essential WASM command set (standard + make + git + curl) | standard, make, git, curl |
+| `@agentos-software/common` | Common WASM command set (coreutils + sed + grep + gawk + findutils + diffutils + tar + gzip) | coreutils, sed, grep, gawk, findutils, diffutils, tar, gzip |
 <!-- END PACKAGE TABLE -->
 
 ## Building

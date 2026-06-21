@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/file",
+  "name": "@agentos-software/file",
   "type": "wasm",
   "description": "file type detection",
   "aptName": "file",

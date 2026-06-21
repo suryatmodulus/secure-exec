@@ -1,5 +1,5 @@
 {
-	"name": "@agent-os-pkgs/sed",
+	"name": "@agentos-software/sed",
 	"version": "0.3.0-rc.1",
 	"type": "module",
 	"license": "Apache-2.0",

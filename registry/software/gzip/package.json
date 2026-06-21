@@ -1,5 +1,5 @@
 {
-	"name": "@agent-os-pkgs/gzip",
+	"name": "@agentos-software/gzip",
 	"version": "0.3.0-rc.1",
 	"type": "module",
 	"license": "Apache-2.0",

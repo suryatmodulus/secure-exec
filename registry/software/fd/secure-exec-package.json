@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/fd",
+  "name": "@agentos-software/fd",
   "type": "wasm",
   "description": "fd fast file finder",
   "aptName": "fd-find",

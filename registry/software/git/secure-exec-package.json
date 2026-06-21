@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/git",
+  "name": "@agentos-software/git",
   "type": "wasm",
   "description": "git version control",
   "aptName": "git",

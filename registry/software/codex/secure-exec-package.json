@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/codex",
+  "name": "@agentos-software/codex",
   "type": "wasm",
   "description": "OpenAI Codex command package (codex, codex-exec)",
   "aptName": "codex",

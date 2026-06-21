@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/make",
+  "name": "@agentos-software/make",
   "type": "wasm",
   "description": "GNU make build tool (planned)",
   "aptName": "make",

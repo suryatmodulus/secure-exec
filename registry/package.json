@@ -14,9 +14,9 @@
 		"test": "node ./scripts/run-vitest.mjs"
 	},
 	"devDependencies": {
-		"@agent-os-pkgs/common": "link:software/common",
+		"@agentos-software/common": "link:software/common",
 		"@secure-exec/core": "link:../packages/core",
-		"@agent-os-pkgs/curl": "link:software/curl",
+		"@agentos-software/curl": "link:software/curl",
 		"@types/node": "^22.10.2",
 		"@xterm/headless": "^6.0.0",
 		"typescript": "^5.9.2",

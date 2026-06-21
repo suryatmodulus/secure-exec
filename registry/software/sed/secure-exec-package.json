@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/sed",
+  "name": "@agentos-software/sed",
   "type": "wasm",
   "description": "GNU sed stream editor",
   "aptName": "sed",

@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/jq",
+  "name": "@agentos-software/jq",
   "type": "wasm",
   "description": "jq JSON processor",
   "aptName": "jq",
