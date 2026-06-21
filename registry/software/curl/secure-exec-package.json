@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/curl",
+  "name": "@agentos-software/curl",
   "type": "wasm",
   "description": "curl HTTP client",
   "aptName": "curl",

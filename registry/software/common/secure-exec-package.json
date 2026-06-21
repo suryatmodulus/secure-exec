@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/common",
+  "name": "@agentos-software/common",
   "type": "meta",
   "description": "Common WASM command set (coreutils + sed + grep + gawk + findutils + diffutils + tar + gzip)",
   "includes": [

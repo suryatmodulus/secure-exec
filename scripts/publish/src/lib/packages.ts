@@ -125,7 +125,7 @@ export function discoverPackages(
 	for (const p of workspacePkgs) {
 		if (!p.name) continue;
 		// Only the curated secure-exec workspace packages are published; the
-		// @agent-os-pkgs/* software packages (registry/software/*) are not.
+		// @agentos-software/* software packages (registry/software/*) are not.
 		if (!SECURE_EXEC_WORKSPACE_PACKAGES.has(p.name)) continue;
 		add(p.path);
 	}

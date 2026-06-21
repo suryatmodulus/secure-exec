@@ -1,5 +1,5 @@
 {
-	"name": "@agent-os-pkgs/duckdb",
+	"name": "@agentos-software/duckdb",
 	"version": "0.3.0-rc.1",
 	"type": "module",
 	"license": "Apache-2.0",

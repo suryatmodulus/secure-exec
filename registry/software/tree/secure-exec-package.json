@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/tree",
+  "name": "@agentos-software/tree",
   "type": "wasm",
   "description": "tree directory listing",
   "aptName": "tree",

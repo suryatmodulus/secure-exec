@@ -40,7 +40,7 @@ test('rejects Agent OS package dependencies', () => {
 		writeJson(root, 'package.json', {
 			name: 'secure-exec-workspace',
 			dependencies: {
-				'@rivet-dev/agent-os-core': 'workspace:*',
+				'@rivet-dev/agentos-core': 'workspace:*',
 			},
 		});
 		const result = spawnSync(process.execPath, [scriptPath, '--root', root], {

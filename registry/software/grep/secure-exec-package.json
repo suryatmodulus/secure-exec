@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/grep",
+  "name": "@agentos-software/grep",
   "type": "wasm",
   "description": "GNU grep pattern matching (grep, egrep, fgrep)",
   "aptName": "grep",

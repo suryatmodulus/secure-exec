@@ -1,5 +1,5 @@
 {
-	"name": "@agent-os-pkgs/http-get",
+	"name": "@agentos-software/http-get",
 	"version": "0.3.0-rc.1",
 	"type": "module",
 	"license": "Apache-2.0",

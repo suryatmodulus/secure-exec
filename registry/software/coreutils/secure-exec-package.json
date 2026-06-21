@@ -1,5 +1,5 @@
 {
-  "name": "@agent-os-pkgs/coreutils",
+  "name": "@agentos-software/coreutils",
   "type": "wasm",
   "description": "GNU coreutils: sh, cat, ls, cp, sort, and 80+ commands",
   "aptName": "coreutils",
