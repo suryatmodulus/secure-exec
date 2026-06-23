@@ -251,6 +251,10 @@ const FS_ALLOW: &[&str] = &[
     // sidecar host-FS chokepoint + bootstrap
     "crates/sidecar/src/filesystem.rs",
     "crates/sidecar/src/plugins/host_dir.rs",
+    // macOS host-mount confinement primitives: the cap-std resolve-beneath walk
+    // that stands in for Linux `openat2(RESOLVE_BENEATH)` on darwin. Same
+    // sanctioned boundary as host_dir.rs/filesystem.rs, macOS-only.
+    "crates/sidecar/src/macos_fs.rs",
     "crates/sidecar/src/plugins/module_access.rs",
     "crates/sidecar/src/stdio.rs",
     "crates/sidecar/src/state.rs",
@@ -509,7 +513,7 @@ fn no_secure_exec_crate_depends_on_agent_acp_session() {
             if key.is_empty() {
                 continue;
             }
-            // Only consider secure-exec / agent-os style crate names, and skip
+            // Only consider secure-exec / agentos style crate names, and skip
             // false positives like "tokio" containing none of the markers.
             for marker in banned_dep_markers {
                 if key.contains(marker) {

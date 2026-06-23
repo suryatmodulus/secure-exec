@@ -1,6 +1,16 @@
 use nix::errno::Errno;
-use nix::fcntl::{openat2, readlinkat, renameat, AtFlags, OFlag, OpenHow, ResolveFlag};
+#[cfg(not(target_os = "macos"))]
+use nix::fcntl::{openat2, OpenHow, ResolveFlag};
+use nix::fcntl::{readlinkat, renameat, AtFlags, OFlag};
 use nix::libc;
+
+// macOS has no `O_PATH` (metadata-only anchor fd). The host-mount code only uses
+// O_PATH fds as anchors that are re-opened via `/dev/fd/N`, so a read-only open
+// is an adequate stand-in there; the real access mode is applied on re-open.
+#[cfg(not(target_os = "macos"))]
+const O_PATH_ANCHOR: OFlag = OFlag::O_PATH;
+#[cfg(target_os = "macos")]
+const O_PATH_ANCHOR: OFlag = OFlag::O_RDONLY;
 use nix::sys::stat::{fstatat, mkdirat, utimensat, Mode, SFlag, UtimensatFlags};
 use nix::sys::time::TimeSpec;
 use nix::unistd::{chown, linkat, symlinkat, unlinkat, Gid, Uid, UnlinkatFlags};
@@ -32,8 +42,31 @@ struct AnchoredFd {
 }
 
 impl AnchoredFd {
+    #[cfg(not(target_os = "macos"))]
     fn proc_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.fd))
+    }
+
+    // macOS exposes per-fd paths under `/dev/fd/N` (the kernel dups the fd),
+    // serving the same role as Linux's `/proc/self/fd/N` for re-opening a
+    // *file* fd. Unlike `/proc/self/fd/N` it is NOT a readdir-able directory,
+    // so directory enumeration goes through [`readdir_path`]; child mutations
+    // use the fd-relative `*at` syscalls below.
+    #[cfg(target_os = "macos")]
+    fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!("/dev/fd/{}", self.fd))
+    }
+
+    // Path to enumerate this fd's directory entries. Linux can `readdir`
+    // `/proc/self/fd/N` directly; macOS `/dev/fd/N` yields `ENOTDIR`, so recover
+    // the fd's real host path via `fcntl(F_GETPATH)` (see [`anchored_fd_real_path`]).
+    #[cfg(not(target_os = "macos"))]
+    fn readdir_path(&self) -> io::Result<PathBuf> {
+        Ok(self.proc_path())
+    }
+    #[cfg(target_os = "macos")]
+    fn readdir_path(&self) -> io::Result<PathBuf> {
+        anchored_fd_real_path(self)
     }
 }
 
@@ -47,6 +80,19 @@ impl Drop for AnchoredFd {
     fn drop(&mut self) {
         let _ = nix::unistd::close(self.fd);
     }
+}
+
+/// Recover the real host path an anchored fd points at. Linux reads the magic
+/// symlink `/proc/self/fd/N`; macOS uses `fcntl(F_GETPATH)` (see
+/// [`crate::macos_fs::fd_real_path`]).
+#[cfg(not(target_os = "macos"))]
+fn anchored_fd_real_path(fd: &AnchoredFd) -> io::Result<PathBuf> {
+    fs::read_link(fd.proc_path())
+}
+
+#[cfg(target_os = "macos")]
+fn anchored_fd_real_path(fd: &AnchoredFd) -> io::Result<PathBuf> {
+    crate::macos_fs::fd_real_path(fd.as_raw_fd())
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,13 +226,38 @@ impl HostDirFilesystem {
         (normalized, relative)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn resolve_flags() -> ResolveFlag {
         ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_MAGICLINKS
     }
 
     fn open_beneath(&self, relative: &Path, flags: OFlag, mode: Mode) -> VfsResult<AnchoredFd> {
         let relative_display = relative.display().to_string();
-        let fd = openat2(
+        let fd = self
+            .resolve_beneath_fd(relative, flags, mode)
+            .map_err(|error| match error {
+                Errno::EXDEV => VfsError::access_denied(
+                    "open",
+                    &relative_display,
+                    Some("path escapes host directory"),
+                ),
+                other => io_error_to_vfs("open", &relative_display, nix_to_io(other)),
+            })?;
+        Ok(AnchoredFd { fd })
+    }
+
+    /// Open `relative` strictly beneath the mount root, returning an owned raw
+    /// fd. Linux uses `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`; macOS
+    /// has no such syscall and uses cap-std's audited resolve-beneath instead
+    /// (see [`crate::macos_fs`]).
+    #[cfg(not(target_os = "macos"))]
+    fn resolve_beneath_fd(
+        &self,
+        relative: &Path,
+        flags: OFlag,
+        mode: Mode,
+    ) -> Result<RawFd, Errno> {
+        openat2(
             self.host_root_dir.as_raw_fd(),
             relative,
             OpenHow::new()
@@ -194,15 +265,16 @@ impl HostDirFilesystem {
                 .mode(mode)
                 .resolve(Self::resolve_flags()),
         )
-        .map_err(|error| match error {
-            Errno::EXDEV => VfsError::access_denied(
-                "open",
-                &relative_display,
-                Some("path escapes host directory"),
-            ),
-            other => io_error_to_vfs("open", &relative_display, nix_to_io(other)),
-        })?;
-        Ok(AnchoredFd { fd })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resolve_beneath_fd(
+        &self,
+        relative: &Path,
+        flags: OFlag,
+        mode: Mode,
+    ) -> Result<RawFd, Errno> {
+        crate::macos_fs::resolve_beneath(&self.host_root, relative, flags, mode)
     }
 
     fn open_directory_beneath(&self, relative: &Path) -> VfsResult<AnchoredFd> {
@@ -214,16 +286,17 @@ impl HostDirFilesystem {
     }
 
     fn host_path_for_fd(&self, fd: &AnchoredFd, virtual_path: &str) -> VfsResult<PathBuf> {
-        let host_path = fs::read_link(fd.proc_path())
-            .map_err(|error| io_error_to_vfs("open", virtual_path, error))?;
+        let host_path =
+            anchored_fd_real_path(fd).map_err(|error| io_error_to_vfs("open", virtual_path, error))?;
         self.ensure_within_root(&host_path, virtual_path)?;
         Ok(host_path)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn open_metadata_beneath(&self, path: &str, op: &'static str) -> VfsResult<AnchoredFd> {
         let (_, relative) = self.relative_virtual_path(path);
         let handle =
-            self.open_beneath(&relative, OFlag::O_PATH | OFlag::O_NOFOLLOW, Mode::empty())?;
+            self.open_beneath(&relative, O_PATH_ANCHOR | OFlag::O_NOFOLLOW, Mode::empty())?;
         let metadata =
             fs::metadata(handle.proc_path()).map_err(|error| io_error_to_vfs(op, path, error))?;
         if metadata.file_type().is_symlink() {
@@ -233,6 +306,39 @@ impl HostDirFilesystem {
             ));
         }
         Ok(handle)
+    }
+
+    // macOS has no `O_PATH`, and `open(O_NOFOLLOW)` on a symlink fails outright,
+    // so the Linux path above (open the link as an anchor, then inspect it)
+    // cannot run — the resolve-beneath refusal instead surfaces as `EACCES`,
+    // diverging from Linux's `EPERM`. Detect the symlink directly: `lstat` the
+    // final component through the resolved parent fd and reject it with `EPERM`;
+    // otherwise open the (non-symlink) target as the metadata anchor.
+    #[cfg(target_os = "macos")]
+    fn open_metadata_beneath(&self, path: &str, op: &'static str) -> VfsResult<AnchoredFd> {
+        // The mount root has no final component to lstat and is always a
+        // directory (never a symlink), so open it directly as the anchor —
+        // matching Linux, where the `O_PATH | O_NOFOLLOW` open of the root
+        // succeeds. (`split_parent` would otherwise reject `/` with EINVAL.)
+        let (_, root_relative) = self.relative_virtual_path(path);
+        if root_relative.file_name().is_none() {
+            return self.open_beneath(&root_relative, O_PATH_ANCHOR, Mode::empty());
+        }
+        let (parent_dir, _, name, normalized) = self.split_parent(path, false)?;
+        let stat = fstatat(
+            Some(parent_dir.as_raw_fd()),
+            name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| io_error_to_vfs(op, &normalized, nix_to_io(error)))?;
+        if stat.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFLNK.bits() {
+            return Err(VfsError::new(
+                "EPERM",
+                format!("{op} '{path}': metadata operations do not follow symlinks"),
+            ));
+        }
+        let (_, relative) = self.relative_virtual_path(path);
+        self.open_beneath(&relative, O_PATH_ANCHOR, Mode::empty())
     }
 
     fn ensure_directory_tree(
@@ -273,7 +379,7 @@ impl HostDirFilesystem {
             match mkdirat(
                 Some(parent_dir.as_raw_fd()),
                 name,
-                Mode::from_bits_truncate(mode),
+                Mode::from_bits_truncate(mode as _),
             ) {
                 Ok(()) => {}
                 Err(Errno::EEXIST) => {}
@@ -457,11 +563,13 @@ impl HostDirFilesystem {
         let ctime_nsec = stat.st_ctime_nsec.clamp(0, 999_999_999) as u32;
 
         VirtualStat {
-            mode: stat.st_mode,
+            // Widen for platform differences: mode_t/dev_t/nlink_t are narrower
+            // on macOS (u16/i32/u16) than on Linux.
+            mode: stat.st_mode as u32,
             size: stat.st_size as u64,
             blocks: stat.st_blocks as u64,
-            dev: stat.st_dev,
-            rdev: stat.st_rdev,
+            dev: stat.st_dev as u64,
+            rdev: stat.st_rdev as u64,
             is_directory: file_type == SFlag::S_IFDIR,
             is_symbolic_link: file_type == SFlag::S_IFLNK,
             atime_ms,
@@ -472,8 +580,8 @@ impl HostDirFilesystem {
             ctime_nsec,
             birthtime_ms: ctime_ms,
             ino: stat.st_ino,
-            // st_nlink is u64 on x86_64 but u32 on aarch64; widen for both.
-            nlink: stat.st_nlink,
+            // st_nlink is u64 on x86_64 but u32 on aarch64 / u16 on macOS; widen.
+            nlink: stat.st_nlink as u64,
             uid: stat.st_uid,
             gid: stat.st_gid,
         }
@@ -569,7 +677,7 @@ impl HostDirFilesystem {
         let handle = self.open_beneath(
             &relative,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
-            Mode::from_bits_truncate(file_mode),
+            Mode::from_bits_truncate(file_mode as _),
         )?;
         let mut file = File::options()
             .write(true)
@@ -585,7 +693,7 @@ impl HostDirFilesystem {
         mkdirat(
             Some(parent_dir.as_raw_fd()),
             name.as_os_str(),
-            Mode::from_bits_truncate(mode),
+            Mode::from_bits_truncate(mode as _),
         )
         .map_err(|error| io_error_to_vfs("mkdir", &normalized, nix_to_io(error)))
     }
@@ -623,7 +731,10 @@ impl VirtualFileSystem for HostDirFilesystem {
     fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>> {
         let (_, relative) = self.relative_virtual_path(path);
         let directory = self.open_directory_beneath(&relative)?;
-        let mut entries = fs::read_dir(directory.proc_path())
+        let readdir_path = directory
+            .readdir_path()
+            .map_err(|error| io_error_to_vfs("readdir", path, error))?;
+        let mut entries = fs::read_dir(readdir_path)
             .map_err(|error| io_error_to_vfs("readdir", path, error))?
             .map(|entry| {
                 entry
@@ -638,7 +749,10 @@ impl VirtualFileSystem for HostDirFilesystem {
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
         let (_, relative) = self.relative_virtual_path(path);
         let directory = self.open_directory_beneath(&relative)?;
-        let mut entries = fs::read_dir(directory.proc_path())
+        let readdir_path = directory
+            .readdir_path()
+            .map_err(|error| io_error_to_vfs("readdir", path, error))?;
+        let mut entries = fs::read_dir(readdir_path)
             .map_err(|error| io_error_to_vfs("readdir", path, error))?
             .map(|entry| {
                 let entry = entry.map_err(|error| io_error_to_vfs("readdir", path, error))?;
@@ -687,13 +801,13 @@ impl VirtualFileSystem for HostDirFilesystem {
 
     fn exists(&self, path: &str) -> bool {
         let (_, relative) = self.relative_virtual_path(path);
-        self.open_beneath(&relative, OFlag::O_PATH, Mode::empty())
+        self.open_beneath(&relative, O_PATH_ANCHOR, Mode::empty())
             .is_ok()
     }
 
     fn stat(&mut self, path: &str) -> VfsResult<VirtualStat> {
         let (_, relative) = self.relative_virtual_path(path);
-        let handle = self.open_beneath(&relative, OFlag::O_PATH, Mode::empty())?;
+        let handle = self.open_beneath(&relative, O_PATH_ANCHOR, Mode::empty())?;
         fs::metadata(handle.proc_path())
             .map(Self::stat_from_metadata)
             .map_err(|error| io_error_to_vfs("stat", path, error))
@@ -733,7 +847,7 @@ impl VirtualFileSystem for HostDirFilesystem {
 
     fn realpath(&self, path: &str) -> VfsResult<String> {
         let (_, relative) = self.relative_virtual_path(path);
-        let file = self.open_beneath(&relative, OFlag::O_PATH, Mode::empty())?;
+        let file = self.open_beneath(&relative, O_PATH_ANCHOR, Mode::empty())?;
         let resolved = self.host_path_for_fd(&file, path)?;
         self.host_to_virtual_path(&resolved, path)
     }

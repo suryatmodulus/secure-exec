@@ -34,7 +34,10 @@ jsonwebtoken = "8.3.0"
 log = "0.4"
 md-5 = "0.10"
 nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
-openssl = "0.10"
+# `vendored` builds OpenSSL from source → self-contained binary with no
+# system-openssl discovery on any runner (ubuntu/macOS). openssl backs the
+# guest crypto runtime (RSA/EC/DH/AES), so it cannot be a TLS-only stack.
+openssl = { version = "0.10", features = ["vendored"] }
 pbkdf2 = "0.12"
 rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
@@ -55,6 +58,11 @@ ureq = { version = "2.10", features = ["json"] }
 url = "2"
 vbare = { workspace = true }
 vfs = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS has no openat2/RESOLVE_BENEATH; cap-std provides the audited
+# resolve-beneath path resolution used in place of openat2 on this platform.
+cap-std = "3"
 
 [build-dependencies]
 vbare-compiler = { workspace = true }
