@@ -5,10 +5,47 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::ipc_binary::{self, BinaryFrame};
 use crate::runtime_protocol::{BridgeResponse, RuntimeEvent};
 use crate::session::RuntimeEventEnvelope;
+
+// ── Sync bridge-call round-trip latency (opt-in via AGENTOS_SYNCRPC_LAT=1) ──
+// Measures the guest-observed cost of one host_call round trip (send + block on
+// response). If this is ~ms per call, the embedded-V8 IPC floor is a big part of
+// the evaluate-phase VM tax (~50 fs sync RPCs during SDK init). Writes running
+// (count, total_us, max_us) to AGENTOS_SYNCRPC_LAT_FILE.
+static SYNCRPC_LAT: std::sync::OnceLock<std::sync::Mutex<(u64, u64, u64)>> =
+    std::sync::OnceLock::new();
+
+fn syncrpc_lat_enabled() -> bool {
+    std::env::var("AGENTOS_SYNCRPC_LAT").as_deref() == Ok("1")
+}
+
+fn record_syncrpc_lat(ns: u64) {
+    let m = SYNCRPC_LAT.get_or_init(|| std::sync::Mutex::new((0, 0, 0)));
+    let Ok(mut a) = m.lock() else {
+        return;
+    };
+    a.0 += 1;
+    a.1 = a.1.wrapping_add(ns / 1000);
+    a.2 = a.2.max(ns / 1000);
+    if a.0 % 25 == 0 {
+        if let Ok(path) = std::env::var("AGENTOS_SYNCRPC_LAT_FILE") {
+            let _ = std::fs::write(
+                &path,
+                format!(
+                    "calls={} total_us={} avg_us={} max_us={}\n",
+                    a.0,
+                    a.1,
+                    a.1 / a.0,
+                    a.2
+                ),
+            );
+        }
+    }
+}
 
 /// Trait for sending serialized frames to the host without holding a shared mutex.
 /// Production code uses ChannelRuntimeEventSender (lock-free MPSC); tests use WriterRuntimeEventSender.
@@ -263,6 +300,7 @@ impl BridgeCallContext {
             payload: args,
         };
 
+        let __lat = syncrpc_lat_enabled().then(Instant::now);
         if let Err(e) = self.sender.send_event(bridge_call) {
             self.pending_calls.lock().unwrap().remove(&call_id);
             self.remove_call_route(call_id);
@@ -281,6 +319,9 @@ impl BridgeCallContext {
                 }
             }
         };
+        if let Some(t) = __lat {
+            record_syncrpc_lat(t.elapsed().as_nanos() as u64);
+        }
 
         // Remove from pending
         self.pending_calls.lock().unwrap().remove(&call_id);
