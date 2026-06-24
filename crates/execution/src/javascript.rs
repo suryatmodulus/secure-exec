@@ -318,6 +318,12 @@ pub struct GuestRuntimeConfig {
     pub os_shell: Option<String>,
     /// `os.userInfo().username`.
     pub os_user: Option<String>,
+    /// Optional agent-SDK bundle (esbuild IIFE) to evaluate into the per-sidecar
+    /// V8 snapshot alongside the bridge, so the SDK is loaded once per sidecar and
+    /// reused across sessions instead of re-imported on every execution. `None`
+    /// keeps the bridge-only snapshot (unchanged behavior). The runtime caches the
+    /// snapshot process-wide keyed by sha256(bridge_code + this bundle).
+    pub snapshot_userland_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1850,6 +1856,11 @@ impl JavascriptExecutionEngine {
                 file_path: guest_entrypoint.clone(),
                 bridge_code: V8RuntimeHost::bridge_code().to_owned(),
                 post_restore_script: String::new(),
+                userland_code: request
+                    .guest_runtime
+                    .snapshot_userland_code
+                    .clone()
+                    .unwrap_or_default(),
                 user_code,
             })
             .map_err(JavascriptExecutionError::Spawn)?;

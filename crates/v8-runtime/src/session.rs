@@ -791,6 +791,9 @@ fn session_thread(
     // Cached bridge code string to skip resending over IPC
     #[cfg(not(test))]
     let mut last_bridge_code: Option<String> = None;
+    // Cached agent-SDK userland bundle (same 0-length = use cached convention).
+    #[cfg(not(test))]
+    let mut last_userland_code: Option<String> = None;
 
     // A session can reuse its isolate across Executes only while the effective
     // bridge code stays the same. Fresh contexts cloned from a snapshot inherit
@@ -799,6 +802,10 @@ fn session_thread(
     // old snapshot forever.
     #[cfg(not(test))]
     let mut isolate_bridge_code: Option<String> = None;
+    // The userland bundle baked into the current isolate's snapshot — a change
+    // must rebuild the isolate for the same reason as a bridge-code change.
+    #[cfg(not(test))]
+    let mut isolate_userland_code: Option<String> = None;
 
     // Pre-allocated serialization buffers for V8 ValueSerializer output
     #[cfg(not(test))]
@@ -834,6 +841,7 @@ fn session_thread(
                     file_path,
                     bridge_code,
                     post_restore_script,
+                    userland_code,
                     user_code,
                 } => {
                     #[cfg(not(test))]
@@ -845,6 +853,13 @@ fn session_thread(
                             last_bridge_code.as_deref().unwrap_or("").to_string()
                         } else {
                             bridge_code
+                        };
+                        // Same 0-length = use-cached convention for the userland bundle.
+                        let should_update_cached_userland_code = !userland_code.is_empty();
+                        let effective_userland_code = if userland_code.is_empty() {
+                            last_userland_code.as_deref().unwrap_or("").to_string()
+                        } else {
+                            userland_code
                         };
 
                         if let Err(message) =
@@ -868,10 +883,15 @@ fn session_thread(
                         if should_update_cached_bridge_code {
                             last_bridge_code = Some(effective_bridge_code.clone());
                         }
+                        if should_update_cached_userland_code {
+                            last_userland_code = Some(effective_userland_code.clone());
+                        }
 
                         if v8_isolate.is_some()
-                            && isolate_bridge_code.as_deref()
+                            && (isolate_bridge_code.as_deref()
                                 != Some(effective_bridge_code.as_str())
+                                || isolate_userland_code.as_deref()
+                                    != Some(effective_userland_code.as_str()))
                         {
                             *isolate_handle
                                 .lock()
@@ -880,13 +900,25 @@ fn session_thread(
                             drop(v8_isolate.take());
                             from_snapshot = false;
                             isolate_bridge_code = None;
+                            isolate_userland_code = None;
                         }
 
                         // Deferred isolate creation: create on first Execute using snapshot cache
                         if v8_isolate.is_none() {
                             isolate::init_v8_platform();
+                            // The snapshot captures the bridge AND (when present) the
+                            // agent-SDK userland bundle, keyed process-wide by both, so
+                            // the SDK is evaluated once per sidecar and reused here.
+                            let userland_for_snapshot = if effective_userland_code.is_empty() {
+                                None
+                            } else {
+                                Some(effective_userland_code.as_str())
+                            };
                             let mut iso = if !effective_bridge_code.is_empty() {
-                                match snapshot_cache.get_or_create(&effective_bridge_code) {
+                                match snapshot_cache.get_or_create_with_userland(
+                                    &effective_bridge_code,
+                                    userland_for_snapshot,
+                                ) {
                                     Ok(blob) => {
                                         from_snapshot = true;
                                         snapshot::create_isolate_from_snapshot(
@@ -921,6 +953,7 @@ fn session_thread(
                             _v8_context = Some(ctx);
                             v8_isolate = Some(iso);
                             isolate_bridge_code = Some(effective_bridge_code.clone());
+                            isolate_userland_code = Some(effective_userland_code.clone());
                         }
 
                         let iso = v8_isolate.as_mut().unwrap();

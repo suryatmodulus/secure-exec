@@ -116,6 +116,15 @@ pub fn init_v8_platform() {
 // uncatchable termination exception, not continued guest allocation.
 const NEAR_HEAP_LIMIT_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
 
+/// Default per-isolate heap cap applied when the caller passes no explicit limit.
+///
+/// Resource limits must be bounded by default (never unbounded for memory): a
+/// guest with no configured `heap_limit_mb` must NOT be able to grow the heap until
+/// V8 fatal-aborts the process-global runtime and takes down every co-tenant
+/// isolate. 128 MiB matches the Cloudflare Workers per-isolate budget we mirror for
+/// isolation semantics; operators may raise it via the configured limit.
+pub const DEFAULT_HEAP_LIMIT_MB: u32 = 128;
+
 /// Invoked by V8 when heap usage approaches the configured limit. Instead of
 /// letting V8 fatal-abort the (process-global) runtime, request termination of the
 /// offending isolate and return a raised limit so V8 can propagate the uncatchable
@@ -159,18 +168,18 @@ pub fn install_heap_limit_guard(isolate: &mut v8::OwnedIsolate) {
     isolate.add_near_heap_limit_callback(near_heap_limit_callback, data);
 }
 
-/// Create a new V8 isolate with an optional heap limit in MB.
+/// Create a new V8 isolate with an optional heap limit in MB. `None` applies the
+/// bounded-by-default cap (`DEFAULT_HEAP_LIMIT_MB`) — an isolate is NEVER created
+/// with an unbounded heap, so a guest heap bomb terminates its own isolate rather
+/// than fatal-aborting the shared process.
 pub fn create_isolate(heap_limit_mb: Option<u32>) -> v8::OwnedIsolate {
+    let limit = heap_limit_mb.unwrap_or(DEFAULT_HEAP_LIMIT_MB);
     let mut params = v8::CreateParams::default();
-    if let Some(limit) = heap_limit_mb {
-        let limit_bytes = (limit as usize) * 1024 * 1024;
-        params = params.heap_limits(0, limit_bytes);
-    }
+    let limit_bytes = (limit as usize) * 1024 * 1024;
+    params = params.heap_limits(0, limit_bytes);
     let mut isolate = v8::Isolate::new(params);
     configure_isolate(&mut isolate);
-    if heap_limit_mb.is_some() {
-        install_heap_limit_guard(&mut isolate);
-    }
+    install_heap_limit_guard(&mut isolate);
     isolate
 }
 

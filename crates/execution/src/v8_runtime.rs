@@ -67,6 +67,7 @@ impl V8Runtime {
             file_path: file_path.to_owned(),
             bridge_code: bridge_code.to_owned(),
             post_restore_script: String::new(),
+            userland_code: String::new(),
             user_code: user_code.to_owned(),
         })
     }

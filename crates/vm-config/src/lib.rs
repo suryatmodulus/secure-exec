@@ -106,6 +106,20 @@ pub struct JsRuntimeConfig {
     )]
     #[ts(optional)]
     pub allowed_builtins: Option<Vec<String>>,
+    /// Optional userland JS (an esbuild IIFE, e.g. a bundled agent SDK) to
+    /// evaluate into the per-sidecar V8 startup snapshot alongside the bridge, so
+    /// it is loaded once per sidecar and reused across sessions instead of
+    /// re-imported on every execution. The snapshot is cached process-wide keyed
+    /// by sha256(bridge + this code). Trusted client config; `None` keeps the
+    /// bridge-only snapshot. Must be snapshot-safe (no native/External handles,
+    /// fds, timers, or non-deterministic reads at module-init).
+    #[serde(
+        default,
+        rename = "snapshotUserlandCode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub snapshot_userland_code: Option<String>,
 }
 
 impl JsRuntimeConfig {

@@ -607,8 +607,18 @@ fn dispatch_runtime_command(
                 None => Ok(()),
             }
         }
-        RuntimeCommand::WarmSnapshot { bridge_code } => snapshot_cache
-            .get_or_create(&bridge_code)
+        RuntimeCommand::WarmSnapshot {
+            bridge_code,
+            userland_code,
+        } => snapshot_cache
+            .get_or_create_with_userland(
+                &bridge_code,
+                if userland_code.is_empty() {
+                    None
+                } else {
+                    Some(userland_code.as_str())
+                },
+            )
             .map(|_| ())
             .map_err(other_io_error),
     }

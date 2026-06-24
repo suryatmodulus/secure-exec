@@ -100,6 +100,21 @@ impl V8RuntimeHost {
         V8_BRIDGE_CODE
     }
 
+    /// Pre-build the per-sidecar snapshot for an agent-SDK `userland_code` bundle
+    /// into the process-wide cache, so the FIRST session that uses it is already
+    /// warm (no cold-build penalty on the session-create path). Blocks until the
+    /// snapshot is built; idempotent (a cache hit returns immediately). A no-op for
+    /// empty `userland_code`.
+    pub fn pre_warm_snapshot(&self, userland_code: &str) -> io::Result<()> {
+        if userland_code.is_empty() {
+            return Ok(());
+        }
+        self.shared.runtime.dispatch(RuntimeCommand::WarmSnapshot {
+            bridge_code: Self::bridge_code().to_owned(),
+            userland_code: userland_code.to_owned(),
+        })
+    }
+
     /// Create a session handle for sending session-scoped frames and cleanup.
     pub fn session_handle(&self, session_id: String) -> V8SessionHandle {
         V8SessionHandle::new(session_id, Arc::clone(&self.shared.runtime))
@@ -186,6 +201,42 @@ impl Clone for V8SessionHandle {
             inner: self.inner.clone(),
         }
     }
+}
+
+/// Pre-build the per-sidecar snapshot for an agent-SDK `userland_code` bundle into
+/// the process-wide cache, so the FIRST session that uses it is already warm. Uses
+/// the shared embedded runtime directly (no per-call host lifecycle). Blocks until
+/// built; idempotent (cache hit returns immediately); no-op for empty input.
+/// Eagerly initialize the process-wide embedded V8 runtime (and the V8 platform)
+/// on the calling thread. Call this once on a long-lived thread (the sidecar main
+/// thread) at startup so V8 is NOT first initialized on a transient worker thread
+/// (e.g. a VM-create pre-warm thread that then exits, which corrupts the platform).
+pub fn ensure_runtime_initialized() -> io::Result<()> {
+    shared_embedded_runtime_client().map(|_| ())
+}
+
+pub fn pre_warm_agent_snapshot(userland_code: &str) -> io::Result<()> {
+    if userland_code.is_empty() {
+        return Ok(());
+    }
+    let userland = userland_code.to_owned();
+    // Build the SnapshotCreator on a dedicated, fully-joined std::thread rather than
+    // the caller's (tokio blocking-pool) thread. V8 SnapshotCreator isolates are
+    // thread-sensitive; a reused pool thread leaves per-thread V8 state that corrupts
+    // later isolate creation. A spawned+joined thread tears down cleanly, mirroring
+    // how per-session snapshot builds run on their own dedicated session threads.
+    let handle = std::thread::Builder::new()
+        .name("agentos-snapshot-prewarm".to_owned())
+        .spawn(move || -> io::Result<()> {
+            let client = shared_embedded_runtime_client()?;
+            client.runtime.dispatch(RuntimeCommand::WarmSnapshot {
+                bridge_code: V8_BRIDGE_CODE.to_owned(),
+                userland_code: userland,
+            })
+        })?;
+    handle
+        .join()
+        .map_err(|_| io::Error::other("snapshot pre-warm thread panicked"))?
 }
 
 fn shared_embedded_runtime_client() -> io::Result<Arc<SharedEmbeddedRuntimeClient>> {

@@ -103,6 +103,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 }
 
 pub fn run_with_extensions(extensions: Vec<Box<dyn Extension>>) -> Result<(), Box<dyn Error>> {
+    // Initialize the embedded V8 runtime + platform now, on the long-lived main
+    // thread, so it is never first-initialized on a transient worker thread (e.g. a
+    // VM-create snapshot pre-warm thread that then exits — which corrupts V8's
+    // platform and wedges later isolate creation). Best-effort.
+    if let Err(error) = secure_exec_execution::v8_host::ensure_runtime_initialized() {
+        eprintln!("embedded V8 runtime init failed at startup: {error}");
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

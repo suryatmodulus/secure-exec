@@ -14,6 +14,7 @@ pub enum RuntimeCommand {
     },
     WarmSnapshot {
         bridge_code: String,
+        userland_code: String,
     },
     SendToSession {
         session_id: String,
@@ -70,6 +71,7 @@ pub enum SessionMessage {
         file_path: String,
         bridge_code: String,
         post_restore_script: String,
+        userland_code: String,
         user_code: String,
     },
     BridgeResponse(BridgeResponse),
@@ -159,6 +161,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                 file_path,
                 bridge_code,
                 post_restore_script,
+                userland_code,
                 user_code,
             } => {
                 if mode > 1 {
@@ -174,6 +177,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                         file_path,
                         bridge_code,
                         post_restore_script,
+                        userland_code,
                         user_code,
                     },
                 })
@@ -209,9 +213,13 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                 session_id,
                 message: SessionMessage::TerminateExecution,
             }),
-            BinaryFrame::WarmSnapshot { bridge_code } => {
-                Ok(RuntimeCommand::WarmSnapshot { bridge_code })
-            }
+            BinaryFrame::WarmSnapshot {
+                bridge_code,
+                userland_code,
+            } => Ok(RuntimeCommand::WarmSnapshot {
+                bridge_code,
+                userland_code,
+            }),
             BinaryFrame::Authenticate { .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Authenticate is not supported by the embedded runtime",
@@ -301,6 +309,7 @@ mod tests {
             file_path: "/app/main.mjs".into(),
             bridge_code: String::new(),
             post_restore_script: String::new(),
+            userland_code: String::new(),
             user_code: String::new(),
         })
         .expect_err("unknown execute mode should be rejected");

@@ -13,7 +13,12 @@ use crate::session::{ASYNC_BRIDGE_FNS, SYNC_BRIDGE_FNS};
 /// Prevents resource exhaustion from degenerate bridge code.
 const MAX_SNAPSHOT_BLOB_BYTES: usize = 50 * 1024 * 1024;
 const MAX_V8_BRIDGE_CODE_BYTES: usize = 16 * 1024 * 1024;
+/// Userland (agent-SDK) bundles are whole dependency graphs flattened into one
+/// IIFE, so they are larger than the bridge. Bounded so a degenerate bundle cannot
+/// exhaust memory, but generous enough for a real SDK (the pi bundle is ~7.6 MB).
+const MAX_V8_USERLAND_CODE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const V8_BRIDGE_CODE_LIMIT_ERROR_CODE: &str = "ERR_V8_BRIDGE_CODE_LIMIT";
+pub(crate) const V8_USERLAND_CODE_LIMIT_ERROR_CODE: &str = "ERR_V8_USERLAND_CODE_LIMIT";
 
 pub(crate) fn validate_bridge_code_size(bridge_code: &str) -> Result<(), String> {
     if bridge_code.len() > MAX_V8_BRIDGE_CODE_BYTES {
@@ -24,6 +29,107 @@ pub(crate) fn validate_bridge_code_size(bridge_code: &str) -> Result<(), String>
         ));
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_userland_code_size(userland_code: &str) -> Result<(), String> {
+    if userland_code.len() > MAX_V8_USERLAND_CODE_BYTES {
+        return Err(format!(
+            "{V8_USERLAND_CODE_LIMIT_ERROR_CODE}: userland snapshot code too large: {} bytes (max {})",
+            userland_code.len(),
+            MAX_V8_USERLAND_CODE_BYTES
+        ));
+    }
+
+    Ok(())
+}
+
+/// Runs after the bridge but before the userland (agent-SDK) IIFE during snapshot
+/// creation. Replaces bridge-backed lazy getters that would dispatch a host call
+/// (unavailable when bridge fns are stubs) with static, snapshot-safe values. These
+/// are environment-identity values (not per-session config), so baking them is
+/// correct; per-session config is still injected post-restore.
+const SNAPSHOT_USERLAND_PREP: &str = r#"
+(function () {
+    // Agent-SDK bundles are esbuild IIFEs that expect a global CJS `require` for
+    // their node-builtin imports, but the bridge exposes require only via module
+    // wrappers. Bind one from the bridge's namespaced createRequire so the bundle's
+    // __require resolves builtins (via the in-context loadBuiltinModule) during
+    // snapshot eval; it also works post-restore (resolution flows through the real
+    // bridge fns swapped in after restore).
+    if (typeof globalThis.require === "undefined" &&
+        typeof globalThis.__secureExecGuestCreateRequire === "function") {
+        try {
+            globalThis.require = globalThis.__secureExecGuestCreateRequire("/root/index.js");
+        } catch (e) {}
+    }
+    // `process.versions` is a bridge-backed lazy getter: it derives `.node` from the
+    // per-session `config2.version` and merges a host bridge call. During snapshot
+    // creation the bridge fns are stubs AND the default `_processConfig` has no
+    // `version`, so the live getter THROWS — an agent SDK that reads it at
+    // module-init would fail. Rather than REPLACE the getter with a static value
+    // (which would permanently shadow the real per-session version for every
+    // restored session — they'd all read a frozen, fabricated identity), WRAP it:
+    // defer to the live getter so that post-restore — once the real bridge fns and
+    // per-session config are injected — sessions read accurate per-session versions,
+    // and fall back to the static, snapshot-safe identity only while the live getter
+    // throws (i.e. during snapshot creation, before any real config exists).
+    if (typeof process !== "undefined" && process) {
+        var staticVersions = { node: "20.0.0", v8: "12.0.0", uv: "1.0.0", modules: "115" };
+        try {
+            var __verDesc = Object.getOwnPropertyDescriptor(process, "versions");
+            var __liveVersions = __verDesc && __verDesc.get;
+            Object.defineProperty(process, "versions", {
+                configurable: true,
+                enumerable: true,
+                get: function () {
+                    if (__liveVersions) {
+                        try {
+                            var v = __liveVersions.call(this);
+                            // A real per-session result has a node version; during
+                            // snapshot creation the live getter throws before here.
+                            if (v && typeof v === "object" && v.node) return v;
+                        } catch (e) {}
+                    }
+                    return staticVersions;
+                },
+            });
+        } catch (e) {}
+    }
+})();
+"#;
+
+/// Compile and run a Script in the snapshot-creation context, returning a
+/// descriptive error (with the V8 exception message) on failure. `label`
+/// identifies the phase (e.g. "bridge code" / "userland code") in error text.
+fn run_snapshot_script(
+    scope: &mut v8::HandleScope,
+    code: &str,
+    label: &str,
+) -> Result<(), String> {
+    let try_catch = &mut v8::TryCatch::new(scope);
+    let source = match v8::String::new(try_catch, code) {
+        Some(source) => source,
+        None => return Err(format!("failed to create V8 string for {label}")),
+    };
+    let Some(script) = v8::Script::compile(try_catch, source, None) else {
+        let message = try_catch
+            .exception()
+            .map(|exception| exception.to_rust_string_lossy(try_catch))
+            .unwrap_or_else(|| format!("{label} compilation failed during snapshot creation"));
+        return Err(format!(
+            "{label} compilation failed during snapshot creation: {message}"
+        ));
+    };
+    if script.run(try_catch).is_none() {
+        let message = try_catch
+            .exception()
+            .map(|exception| exception.to_rust_string_lossy(try_catch))
+            .unwrap_or_else(|| format!("{label} execution failed during snapshot creation"));
+        return Err(format!(
+            "{label} execution failed during snapshot creation: {message}"
+        ));
+    }
     Ok(())
 }
 
@@ -39,7 +145,36 @@ pub(crate) fn validate_bridge_code_size(bridge_code: &str) -> Result<(), String>
 /// Returns an error if the bridge code fails to compile or the resulting
 /// snapshot exceeds MAX_SNAPSHOT_BLOB_BYTES.
 pub fn create_snapshot(bridge_code: &str) -> Result<v8::StartupData, String> {
+    create_snapshot_inner(bridge_code, None)
+}
+
+/// Create a V8 startup snapshot whose default context has BOTH the bridge
+/// infrastructure AND an evaluated userland module graph (e.g. a bundled agent
+/// SDK) captured into it.
+///
+/// `userland_code` is an IIFE (esbuild `format:'iife'`) that runs after the bridge
+/// in the same context and publishes its evaluated exports on `globalThis`. Because
+/// the bridge has already installed node-builtin polyfills and stub bridge fns at
+/// this point, the userland code can `require`/reference them while it evaluates.
+/// The whole post-evaluation heap is frozen into the blob, so restoring a fresh
+/// isolate skips re-evaluating the SDK entirely — collapsing the per-session
+/// module-load/eval tax. Per-session bridge fns and config are still swapped/injected
+/// post-restore exactly as for the bridge-only snapshot.
+pub fn create_snapshot_with_userland(
+    bridge_code: &str,
+    userland_code: &str,
+) -> Result<v8::StartupData, String> {
+    create_snapshot_inner(bridge_code, Some(userland_code))
+}
+
+fn create_snapshot_inner(
+    bridge_code: &str,
+    userland_code: Option<&str>,
+) -> Result<v8::StartupData, String> {
     validate_bridge_code_size(bridge_code)?;
+    if let Some(userland_code) = userland_code {
+        validate_userland_code_size(userland_code)?;
+    }
 
     init_v8_platform();
 
@@ -55,34 +190,19 @@ pub fn create_snapshot(bridge_code: &str) -> Result<v8::StartupData, String> {
         // Inject default config globals for bridge IIFE setup
         inject_snapshot_defaults(scope);
 
-        // Compile and run bridge code — context captures fully-initialized state
+        // Compile and run bridge code — context captures fully-initialized state.
+        // Then, if present, run the userland (agent-SDK) IIFE in the SAME context so
+        // its evaluated graph is captured alongside the bridge.
         let result = (|| -> Result<(), String> {
-            let try_catch = &mut v8::TryCatch::new(scope);
-            let source = match v8::String::new(try_catch, bridge_code) {
-                Some(source) => source,
-                None => return Err("failed to create V8 string for bridge code".to_string()),
-            };
-            let Some(script) = v8::Script::compile(try_catch, source, None) else {
-                let message = try_catch
-                    .exception()
-                    .map(|exception| exception.to_rust_string_lossy(try_catch))
-                    .unwrap_or_else(|| {
-                        "bridge code compilation failed during snapshot creation".into()
-                    });
-                return Err(format!(
-                    "bridge code compilation failed during snapshot creation: {message}"
-                ));
-            };
-            if script.run(try_catch).is_none() {
-                let message = try_catch
-                    .exception()
-                    .map(|exception| exception.to_rust_string_lossy(try_catch))
-                    .unwrap_or_else(|| {
-                        "bridge code execution failed during snapshot creation".into()
-                    });
-                return Err(format!(
-                    "bridge code execution failed during snapshot creation: {message}"
-                ));
+            run_snapshot_script(scope, bridge_code, "bridge code")?;
+            if let Some(userland_code) = userland_code {
+                // Some bridge-backed globals (e.g. `process.versions`) are lazy
+                // getters that dispatch a host bridge call on first access. During
+                // snapshot creation the bridge fns are stubs, so an agent SDK that
+                // reads them at module-init would fail. Freeze them to static values
+                // first; per-session config is still injected post-restore.
+                run_snapshot_script(scope, SNAPSHOT_USERLAND_PREP, "userland prep")?;
+                run_snapshot_script(scope, userland_code, "userland code")?;
             }
             Ok(())
         })();
@@ -172,20 +292,19 @@ where
 {
     init_v8_platform();
 
-    let mut params = v8::CreateParams::default()
+    // `None` applies the bounded-by-default cap (`DEFAULT_HEAP_LIMIT_MB`), same as
+    // the fresh-isolate path — a snapshot-restored isolate is never unbounded.
+    let limit = heap_limit_mb.unwrap_or(crate::isolate::DEFAULT_HEAP_LIMIT_MB);
+    let limit_bytes = (limit as usize) * 1024 * 1024;
+    let params = v8::CreateParams::default()
         .snapshot_blob(blob)
-        .external_references(&**external_refs());
-    if let Some(limit) = heap_limit_mb {
-        let limit_bytes = (limit as usize) * 1024 * 1024;
-        params = params.heap_limits(0, limit_bytes);
-    }
+        .external_references(&**external_refs())
+        .heap_limits(0, limit_bytes);
     let mut isolate = v8::Isolate::new(params);
     crate::isolate::configure_isolate(&mut isolate);
-    if heap_limit_mb.is_some() {
-        // Same OOM guard as the fresh-isolate path: terminate this isolate on heap
-        // exhaustion instead of fatal-aborting the shared process (F-003).
-        crate::isolate::install_heap_limit_guard(&mut isolate);
-    }
+    // Same OOM guard as the fresh-isolate path: terminate this isolate on heap
+    // exhaustion instead of fatal-aborting the shared process (F-003).
+    crate::isolate::install_heap_limit_guard(&mut isolate);
     isolate
 }
 
@@ -241,7 +360,19 @@ impl SnapshotCache {
     /// inserts, never during snapshot creation. Per-key in-flight tracking
     /// prevents duplicate snapshot creation for the same bridge code.
     pub fn get_or_create(&self, bridge_code: &str) -> Result<Arc<Vec<u8>>, String> {
-        let key = bridge_cache_key(bridge_code);
+        self.get_or_create_with_userland(bridge_code, None)
+    }
+
+    /// Like [`get_or_create`], but the snapshot also captures an evaluated userland
+    /// (agent-SDK) graph. The cache key is the digest of BOTH `bridge_code` and
+    /// `userland_code`, so a change to either — i.e. any change in the bundled
+    /// dependency graph — invalidates the entry and triggers exactly one rebuild.
+    pub fn get_or_create_with_userland(
+        &self,
+        bridge_code: &str,
+        userland_code: Option<&str>,
+    ) -> Result<Arc<Vec<u8>>, String> {
+        let key = snapshot_cache_key(bridge_code, userland_code);
 
         // Phase 1: short lock — check cache, check in-flight, or claim creation
         let in_flight = {
@@ -279,8 +410,8 @@ impl SnapshotCache {
         }
 
         // Phase 2: create snapshot without holding the cache lock
-        let creation_result =
-            create_snapshot(bridge_code).map(|startup_data| Arc::new(startup_data.to_vec()));
+        let creation_result = create_snapshot_inner(bridge_code, userland_code)
+            .map(|startup_data| Arc::new(startup_data.to_vec()));
 
         // Phase 3: short lock — insert result, notify waiters, clean up
         {
@@ -309,8 +440,21 @@ impl SnapshotCache {
     }
 }
 
-fn bridge_cache_key(bridge_code: &str) -> SnapshotCacheKey {
-    sha256(bridge_code.as_bytes())
+/// Cache key over bridge + optional userland code. With no userland this is just
+/// `sha256(bridge_code)` (a NUL separator is only added when userland is present),
+/// so existing bridge-only entries keep their historical keys.
+fn snapshot_cache_key(bridge_code: &str, userland_code: Option<&str>) -> SnapshotCacheKey {
+    match userland_code {
+        None => sha256(bridge_code.as_bytes()),
+        Some(userland_code) => {
+            let mut buf =
+                Vec::with_capacity(bridge_code.len() + 1 + userland_code.len());
+            buf.extend_from_slice(bridge_code.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(userland_code.as_bytes());
+            sha256(&buf)
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -1280,6 +1424,301 @@ pub fn run_snapshot_consolidated_checks() {
             );
         }
     }
+
+    // --- Part 21: Userland snapshot — evaluated graph captured, ZERO re-eval on
+    // restore, isolation preserved (2b acceptance). ---
+    {
+        // Evaluate a string in a fresh context on a restored isolate. Unlike the
+        // function-level `eval`, this takes an existing ContextScope so successive
+        // checks observe globals set by earlier scripts in the SAME context.
+        fn run_in(scope: &mut v8::ContextScope<v8::HandleScope>, code: &str) -> String {
+            let source = v8::String::new(scope, code).unwrap();
+            let script = v8::Script::compile(scope, source, None).unwrap();
+            let result = script.run(scope).unwrap();
+            result.to_rust_string_lossy(scope)
+        }
+
+        // `userland` stands in for an esbuild IIFE bundle: it evaluates a small
+        // module graph, references a bridge-provided global (proving the bridge is
+        // available when userland runs), publishes exports on globalThis, and bumps
+        // a side-effect counter so we can prove the top-level runs exactly once.
+        let bridge_code = "(function(){ globalThis.__bridge_ok = true; })();";
+        let userland = r#"
+            (function () {
+                if (typeof globalThis._fsReadFile !== "function") {
+                    throw new Error("bridge fns missing during userland eval");
+                }
+                globalThis.__sideEffectCount = (globalThis.__sideEffectCount || 0) + 1;
+                var secret = 42;
+                globalThis.__x = { f: function () { return secret; } };
+            })();
+        "#;
+
+        let blob = create_snapshot_with_userland(bridge_code, userland)
+            .expect("userland snapshot creation should succeed");
+        let blob_bytes: Vec<u8> = blob.to_vec();
+
+        // Restore A: fresh isolate + fresh context cloned from the snapshot default
+        // context. The userland top-level must NOT run again here.
+        {
+            let mut isolate = create_isolate_from_snapshot(blob_bytes.clone(), None);
+            let scope = &mut v8::HandleScope::new(&mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+
+            assert_eq!(
+                run_in(scope, "String(globalThis.__x.f())"),
+                "42",
+                "userland export __x.f() should return 42 from the snapshot"
+            );
+            assert_eq!(
+                run_in(scope, "String(globalThis.__sideEffectCount)"),
+                "1",
+                "userland top-level must run exactly once (zero re-eval on restore)"
+            );
+            assert_eq!(
+                run_in(scope, "String(globalThis.__bridge_ok)"),
+                "true",
+                "bridge state should coexist with userland state in the snapshot"
+            );
+
+            // Mutate a global in session A.
+            run_in(scope, "globalThis.__leak = 'session-a'; ''");
+        }
+
+        // Restore B: a separate fresh isolate from the SAME blob must see the
+        // captured userland state but NOT session A's mutation (isolation).
+        {
+            let mut isolate = create_isolate_from_snapshot(blob_bytes.clone(), None);
+            let scope = &mut v8::HandleScope::new(&mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+
+            assert_eq!(
+                run_in(scope, "String(globalThis.__x.f())"),
+                "42",
+                "session B should see the captured userland export"
+            );
+            assert_eq!(
+                run_in(scope, "String(globalThis.__sideEffectCount)"),
+                "1",
+                "session B counter must still be 1 (no re-eval, no cross-session bump)"
+            );
+            assert_eq!(
+                run_in(scope, "typeof globalThis.__leak"),
+                "undefined",
+                "session B must NOT observe session A's mutation"
+            );
+        }
+
+        // Cache: identical (bridge, userland) → same Arc; changed userland → new Arc.
+        {
+            let cache = SnapshotCache::new(4);
+            let a = cache
+                .get_or_create_with_userland(bridge_code, Some(userland))
+                .expect("userland cache create");
+            let b = cache
+                .get_or_create_with_userland(bridge_code, Some(userland))
+                .expect("userland cache hit");
+            assert!(Arc::ptr_eq(&a, &b), "identical userland should hit the cache");
+
+            let userland2 =
+                "(function(){ globalThis.__x = { f: function(){ return 7; } }; })();";
+            let c = cache
+                .get_or_create_with_userland(bridge_code, Some(userland2))
+                .expect("changed userland create");
+            assert!(
+                !Arc::ptr_eq(&a, &c),
+                "changed userland (dep-graph change) should rebuild"
+            );
+        }
+    }
+
+    // --- Part 22: REAL agent-SDK bundle snapshots + restores (env-gated). ---
+    // End-to-end primitive validation against the actual pi SDK snapshot bundle:
+    // the real bridge bundle + the real esbuild IIFE evaluate together into the
+    // snapshot, and a fresh restored isolate exposes the SDK runtime global with a
+    // working createAgentSession. Gated on PI_SNAPSHOT_BUNDLE_PATH so CI without the
+    // bundle skips it; run with that env var pointing at dist/pi-sdk-snapshot.js.
+    if let Ok(bundle_path) = std::env::var("PI_SNAPSHOT_BUNDLE_PATH") {
+        let userland = std::fs::read_to_string(&bundle_path)
+            .unwrap_or_else(|e| panic!("read pi bundle at {bundle_path}: {e}"));
+        let bridge_code = concat!(
+            include_str!(concat!(env!("OUT_DIR"), "/v8-bridge.js")),
+            "\n",
+            include_str!(concat!(env!("OUT_DIR"), "/v8-bridge-zlib.js"))
+        );
+
+        let blob = create_snapshot_with_userland(bridge_code, &userland)
+            .expect("real pi SDK bundle should snapshot cleanly (pure-JS, no top-level I/O)");
+        let mut isolate = create_isolate_from_snapshot(blob, None);
+        let scope = &mut v8::HandleScope::new(&mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let check = v8::String::new(
+            scope,
+            "(function(){ var r = globalThis.__PI_SDK_RUNTIME__; \
+             return r && typeof r.createAgentSession === 'function' && \
+             typeof r.createAllTools === 'function' ? 'ok' : 'missing'; })()",
+        )
+        .unwrap();
+        let script = v8::Script::compile(scope, check, None).unwrap();
+        let result = script.run(scope).unwrap();
+        assert_eq!(
+            result.to_rust_string_lossy(scope),
+            "ok",
+            "restored isolate must expose the pi SDK runtime global from the snapshot"
+        );
+    }
+
+    // --- Part 23: cross-thread snapshot build → restore (diagnoses pre-warm). ---
+    // Build a userland snapshot on a SEPARATE spawned+joined thread, then restore and
+    // eval it on the main thread. If V8 fundamentally forbids restoring a blob built
+    // on a different thread (the suspected cause of the pre-warm wedge), this aborts.
+    {
+        let bridge_code = "(function(){ globalThis.__xt_bridge = true; })();";
+        let userland = "(function(){ globalThis.__xt = { f: function(){ return 99; } }; })();";
+        let blob_bytes: Vec<u8> = std::thread::spawn(move || {
+            create_snapshot_with_userland(bridge_code, userland)
+                .expect("cross-thread snapshot build should succeed")
+                .to_vec()
+        })
+        .join()
+        .expect("build thread join");
+
+        let mut isolate = create_isolate_from_snapshot(blob_bytes, None);
+        let scope = &mut v8::HandleScope::new(&mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let check = v8::String::new(scope, "String(globalThis.__xt.f())").unwrap();
+        let script = v8::Script::compile(scope, check, None).unwrap();
+        let result = script.run(scope).unwrap();
+        assert_eq!(
+            result.to_rust_string_lossy(scope),
+            "99",
+            "a snapshot built on another thread must restore correctly on this thread"
+        );
+    }
+
+    // --- Part 24: session-level isolation (global AND prototype). ---
+    // Each agent session leases a FRESH context cloned from the same snapshot's
+    // default context. This is the isolation unit: a global or built-in-prototype
+    // mutation in "session A" must NOT be observable in "session B".
+    {
+        let bridge_code = "(function(){ globalThis.__iso_ok = true; })();";
+        let userland = "(function(){ globalThis.__sdk = { v: 1 }; })();";
+        let blob_bytes: Vec<u8> = create_snapshot_with_userland(bridge_code, userland)
+            .expect("isolation snapshot")
+            .to_vec();
+
+        // Session A: mutate a global, the captured SDK object, AND a built-in prototype.
+        {
+            let mut isolate = create_isolate_from_snapshot(blob_bytes.clone(), None);
+            let scope = &mut v8::HandleScope::new(&mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let src = v8::String::new(
+                scope,
+                "globalThis.__leakG = 'A'; globalThis.__sdk.v = 999; \
+                 Array.prototype.__leakP = 'A'; ''",
+            )
+            .unwrap();
+            let script = v8::Script::compile(scope, src, None).unwrap();
+            script.run(scope);
+        }
+
+        // Session B: a separate fresh context from the SAME blob sees the captured
+        // snapshot state but NONE of session A's mutations.
+        {
+            let mut isolate = create_isolate_from_snapshot(blob_bytes.clone(), None);
+            let scope = &mut v8::HandleScope::new(&mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let check = v8::String::new(
+                scope,
+                "(function(){ return [ \
+                   String(globalThis.__iso_ok), \
+                   typeof globalThis.__leakG, \
+                   String(globalThis.__sdk.v), \
+                   typeof ([].__leakP) \
+                 ].join(','); })()",
+            )
+            .unwrap();
+            let script = v8::Script::compile(scope, check, None).unwrap();
+            let result = script.run(scope).unwrap();
+            assert_eq!(
+                result.to_rust_string_lossy(scope),
+                "true,undefined,1,undefined",
+                "session B must see snapshot state but NOT session A's global/SDK/prototype mutations"
+            );
+        }
+    }
+
+    // --- Part 25: H-1 regression — the userland-prep `process.versions` wrapper
+    // DEFERS to the bridge's live getter post-restore instead of freezing a static
+    // identity. ---
+    // `SNAPSHOT_USERLAND_PREP` wraps (does not replace) the bridge's lazy
+    // `process.versions` getter: during snapshot creation the live getter throws
+    // (bridge fns are stubs) so a static identity is used, but post-restore — once
+    // the real bridge fns + per-session config are injected — sessions must read the
+    // LIVE per-session value. A plain static pin (the prior bug) permanently shadowed
+    // it. This models the deferral with a getter whose result depends on the
+    // post-restore-injected `_processConfig`, so a regression back to a static pin
+    // fails here.
+    {
+        use crate::bridge::serialize_v8_value;
+
+        // Bridge installs a lazy `process.versions` getter that derives its value from
+        // the per-session `_processConfig` (resolved live on each access). During
+        // snapshot creation `_processConfig` is the default (no `version`), so the
+        // getter throws — exactly the case the prep wraps. A userland is required so
+        // SNAPSHOT_USERLAND_PREP runs.
+        let bridge_code = r#"
+            (function () {
+                globalThis.process = {
+                    get versions() {
+                        // Throws during creation (default _processConfig has no
+                        // version); returns the live per-session value post-restore.
+                        return { node: _processConfig.version.replace(/^v/, "") };
+                    },
+                };
+            })();
+        "#;
+        let userland = "(function(){ globalThis.__sdk_ready = true; })();";
+        let blob = create_snapshot_with_userland(bridge_code, userland)
+            .expect("userland snapshot with a lazy process.versions getter");
+
+        let mut isolate = create_isolate_from_snapshot(blob, None);
+        let scope = &mut v8::HandleScope::new(&mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        // Inject a per-session config carrying a distinctive version (as the sidecar
+        // does post-restore via inject_globals_from_payload).
+        let payload_code = r#"({
+            processConfig: { cwd: "/", env: {}, version: "v99.1.2", timing_mitigation: "off", frozen_time_ms: null },
+            osConfig: { homedir: "/root", tmpdir: "/tmp", platform: "linux", arch: "x64" }
+        })"#;
+        let payload_source = v8::String::new(scope, payload_code).unwrap();
+        let payload_script = v8::Script::compile(scope, payload_source, None).unwrap();
+        let payload_val = payload_script.run(scope).unwrap();
+        let payload_bytes = serialize_v8_value(scope, payload_val).expect("serialize payload");
+        crate::execution::inject_globals_from_payload(scope, &payload_bytes)
+            .expect("inject per-session config");
+
+        // The wrapper must defer to the live getter → per-session "99.1.2", NOT the
+        // snapshot-build-time static identity "20.0.0".
+        let check = v8::String::new(scope, "String(process.versions.node)").unwrap();
+        let script = v8::Script::compile(scope, check, None).unwrap();
+        let result = script.run(scope).unwrap();
+        assert_eq!(
+            result.to_rust_string_lossy(scope),
+            "99.1.2",
+            "process.versions must defer to the live per-session getter post-restore, \
+             not the frozen snapshot-build-time static identity (H-1 regression)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1288,8 +1727,10 @@ mod tests {
 
     #[test]
     fn bridge_cache_key_uses_full_sha256_digest() {
+        // With no userland the key is the plain sha256 of the bridge code, so
+        // bridge-only snapshot entries keep their historical keys.
         assert_eq!(
-            bridge_cache_key("abc"),
+            snapshot_cache_key("abc", None),
             [
                 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
                 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
@@ -1324,5 +1765,46 @@ mod tests {
 
             assert!(error.contains(V8_BRIDGE_CODE_LIMIT_ERROR_CODE));
         }
+    }
+
+    #[test]
+    fn snapshot_cache_key_is_dep_keyed_over_bridge_and_userland() {
+        let bridge = "bridge-a";
+        // Userland presence changes the key vs bridge-only.
+        assert_ne!(
+            snapshot_cache_key(bridge, None),
+            snapshot_cache_key(bridge, Some("user-1")),
+            "adding userland must change the key"
+        );
+        // Different userland → different key (any dep-graph change invalidates).
+        assert_ne!(
+            snapshot_cache_key(bridge, Some("user-1")),
+            snapshot_cache_key(bridge, Some("user-2")),
+            "different userland must produce a different key"
+        );
+        // Identical inputs → identical key (cache hit).
+        assert_eq!(
+            snapshot_cache_key(bridge, Some("user-1")),
+            snapshot_cache_key(bridge, Some("user-1")),
+        );
+        // The NUL separator prevents bridge/userland boundary collisions.
+        assert_ne!(
+            snapshot_cache_key("ab", Some("c")),
+            snapshot_cache_key("a", Some("bc")),
+            "the bridge/userland split must be unambiguous"
+        );
+    }
+
+    #[test]
+    fn create_snapshot_with_userland_rejects_oversized_userland_code() {
+        let bridge_code = "(function(){})();";
+        let userland = " ".repeat(MAX_V8_USERLAND_CODE_BYTES + 1);
+        let error = match create_snapshot_with_userland(bridge_code, &userland) {
+            Ok(_) => panic!("oversized userland code should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains(V8_USERLAND_CODE_LIMIT_ERROR_CODE));
+        assert!(error.contains("userland snapshot code too large"));
     }
 }

@@ -26483,6 +26483,14 @@ ${headerLines}\r
     requireFn.resolve = resolve;
     return attachRequireMetadata(requireFn);
   }
+  // Expose createRequire under a namespaced global so an agent-SDK snapshot bundle
+  // (which runs as a raw IIFE Script, not a wrapped CJS module, when evaluated into
+  // the V8 startup snapshot) can bind a `require` for its node-builtin imports. This
+  // grants no new capability — guest CJS modules already receive `require` via the
+  // module wrapper, and resolution still flows through _requireFrom with the same
+  // permission checks — and the namespaced name avoids changing `typeof require` for
+  // guest code that branches on CJS-vs-ESM.
+  defineGlobal("__secureExecGuestCreateRequire", createRequire);
   var Module = class _Module {
     id;
     path;

@@ -287,6 +287,27 @@ where
             },
         );
 
+        // Pre-warm the agent-SDK snapshot (when the trusted client supplied one via
+        // jsRuntime.snapshotUserlandCode) so the FIRST session is already warm — the
+        // one-per-sidecar build happens here at VM create, off the session-create
+        // critical path. The V8 platform is already initialized on the main thread at
+        // startup (ensure_runtime_initialized), so building on this worker thread is
+        // safe. Best-effort: on failure the runtime falls back to the lazy build.
+        if let Some(userland) = create_config
+            .js_runtime
+            .as_ref()
+            .and_then(|cfg| cfg.snapshot_userland_code.clone())
+        {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    secure_exec_execution::v8_host::pre_warm_agent_snapshot(&userland)
+                {
+                    eprintln!("agent snapshot pre-warm failed: {error}");
+                }
+            })
+            .await;
+        }
+
         let events = vec![
             self.vm_lifecycle_event(
                 &connection_id,

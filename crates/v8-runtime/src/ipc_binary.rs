@@ -62,6 +62,10 @@ pub enum BinaryFrame {
         file_path: String,
         bridge_code: String,
         post_restore_script: String,
+        // Optional agent-SDK bundle evaluated into the per-sidecar snapshot alongside
+        // the bridge (empty = bridge-only snapshot, unchanged behavior). The snapshot
+        // is cached process-wide keyed by sha256(bridge_code + userland_code).
+        userland_code: String,
         user_code: String,
     },
     BridgeResponse {
@@ -80,6 +84,8 @@ pub enum BinaryFrame {
     },
     WarmSnapshot {
         bridge_code: String,
+        // Optional agent-SDK bundle to pre-warm into the snapshot (empty = bridge-only).
+        userland_code: String,
     },
 
     // Rust → Host
@@ -236,6 +242,7 @@ fn encode_body(buf: &mut Vec<u8>, frame: &BinaryFrame) -> io::Result<()> {
             file_path,
             bridge_code,
             post_restore_script,
+            userland_code,
             user_code,
         } => {
             buf.push(MSG_EXECUTE);
@@ -251,6 +258,10 @@ fn encode_body(buf: &mut Vec<u8>, frame: &BinaryFrame) -> io::Result<()> {
             let prs_bytes = post_restore_script.as_bytes();
             buf.extend_from_slice(&(prs_bytes.len() as u32).to_be_bytes());
             buf.extend_from_slice(prs_bytes);
+            // userland_code length (u32 BE)
+            let ul_bytes = userland_code.as_bytes();
+            buf.extend_from_slice(&(ul_bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(ul_bytes);
             // user_code (rest of frame)
             buf.extend_from_slice(user_code.as_bytes());
         }
@@ -280,12 +291,19 @@ fn encode_body(buf: &mut Vec<u8>, frame: &BinaryFrame) -> io::Result<()> {
             buf.push(MSG_TERMINATE_EXECUTION);
             write_session_id(buf, session_id)?;
         }
-        BinaryFrame::WarmSnapshot { bridge_code } => {
+        BinaryFrame::WarmSnapshot {
+            bridge_code,
+            userland_code,
+        } => {
             buf.push(MSG_WARM_SNAPSHOT);
             buf.push(0); // no session_id
             let bc_bytes = bridge_code.as_bytes();
             buf.extend_from_slice(&(bc_bytes.len() as u32).to_be_bytes());
             buf.extend_from_slice(bc_bytes);
+            // userland_code length (u32 BE) + bytes (rest)
+            let ul_bytes = userland_code.as_bytes();
+            buf.extend_from_slice(&(ul_bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(ul_bytes);
         }
         BinaryFrame::BridgeCall {
             session_id,
@@ -403,6 +421,8 @@ fn decode_body(buf: &[u8]) -> io::Result<BinaryFrame> {
             let bridge_code = read_utf8(buf, &mut pos, bc_len)?;
             let prs_len = read_u32(buf, &mut pos)? as usize;
             let post_restore_script = read_utf8(buf, &mut pos, prs_len)?;
+            let ul_len = read_u32(buf, &mut pos)? as usize;
+            let userland_code = read_utf8(buf, &mut pos, ul_len)?;
             let remaining = buf.len() - pos;
             let user_code = read_utf8(buf, &mut pos, remaining)?;
             Ok(BinaryFrame::Execute {
@@ -411,6 +431,7 @@ fn decode_body(buf: &[u8]) -> io::Result<BinaryFrame> {
                 file_path,
                 bridge_code,
                 post_restore_script,
+                userland_code,
                 user_code,
             })
         }
@@ -443,8 +464,13 @@ fn decode_body(buf: &[u8]) -> io::Result<BinaryFrame> {
             ensure_no_session_id(&session_id, "WarmSnapshot")?;
             let bc_len = read_u32(buf, &mut pos)? as usize;
             let bridge_code = read_utf8(buf, &mut pos, bc_len)?;
+            let ul_len = read_u32(buf, &mut pos)? as usize;
+            let userland_code = read_utf8(buf, &mut pos, ul_len)?;
             ensure_frame_consumed(buf, pos)?;
-            Ok(BinaryFrame::WarmSnapshot { bridge_code })
+            Ok(BinaryFrame::WarmSnapshot {
+                bridge_code,
+                userland_code,
+            })
         }
         MSG_BRIDGE_CALL => {
             let call_id = read_u64(buf, &mut pos)?;
