@@ -14,7 +14,10 @@ const O_PATH_ANCHOR: OFlag = OFlag::O_RDONLY;
 use nix::sys::stat::{fstatat, mkdirat, utimensat, Mode, SFlag, UtimensatFlags};
 use nix::sys::time::TimeSpec;
 use nix::unistd::{chown, linkat, symlinkat, unlinkat, Gid, Uid, UnlinkatFlags};
-use secure_exec_execution::ModuleFsReader;
+use secure_exec_execution::{
+    GuestModuleReader, LocalModuleResolutionCache, ModuleFsReader, ModuleResolveMode,
+    ModuleResolver,
+};
 use secure_exec_kernel::mount_plugin::{
     FileSystemPluginFactory, OpenFileSystemPluginRequest, PluginError,
 };
@@ -1154,12 +1157,36 @@ impl ModuleFsReader for HostDirModuleReader {
     }
 }
 
-// Lets the V8 session thread read module source directly through the same mount
-// (and the same openat2(RESOLVE_BENEATH) confinement) the bridge reader uses,
-// skipping the per-module bridge round-trip.
-impl secure_exec_execution::GuestModuleReader for HostDirModuleReader {
+/// Session-thread module reader: the mounted `HostDirModuleReader` plus a
+/// persistent resolution cache, so the V8 isolate thread can both resolve
+/// specifiers and read source DIRECTLY (same mount + `openat2(RESOLVE_BENEATH)`
+/// confinement, same `ModuleResolver` semantics as the bridge), skipping the
+/// per-module `_resolveModule`/`_loadFile` bridge round-trips.
+pub(crate) struct SessionModuleReader {
+    reader: HostDirModuleReader,
+    cache: LocalModuleResolutionCache,
+}
+
+impl SessionModuleReader {
+    pub(crate) fn new(reader: HostDirModuleReader) -> Self {
+        Self {
+            reader,
+            cache: LocalModuleResolutionCache::default(),
+        }
+    }
+}
+
+impl GuestModuleReader for SessionModuleReader {
     fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String> {
-        self.read_to_string(resolved_guest_path)
+        self.reader.read_to_string(resolved_guest_path)
+    }
+
+    fn resolve_module(&mut self, specifier: &str, referrer: &str) -> Option<String> {
+        // Mirror the bridge's `_resolveModule` exactly: import mode, same reader,
+        // same persisted cache.
+        let reader: &mut dyn ModuleFsReader = &mut self.reader;
+        let mut resolver = ModuleResolver::new(reader, &mut self.cache);
+        resolver.resolve_module(specifier, referrer, ModuleResolveMode::Import)
     }
 }
 

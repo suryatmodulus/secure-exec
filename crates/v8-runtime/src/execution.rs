@@ -777,6 +777,15 @@ pub trait GuestModuleReader: Send {
     /// Read the source for an already-resolved guest module path, or `None` if
     /// the path isn't served by this reader (caller falls back to the bridge IPC).
     fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String>;
+
+    /// Resolve a module specifier (import mode) to a resolved guest path directly,
+    /// skipping the bridge `_resolveModule` round-trip. `None` => fall back to IPC.
+    /// Implementations must match the bridge resolver exactly (same cache, same
+    /// ESM/CJS/exports/symlink semantics).
+    fn resolve_module(&mut self, specifier: &str, referrer: &str) -> Option<String> {
+        let _ = (specifier, referrer);
+        None
+    }
 }
 
 /// Install (or clear) the direct module reader for the current session thread.
@@ -1445,10 +1454,20 @@ fn resolve_or_compile_module<'s>(
     let bridge_ctx_ptr = bridge_ctx_ptr?;
     let ctx = unsafe { &*bridge_ctx_ptr };
 
-    // Phase 3: Resolve module path.
+    // Phase 3: Resolve module path — directly on this thread via the session
+    // reader when present (skips the bridge `_resolveModule` round-trip), else IPC.
     let trace = mod_trace_enabled();
     let t = trace.then(Instant::now);
-    let resolved_path = resolve_module_via_ipc(scope, ctx, specifier_str, referrer_name)?;
+    let direct_resolved = MODULE_RESOLVE_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|state| state.guest_reader.as_mut())
+            .and_then(|reader| reader.resolve_module(specifier_str, referrer_name))
+    });
+    let resolved_path = match direct_resolved {
+        Some(path) => path,
+        None => resolve_module_via_ipc(scope, ctx, specifier_str, referrer_name)?,
+    };
     if let Some(t) = t {
         record_mod(1, t.elapsed().as_nanos() as u64);
     }
@@ -7271,6 +7290,7 @@ export const file = new File([], "empty.txt");
                     bridge_ctx: std::ptr::null(),
                     module_names: HashMap::new(),
                     module_cache: HashMap::new(),
+                    guest_reader: None,
                 });
             });
             let imports = extract_uncached_imports(scope, module, "/app/main.mjs");
@@ -7318,6 +7338,7 @@ export const file = new File([], "empty.txt");
                     bridge_ctx: std::ptr::null(),
                     module_names: HashMap::new(),
                     module_cache,
+                    guest_reader: None,
                 });
             });
 

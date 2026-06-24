@@ -3068,7 +3068,10 @@ where
                 let built_reader = build_module_reader(vm, &resolved);
                 let guest_reader = built_reader
                     .clone()
-                    .map(|reader| Box::new(reader) as Box<dyn GuestModuleReader>);
+                    .map(|reader| {
+                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                            as Box<dyn GuestModuleReader>
+                    });
                 let module_reader = built_reader
                     .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                 let execution = self
@@ -5385,7 +5388,10 @@ where
                     let built_reader = build_module_reader(vm, &resolved);
                     let guest_reader = built_reader
                         .clone()
-                        .map(|reader| Box::new(reader) as Box<dyn GuestModuleReader>);
+                        .map(|reader| {
+                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                            as Box<dyn GuestModuleReader>
+                    });
                     let module_reader = built_reader
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
@@ -5783,7 +5789,10 @@ where
                     let built_reader = build_module_reader(vm, &resolved);
                     let guest_reader = built_reader
                         .clone()
-                        .map(|reader| Box::new(reader) as Box<dyn GuestModuleReader>);
+                        .map(|reader| {
+                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                            as Box<dyn GuestModuleReader>
+                    });
                     let module_reader = built_reader
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
