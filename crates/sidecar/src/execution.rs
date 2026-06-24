@@ -97,7 +97,7 @@ use secure_exec_execution::wasm::WasmExecutionError;
 use secure_exec_execution::{
     javascript::handle_internal_bridge_call_from_host_context, v8_host::V8SessionHandle,
     v8_runtime, CreateJavascriptContextRequest, CreatePythonContextRequest,
-    CreateWasmContextRequest, GuestRuntimeConfig, JavascriptExecutionEvent,
+    CreateWasmContextRequest, GuestModuleReader, GuestRuntimeConfig, JavascriptExecutionEvent,
     JavascriptExecutionLimits, JavascriptSyncRpcRequest, ModuleFsReader,
     NodeSignalDispositionAction, NodeSignalHandlerRegistration, PythonExecutionEvent,
     PythonExecutionLimits, PythonVfsRpcMethod, PythonVfsRpcRequest, PythonVfsRpcResponsePayload,
@@ -3065,7 +3065,11 @@ where
                             bootstrap_module: None,
                             compile_cache_root: Some(self.cache_root.join("node-compile-cache")),
                         });
-                let module_reader = build_module_reader(vm, &resolved)
+                let built_reader = build_module_reader(vm, &resolved);
+                let guest_reader = built_reader
+                    .clone()
+                    .map(|reader| Box::new(reader) as Box<dyn GuestModuleReader>);
+                let module_reader = built_reader
                     .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                 let execution = self
                     .javascript_engine
@@ -3083,6 +3087,7 @@ where
                             inline_code,
                         },
                         module_reader,
+                        guest_reader,
                     )
                     .map_err(javascript_error)?;
                 (ActiveExecution::Javascript(execution), env.clone())
@@ -5377,7 +5382,11 @@ where
                     );
                     prepare_javascript_shadow(vm, &resolved)?;
 
-                    let module_reader = build_module_reader(vm, &resolved)
+                    let built_reader = build_module_reader(vm, &resolved);
+                    let guest_reader = built_reader
+                        .clone()
+                        .map(|reader| Box::new(reader) as Box<dyn GuestModuleReader>);
+                    let module_reader = built_reader
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
                         .javascript_engine
@@ -5399,6 +5408,7 @@ where
                                 inline_code,
                             },
                             module_reader,
+                            guest_reader,
                         )
                         .map_err(javascript_error)?;
                     ActiveExecution::Javascript(execution)
@@ -5770,7 +5780,11 @@ where
                     );
                     prepare_javascript_shadow(vm, &resolved)?;
 
-                    let module_reader = build_module_reader(vm, &resolved)
+                    let built_reader = build_module_reader(vm, &resolved);
+                    let guest_reader = built_reader
+                        .clone()
+                        .map(|reader| Box::new(reader) as Box<dyn GuestModuleReader>);
+                    let module_reader = built_reader
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
                         .javascript_engine
@@ -5792,6 +5806,7 @@ where
                                 inline_code,
                             },
                             module_reader,
+                            guest_reader,
                         )
                         .map_err(javascript_error)?;
                     ActiveExecution::Javascript(execution)

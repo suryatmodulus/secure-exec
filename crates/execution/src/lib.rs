@@ -31,6 +31,7 @@ pub use python::{
     StartPythonExecutionRequest,
 };
 pub use secure_exec_bridge::GuestRuntime;
+pub use secure_exec_v8_runtime::execution::GuestModuleReader;
 pub use signal::{NodeSignalDispositionAction, NodeSignalHandlerRegistration};
 pub use wasm::{
     CreateWasmContextRequest, NativeBinaryFormat, StartWasmExecutionRequest, WasmContext,

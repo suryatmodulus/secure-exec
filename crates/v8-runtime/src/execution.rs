@@ -779,6 +779,14 @@ pub trait GuestModuleReader: Send {
     fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String>;
 }
 
+/// Install (or clear) the direct module reader for the current session thread.
+/// Called by the session thread when it receives a `SetModuleReader` command; the
+/// next `execute_module` moves it into the resolve state. Must be called on the
+/// session/isolate thread.
+pub fn install_session_guest_reader(reader: Option<Box<dyn GuestModuleReader>>) {
+    SESSION_GUEST_READER.with(|cell| *cell.borrow_mut() = reader);
+}
+
 struct ModuleResolveState {
     bridge_ctx: *const BridgeCallContext,
     /// identity_hash → resource_name for referrer lookup
@@ -819,6 +827,10 @@ unsafe impl Send for PendingScriptEvaluation {}
 
 thread_local! {
     static MODULE_RESOLVE_STATE: RefCell<Option<ModuleResolveState>> = const { RefCell::new(None) };
+    /// Session-thread-local handoff: a SetModuleReader command stashes the reader
+    /// here, and the next execute_module moves it into ModuleResolveState so module
+    /// source loads read directly on this thread instead of round-tripping the bridge.
+    static SESSION_GUEST_READER: RefCell<Option<Box<dyn GuestModuleReader>>> = const { RefCell::new(None) };
     static PENDING_MODULE_EVALUATION: RefCell<Option<PendingModuleEvaluation>> = const { RefCell::new(None) };
     static PENDING_SCRIPT_EVALUATION: RefCell<Option<PendingScriptEvaluation>> = const { RefCell::new(None) };
     static CJS_RUNTIME_EXTRACTION_IN_PROGRESS: RefCell<HashSet<String>> =
@@ -1067,13 +1079,15 @@ pub fn execute_module(
 ) -> (i32, Option<Vec<u8>>, Option<ExecutionError>) {
     clear_pending_module_evaluation();
 
-    // Set up thread-local resolve state
+    // Set up thread-local resolve state, taking any reader the session thread
+    // stashed via a SetModuleReader command so module loads read source directly.
+    let guest_reader = SESSION_GUEST_READER.with(|cell| cell.borrow_mut().take());
     MODULE_RESOLVE_STATE.with(|cell| {
         *cell.borrow_mut() = Some(ModuleResolveState {
             bridge_ctx: bridge_ctx as *const BridgeCallContext,
             module_names: HashMap::new(),
             module_cache: HashMap::new(),
-            guest_reader: None,
+            guest_reader,
         });
     });
 

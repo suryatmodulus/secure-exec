@@ -1154,6 +1154,15 @@ impl ModuleFsReader for HostDirModuleReader {
     }
 }
 
+// Lets the V8 session thread read module source directly through the same mount
+// (and the same openat2(RESOLVE_BENEATH) confinement) the bridge reader uses,
+// skipping the per-module bridge round-trip.
+impl secure_exec_execution::GuestModuleReader for HostDirModuleReader {
+    fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String> {
+        self.read_to_string(resolved_guest_path)
+    }
+}
+
 fn nix_to_io(error: Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }

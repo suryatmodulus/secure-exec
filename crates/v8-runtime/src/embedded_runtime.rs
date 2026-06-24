@@ -10,7 +10,8 @@ use std::thread;
 use crate::host_call::CallIdRouter;
 use crate::ipc_binary::BinaryFrame;
 use crate::runtime_protocol::{
-    validate_bridge_response_status, BridgeResponse, RuntimeCommand, RuntimeEvent, SessionMessage,
+    validate_bridge_response_status, BridgeResponse, ModuleReaderHandle, RuntimeCommand,
+    RuntimeEvent, SessionMessage,
     StreamEvent,
 };
 use crate::session::{RuntimeEventEnvelope, SessionCommand, SessionManager};
@@ -291,6 +292,19 @@ impl EmbeddedV8SessionHandle {
                 event_type: event_type.to_owned(),
                 payload,
             }),
+        })
+    }
+
+    /// Install a direct module-source reader on this session's thread so module
+    /// loads read source directly instead of round-tripping the bridge. Routed
+    /// through the dispatch thread (which owns the session manager).
+    pub fn set_module_reader(
+        &self,
+        reader: Box<dyn crate::execution::GuestModuleReader>,
+    ) -> io::Result<()> {
+        self.runtime.dispatch(RuntimeCommand::SetSessionModuleReader {
+            session_id: self.session_id.clone(),
+            reader: ModuleReaderHandle::new(reader),
         })
     }
 
@@ -575,6 +589,23 @@ fn dispatch_runtime_command(
             sender
                 .send(SessionCommand::Message(message))
                 .map_err(|e| other_io_error(format!("session thread disconnected: {}", e)))
+        }
+        RuntimeCommand::SetSessionModuleReader { session_id, reader } => {
+            // Resolve the sender under the lock, release, then forward the live
+            // reader as a SetModuleReader command to the session thread.
+            let sender = {
+                let mgr = session_mgr.lock().expect("session manager lock poisoned");
+                mgr.session_sender(&session_id)
+            };
+            let sender = sender.map_err(other_io_error)?;
+            match reader.take() {
+                Some(reader) => sender
+                    .send(SessionCommand::SetModuleReader(reader))
+                    .map_err(|e| {
+                        other_io_error(format!("session thread disconnected: {}", e))
+                    }),
+                None => Ok(()),
+            }
         }
         RuntimeCommand::WarmSnapshot { bridge_code } => snapshot_cache
             .get_or_create(&bridge_code)

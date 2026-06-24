@@ -25,6 +25,11 @@ pub enum SessionCommand {
     Shutdown,
     /// Forward a typed session message to the session thread for processing
     Message(SessionMessage),
+    /// Install a direct module-source reader on the session thread. Carried as a
+    /// live object over the in-process command channel (NOT a serialized frame),
+    /// so subsequent module loads on this thread read source directly instead of
+    /// round-tripping the bridge. Sent just before an Execute message.
+    SetModuleReader(Box<dyn crate::execution::GuestModuleReader>),
 }
 
 #[cfg(not(test))]
@@ -509,6 +514,15 @@ impl SessionManager {
         Ok(entry.tx.clone())
     }
 
+    /// Get a session's command sender without a message (used for control commands
+    /// like SetModuleReader that aren't a SessionMessage). Dispatch-thread only.
+    pub fn session_sender(&self, session_id: &str) -> Result<Sender<SessionCommand>, String> {
+        self.sessions
+            .get(session_id)
+            .map(|entry| entry.tx.clone())
+            .ok_or_else(|| format!("session {} does not exist", session_id))
+    }
+
     /// Send a message to a session. Blocks on the session command channel, so
     /// this must not be called while a shared lock on the manager is held.
     pub fn send_to_session(&self, session_id: &str, msg: SessionMessage) -> Result<(), String> {
@@ -800,6 +814,9 @@ fn session_thread(
 
         match next_command {
             Ok(SessionCommand::Shutdown) | Err(_) => break,
+            Ok(SessionCommand::SetModuleReader(reader)) => {
+                execution::install_session_guest_reader(Some(reader));
+            }
             Ok(SessionCommand::Message(msg)) => match msg {
                 SessionMessage::InjectGlobals { payload } => {
                     #[cfg(not(test))]
@@ -1787,6 +1804,9 @@ pub fn run_event_loop(
                     return status;
                 }
             }
+            SessionCommand::SetModuleReader(reader) => {
+                execution::install_session_guest_reader(Some(reader));
+            }
             SessionCommand::Shutdown => return EventLoopStatus::Terminated,
         }
     }
@@ -1955,6 +1975,9 @@ impl crate::host_call::BridgeResponseReceiver for ChannelResponseReceiver {
                     }
                     // Queue non-BridgeResponse for later event loop processing
                     push_deferred_sync_message(&self.deferred, frame)?;
+                }
+                SessionCommand::SetModuleReader(reader) => {
+                    execution::install_session_guest_reader(Some(reader));
                 }
                 SessionCommand::Shutdown => return Err("session shutdown".into()),
             }

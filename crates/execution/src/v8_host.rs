@@ -155,6 +155,15 @@ impl V8SessionHandle {
         self.inner.send_stream_event(event_type, payload)
     }
 
+    /// Install a direct module-source reader on this session's V8 thread so module
+    /// loads read source directly instead of round-tripping the bridge.
+    pub fn set_module_reader(
+        &self,
+        reader: Box<dyn secure_exec_v8_runtime::execution::GuestModuleReader>,
+    ) -> io::Result<()> {
+        self.inner.set_module_reader(reader)
+    }
+
     /// Terminate execution in this session.
     pub fn terminate(&self) -> io::Result<()> {
         self.inner.terminate()

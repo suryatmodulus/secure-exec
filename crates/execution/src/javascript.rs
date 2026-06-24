@@ -1669,7 +1669,7 @@ impl JavascriptExecutionEngine {
         &mut self,
         request: StartJavascriptExecutionRequest,
     ) -> Result<JavascriptExecution, JavascriptExecutionError> {
-        self.start_execution_with_module_reader(request, None)
+        self.start_execution_with_module_reader(request, None, None)
     }
 
     /// Like [`start_execution`](Self::start_execution) but with an optional
@@ -1682,6 +1682,7 @@ impl JavascriptExecutionEngine {
         &mut self,
         request: StartJavascriptExecutionRequest,
         module_reader: Option<Box<dyn ModuleFsReader + Send>>,
+        guest_reader: Option<Box<dyn secure_exec_v8_runtime::execution::GuestModuleReader>>,
     ) -> Result<JavascriptExecution, JavascriptExecutionError> {
         let context = self
             .contexts
@@ -1830,6 +1831,16 @@ impl JavascriptExecutionEngine {
                 ..Default::default()
             },
         );
+
+        // Install the direct module reader on the session thread BEFORE the Execute
+        // frame so the SetModuleReader command (routed through the same dispatch
+        // queue) arrives first; module loads then read source directly on the V8
+        // thread instead of round-tripping the bridge.
+        if let Some(guest_reader) = guest_reader {
+            v8_session
+                .set_module_reader(guest_reader)
+                .map_err(JavascriptExecutionError::Spawn)?;
+        }
 
         // Execute bridge code + user code in the V8 isolate
         v8_host
