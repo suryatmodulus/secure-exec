@@ -13553,6 +13553,41 @@ fn javascript_sync_rpc_base64_arg(
         })
 }
 
+// ── Sync-RPC round-trip counting (opt-in via AGENTOS_SYNC_RPC_TRACE=1) ──
+// Each guest fs/module/net sync RPC funnels through service_javascript_sync_rpc,
+// so this is the one place to measure the kernel-VFS "syscall storm" that makes
+// metadata-heavy phases (resourceLoader.reload, createAgentSession) 40-90x slower
+// in the VM than on bare node. Emits a perf log line every 200 calls with the
+// running per-method breakdown.
+static SYNC_RPC_STATS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+fn sync_rpc_trace_enabled() -> bool {
+    std::env::var("AGENTOS_SYNC_RPC_TRACE").as_deref() == Ok("1")
+}
+
+fn record_sync_rpc(method: &str) {
+    let stats =
+        SYNC_RPC_STATS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let Ok(mut map) = stats.lock() else {
+        return;
+    };
+    *map.entry(method.to_string()).or_insert(0) += 1;
+    let total: u64 = map.values().sum();
+    if total == 1 || total % 50 == 0 {
+        let mut top: Vec<(&String, &u64)> = map.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let breakdown = top
+            .iter()
+            .take(8)
+            .map(|(m, c)| format!("{m}={c}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(target: "secure_exec_sidecar::perf", total, %breakdown, "sync_rpc count");
+    }
+}
+
 pub(crate) fn service_javascript_sync_rpc<B>(
     request: JavascriptSyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
@@ -13560,6 +13595,9 @@ where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    if sync_rpc_trace_enabled() {
+        record_sync_rpc(request.sync_request.method.as_str());
+    }
     let JavascriptSyncRpcServiceRequest {
         bridge,
         vm_id,
