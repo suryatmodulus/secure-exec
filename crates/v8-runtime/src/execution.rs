@@ -3,6 +3,44 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroI32;
+use std::time::Instant;
+
+// ── Module-load read/compile split (opt-in via AGENTOS_MODULE_TRACE=1) ──
+// Per module miss: resolve IPC + load (read) IPC + format IPC + V8 compile.
+// Accumulates ns per category and writes a running total to
+// AGENTOS_MODULE_TRACE_FILE so we can see whether the VM module-load tax is
+// IPC (read) or V8 compile bound. Index: 0=count 1=resolve 2=load 3=format 4=compile.
+static MOD_TRACE: std::sync::OnceLock<std::sync::Mutex<[u64; 5]>> = std::sync::OnceLock::new();
+
+fn mod_trace_enabled() -> bool {
+    std::env::var("AGENTOS_MODULE_TRACE").as_deref() == Ok("1")
+}
+
+fn record_mod(idx: usize, ns: u64) {
+    let m = MOD_TRACE.get_or_init(|| std::sync::Mutex::new([0u64; 5]));
+    let Ok(mut a) = m.lock() else {
+        return;
+    };
+    a[idx] = a[idx].wrapping_add(ns);
+    if idx == 4 {
+        a[0] += 1;
+        if a[0] % 25 == 0 {
+            if let Ok(path) = std::env::var("AGENTOS_MODULE_TRACE_FILE") {
+                let _ = std::fs::write(
+                    &path,
+                    format!(
+                        "modules={} resolve_ms={} load_ms={} format_ms={} compile_ms={}\n",
+                        a[0],
+                        a[1] / 1_000_000,
+                        a[2] / 1_000_000,
+                        a[3] / 1_000_000,
+                        a[4] / 1_000_000,
+                    ),
+                );
+            }
+        }
+    }
+}
 
 use crate::bridge::{deserialize_v8_value, serialize_v8_value};
 use crate::host_call::BridgeCallContext;
@@ -1372,7 +1410,12 @@ fn resolve_or_compile_module<'s>(
     let ctx = unsafe { &*bridge_ctx_ptr };
 
     // Phase 3: Resolve module path.
+    let trace = mod_trace_enabled();
+    let t = trace.then(Instant::now);
     let resolved_path = resolve_module_via_ipc(scope, ctx, specifier_str, referrer_name)?;
+    if let Some(t) = t {
+        record_mod(1, t.elapsed().as_nanos() as u64);
+    }
 
     // Phase 4: Check cache by resolved path.
     let cached_global = MODULE_RESOLVE_STATE.with(|cell| {
@@ -1385,8 +1428,16 @@ fn resolve_or_compile_module<'s>(
     }
 
     // Phase 5: Load and compile the module source.
+    let t = trace.then(Instant::now);
     let raw_source = load_module_via_ipc(scope, ctx, &resolved_path)?;
+    if let Some(t) = t {
+        record_mod(2, t.elapsed().as_nanos() as u64);
+    }
+    let t = trace.then(Instant::now);
     let module_format = lookup_module_format_via_ipc(scope, ctx, &resolved_path);
+    if let Some(t) = t {
+        record_mod(3, t.elapsed().as_nanos() as u64);
+    }
     let source_code = build_module_source(scope, &raw_source, &resolved_path, module_format);
 
     let resource = v8::String::new(scope, &resolved_path)?;
@@ -1411,7 +1462,11 @@ fn resolve_or_compile_module<'s>(
         }
     };
     let mut compiled = v8::script_compiler::Source::new(v8_source, Some(&origin));
+    let t = trace.then(Instant::now);
     let module = v8::script_compiler::compile_module(scope, &mut compiled)?;
+    if let Some(t) = t {
+        record_mod(4, t.elapsed().as_nanos() as u64);
+    }
     let global = v8::Global::new(scope, module);
     if !cache_resolved_module(module, global, resolved_path, Some(request_cache_key)) {
         throw_module_error(scope, "module resolution cache limit exceeded");
