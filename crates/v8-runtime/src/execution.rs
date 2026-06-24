@@ -420,6 +420,7 @@ pub fn execute_script_with_options(
                 bridge_ctx: bridge_ctx as *const BridgeCallContext,
                 module_names: HashMap::new(),
                 module_cache: HashMap::new(),
+                guest_reader: None,
             });
         });
     }
@@ -761,12 +762,32 @@ fn build_os_config<'s>(
 
 /// Thread-local state for module resolution during execute_module.
 /// Avoids passing user data through V8's ResolveModuleCallback (which is a plain fn pointer).
+/// Direct, in-process module source reader living on the V8 session thread.
+///
+/// The V8 module callback (resolve_or_compile_module) runs in this crate
+/// (v8-runtime), but the module reader/resolver lives in the higher `execution`
+/// crate, so a direct call would be a circular dependency — today every module
+/// resolve/load/format is a sync bridge round-trip (~139us × ~5,100 calls ≈ all
+/// of loadPiSdkRuntime). This trait is owned here and implemented in the higher
+/// crate over the mounted `HostDirModuleReader`, then handed down to the session
+/// thread so module source can be read directly, skipping the round-trip. It is
+/// confined to the same mounts the guest sees (the impl keeps the reader's
+/// `openat2(RESOLVE_BENEATH)` confinement).
+pub trait GuestModuleReader: Send {
+    /// Read the source for an already-resolved guest module path, or `None` if
+    /// the path isn't served by this reader (caller falls back to the bridge IPC).
+    fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String>;
+}
+
 struct ModuleResolveState {
     bridge_ctx: *const BridgeCallContext,
     /// identity_hash → resource_name for referrer lookup
     module_names: HashMap<NonZeroI32, String>,
     /// resolved_path and referrer-qualified request keys → Global<Module> cache
     module_cache: HashMap<String, v8::Global<v8::Module>>,
+    /// Optional direct module-source reader (session-thread local). When present,
+    /// module loads read source directly instead of via the bridge round-trip.
+    guest_reader: Option<Box<dyn GuestModuleReader>>,
 }
 
 // SAFETY: ModuleResolveState is only accessed from the session thread
@@ -1052,6 +1073,7 @@ pub fn execute_module(
             bridge_ctx: bridge_ctx as *const BridgeCallContext,
             module_names: HashMap::new(),
             module_cache: HashMap::new(),
+            guest_reader: None,
         });
     });
 
@@ -1427,9 +1449,21 @@ fn resolve_or_compile_module<'s>(
         return Some(v8::Local::new(scope, &cached));
     }
 
-    // Phase 5: Load and compile the module source.
+    // Phase 5: Load the module source — directly via the session-thread reader
+    // when present (skips the ~139us bridge round-trip), else via the bridge IPC.
+    // guest_reader is None until the higher crate plumbs the reader down, so this
+    // is currently a no-op fall-through to the IPC path (zero behavior change).
     let t = trace.then(Instant::now);
-    let raw_source = load_module_via_ipc(scope, ctx, &resolved_path)?;
+    let direct_source = MODULE_RESOLVE_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|state| state.guest_reader.as_mut())
+            .and_then(|reader| reader.read_module_source(&resolved_path))
+    });
+    let raw_source = match direct_source {
+        Some(source) => source,
+        None => load_module_via_ipc(scope, ctx, &resolved_path)?,
+    };
     if let Some(t) = t {
         record_mod(2, t.elapsed().as_nanos() as u64);
     }
