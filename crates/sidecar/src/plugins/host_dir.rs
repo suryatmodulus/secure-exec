@@ -168,10 +168,11 @@ impl HostDirFilesystem {
         host_path: impl AsRef<Path>,
         max_read_bytes: Option<usize>,
     ) -> VfsResult<Self> {
+        let host_path_str = host_path.as_ref().to_string_lossy().into_owned();
         let canonical_root = fs::canonicalize(host_path.as_ref())
-            .map_err(|error| io_error_to_vfs("open", "/", error))?;
-        let metadata =
-            fs::metadata(&canonical_root).map_err(|error| io_error_to_vfs("stat", "/", error))?;
+            .map_err(|error| io_error_to_vfs("open", &host_path_str, error))?;
+        let metadata = fs::metadata(&canonical_root)
+            .map_err(|error| io_error_to_vfs("stat", &host_path_str, error))?;
         if !metadata.is_dir() {
             return Err(VfsError::new(
                 "ENOTDIR",

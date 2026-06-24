@@ -121,6 +121,7 @@ where
         request: &crate::protocol::RequestFrame,
         payload: crate::protocol::CreateVmRequest,
     ) -> Result<DispatchResult, SidecarError> {
+        let __t = Instant::now();
         let (connection_id, session_id) = self.session_scope_for(&request.ownership)?;
         self.require_owned_session(&connection_id, &session_id)?;
         let create_config: vm_config::CreateVmConfig = serde_json::from_str(&payload.config)
@@ -296,6 +297,7 @@ where
             self.vm_lifecycle_event(&connection_id, &session_id, &vm_id, VmLifecycleState::Ready),
         ];
 
+        tracing::info!(target: "secure_exec_sidecar::perf", phase = "create_vm", elapsed_ms = __t.elapsed().as_millis() as u64, "vm phase");
         Ok(DispatchResult {
             response: self.respond(
                 request,
@@ -358,6 +360,7 @@ where
         request: &crate::protocol::RequestFrame,
         payload: ConfigureVmRequest,
     ) -> Result<DispatchResult, SidecarError> {
+        let __t = Instant::now();
         let (connection_id, session_id, vm_id) = self.vm_scope_for(&request.ownership)?;
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
@@ -436,6 +439,7 @@ where
             }
         }
 
+        tracing::info!(target: "secure_exec_sidecar::perf", phase = "configure_vm", elapsed_ms = __t.elapsed().as_millis() as u64, applied_mounts = effective_mounts.len() as u64, "vm phase");
         Ok(DispatchResult {
             response: self.respond(
                 request,
