@@ -97,7 +97,7 @@ use secure_exec_execution::wasm::WasmExecutionError;
 use secure_exec_execution::{
     javascript::handle_internal_bridge_call_from_host_context, v8_host::V8SessionHandle,
     v8_runtime, CreateJavascriptContextRequest, CreatePythonContextRequest,
-    CreateWasmContextRequest, GuestRuntimeConfig, JavascriptExecutionEvent,
+    CreateWasmContextRequest, GuestModuleReader, GuestRuntimeConfig, JavascriptExecutionEvent,
     JavascriptExecutionLimits, JavascriptSyncRpcRequest, ModuleFsReader,
     NodeSignalDispositionAction, NodeSignalHandlerRegistration, PythonExecutionEvent,
     PythonExecutionLimits, PythonVfsRpcMethod, PythonVfsRpcRequest, PythonVfsRpcResponsePayload,
@@ -3065,7 +3065,14 @@ where
                             bootstrap_module: None,
                             compile_cache_root: Some(self.cache_root.join("node-compile-cache")),
                         });
-                let module_reader = build_module_reader(vm, &resolved)
+                let built_reader = build_module_reader(vm, &resolved);
+                let guest_reader = built_reader
+                    .clone()
+                    .map(|reader| {
+                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                            as Box<dyn GuestModuleReader>
+                    });
+                let module_reader = built_reader
                     .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                 let execution = self
                     .javascript_engine
@@ -3083,6 +3090,7 @@ where
                             inline_code,
                         },
                         module_reader,
+                        guest_reader,
                     )
                     .map_err(javascript_error)?;
                 (ActiveExecution::Javascript(execution), env.clone())
@@ -5377,7 +5385,14 @@ where
                     );
                     prepare_javascript_shadow(vm, &resolved)?;
 
-                    let module_reader = build_module_reader(vm, &resolved)
+                    let built_reader = build_module_reader(vm, &resolved);
+                    let guest_reader = built_reader
+                        .clone()
+                        .map(|reader| {
+                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                            as Box<dyn GuestModuleReader>
+                    });
+                    let module_reader = built_reader
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
                         .javascript_engine
@@ -5399,6 +5414,7 @@ where
                                 inline_code,
                             },
                             module_reader,
+                            guest_reader,
                         )
                         .map_err(javascript_error)?;
                     ActiveExecution::Javascript(execution)
@@ -5770,7 +5786,14 @@ where
                     );
                     prepare_javascript_shadow(vm, &resolved)?;
 
-                    let module_reader = build_module_reader(vm, &resolved)
+                    let built_reader = build_module_reader(vm, &resolved);
+                    let guest_reader = built_reader
+                        .clone()
+                        .map(|reader| {
+                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                            as Box<dyn GuestModuleReader>
+                    });
+                    let module_reader = built_reader
                         .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                     let execution = self
                         .javascript_engine
@@ -5792,6 +5815,7 @@ where
                                 inline_code,
                             },
                             module_reader,
+                            guest_reader,
                         )
                         .map_err(javascript_error)?;
                     ActiveExecution::Javascript(execution)
@@ -8803,6 +8827,15 @@ fn guest_runtime_identity(
         os_hostname: None,
         os_shell: Some(user.shell.clone()),
         os_user: Some(user.username.clone()),
+        // Userland bundle to bake into the per-sidecar snapshot, supplied by the
+        // (trusted) client via jsRuntime.snapshotUserlandCode. The agent-os layer
+        // sets this to the agent SDK bundle for snapshot-enabled agents; `None`
+        // keeps the bridge-only snapshot.
+        snapshot_userland_code: vm
+            .configuration
+            .js_runtime
+            .as_ref()
+            .and_then(|cfg| cfg.snapshot_userland_code.clone()),
     }
 }
 
@@ -13553,6 +13586,41 @@ fn javascript_sync_rpc_base64_arg(
         })
 }
 
+// ── Sync-RPC round-trip counting (opt-in via AGENTOS_SYNC_RPC_TRACE=1) ──
+// Each guest fs/module/net sync RPC funnels through service_javascript_sync_rpc,
+// so this is the one place to measure the kernel-VFS "syscall storm" that makes
+// metadata-heavy phases (resourceLoader.reload, createAgentSession) 40-90x slower
+// in the VM than on bare node. Emits a perf log line every 200 calls with the
+// running per-method breakdown.
+static SYNC_RPC_STATS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+fn sync_rpc_trace_enabled() -> bool {
+    std::env::var("AGENTOS_SYNC_RPC_TRACE").as_deref() == Ok("1")
+}
+
+fn record_sync_rpc(method: &str) {
+    let stats =
+        SYNC_RPC_STATS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let Ok(mut map) = stats.lock() else {
+        return;
+    };
+    *map.entry(method.to_string()).or_insert(0) += 1;
+    let total: u64 = map.values().sum();
+    if total == 1 || total % 50 == 0 {
+        let mut top: Vec<(&String, &u64)> = map.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let breakdown = top
+            .iter()
+            .take(8)
+            .map(|(m, c)| format!("{m}={c}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(target: "secure_exec_sidecar::perf", total, %breakdown, "sync_rpc count");
+    }
+}
+
 pub(crate) fn service_javascript_sync_rpc<B>(
     request: JavascriptSyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
@@ -13560,6 +13628,9 @@ where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    if sync_rpc_trace_enabled() {
+        record_sync_rpc(request.sync_request.method.as_str());
+    }
     let JavascriptSyncRpcServiceRequest {
         bridge,
         vm_id,

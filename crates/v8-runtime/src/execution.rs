@@ -3,6 +3,44 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroI32;
+use std::time::Instant;
+
+// ── Module-load read/compile split (opt-in via AGENTOS_MODULE_TRACE=1) ──
+// Per module miss: resolve IPC + load (read) IPC + format IPC + V8 compile.
+// Accumulates ns per category and writes a running total to
+// AGENTOS_MODULE_TRACE_FILE so we can see whether the VM module-load tax is
+// IPC (read) or V8 compile bound. Index: 0=count 1=resolve 2=load 3=format 4=compile.
+static MOD_TRACE: std::sync::OnceLock<std::sync::Mutex<[u64; 5]>> = std::sync::OnceLock::new();
+
+fn mod_trace_enabled() -> bool {
+    std::env::var("AGENTOS_MODULE_TRACE").as_deref() == Ok("1")
+}
+
+fn record_mod(idx: usize, ns: u64) {
+    let m = MOD_TRACE.get_or_init(|| std::sync::Mutex::new([0u64; 5]));
+    let Ok(mut a) = m.lock() else {
+        return;
+    };
+    a[idx] = a[idx].wrapping_add(ns);
+    if idx == 4 {
+        a[0] += 1;
+        if a[0] % 25 == 0 {
+            if let Ok(path) = std::env::var("AGENTOS_MODULE_TRACE_FILE") {
+                let _ = std::fs::write(
+                    &path,
+                    format!(
+                        "modules={} resolve_ms={} load_ms={} format_ms={} compile_ms={}\n",
+                        a[0],
+                        a[1] / 1_000_000,
+                        a[2] / 1_000_000,
+                        a[3] / 1_000_000,
+                        a[4] / 1_000_000,
+                    ),
+                );
+            }
+        }
+    }
+}
 
 use crate::bridge::{deserialize_v8_value, serialize_v8_value};
 use crate::host_call::BridgeCallContext;
@@ -382,6 +420,7 @@ pub fn execute_script_with_options(
                 bridge_ctx: bridge_ctx as *const BridgeCallContext,
                 module_names: HashMap::new(),
                 module_cache: HashMap::new(),
+                guest_reader: None,
             });
         });
     }
@@ -723,12 +762,49 @@ fn build_os_config<'s>(
 
 /// Thread-local state for module resolution during execute_module.
 /// Avoids passing user data through V8's ResolveModuleCallback (which is a plain fn pointer).
+/// Direct, in-process module source reader living on the V8 session thread.
+///
+/// The V8 module callback (resolve_or_compile_module) runs in this crate
+/// (v8-runtime), but the module reader/resolver lives in the higher `execution`
+/// crate, so a direct call would be a circular dependency — today every module
+/// resolve/load/format is a sync bridge round-trip (~139us × ~5,100 calls ≈ all
+/// of loadPiSdkRuntime). This trait is owned here and implemented in the higher
+/// crate over the mounted `HostDirModuleReader`, then handed down to the session
+/// thread so module source can be read directly, skipping the round-trip. It is
+/// confined to the same mounts the guest sees (the impl keeps the reader's
+/// `openat2(RESOLVE_BENEATH)` confinement).
+pub trait GuestModuleReader: Send {
+    /// Read the source for an already-resolved guest module path, or `None` if
+    /// the path isn't served by this reader (caller falls back to the bridge IPC).
+    fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String>;
+
+    /// Resolve a module specifier (import mode) to a resolved guest path directly,
+    /// skipping the bridge `_resolveModule` round-trip. `None` => fall back to IPC.
+    /// Implementations must match the bridge resolver exactly (same cache, same
+    /// ESM/CJS/exports/symlink semantics).
+    fn resolve_module(&mut self, specifier: &str, referrer: &str) -> Option<String> {
+        let _ = (specifier, referrer);
+        None
+    }
+}
+
+/// Install (or clear) the direct module reader for the current session thread.
+/// Called by the session thread when it receives a `SetModuleReader` command; the
+/// next `execute_module` moves it into the resolve state. Must be called on the
+/// session/isolate thread.
+pub fn install_session_guest_reader(reader: Option<Box<dyn GuestModuleReader>>) {
+    SESSION_GUEST_READER.with(|cell| *cell.borrow_mut() = reader);
+}
+
 struct ModuleResolveState {
     bridge_ctx: *const BridgeCallContext,
     /// identity_hash → resource_name for referrer lookup
     module_names: HashMap<NonZeroI32, String>,
     /// resolved_path and referrer-qualified request keys → Global<Module> cache
     module_cache: HashMap<String, v8::Global<v8::Module>>,
+    /// Optional direct module-source reader (session-thread local). When present,
+    /// module loads read source directly instead of via the bridge round-trip.
+    guest_reader: Option<Box<dyn GuestModuleReader>>,
 }
 
 // SAFETY: ModuleResolveState is only accessed from the session thread
@@ -760,6 +836,10 @@ unsafe impl Send for PendingScriptEvaluation {}
 
 thread_local! {
     static MODULE_RESOLVE_STATE: RefCell<Option<ModuleResolveState>> = const { RefCell::new(None) };
+    /// Session-thread-local handoff: a SetModuleReader command stashes the reader
+    /// here, and the next execute_module moves it into ModuleResolveState so module
+    /// source loads read directly on this thread instead of round-tripping the bridge.
+    static SESSION_GUEST_READER: RefCell<Option<Box<dyn GuestModuleReader>>> = const { RefCell::new(None) };
     static PENDING_MODULE_EVALUATION: RefCell<Option<PendingModuleEvaluation>> = const { RefCell::new(None) };
     static PENDING_SCRIPT_EVALUATION: RefCell<Option<PendingScriptEvaluation>> = const { RefCell::new(None) };
     static CJS_RUNTIME_EXTRACTION_IN_PROGRESS: RefCell<HashSet<String>> =
@@ -1008,12 +1088,15 @@ pub fn execute_module(
 ) -> (i32, Option<Vec<u8>>, Option<ExecutionError>) {
     clear_pending_module_evaluation();
 
-    // Set up thread-local resolve state
+    // Set up thread-local resolve state, taking any reader the session thread
+    // stashed via a SetModuleReader command so module loads read source directly.
+    let guest_reader = SESSION_GUEST_READER.with(|cell| cell.borrow_mut().take());
     MODULE_RESOLVE_STATE.with(|cell| {
         *cell.borrow_mut() = Some(ModuleResolveState {
             bridge_ctx: bridge_ctx as *const BridgeCallContext,
             module_names: HashMap::new(),
             module_cache: HashMap::new(),
+            guest_reader,
         });
     });
 
@@ -1371,8 +1454,23 @@ fn resolve_or_compile_module<'s>(
     let bridge_ctx_ptr = bridge_ctx_ptr?;
     let ctx = unsafe { &*bridge_ctx_ptr };
 
-    // Phase 3: Resolve module path.
-    let resolved_path = resolve_module_via_ipc(scope, ctx, specifier_str, referrer_name)?;
+    // Phase 3: Resolve module path — directly on this thread via the session
+    // reader when present (skips the bridge `_resolveModule` round-trip), else IPC.
+    let trace = mod_trace_enabled();
+    let t = trace.then(Instant::now);
+    let direct_resolved = MODULE_RESOLVE_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|state| state.guest_reader.as_mut())
+            .and_then(|reader| reader.resolve_module(specifier_str, referrer_name))
+    });
+    let resolved_path = match direct_resolved {
+        Some(path) => path,
+        None => resolve_module_via_ipc(scope, ctx, specifier_str, referrer_name)?,
+    };
+    if let Some(t) = t {
+        record_mod(1, t.elapsed().as_nanos() as u64);
+    }
 
     // Phase 4: Check cache by resolved path.
     let cached_global = MODULE_RESOLVE_STATE.with(|cell| {
@@ -1384,9 +1482,29 @@ fn resolve_or_compile_module<'s>(
         return Some(v8::Local::new(scope, &cached));
     }
 
-    // Phase 5: Load and compile the module source.
-    let raw_source = load_module_via_ipc(scope, ctx, &resolved_path)?;
+    // Phase 5: Load the module source — directly via the session-thread reader
+    // when present (skips the ~139us bridge round-trip), else via the bridge IPC.
+    // guest_reader is None until the higher crate plumbs the reader down, so this
+    // is currently a no-op fall-through to the IPC path (zero behavior change).
+    let t = trace.then(Instant::now);
+    let direct_source = MODULE_RESOLVE_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|state| state.guest_reader.as_mut())
+            .and_then(|reader| reader.read_module_source(&resolved_path))
+    });
+    let raw_source = match direct_source {
+        Some(source) => source,
+        None => load_module_via_ipc(scope, ctx, &resolved_path)?,
+    };
+    if let Some(t) = t {
+        record_mod(2, t.elapsed().as_nanos() as u64);
+    }
+    let t = trace.then(Instant::now);
     let module_format = lookup_module_format_via_ipc(scope, ctx, &resolved_path);
+    if let Some(t) = t {
+        record_mod(3, t.elapsed().as_nanos() as u64);
+    }
     let source_code = build_module_source(scope, &raw_source, &resolved_path, module_format);
 
     let resource = v8::String::new(scope, &resolved_path)?;
@@ -1411,7 +1529,11 @@ fn resolve_or_compile_module<'s>(
         }
     };
     let mut compiled = v8::script_compiler::Source::new(v8_source, Some(&origin));
+    let t = trace.then(Instant::now);
     let module = v8::script_compiler::compile_module(scope, &mut compiled)?;
+    if let Some(t) = t {
+        record_mod(4, t.elapsed().as_nanos() as u64);
+    }
     let global = v8::Global::new(scope, module);
     if !cache_resolved_module(module, global, resolved_path, Some(request_cache_key)) {
         throw_module_error(scope, "module resolution cache limit exceeded");
@@ -7168,6 +7290,7 @@ export const file = new File([], "empty.txt");
                     bridge_ctx: std::ptr::null(),
                     module_names: HashMap::new(),
                     module_cache: HashMap::new(),
+                    guest_reader: None,
                 });
             });
             let imports = extract_uncached_imports(scope, module, "/app/main.mjs");
@@ -7215,6 +7338,7 @@ export const file = new File([], "empty.txt");
                     bridge_ctx: std::ptr::null(),
                     module_names: HashMap::new(),
                     module_cache,
+                    guest_reader: None,
                 });
             });
 

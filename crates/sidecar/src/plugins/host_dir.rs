@@ -14,7 +14,10 @@ const O_PATH_ANCHOR: OFlag = OFlag::O_RDONLY;
 use nix::sys::stat::{fstatat, mkdirat, utimensat, Mode, SFlag, UtimensatFlags};
 use nix::sys::time::TimeSpec;
 use nix::unistd::{chown, linkat, symlinkat, unlinkat, Gid, Uid, UnlinkatFlags};
-use secure_exec_execution::ModuleFsReader;
+use secure_exec_execution::{
+    GuestModuleReader, LocalModuleResolutionCache, ModuleFsReader, ModuleResolveMode,
+    ModuleResolver,
+};
 use secure_exec_kernel::mount_plugin::{
     FileSystemPluginFactory, OpenFileSystemPluginRequest, PluginError,
 };
@@ -168,10 +171,11 @@ impl HostDirFilesystem {
         host_path: impl AsRef<Path>,
         max_read_bytes: Option<usize>,
     ) -> VfsResult<Self> {
+        let host_path_str = host_path.as_ref().to_string_lossy().into_owned();
         let canonical_root = fs::canonicalize(host_path.as_ref())
-            .map_err(|error| io_error_to_vfs("open", "/", error))?;
-        let metadata =
-            fs::metadata(&canonical_root).map_err(|error| io_error_to_vfs("stat", "/", error))?;
+            .map_err(|error| io_error_to_vfs("open", &host_path_str, error))?;
+        let metadata = fs::metadata(&canonical_root)
+            .map_err(|error| io_error_to_vfs("stat", &host_path_str, error))?;
         if !metadata.is_dir() {
             return Err(VfsError::new(
                 "ENOTDIR",
@@ -1150,6 +1154,39 @@ impl ModuleFsReader for HostDirModuleReader {
             Some((index, relative)) => self.mounts[index].filesystem.exists(&relative),
             None => false,
         }
+    }
+}
+
+/// Session-thread module reader: the mounted `HostDirModuleReader` plus a
+/// persistent resolution cache, so the V8 isolate thread can both resolve
+/// specifiers and read source DIRECTLY (same mount + `openat2(RESOLVE_BENEATH)`
+/// confinement, same `ModuleResolver` semantics as the bridge), skipping the
+/// per-module `_resolveModule`/`_loadFile` bridge round-trips.
+pub(crate) struct SessionModuleReader {
+    reader: HostDirModuleReader,
+    cache: LocalModuleResolutionCache,
+}
+
+impl SessionModuleReader {
+    pub(crate) fn new(reader: HostDirModuleReader) -> Self {
+        Self {
+            reader,
+            cache: LocalModuleResolutionCache::default(),
+        }
+    }
+}
+
+impl GuestModuleReader for SessionModuleReader {
+    fn read_module_source(&mut self, resolved_guest_path: &str) -> Option<String> {
+        self.reader.read_to_string(resolved_guest_path)
+    }
+
+    fn resolve_module(&mut self, specifier: &str, referrer: &str) -> Option<String> {
+        // Mirror the bridge's `_resolveModule` exactly: import mode, same reader,
+        // same persisted cache.
+        let reader: &mut dyn ModuleFsReader = &mut self.reader;
+        let mut resolver = ModuleResolver::new(reader, &mut self.cache);
+        resolver.resolve_module(specifier, referrer, ModuleResolveMode::Import)
     }
 }
 

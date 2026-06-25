@@ -318,6 +318,12 @@ pub struct GuestRuntimeConfig {
     pub os_shell: Option<String>,
     /// `os.userInfo().username`.
     pub os_user: Option<String>,
+    /// Optional agent-SDK bundle (esbuild IIFE) to evaluate into the per-sidecar
+    /// V8 snapshot alongside the bridge, so the SDK is loaded once per sidecar and
+    /// reused across sessions instead of re-imported on every execution. `None`
+    /// keeps the bridge-only snapshot (unchanged behavior). The runtime caches the
+    /// snapshot process-wide keyed by sha256(bridge_code + this bundle).
+    pub snapshot_userland_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1669,7 +1675,7 @@ impl JavascriptExecutionEngine {
         &mut self,
         request: StartJavascriptExecutionRequest,
     ) -> Result<JavascriptExecution, JavascriptExecutionError> {
-        self.start_execution_with_module_reader(request, None)
+        self.start_execution_with_module_reader(request, None, None)
     }
 
     /// Like [`start_execution`](Self::start_execution) but with an optional
@@ -1682,6 +1688,7 @@ impl JavascriptExecutionEngine {
         &mut self,
         request: StartJavascriptExecutionRequest,
         module_reader: Option<Box<dyn ModuleFsReader + Send>>,
+        guest_reader: Option<Box<dyn secure_exec_v8_runtime::execution::GuestModuleReader>>,
     ) -> Result<JavascriptExecution, JavascriptExecutionError> {
         let context = self
             .contexts
@@ -1831,6 +1838,16 @@ impl JavascriptExecutionEngine {
             },
         );
 
+        // Install the direct module reader on the session thread BEFORE the Execute
+        // frame so the SetModuleReader command (routed through the same dispatch
+        // queue) arrives first; module loads then read source directly on the V8
+        // thread instead of round-tripping the bridge.
+        if let Some(guest_reader) = guest_reader {
+            v8_session
+                .set_module_reader(guest_reader)
+                .map_err(JavascriptExecutionError::Spawn)?;
+        }
+
         // Execute bridge code + user code in the V8 isolate
         v8_host
             .send_frame(&BinaryFrame::Execute {
@@ -1839,6 +1856,11 @@ impl JavascriptExecutionEngine {
                 file_path: guest_entrypoint.clone(),
                 bridge_code: V8RuntimeHost::bridge_code().to_owned(),
                 post_restore_script: String::new(),
+                userland_code: request
+                    .guest_runtime
+                    .snapshot_userland_code
+                    .clone()
+                    .unwrap_or_default(),
                 user_code,
             })
             .map_err(JavascriptExecutionError::Spawn)?;

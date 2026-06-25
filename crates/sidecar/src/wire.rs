@@ -645,7 +645,12 @@ impl crate::generated_protocol::v1::OwnershipScope {
 
 pub const PROTOCOL_NAME: &str = "secure-exec-sidecar";
 pub const PROTOCOL_VERSION: u16 = 7;
-pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
+// 16 MiB: large enough to carry a trusted-client CreateVm config that inlines an
+// agent-SDK snapshot bundle (jsRuntime.snapshotUserlandCode, ~8 MB). The wire is
+// single-client over stdio (trusted), so this is not an untrusted-input DoS surface.
+// TODO(perf): ship the bundle as a VFS-loaded blob (path reference) so the config
+// stays small and the sidecar reads the blob once, per the goal's pre-warm design.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolCodecError {

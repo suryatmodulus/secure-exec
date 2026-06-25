@@ -14,11 +14,51 @@ pub enum RuntimeCommand {
     },
     WarmSnapshot {
         bridge_code: String,
+        userland_code: String,
     },
     SendToSession {
         session_id: String,
         message: SessionMessage,
     },
+    /// Install a direct module-source reader on a session thread. Carries the live
+    /// reader (not serialized) so module loads skip the bridge round-trip. Routed
+    /// through the dispatch thread (which owns the session manager) like
+    /// `SendToSession`, then forwarded as a `SessionCommand::SetModuleReader`.
+    SetSessionModuleReader {
+        session_id: String,
+        reader: ModuleReaderHandle,
+    },
+}
+
+/// Wrapper that lets a live `GuestModuleReader` ride `RuntimeCommand` despite its
+/// `derive(Debug, Clone, PartialEq)`: the trait object lives behind an
+/// `Arc<Mutex<Option<..>>>`, and the dispatch thread `take()`s it out exactly once.
+#[derive(Clone)]
+pub struct ModuleReaderHandle(
+    std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::execution::GuestModuleReader>>>>,
+);
+
+impl ModuleReaderHandle {
+    pub fn new(reader: Box<dyn crate::execution::GuestModuleReader>) -> Self {
+        ModuleReaderHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(reader))))
+    }
+
+    /// Take the reader out (dispatch-thread side); `None` if already taken.
+    pub fn take(&self) -> Option<Box<dyn crate::execution::GuestModuleReader>> {
+        self.0.lock().ok().and_then(|mut guard| guard.take())
+    }
+}
+
+impl std::fmt::Debug for ModuleReaderHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ModuleReaderHandle(..)")
+    }
+}
+
+impl PartialEq for ModuleReaderHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +71,7 @@ pub enum SessionMessage {
         file_path: String,
         bridge_code: String,
         post_restore_script: String,
+        userland_code: String,
         user_code: String,
     },
     BridgeResponse(BridgeResponse),
@@ -120,6 +161,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                 file_path,
                 bridge_code,
                 post_restore_script,
+                userland_code,
                 user_code,
             } => {
                 if mode > 1 {
@@ -135,6 +177,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                         file_path,
                         bridge_code,
                         post_restore_script,
+                        userland_code,
                         user_code,
                     },
                 })
@@ -170,9 +213,13 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                 session_id,
                 message: SessionMessage::TerminateExecution,
             }),
-            BinaryFrame::WarmSnapshot { bridge_code } => {
-                Ok(RuntimeCommand::WarmSnapshot { bridge_code })
-            }
+            BinaryFrame::WarmSnapshot {
+                bridge_code,
+                userland_code,
+            } => Ok(RuntimeCommand::WarmSnapshot {
+                bridge_code,
+                userland_code,
+            }),
             BinaryFrame::Authenticate { .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Authenticate is not supported by the embedded runtime",
@@ -262,6 +309,7 @@ mod tests {
             file_path: "/app/main.mjs".into(),
             bridge_code: String::new(),
             post_restore_script: String::new(),
+            userland_code: String::new(),
             user_code: String::new(),
         })
         .expect_err("unknown execute mode should be rejected");
