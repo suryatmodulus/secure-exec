@@ -31,7 +31,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::mpsc::{channel, unbounded_channel, Receiver};
+use tokio::sync::{
+    mpsc::{channel, unbounded_channel, Receiver},
+    Notify,
+};
 use tokio::time;
 
 // Guest sync fs/module RPCs are serviced by `pump_process_events` on this timer,
@@ -162,6 +165,10 @@ async fn run_async(extensions: Vec<Box<dyn Extension>>) -> Result<(), Box<dyn Er
     let event_transport = Arc::new(FrameEventTransport::new(write_tx.clone()));
     sidecar.set_event_transport(event_transport);
     let mut event_pump = time::interval(EVENT_PUMP_INTERVAL);
+    let process_event_notify = Arc::new(Notify::new());
+    sidecar
+        .javascript_engine
+        .set_event_notify(Some(process_event_notify.clone()));
     let writer_codec = codec.clone();
     let reader_codec = codec.clone();
     let writer_error_tx = write_error_tx.clone();
@@ -307,6 +314,14 @@ async fn run_async(extensions: Vec<Box<dyn Extension>>) -> Result<(), Box<dyn Er
 
                     if !emitted_frame {
                         break;
+                    }
+                }
+                flush_sidecar_requests(&mut sidecar, &write_tx)?;
+            }
+            _ = process_event_notify.notified() => {
+                for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
+                    if sidecar.pump_process_events(&session.compat_ownership_scope()).await? {
+                        let _ = event_ready_tx.try_send(());
                     }
                 }
                 flush_sidecar_requests(&mut sidecar, &write_tx)?;
@@ -514,6 +529,7 @@ fn extension_interrupt_response(
                 | RequestPayload::ResizePtyRequest(_)
                 | RequestPayload::CloseStdinRequest(_)
                 | RequestPayload::GetProcessSnapshotRequest
+                | RequestPayload::GetResourceSnapshotRequest
                 | RequestPayload::FindListenerRequest(_)
                 | RequestPayload::FindBoundUdpRequest(_)
                 | RequestPayload::VmFetchRequest(_)
@@ -591,6 +607,7 @@ fn interrupted_extension_dispatch(
         | RequestPayload::CloseStdinRequest(_)
         | RequestPayload::KillProcessRequest(_)
         | RequestPayload::GetProcessSnapshotRequest
+        | RequestPayload::GetResourceSnapshotRequest
         | RequestPayload::FindListenerRequest(_)
         | RequestPayload::FindBoundUdpRequest(_)
         | RequestPayload::VmFetchRequest(_)

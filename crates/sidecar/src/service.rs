@@ -6,9 +6,11 @@ pub(crate) use crate::execution::{
     javascript_sync_rpc_arg_u32_optional, javascript_sync_rpc_arg_u64,
     javascript_sync_rpc_arg_u64_optional, javascript_sync_rpc_bytes_arg,
     javascript_sync_rpc_bytes_value, javascript_sync_rpc_encoding, javascript_sync_rpc_error_code,
-    javascript_sync_rpc_option_bool, javascript_sync_rpc_option_u32, parse_signal,
-    sanitize_javascript_child_process_internal_bootstrap_env, service_javascript_sync_rpc,
-    vm_network_resource_counts, JavascriptSyncRpcServiceRequest, LoopbackHttpDispatchRequest,
+    javascript_sync_rpc_option_bool, javascript_sync_rpc_option_u32,
+    mark_execute_exit_event_queued, parse_signal, record_execute_exit_event_queue_wait,
+    record_execute_phase, sanitize_javascript_child_process_internal_bootstrap_env,
+    service_javascript_sync_rpc, vm_network_resource_counts, JavascriptSyncRpcServiceRequest,
+    LoopbackHttpDispatchRequest,
 };
 use crate::extension::{
     Extension, ExtensionBufferedProcessOutput, ExtensionContext, ExtensionFuture, ExtensionHost,
@@ -43,8 +45,9 @@ use secure_exec_bridge::{
     NetworkAccess, NetworkPermissionRequest, StructuredEventRecord,
 };
 use secure_exec_execution::{
-    JavascriptExecutionEngine, JavascriptExecutionError, JavascriptSyncRpcRequest,
-    PythonExecutionEngine, PythonExecutionError, WasmExecutionEngine, WasmExecutionError,
+    record_sync_bridge_request_observed, JavascriptExecutionEngine, JavascriptExecutionError,
+    JavascriptSyncRpcRequest, PythonExecutionEngine, PythonExecutionError, WasmExecutionEngine,
+    WasmExecutionError,
 };
 use secure_exec_kernel::kernel::KernelError;
 use secure_exec_kernel::mount_plugin::{FileSystemPluginRegistry, PluginError};
@@ -1246,6 +1249,9 @@ where
         if self.pending_process_events.len() >= MAX_PROCESS_EVENT_QUEUE {
             return Err(process_event_queue_overflow_error());
         }
+        if matches!(&envelope.event, ActiveExecutionEvent::Exited(_)) {
+            mark_execute_exit_event_queued(&envelope.vm_id, &envelope.process_id);
+        }
         self.pending_process_events.push_back(envelope);
         self.pending_process_events_gauge
             .observe_depth(self.pending_process_events.len());
@@ -1258,6 +1264,9 @@ where
     ) -> Result<(), SidecarError> {
         if self.pending_process_events.len() >= MAX_PROCESS_EVENT_QUEUE {
             return Err(process_event_queue_overflow_error());
+        }
+        if matches!(&envelope.event, ActiveExecutionEvent::Exited(_)) {
+            mark_execute_exit_event_queued(&envelope.vm_id, &envelope.process_id);
         }
         self.pending_process_events.push_front(envelope);
         self.pending_process_events_gauge
@@ -1418,6 +1427,9 @@ where
             RequestPayload::KillProcess(payload) => self.kill_process(&request, payload).await,
             RequestPayload::GetProcessSnapshot(payload) => {
                 self.get_process_snapshot(&request, payload).await
+            }
+            RequestPayload::GetResourceSnapshot(payload) => {
+                self.get_resource_snapshot(&request, payload).await
             }
             RequestPayload::FindListener(payload) => self.find_listener(&request, payload).await,
             RequestPayload::FindBoundUdp(payload) => self.find_bound_udp(&request, payload).await,
@@ -1589,6 +1601,7 @@ where
         &mut self,
         envelope: ProcessEventEnvelope,
     ) -> Result<Option<EventFrame>, SidecarError> {
+        let handle_start = Instant::now();
         let ProcessEventEnvelope {
             connection_id,
             session_id,
@@ -1597,9 +1610,17 @@ where
             event,
         } = envelope;
 
-        if matches!(event, ActiveExecutionEvent::Exited(_)) {
+        let is_exit_event = matches!(event, ActiveExecutionEvent::Exited(_));
+
+        if is_exit_event {
+            record_execute_exit_event_queue_wait(
+                "process_exit_event_queue_wait",
+                &vm_id,
+                &process_id,
+            );
             let mut trailing = Vec::new();
             let mut deferred = VecDeque::new();
+            let phase_start = Instant::now();
             while let Some(pending) = self.pending_process_events.pop_front() {
                 if pending.vm_id == vm_id
                     && pending.process_id == process_id
@@ -1611,13 +1632,19 @@ where
                 }
             }
             self.pending_process_events = deferred;
+            record_execute_phase("process_exit_trailing_pending_scan", phase_start.elapsed());
             let drain_limit = self
                 .pending_process_event_capacity()
                 .saturating_sub(trailing.len().saturating_add(1));
+            let phase_start = Instant::now();
             trailing.extend(
                 self.drain_process_events_blocking_with_limit(&vm_id, &process_id, drain_limit)?
                     .into_iter()
                     .filter(|event| !matches!(event, ActiveExecutionEvent::Exited(_))),
+            );
+            record_execute_phase(
+                "process_exit_trailing_blocking_drain",
+                phase_start.elapsed(),
             );
 
             if !trailing.is_empty() {
@@ -1629,6 +1656,8 @@ where
                 } else {
                     None
                 };
+                let phase_start = Instant::now();
+                mark_execute_exit_event_queued(&vm_id, &process_id);
                 self.queue_front_pending_process_event(ProcessEventEnvelope {
                     connection_id: connection_id.clone(),
                     session_id: session_id.clone(),
@@ -1645,14 +1674,31 @@ where
                         event,
                     })?;
                 }
+                record_execute_phase("process_exit_trailing_requeue", phase_start.elapsed());
                 if let Some(event) = emit_now {
-                    return self.handle_execution_event(&vm_id, &process_id, event);
+                    let result = self.handle_execution_event(&vm_id, &process_id, event);
+                    record_execute_phase(
+                        "process_exit_event_handle_envelope_total",
+                        handle_start.elapsed(),
+                    );
+                    return result;
                 }
+                record_execute_phase(
+                    "process_exit_event_handle_envelope_total",
+                    handle_start.elapsed(),
+                );
                 return Ok(None);
             }
         }
 
-        self.handle_execution_event(&vm_id, &process_id, event)
+        let result = self.handle_execution_event(&vm_id, &process_id, event);
+        if is_exit_event {
+            record_execute_phase(
+                "process_exit_event_handle_envelope_total",
+                handle_start.elapsed(),
+            );
+        }
+        result
     }
 
     // try_poll_event moved to crate::execution
@@ -1939,6 +1985,7 @@ where
         process_id: &str,
         request: JavascriptSyncRpcRequest,
     ) -> Result<(), SidecarError> {
+        record_sync_bridge_request_observed(request.id, &request.method);
         let Some(vm) = self.vms.get(vm_id) else {
             log_stale_process_event(&self.bridge, vm_id, process_id, "javascript sync RPC");
             return Ok(());
@@ -1948,147 +1995,104 @@ where
             return Ok(());
         }
 
-        let response: Result<Value, SidecarError> = match request.method.as_str() {
-            "child_process.spawn" => {
-                let Some(vm) = self.vms.get(vm_id) else {
-                    log_stale_process_event(
-                        &self.bridge,
-                        vm_id,
-                        process_id,
-                        "javascript sync RPC child_process.spawn",
-                    );
-                    return Ok(());
-                };
-                let (payload, _) = parse_javascript_child_process_spawn_request(vm, &request.args)?;
-                self.spawn_javascript_child_process(vm_id, process_id, payload)
-            }
-            "child_process.spawn_sync" => {
-                let Some(vm) = self.vms.get(vm_id) else {
-                    log_stale_process_event(
-                        &self.bridge,
-                        vm_id,
-                        process_id,
-                        "javascript sync RPC child_process.spawn_sync",
-                    );
-                    return Ok(());
-                };
-                let (payload, max_buffer) =
-                    parse_javascript_child_process_spawn_request(vm, &request.args)?;
-                self.spawn_javascript_child_process_sync(vm_id, process_id, payload, max_buffer)
-            }
-            "child_process.poll" => {
-                let child_process_id =
-                    javascript_sync_rpc_arg_str(&request.args, 0, "child_process.poll child id")?;
-                let wait_ms = javascript_sync_rpc_arg_u64_optional(
-                    &request.args,
-                    1,
-                    "child_process.poll wait ms",
-                )?
-                .unwrap_or_default();
-                self.poll_javascript_child_process(vm_id, process_id, child_process_id, wait_ms)
-            }
-            "child_process.write_stdin" => {
-                let child_process_id = javascript_sync_rpc_arg_str(
-                    &request.args,
-                    0,
-                    "child_process.write_stdin child id",
-                )?;
-                let chunk = javascript_sync_rpc_bytes_arg(
-                    &request.args,
-                    1,
-                    "child_process.write_stdin chunk",
-                )?;
-                self.write_javascript_child_process_stdin(
-                    vm_id,
-                    process_id,
-                    child_process_id,
-                    &chunk,
-                )?;
-                Ok(Value::Null)
-            }
-            "child_process.close_stdin" => {
-                let child_process_id = javascript_sync_rpc_arg_str(
-                    &request.args,
-                    0,
-                    "child_process.close_stdin child id",
-                )?;
-                self.close_javascript_child_process_stdin(vm_id, process_id, child_process_id)?;
-                Ok(Value::Null)
-            }
-            "child_process.kill" => {
-                let child_process_id =
-                    javascript_sync_rpc_arg_str(&request.args, 0, "child_process.kill child id")?;
-                let signal =
-                    javascript_sync_rpc_arg_str(&request.args, 1, "child_process.kill signal")?;
-                self.kill_javascript_child_process(vm_id, process_id, child_process_id, signal)?;
-                Ok(Value::Null)
-            }
-            "process.kill" => {
-                let target_pid =
-                    javascript_sync_rpc_arg_i32(&request.args, 0, "process.kill target pid")?;
-                let signal = javascript_sync_rpc_arg_str(&request.args, 1, "process.kill signal")?;
-                let parsed_signal = parse_signal(signal)?;
-                if parsed_signal == 0 {
+        let response: Result<crate::execution::JavascriptSyncRpcServiceResponse, SidecarError> =
+            match request.method.as_str() {
+                "child_process.spawn" => {
                     let Some(vm) = self.vms.get(vm_id) else {
                         log_stale_process_event(
                             &self.bridge,
                             vm_id,
                             process_id,
-                            "javascript sync RPC process.kill",
+                            "javascript sync RPC child_process.spawn",
                         );
                         return Ok(());
                     };
-                    if !vm.active_processes.contains_key(process_id) {
+                    let (payload, _) =
+                        parse_javascript_child_process_spawn_request(vm, &request.args)?;
+                    self.spawn_javascript_child_process(vm_id, process_id, payload)
+                        .map(Into::into)
+                }
+                "child_process.spawn_sync" => {
+                    let Some(vm) = self.vms.get(vm_id) else {
                         log_stale_process_event(
                             &self.bridge,
                             vm_id,
                             process_id,
-                            "javascript sync RPC process.kill",
+                            "javascript sync RPC child_process.spawn_sync",
                         );
                         return Ok(());
-                    }
-                    vm.kernel
-                        .signal_process(EXECUTION_DRIVER_NAME, target_pid, parsed_signal)
-                        .map(|()| Value::Null)
-                        .map_err(kernel_error)
-                } else if target_pid < 0 {
-                    let caller_kernel_pid = {
-                        let Some(vm) = self.vms.get(vm_id) else {
-                            log_stale_process_event(
-                                &self.bridge,
-                                vm_id,
-                                process_id,
-                                "javascript sync RPC process.kill",
-                            );
-                            return Ok(());
-                        };
-                        let Some(caller) = vm.active_processes.get(process_id) else {
-                            log_stale_process_event(
-                                &self.bridge,
-                                vm_id,
-                                process_id,
-                                "javascript sync RPC process.kill",
-                            );
-                            return Ok(());
-                        };
-                        caller.kernel_pid
                     };
-                    let pgid = target_pid.unsigned_abs();
-                    match self.signal_vm_process_group(vm_id, caller_kernel_pid, pgid, signal) {
-                        Ok(true) => {
-                            Ok(self.apply_self_process_kill(vm_id, process_id, parsed_signal))
-                        }
-                        Ok(false) => Ok(Value::Null),
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    enum ProcessKillTarget {
-                        SelfProcess,
-                        Child(String),
-                        TopLevel(String),
-                        KernelPid(u32),
-                    }
-                    let target = {
+                    let (payload, max_buffer) =
+                        parse_javascript_child_process_spawn_request(vm, &request.args)?;
+                    self.spawn_javascript_child_process_sync(vm_id, process_id, payload, max_buffer)
+                        .map(Into::into)
+                }
+                "child_process.poll" => {
+                    let child_process_id = javascript_sync_rpc_arg_str(
+                        &request.args,
+                        0,
+                        "child_process.poll child id",
+                    )?;
+                    let wait_ms = javascript_sync_rpc_arg_u64_optional(
+                        &request.args,
+                        1,
+                        "child_process.poll wait ms",
+                    )?
+                    .unwrap_or_default();
+                    self.poll_javascript_child_process(vm_id, process_id, child_process_id, wait_ms)
+                        .map(Into::into)
+                }
+                "child_process.write_stdin" => {
+                    let child_process_id = javascript_sync_rpc_arg_str(
+                        &request.args,
+                        0,
+                        "child_process.write_stdin child id",
+                    )?;
+                    let chunk = javascript_sync_rpc_bytes_arg(
+                        &request.args,
+                        1,
+                        "child_process.write_stdin chunk",
+                    )?;
+                    self.write_javascript_child_process_stdin(
+                        vm_id,
+                        process_id,
+                        child_process_id,
+                        &chunk,
+                    )?;
+                    Ok(Value::Null.into())
+                }
+                "child_process.close_stdin" => {
+                    let child_process_id = javascript_sync_rpc_arg_str(
+                        &request.args,
+                        0,
+                        "child_process.close_stdin child id",
+                    )?;
+                    self.close_javascript_child_process_stdin(vm_id, process_id, child_process_id)?;
+                    Ok(Value::Null.into())
+                }
+                "child_process.kill" => {
+                    let child_process_id = javascript_sync_rpc_arg_str(
+                        &request.args,
+                        0,
+                        "child_process.kill child id",
+                    )?;
+                    let signal =
+                        javascript_sync_rpc_arg_str(&request.args, 1, "child_process.kill signal")?;
+                    self.kill_javascript_child_process(
+                        vm_id,
+                        process_id,
+                        child_process_id,
+                        signal,
+                    )?;
+                    Ok(Value::Null.into())
+                }
+                "process.kill" => {
+                    let target_pid =
+                        javascript_sync_rpc_arg_i32(&request.args, 0, "process.kill target pid")?;
+                    let signal =
+                        javascript_sync_rpc_arg_str(&request.args, 1, "process.kill signal")?;
+                    let parsed_signal = parse_signal(signal)?;
+                    if parsed_signal == 0 {
                         let Some(vm) = self.vms.get(vm_id) else {
                             log_stale_process_event(
                                 &self.bridge,
@@ -2098,7 +2102,7 @@ where
                             );
                             return Ok(());
                         };
-                        let Some(caller) = vm.active_processes.get(process_id) else {
+                        if !vm.active_processes.contains_key(process_id) {
                             log_stale_process_event(
                                 &self.bridge,
                                 vm_id,
@@ -2106,232 +2110,304 @@ where
                                 "javascript sync RPC process.kill",
                             );
                             return Ok(());
+                        }
+                        vm.kernel
+                            .signal_process(EXECUTION_DRIVER_NAME, target_pid, parsed_signal)
+                            .map(|()| Value::Null.into())
+                            .map_err(kernel_error)
+                    } else if target_pid < 0 {
+                        let caller_kernel_pid = {
+                            let Some(vm) = self.vms.get(vm_id) else {
+                                log_stale_process_event(
+                                    &self.bridge,
+                                    vm_id,
+                                    process_id,
+                                    "javascript sync RPC process.kill",
+                                );
+                                return Ok(());
+                            };
+                            let Some(caller) = vm.active_processes.get(process_id) else {
+                                log_stale_process_event(
+                                    &self.bridge,
+                                    vm_id,
+                                    process_id,
+                                    "javascript sync RPC process.kill",
+                                );
+                                return Ok(());
+                            };
+                            caller.kernel_pid
                         };
-                        let caller_pid = i32::try_from(caller.kernel_pid).map_err(|_| {
-                            SidecarError::InvalidState("caller pid exceeds i32".into())
-                        })?;
-                        if caller_pid == target_pid {
-                            ProcessKillTarget::SelfProcess
-                        } else if let Some((child_process_id, _)) = caller
-                            .child_processes
-                            .iter()
-                            .find(|(_, child)| i32::try_from(child.kernel_pid) == Ok(target_pid))
-                        {
-                            ProcessKillTarget::Child(child_process_id.clone())
-                        } else if let Some((target_process_id, _)) =
-                            vm.active_processes.iter().find(|(_, process)| {
-                                i32::try_from(process.kernel_pid) == Ok(target_pid)
-                            })
-                        {
-                            ProcessKillTarget::TopLevel(target_process_id.clone())
-                        } else {
-                            let target_kernel_pid = u32::try_from(target_pid).map_err(|_| {
-                                SidecarError::InvalidState(format!(
-                                    "EINVAL: invalid process pid {target_pid}"
-                                ))
+                        let pgid = target_pid.unsigned_abs();
+                        match self.signal_vm_process_group(vm_id, caller_kernel_pid, pgid, signal) {
+                            Ok(true) => Ok(self
+                                .apply_self_process_kill(vm_id, process_id, parsed_signal)
+                                .into()),
+                            Ok(false) => Ok(Value::Null.into()),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        enum ProcessKillTarget {
+                            SelfProcess,
+                            Child(String),
+                            TopLevel(String),
+                            KernelPid(u32),
+                        }
+                        let target = {
+                            let Some(vm) = self.vms.get(vm_id) else {
+                                log_stale_process_event(
+                                    &self.bridge,
+                                    vm_id,
+                                    process_id,
+                                    "javascript sync RPC process.kill",
+                                );
+                                return Ok(());
+                            };
+                            let Some(caller) = vm.active_processes.get(process_id) else {
+                                log_stale_process_event(
+                                    &self.bridge,
+                                    vm_id,
+                                    process_id,
+                                    "javascript sync RPC process.kill",
+                                );
+                                return Ok(());
+                            };
+                            let caller_pid = i32::try_from(caller.kernel_pid).map_err(|_| {
+                                SidecarError::InvalidState("caller pid exceeds i32".into())
                             })?;
-                            ProcessKillTarget::KernelPid(target_kernel_pid)
-                        }
-                    };
-                    match target {
-                        ProcessKillTarget::SelfProcess => {
-                            Ok(self.apply_self_process_kill(vm_id, process_id, parsed_signal))
-                        }
-                        ProcessKillTarget::Child(child_process_id) => {
-                            self.kill_javascript_child_process(
-                                vm_id,
-                                process_id,
-                                &child_process_id,
-                                signal,
-                            )?;
-                            Ok(Value::Null)
-                        }
-                        ProcessKillTarget::TopLevel(target_process_id) => {
-                            self.kill_process_internal(vm_id, &target_process_id, signal)?;
-                            Ok(Value::Null)
-                        }
-                        ProcessKillTarget::KernelPid(target_kernel_pid) => {
-                            // Grandchildren and untracked kernel processes are
-                            // resolved VM-wide instead of failing with an
-                            // unknown-pid error.
-                            self.signal_vm_kernel_pid(vm_id, target_kernel_pid, signal)
-                                .map(|()| Value::Null)
+                            if caller_pid == target_pid {
+                                ProcessKillTarget::SelfProcess
+                            } else if let Some((child_process_id, _)) =
+                                caller.child_processes.iter().find(|(_, child)| {
+                                    i32::try_from(child.kernel_pid) == Ok(target_pid)
+                                })
+                            {
+                                ProcessKillTarget::Child(child_process_id.clone())
+                            } else if let Some((target_process_id, _)) =
+                                vm.active_processes.iter().find(|(_, process)| {
+                                    i32::try_from(process.kernel_pid) == Ok(target_pid)
+                                })
+                            {
+                                ProcessKillTarget::TopLevel(target_process_id.clone())
+                            } else {
+                                let target_kernel_pid =
+                                    u32::try_from(target_pid).map_err(|_| {
+                                        SidecarError::InvalidState(format!(
+                                            "EINVAL: invalid process pid {target_pid}"
+                                        ))
+                                    })?;
+                                ProcessKillTarget::KernelPid(target_kernel_pid)
+                            }
+                        };
+                        match target {
+                            ProcessKillTarget::SelfProcess => Ok(self
+                                .apply_self_process_kill(vm_id, process_id, parsed_signal)
+                                .into()),
+                            ProcessKillTarget::Child(child_process_id) => {
+                                self.kill_javascript_child_process(
+                                    vm_id,
+                                    process_id,
+                                    &child_process_id,
+                                    signal,
+                                )?;
+                                Ok(Value::Null.into())
+                            }
+                            ProcessKillTarget::TopLevel(target_process_id) => {
+                                self.kill_process_internal(vm_id, &target_process_id, signal)?;
+                                Ok(Value::Null.into())
+                            }
+                            ProcessKillTarget::KernelPid(target_kernel_pid) => {
+                                // Grandchildren and untracked kernel processes are
+                                // resolved VM-wide instead of failing with an
+                                // unknown-pid error.
+                                self.signal_vm_kernel_pid(vm_id, target_kernel_pid, signal)
+                                    .map(|()| Value::Null.into())
+                            }
                         }
                     }
                 }
-            }
-            "process.signal_state" => {
-                let signal =
-                    javascript_sync_rpc_arg_u32(&request.args, 0, "process.signal_state signal")?;
-                let action =
-                    javascript_sync_rpc_arg_str(&request.args, 1, "process.signal_state action")?;
-                let mask_json =
-                    javascript_sync_rpc_arg_str(&request.args, 2, "process.signal_state mask")?;
-                let flags =
-                    javascript_sync_rpc_arg_u32(&request.args, 3, "process.signal_state flags")?;
-                let mask: Vec<u32> = serde_json::from_str(mask_json).map_err(|error| {
-                    SidecarError::InvalidState(format!(
-                        "process.signal_state mask must be valid JSON: {error}"
-                    ))
-                })?;
-                let action = match action.trim().to_ascii_lowercase().as_str() {
-                    "default" => SignalDispositionAction::Default,
-                    "ignore" => SignalDispositionAction::Ignore,
-                    "user" => SignalDispositionAction::User,
-                    other => {
-                        return Err(SidecarError::InvalidState(format!(
-                            "unsupported process.signal_state action {other}"
+                "process.signal_state" => {
+                    let signal = javascript_sync_rpc_arg_u32(
+                        &request.args,
+                        0,
+                        "process.signal_state signal",
+                    )?;
+                    let action = javascript_sync_rpc_arg_str(
+                        &request.args,
+                        1,
+                        "process.signal_state action",
+                    )?;
+                    let mask_json =
+                        javascript_sync_rpc_arg_str(&request.args, 2, "process.signal_state mask")?;
+                    let flags = javascript_sync_rpc_arg_u32(
+                        &request.args,
+                        3,
+                        "process.signal_state flags",
+                    )?;
+                    let mask: Vec<u32> = serde_json::from_str(mask_json).map_err(|error| {
+                        SidecarError::InvalidState(format!(
+                            "process.signal_state mask must be valid JSON: {error}"
+                        ))
+                    })?;
+                    let action = match action.trim().to_ascii_lowercase().as_str() {
+                        "default" => SignalDispositionAction::Default,
+                        "ignore" => SignalDispositionAction::Ignore,
+                        "user" => SignalDispositionAction::User,
+                        other => {
+                            return Err(SidecarError::InvalidState(format!(
+                                "unsupported process.signal_state action {other}"
+                            )));
+                        }
+                    };
+                    let Some(vm) = self.vms.get_mut(vm_id) else {
+                        log_stale_process_event(
+                            &self.bridge,
+                            vm_id,
+                            process_id,
+                            "javascript sync RPC process.signal_state",
+                        );
+                        return Ok(());
+                    };
+                    if action == SignalDispositionAction::Default && mask.is_empty() && flags == 0 {
+                        let remove_process_entry = vm
+                            .signal_states
+                            .get_mut(process_id)
+                            .map(|handlers| {
+                                handlers.remove(&signal);
+                                handlers.is_empty()
+                            })
+                            .unwrap_or(false);
+                        if remove_process_entry {
+                            vm.signal_states.remove(process_id);
+                        }
+                    } else {
+                        vm.signal_states
+                            .entry(process_id.to_owned())
+                            .or_default()
+                            .insert(
+                                signal,
+                                SignalHandlerRegistration {
+                                    action,
+                                    mask,
+                                    flags,
+                                },
+                            );
+                    }
+                    Ok(Value::Null.into())
+                }
+                "net.http_request" => {
+                    let payload = request
+                        .args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| {
+                            SidecarError::InvalidState(String::from(
+                                "net.http_request requires a request payload",
+                            ))
+                        })
+                        .and_then(|value| {
+                            serde_json::from_value::<JavascriptHttpLoopbackRequest>(value).map_err(
+                                |error| {
+                                    SidecarError::InvalidState(format!(
+                                        "invalid net.http_request payload: {error}"
+                                    ))
+                                },
+                            )
+                        })?;
+                    if !is_javascript_loopback_host(&payload.host) {
+                        return Err(SidecarError::Execution(format!(
+                            "EACCES: HTTP loopback request requires a loopback host, got {}",
+                            payload.host
                         )));
                     }
-                };
-                let Some(vm) = self.vms.get_mut(vm_id) else {
-                    log_stale_process_event(
-                        &self.bridge,
+                    self.bridge.require_network_access(
                         vm_id,
-                        process_id,
-                        "javascript sync RPC process.signal_state",
-                    );
-                    return Ok(());
-                };
-                if action == SignalDispositionAction::Default && mask.is_empty() && flags == 0 {
-                    let remove_process_entry = vm
-                        .signal_states
-                        .get_mut(process_id)
-                        .map(|handlers| {
-                            handlers.remove(&signal);
-                            handlers.is_empty()
-                        })
-                        .unwrap_or(false);
-                    if remove_process_entry {
-                        vm.signal_states.remove(process_id);
-                    }
-                } else {
-                    vm.signal_states
-                        .entry(process_id.to_owned())
-                        .or_default()
-                        .insert(
-                            signal,
-                            SignalHandlerRegistration {
-                                action,
-                                mask,
-                                flags,
-                            },
+                        NetworkOperation::Http,
+                        format_tcp_resource(&payload.host, payload.port),
+                    )?;
+                    let Some(vm) = self.vms.get_mut(vm_id) else {
+                        log_stale_process_event(
+                            &self.bridge,
+                            vm_id,
+                            process_id,
+                            "javascript sync RPC net.http_request",
                         );
-                }
-                Ok(Value::Null)
-            }
-            "net.http_request" => {
-                let payload = request
-                    .args
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| {
-                        SidecarError::InvalidState(String::from(
-                            "net.http_request requires a request payload",
-                        ))
+                        return Ok(());
+                    };
+                    let resource_limits = vm.kernel.resource_limits().clone();
+                    let socket_paths = build_javascript_socket_path_context(vm)?;
+                    let target_is_current =
+                        [JavascriptSocketFamily::Ipv4, JavascriptSocketFamily::Ipv6]
+                            .iter()
+                            .any(|family| {
+                                socket_paths
+                                    .http_loopback_target(*family, payload.port)
+                                    .is_some_and(|target| {
+                                        target.process_id == payload.process_id
+                                            && target.server_id == payload.server_id
+                                    })
+                            });
+                    if !target_is_current {
+                        return Err(SidecarError::InvalidState(format!(
+                            "unknown HTTP loopback target {}:{} for server {} in process {}",
+                            payload.host, payload.port, payload.server_id, payload.process_id
+                        )));
+                    }
+                    let Some(target_process) = vm.active_processes.get_mut(&payload.process_id)
+                    else {
+                        return Err(SidecarError::InvalidState(format!(
+                            "unknown HTTP loopback process {}",
+                            payload.process_id
+                        )));
+                    };
+                    dispatch_loopback_http_request(LoopbackHttpDispatchRequest {
+                        bridge: &self.bridge,
+                        vm_id,
+                        dns: &vm.dns,
+                        socket_paths: &socket_paths,
+                        kernel: &mut vm.kernel,
+                        process: target_process,
+                        resource_limits: &resource_limits,
+                        server_id: payload.server_id,
+                        request_json: &payload.request,
                     })
-                    .and_then(|value| {
-                        serde_json::from_value::<JavascriptHttpLoopbackRequest>(value).map_err(
-                            |error| {
-                                SidecarError::InvalidState(format!(
-                                    "invalid net.http_request payload: {error}"
-                                ))
-                            },
-                        )
-                    })?;
-                if !is_javascript_loopback_host(&payload.host) {
-                    return Err(SidecarError::Execution(format!(
-                        "EACCES: HTTP loopback request requires a loopback host, got {}",
-                        payload.host
-                    )));
+                    .map(Value::String)
+                    .map(Into::into)
                 }
-                self.bridge.require_network_access(
-                    vm_id,
-                    NetworkOperation::Http,
-                    format_tcp_resource(&payload.host, payload.port),
-                )?;
-                let Some(vm) = self.vms.get_mut(vm_id) else {
-                    log_stale_process_event(
-                        &self.bridge,
+                _ => {
+                    let Some(vm) = self.vms.get_mut(vm_id) else {
+                        log_stale_process_event(
+                            &self.bridge,
+                            vm_id,
+                            process_id,
+                            "javascript sync RPC bridge dispatch",
+                        );
+                        return Ok(());
+                    };
+                    let resource_limits = vm.kernel.resource_limits().clone();
+                    let network_counts = vm_network_resource_counts(vm);
+                    let socket_paths = build_javascript_socket_path_context(vm)?;
+                    let Some(process) = vm.active_processes.get_mut(process_id) else {
+                        log_stale_process_event(
+                            &self.bridge,
+                            vm_id,
+                            process_id,
+                            "javascript sync RPC bridge dispatch",
+                        );
+                        return Ok(());
+                    };
+                    service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
+                        bridge: &self.bridge,
                         vm_id,
-                        process_id,
-                        "javascript sync RPC net.http_request",
-                    );
-                    return Ok(());
-                };
-                let resource_limits = vm.kernel.resource_limits().clone();
-                let socket_paths = build_javascript_socket_path_context(vm)?;
-                let target_is_current =
-                    [JavascriptSocketFamily::Ipv4, JavascriptSocketFamily::Ipv6]
-                        .iter()
-                        .any(|family| {
-                            socket_paths
-                                .http_loopback_target(*family, payload.port)
-                                .is_some_and(|target| {
-                                    target.process_id == payload.process_id
-                                        && target.server_id == payload.server_id
-                                })
-                        });
-                if !target_is_current {
-                    return Err(SidecarError::InvalidState(format!(
-                        "unknown HTTP loopback target {}:{} for server {} in process {}",
-                        payload.host, payload.port, payload.server_id, payload.process_id
-                    )));
+                        dns: &vm.dns,
+                        socket_paths: &socket_paths,
+                        kernel: &mut vm.kernel,
+                        process,
+                        sync_request: &request,
+                        resource_limits: &resource_limits,
+                        network_counts,
+                    })
                 }
-                let Some(target_process) = vm.active_processes.get_mut(&payload.process_id) else {
-                    return Err(SidecarError::InvalidState(format!(
-                        "unknown HTTP loopback process {}",
-                        payload.process_id
-                    )));
-                };
-                dispatch_loopback_http_request(LoopbackHttpDispatchRequest {
-                    bridge: &self.bridge,
-                    vm_id,
-                    dns: &vm.dns,
-                    socket_paths: &socket_paths,
-                    kernel: &mut vm.kernel,
-                    process: target_process,
-                    resource_limits: &resource_limits,
-                    server_id: payload.server_id,
-                    request_json: &payload.request,
-                })
-                .map(Value::String)
-            }
-            _ => {
-                let Some(vm) = self.vms.get_mut(vm_id) else {
-                    log_stale_process_event(
-                        &self.bridge,
-                        vm_id,
-                        process_id,
-                        "javascript sync RPC bridge dispatch",
-                    );
-                    return Ok(());
-                };
-                let resource_limits = vm.kernel.resource_limits().clone();
-                let network_counts = vm_network_resource_counts(vm);
-                let socket_paths = build_javascript_socket_path_context(vm)?;
-                let Some(process) = vm.active_processes.get_mut(process_id) else {
-                    log_stale_process_event(
-                        &self.bridge,
-                        vm_id,
-                        process_id,
-                        "javascript sync RPC bridge dispatch",
-                    );
-                    return Ok(());
-                };
-                service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
-                    bridge: &self.bridge,
-                    vm_id,
-                    dns: &vm.dns,
-                    socket_paths: &socket_paths,
-                    kernel: &mut vm.kernel,
-                    process,
-                    sync_request: &request,
-                    resource_limits: &resource_limits,
-                    network_counts,
-                })
-            }
-        };
+            };
 
         let Some(vm) = self.vms.get_mut(vm_id) else {
             log_stale_process_event(
@@ -2380,7 +2456,7 @@ where
         match response {
             Ok(result) => process
                 .execution
-                .respond_javascript_sync_rpc_success(request.id, result)
+                .respond_javascript_sync_rpc_response(request.id, result)
                 .or_else(ignore_stale_javascript_sync_rpc_response),
             Err(error) => process
                 .execution

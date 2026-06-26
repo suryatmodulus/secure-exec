@@ -49,8 +49,9 @@ use secure_exec_execution::{
 };
 use secure_exec_kernel::vfs::{VirtualStat, VirtualTimeSpec, VirtualUtimeSpec};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -58,6 +59,8 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{symlink, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 const PYTHON_PYODIDE_GUEST_ROOT: &str = "/__agentos_pyodide";
 
@@ -1081,12 +1084,117 @@ pub(crate) fn service_javascript_module_sync_rpc(
     Ok(value)
 }
 
+#[derive(Clone, Copy, Default)]
+struct FsSyncPhaseStats {
+    calls: u64,
+    total_ns: u128,
+    max_ns: u128,
+}
+
+static FS_SYNC_PHASES: OnceLock<Mutex<BTreeMap<String, FsSyncPhaseStats>>> = OnceLock::new();
+
+struct FsSyncPhaseTimer<'a> {
+    method: &'a str,
+    start: Option<Instant>,
+}
+
+impl<'a> FsSyncPhaseTimer<'a> {
+    fn start(method: &'a str) -> Self {
+        let start = fs_sync_phases_enabled().then(Instant::now);
+        Self { method, start }
+    }
+}
+
+impl Drop for FsSyncPhaseTimer<'_> {
+    fn drop(&mut self) {
+        let Some(start) = self.start else { return };
+        record_fs_sync_phase(self.method, start.elapsed().as_nanos());
+    }
+}
+
+fn fs_sync_phases_enabled() -> bool {
+    matches!(env::var("AGENTOS_FS_SYNC_PHASES").as_deref(), Ok("1"))
+}
+
+fn record_fs_sync_phase(method: &str, elapsed_ns: u128) {
+    let phases = FS_SYNC_PHASES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut phases) = phases.lock() else {
+        return;
+    };
+    let stats = phases.entry(method.to_string()).or_default();
+    stats.calls += 1;
+    stats.total_ns += elapsed_ns;
+    stats.max_ns = stats.max_ns.max(elapsed_ns);
+
+    let Some(path) = env::var_os("AGENTOS_FS_SYNC_PHASES_FILE") else {
+        return;
+    };
+    let mut output = String::new();
+    for (method, stats) in phases.iter() {
+        let total_us = stats.total_ns / 1_000;
+        let avg_us = if stats.calls == 0 {
+            0
+        } else {
+            total_us / u128::from(stats.calls)
+        };
+        let max_us = stats.max_ns / 1_000;
+        output.push_str(&format!(
+            "method={method} calls={} total_us={total_us} avg_us={avg_us} max_us={max_us}\n",
+            stats.calls
+        ));
+    }
+    let _ = fs::write(path, output);
+}
+
+fn fs_sync_request_marks_host_write_dirty(
+    request: &JavascriptSyncRpcRequest,
+) -> Result<bool, SidecarError> {
+    Ok(match request.method.as_str() {
+        "fs.open" | "fs.openSync" => {
+            let flags = javascript_sync_rpc_arg_u32(&request.args, 1, "filesystem open flags")?;
+            mapped_host_open_is_writable(flags)
+        }
+        "fs.write"
+        | "fs.writeSync"
+        | "fs.writeFileSync"
+        | "fs.promises.writeFile"
+        | "fs.mkdirSync"
+        | "fs.promises.mkdir"
+        | "fs.copyFileSync"
+        | "fs.promises.copyFile"
+        | "fs.symlinkSync"
+        | "fs.promises.symlink"
+        | "fs.linkSync"
+        | "fs.promises.link"
+        | "fs.renameSync"
+        | "fs.promises.rename"
+        | "fs.rmdirSync"
+        | "fs.promises.rmdir"
+        | "fs.unlinkSync"
+        | "fs.promises.unlink"
+        | "fs.chmodSync"
+        | "fs.promises.chmod"
+        | "fs.chownSync"
+        | "fs.promises.chown"
+        | "fs.utimesSync"
+        | "fs.promises.utimes"
+        | "fs.lutimesSync"
+        | "fs.promises.lutimes"
+        | "fs.futimesSync" => true,
+        _ => false,
+    })
+}
+
 pub(crate) fn service_javascript_fs_sync_rpc(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
     kernel_pid: u32,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    let _phase_timer = FsSyncPhaseTimer::start(request.method.as_str());
+    if fs_sync_request_marks_host_write_dirty(request)? {
+        process.mark_host_write_dirty();
+    }
     match request.method.as_str() {
         "fs.open" | "fs.openSync" => {
             let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem open path")?;
@@ -1385,8 +1493,15 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 return Ok(javascript_sync_rpc_readdir_typed_value(typed));
             }
             kernel
-                .read_dir_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
-                .map(javascript_sync_rpc_readdir_value)
+                .read_dir_with_types_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
+                .map(|entries| {
+                    javascript_sync_rpc_readdir_typed_value(
+                        entries
+                            .into_iter()
+                            .map(|entry| (entry.name, entry.is_directory))
+                            .collect(),
+                    )
+                })
                 .map_err(kernel_error)
         }
         "fs.mkdirSync" | "fs.promises.mkdir" => {
@@ -1936,46 +2051,64 @@ fn decode_guest_filesystem_content(
 }
 
 fn javascript_sync_rpc_stat_value(stat: VirtualStat) -> Value {
-    json!({
-        "mode": stat.mode,
-        "size": stat.size,
-        "blocks": stat.blocks,
-        "dev": stat.dev,
-        "rdev": stat.rdev,
-        "isDirectory": stat.is_directory,
-        "isSymbolicLink": stat.is_symbolic_link,
-        "atimeMs": stat.atime_ms,
-        "atimeNsec": stat.atime_nsec,
-        "mtimeMs": stat.mtime_ms,
-        "mtimeNsec": stat.mtime_nsec,
-        "ctimeMs": stat.ctime_ms,
-        "ctimeNsec": stat.ctime_nsec,
-        "birthtimeMs": stat.birthtime_ms,
-        "ino": stat.ino,
-        "nlink": stat.nlink,
-        "uid": stat.uid,
-        "gid": stat.gid,
-    })
+    let mut value = Map::with_capacity(18);
+    value.insert("mode".to_string(), Value::from(stat.mode));
+    value.insert("size".to_string(), Value::from(stat.size));
+    value.insert("blocks".to_string(), Value::from(stat.blocks));
+    value.insert("dev".to_string(), Value::from(stat.dev));
+    value.insert("rdev".to_string(), Value::from(stat.rdev));
+    value.insert("isDirectory".to_string(), Value::from(stat.is_directory));
+    value.insert(
+        "isSymbolicLink".to_string(),
+        Value::from(stat.is_symbolic_link),
+    );
+    value.insert("atimeMs".to_string(), Value::from(stat.atime_ms));
+    value.insert("atimeNsec".to_string(), Value::from(stat.atime_nsec));
+    value.insert("mtimeMs".to_string(), Value::from(stat.mtime_ms));
+    value.insert("mtimeNsec".to_string(), Value::from(stat.mtime_nsec));
+    value.insert("ctimeMs".to_string(), Value::from(stat.ctime_ms));
+    value.insert("ctimeNsec".to_string(), Value::from(stat.ctime_nsec));
+    value.insert("birthtimeMs".to_string(), Value::from(stat.birthtime_ms));
+    value.insert("ino".to_string(), Value::from(stat.ino));
+    value.insert("nlink".to_string(), Value::from(stat.nlink));
+    value.insert("uid".to_string(), Value::from(stat.uid));
+    value.insert("gid".to_string(), Value::from(stat.gid));
+    Value::Object(value)
 }
 
 fn javascript_sync_rpc_host_stat_value(metadata: &fs::Metadata) -> Value {
-    json!({
-        "mode": metadata.mode(),
-        "size": metadata.size(),
-        "blocks": metadata.blocks(),
-        "dev": metadata.dev(),
-        "rdev": metadata.rdev(),
-        "isDirectory": metadata.is_dir(),
-        "isSymbolicLink": metadata.file_type().is_symlink(),
-        "atimeMs": metadata.atime() * 1000 + (metadata.atime_nsec() / 1_000_000),
-        "mtimeMs": metadata.mtime() * 1000 + (metadata.mtime_nsec() / 1_000_000),
-        "ctimeMs": metadata.ctime() * 1000 + (metadata.ctime_nsec() / 1_000_000),
-        "birthtimeMs": metadata.ctime() * 1000 + (metadata.ctime_nsec() / 1_000_000),
-        "ino": metadata.ino(),
-        "nlink": metadata.nlink(),
-        "uid": metadata.uid(),
-        "gid": metadata.gid(),
-    })
+    let mut value = Map::with_capacity(15);
+    value.insert("mode".to_string(), Value::from(metadata.mode()));
+    value.insert("size".to_string(), Value::from(metadata.size()));
+    value.insert("blocks".to_string(), Value::from(metadata.blocks()));
+    value.insert("dev".to_string(), Value::from(metadata.dev()));
+    value.insert("rdev".to_string(), Value::from(metadata.rdev()));
+    value.insert("isDirectory".to_string(), Value::from(metadata.is_dir()));
+    value.insert(
+        "isSymbolicLink".to_string(),
+        Value::from(metadata.file_type().is_symlink()),
+    );
+    value.insert(
+        "atimeMs".to_string(),
+        Value::from(metadata.atime() * 1000 + (metadata.atime_nsec() / 1_000_000)),
+    );
+    value.insert(
+        "mtimeMs".to_string(),
+        Value::from(metadata.mtime() * 1000 + (metadata.mtime_nsec() / 1_000_000)),
+    );
+    value.insert(
+        "ctimeMs".to_string(),
+        Value::from(metadata.ctime() * 1000 + (metadata.ctime_nsec() / 1_000_000)),
+    );
+    value.insert(
+        "birthtimeMs".to_string(),
+        Value::from(metadata.ctime() * 1000 + (metadata.ctime_nsec() / 1_000_000)),
+    );
+    value.insert("ino".to_string(), Value::from(metadata.ino()));
+    value.insert("nlink".to_string(), Value::from(metadata.nlink()));
+    value.insert("uid".to_string(), Value::from(metadata.uid()));
+    value.insert("gid".to_string(), Value::from(metadata.gid()));
+    Value::Object(value)
 }
 
 fn mapped_runtime_host_path(
@@ -3164,13 +3297,6 @@ fn remove_existing_mapped_host_destination(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-fn javascript_sync_rpc_readdir_value(entries: Vec<String>) -> Value {
-    json!(entries
-        .into_iter()
-        .filter(|entry| entry != "." && entry != "..")
-        .collect::<Vec<_>>())
 }
 
 /// Like `javascript_sync_rpc_readdir_value` but carries each entry's

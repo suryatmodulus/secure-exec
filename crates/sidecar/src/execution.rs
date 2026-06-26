@@ -8,18 +8,19 @@ use crate::filesystem::{
 };
 use crate::protocol::{
     BoundUdpSnapshotResponse, CloseStdinRequest, EventFrame, EventPayload, ExecuteRequest,
-    FindBoundUdpRequest, FindListenerRequest, GetProcessSnapshotRequest, GetSignalStateRequest,
-    GetZombieTimerCountRequest, GuestRuntimeKind, JavascriptChildProcessSpawnOptions,
-    JavascriptChildProcessSpawnRequest, JavascriptDgramBindRequest,
-    JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest, JavascriptDnsLookupRequest,
-    JavascriptDnsResolveRequest, JavascriptNetConnectRequest, JavascriptNetListenRequest,
-    JavascriptNetReserveTcpPortRequest, KillProcessRequest, ListenerSnapshotResponse,
-    OwnershipScope, ProcessExitedEvent, ProcessKilledResponse, ProcessOutputEvent,
-    ProcessSnapshotEntry, ProcessSnapshotResponse, ProcessSnapshotStatus, ProcessStartedResponse,
-    PtyResizedResponse, RequestFrame, ResizePtyRequest, ResponseFrame, ResponsePayload,
-    SidecarRequestPayload, SignalDispositionAction, SignalHandlerRegistration, SignalStateResponse,
-    SocketStateEntry, StdinClosedResponse, StdinWrittenResponse, StreamChannel, VmFetchRequest,
-    VmFetchResponse, WasmPermissionTier, WriteStdinRequest, ZombieTimerCountResponse,
+    FindBoundUdpRequest, FindListenerRequest, GetProcessSnapshotRequest,
+    GetResourceSnapshotRequest, GetSignalStateRequest, GetZombieTimerCountRequest,
+    GuestRuntimeKind, JavascriptChildProcessSpawnOptions, JavascriptChildProcessSpawnRequest,
+    JavascriptDgramBindRequest, JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest,
+    JavascriptDnsLookupRequest, JavascriptDnsResolveRequest, JavascriptNetConnectRequest,
+    JavascriptNetListenRequest, JavascriptNetReserveTcpPortRequest, KillProcessRequest,
+    ListenerSnapshotResponse, OwnershipScope, ProcessExitedEvent, ProcessKilledResponse,
+    ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotResponse, ProcessSnapshotStatus,
+    ProcessStartedResponse, PtyResizedResponse, QueueSnapshotEntry, RequestFrame, ResizePtyRequest,
+    ResourceSnapshotResponse, ResponseFrame, ResponsePayload, SidecarRequestPayload,
+    SignalDispositionAction, SignalHandlerRegistration, SignalStateResponse, SocketStateEntry,
+    StdinClosedResponse, StdinWrittenResponse, StreamChannel, VmFetchRequest, VmFetchResponse,
+    WasmPermissionTier, WriteStdinRequest, ZombieTimerCountResponse,
 };
 use crate::service::{
     audit_fields, dirname, emit_security_audit_event, emit_structured_event, javascript_error,
@@ -93,7 +94,7 @@ use rustls::{
     ServerConnection, SignatureScheme,
 };
 use scrypt::{scrypt, Params as ScryptParams};
-use secure_exec_bridge::LifecycleState;
+use secure_exec_bridge::{queue_tracker, LifecycleState};
 use secure_exec_execution::wasm::WasmExecutionError;
 use secure_exec_execution::{
     javascript::handle_internal_bridge_call_from_host_context, v8_host::V8SessionHandle,
@@ -116,6 +117,7 @@ use secure_exec_kernel::pty::LineDisciplineConfig;
 use secure_exec_kernel::resource_accounting::ResourceLimits;
 use secure_exec_kernel::root_fs::RootFilesystemMode;
 use secure_exec_kernel::socket_table::{
+    reset_socket_read_trace, set_socket_read_trace_enabled, socket_read_trace_snapshot,
     InetSocketAddress, SocketDomain, SocketId, SocketShutdown as KernelSocketShutdown, SocketSpec,
     SocketState, SocketType,
 };
@@ -137,7 +139,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -156,6 +158,74 @@ const PYTHON_PYODIDE_CACHE_GUEST_ROOT: &str = "/__agentos_pyodide_cache";
 const TCP_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_LOOPBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_EXIT_DRAIN_INITIAL_QUIET: Duration = Duration::from_millis(1);
+const PROCESS_EXIT_DRAIN_TRAILING_QUIET: Duration = Duration::from_millis(25);
+
+struct NetTcpTraceCounters {
+    socket_read_calls: AtomicU64,
+    socket_read_zero_wait_calls: AtomicU64,
+    socket_read_data_events: AtomicU64,
+    socket_read_bytes: AtomicU64,
+    socket_read_kernel_us: AtomicU64,
+    socket_read_end_events: AtomicU64,
+    socket_read_eagain: AtomicU64,
+    socket_read_errors: AtomicU64,
+    socket_write_calls: AtomicU64,
+    socket_write_bytes: AtomicU64,
+    socket_write_kernel_us: AtomicU64,
+    socket_write_errors: AtomicU64,
+    server_accept_calls: AtomicU64,
+    server_accept_zero_wait_calls: AtomicU64,
+    server_accept_connections: AtomicU64,
+    server_accept_eagain: AtomicU64,
+    server_accept_errors: AtomicU64,
+    kernel_poll_targets: AtomicU64,
+    kernel_poll_zero_wait_calls: AtomicU64,
+    kernel_poll_wait_us: AtomicU64,
+    kernel_poll_elapsed_us: AtomicU64,
+    kernel_poll_empty: AtomicU64,
+    kernel_poll_ready: AtomicU64,
+    kernel_poll_revents_read: AtomicU64,
+    kernel_poll_revents_hup: AtomicU64,
+    kernel_poll_revents_err: AtomicU64,
+    kernel_poll_revents_bits_or: AtomicU64,
+}
+
+impl NetTcpTraceCounters {
+    const fn new() -> Self {
+        Self {
+            socket_read_calls: AtomicU64::new(0),
+            socket_read_zero_wait_calls: AtomicU64::new(0),
+            socket_read_data_events: AtomicU64::new(0),
+            socket_read_bytes: AtomicU64::new(0),
+            socket_read_kernel_us: AtomicU64::new(0),
+            socket_read_end_events: AtomicU64::new(0),
+            socket_read_eagain: AtomicU64::new(0),
+            socket_read_errors: AtomicU64::new(0),
+            socket_write_calls: AtomicU64::new(0),
+            socket_write_bytes: AtomicU64::new(0),
+            socket_write_kernel_us: AtomicU64::new(0),
+            socket_write_errors: AtomicU64::new(0),
+            server_accept_calls: AtomicU64::new(0),
+            server_accept_zero_wait_calls: AtomicU64::new(0),
+            server_accept_connections: AtomicU64::new(0),
+            server_accept_eagain: AtomicU64::new(0),
+            server_accept_errors: AtomicU64::new(0),
+            kernel_poll_targets: AtomicU64::new(0),
+            kernel_poll_zero_wait_calls: AtomicU64::new(0),
+            kernel_poll_wait_us: AtomicU64::new(0),
+            kernel_poll_elapsed_us: AtomicU64::new(0),
+            kernel_poll_empty: AtomicU64::new(0),
+            kernel_poll_ready: AtomicU64::new(0),
+            kernel_poll_revents_read: AtomicU64::new(0),
+            kernel_poll_revents_hup: AtomicU64::new(0),
+            kernel_poll_revents_err: AtomicU64::new(0),
+            kernel_poll_revents_bits_or: AtomicU64::new(0),
+        }
+    }
+}
+
+static NET_TCP_TRACE_COUNTERS: NetTcpTraceCounters = NetTcpTraceCounters::new();
 pub(crate) const MAX_PER_PROCESS_STATE_HANDLES: usize = 1024;
 const VM_FETCH_BUFFER_LIMIT_BYTES: usize = DEFAULT_MAX_FRAME_BYTES;
 const DEFAULT_SCRYPT_COST: u64 = 16_384;
@@ -347,6 +417,7 @@ impl ActiveProcess {
             guest_cwd: String::from("/"),
             env: BTreeMap::new(),
             host_cwd: PathBuf::from("/"),
+            host_write_dirty: false,
             mapped_host_fds: BTreeMap::new(),
             next_mapped_host_fd: MAPPED_HOST_FD_START,
             pending_execution_events: VecDeque::new(),
@@ -396,6 +467,28 @@ impl ActiveProcess {
     pub(crate) fn with_host_cwd(mut self, host_cwd: PathBuf) -> Self {
         self.host_cwd = host_cwd;
         self
+    }
+
+    pub(crate) fn mark_host_write_dirty(&mut self) {
+        self.host_write_dirty = true;
+    }
+
+    pub(crate) fn host_write_dirty_recursive(&self) -> bool {
+        self.host_write_dirty
+            || self
+                .child_processes
+                .values()
+                .any(ActiveProcess::host_write_dirty_recursive)
+    }
+
+    pub(crate) fn clean_host_writes_are_observable_recursive(&self) -> bool {
+        matches!(
+            self.execution,
+            ActiveExecution::Javascript(_) | ActiveExecution::Python(_) | ActiveExecution::Wasm(_)
+        ) && self
+            .child_processes
+            .values()
+            .all(ActiveProcess::clean_host_writes_are_observable_recursive)
     }
 
     pub(crate) fn with_guest_cwd(mut self, guest_cwd: String) -> Self {
@@ -1037,6 +1130,26 @@ pub(crate) struct JavascriptSyncRpcServiceRequest<'a, B> {
     pub(crate) network_counts: NetworkResourceCounts,
 }
 
+pub(crate) enum JavascriptSyncRpcServiceResponse {
+    Json(Value),
+    Raw(Vec<u8>),
+}
+
+impl From<Value> for JavascriptSyncRpcServiceResponse {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+
+impl JavascriptSyncRpcServiceResponse {
+    fn as_json(&self) -> Option<&Value> {
+        match self {
+            Self::Json(value) => Some(value),
+            Self::Raw(_) => None,
+        }
+    }
+}
+
 pub(crate) struct JavascriptNetSyncRpcServiceRequest<'a, B> {
     pub(crate) bridge: &'a SharedBridge<B>,
     pub(crate) vm_id: &'a str,
@@ -1270,6 +1383,7 @@ impl ActiveTcpSocket {
         kernel: &mut SidecarKernel,
         kernel_pid: u32,
         wait: Duration,
+        trace_enabled: bool,
     ) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
         if self.tls_mode.load(Ordering::SeqCst) {
             self.ensure_tcp_reader()?;
@@ -1288,6 +1402,7 @@ impl ActiveTcpSocket {
         }
 
         if let Some(socket_id) = self.kernel_socket_id {
+            let poll_started = Instant::now();
             let result = kernel
                 .poll_targets(
                     EXECUTION_DRIVER_NAME,
@@ -1299,31 +1414,74 @@ impl ActiveTcpSocket {
                     i32::try_from(wait.as_millis()).unwrap_or(i32::MAX),
                 )
                 .map_err(kernel_error)?;
+            let poll_elapsed = poll_started.elapsed();
             let revents = result
                 .targets
                 .first()
                 .map(|entry| entry.revents)
                 .unwrap_or_else(PollEvents::empty);
+            record_net_tcp_kernel_poll(trace_enabled, wait, poll_elapsed, revents);
             if revents.is_empty() {
                 return Ok(None);
             }
             if revents.intersects(POLLIN) {
-                return match kernel.socket_read(
-                    EXECUTION_DRIVER_NAME,
-                    kernel_pid,
-                    socket_id,
-                    64 * 1024,
-                ) {
+                let read_started = Instant::now();
+                let read_result =
+                    kernel.socket_read(EXECUTION_DRIVER_NAME, kernel_pid, socket_id, 64 * 1024);
+                if trace_enabled {
+                    NET_TCP_TRACE_COUNTERS.socket_read_kernel_us.fetch_add(
+                        duration_micros_u64(read_started.elapsed()),
+                        Ordering::Relaxed,
+                    );
+                }
+                return match read_result {
                     Ok(Some(bytes)) if !bytes.is_empty() => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .socket_read_data_events
+                                .fetch_add(1, Ordering::Relaxed);
+                            NET_TCP_TRACE_COUNTERS.socket_read_bytes.fetch_add(
+                                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            );
+                        }
                         Ok(Some(JavascriptTcpSocketEvent::Data(bytes)))
                     }
-                    Ok(Some(_)) => Ok(Some(JavascriptTcpSocketEvent::Data(Vec::new()))),
-                    Ok(None) => Ok(Some(JavascriptTcpSocketEvent::End)),
-                    Err(error) if error.code() == "EAGAIN" => Ok(None),
-                    Err(error) => Ok(Some(JavascriptTcpSocketEvent::Error {
-                        code: Some(error.code().to_string()),
-                        message: error.to_string(),
-                    })),
+                    Ok(Some(_)) => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .socket_read_data_events
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(Some(JavascriptTcpSocketEvent::Data(Vec::new())))
+                    }
+                    Ok(None) => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .socket_read_end_events
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(Some(JavascriptTcpSocketEvent::End))
+                    }
+                    Err(error) if error.code() == "EAGAIN" => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .socket_read_eagain
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(None)
+                    }
+                    Err(error) => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .socket_read_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(Some(JavascriptTcpSocketEvent::Error {
+                            code: Some(error.code().to_string()),
+                            message: error.to_string(),
+                        }))
+                    }
                 };
             }
             if revents.intersects(POLLHUP) {
@@ -2160,8 +2318,10 @@ impl ActiveTcpListener {
         kernel: &mut SidecarKernel,
         kernel_pid: u32,
         wait: Duration,
+        trace_enabled: bool,
     ) -> Result<Option<JavascriptTcpListenerEvent>, SidecarError> {
         if let Some(socket_id) = self.kernel_socket_id {
+            let poll_started = Instant::now();
             let result = kernel
                 .poll_targets(
                     EXECUTION_DRIVER_NAME,
@@ -2170,19 +2330,33 @@ impl ActiveTcpListener {
                     i32::try_from(wait.as_millis()).unwrap_or(i32::MAX),
                 )
                 .map_err(kernel_error)?;
+            let poll_elapsed = poll_started.elapsed();
             let revents = result
                 .targets
                 .first()
                 .map(|entry| entry.revents)
                 .unwrap_or_else(PollEvents::empty);
+            record_net_tcp_kernel_poll(trace_enabled, wait, poll_elapsed, revents);
             if revents.is_empty() {
                 return Ok(None);
             }
             let accepted_socket_id =
                 match kernel.socket_accept(EXECUTION_DRIVER_NAME, kernel_pid, socket_id) {
                     Ok(accepted_socket_id) => accepted_socket_id,
-                    Err(error) if error.code() == "EAGAIN" => return Ok(None),
+                    Err(error) if error.code() == "EAGAIN" => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .server_accept_eagain
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(None);
+                    }
                     Err(error) => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .server_accept_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         return Ok(Some(JavascriptTcpListenerEvent::Error {
                             code: Some(error.code().to_string()),
                             message: error.to_string(),
@@ -2204,6 +2378,11 @@ impl ActiveTcpListener {
                     "accepted kernel TCP socket {accepted_socket_id} missing peer address"
                 ))
             })?;
+            if trace_enabled {
+                NET_TCP_TRACE_COUNTERS
+                    .server_accept_connections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(Some(JavascriptTcpListenerEvent::Connection(
                 PendingTcpSocket {
                     stream: None,
@@ -2718,6 +2897,39 @@ impl ActiveExecution {
         }
     }
 
+    pub(crate) fn respond_javascript_sync_rpc_raw_success(
+        &mut self,
+        id: u64,
+        payload: Vec<u8>,
+    ) -> Result<(), SidecarError> {
+        match self {
+            Self::Javascript(execution) => execution
+                .respond_sync_rpc_raw_success(id, payload)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .respond_sync_rpc_raw_success(id, payload)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            _ => Err(SidecarError::InvalidState(String::from(
+                "only embedded V8 executions can service raw JavaScript sync RPC responses",
+            ))),
+        }
+    }
+
+    pub(crate) fn respond_javascript_sync_rpc_response(
+        &mut self,
+        id: u64,
+        response: JavascriptSyncRpcServiceResponse,
+    ) -> Result<(), SidecarError> {
+        match response {
+            JavascriptSyncRpcServiceResponse::Json(result) => {
+                self.respond_javascript_sync_rpc_success(id, result)
+            }
+            JavascriptSyncRpcServiceResponse::Raw(payload) => {
+                self.respond_javascript_sync_rpc_raw_success(id, payload)
+            }
+        }
+    }
+
     pub(crate) fn respond_javascript_sync_rpc_error(
         &mut self,
         id: u64,
@@ -3046,6 +3258,7 @@ where
         request: &RequestFrame,
         payload: ExecuteRequest,
     ) -> Result<DispatchResult, SidecarError> {
+        let execute_total_start = Instant::now();
         let (connection_id, session_id, vm_id) = self.vm_scope_for(&request.ownership)?;
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
@@ -3130,7 +3343,10 @@ where
             .env
             .get(EXECUTION_REQUEST_TTY_ENV)
             .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let phase_start = Instant::now();
         let resolved = resolve_execute_request(vm, &payload)?;
+        record_execute_phase("resolve_execute_request", phase_start.elapsed());
+        let phase_start = Instant::now();
         let mut env = resolved.env.clone();
         env.remove(EXECUTION_REQUEST_TTY_ENV);
         let sandbox_root = normalize_host_path(&vm.cwd);
@@ -3149,6 +3365,8 @@ where
         let argv = std::iter::once(resolved.entrypoint.clone())
             .chain(resolved.execution_args.iter().cloned())
             .collect::<Vec<_>>();
+        record_execute_phase("env_argv_setup", phase_start.elapsed());
+        let phase_start = Instant::now();
         let kernel_handle = vm
             .kernel
             .spawn_process(
@@ -3162,6 +3380,7 @@ where
             )
             .map_err(kernel_error)?;
         let kernel_pid = kernel_handle.pid();
+        record_execute_phase("kernel_spawn_process", phase_start.elapsed());
         let tty_master_fd = if requested_tty {
             let (master_fd, slave_fd, _) = vm
                 .kernel
@@ -3191,14 +3410,19 @@ where
 
         let (execution, process_env) = match resolved.runtime {
             GuestRuntimeKind::JavaScript => {
+                let phase_start = Instant::now();
                 let inline_code = load_javascript_entrypoint_source(
                     vm,
                     &resolved.host_cwd,
                     &resolved.entrypoint,
                     &env,
                 );
+                record_execute_phase("js_load_entrypoint_source", phase_start.elapsed());
+                let phase_start = Instant::now();
                 prepare_javascript_shadow(vm, &resolved)?;
+                record_execute_phase("js_prepare_shadow", phase_start.elapsed());
 
+                let phase_start = Instant::now();
                 let context =
                     self.javascript_engine
                         .create_context(CreateJavascriptContextRequest {
@@ -3206,6 +3430,8 @@ where
                             bootstrap_module: None,
                             compile_cache_root: Some(self.cache_root.join("node-compile-cache")),
                         });
+                record_execute_phase("js_create_context", phase_start.elapsed());
+                let phase_start = Instant::now();
                 let built_reader = build_module_reader(vm, &resolved);
                 let guest_reader = built_reader.clone().map(|reader| {
                     Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
@@ -3213,6 +3439,8 @@ where
                 });
                 let module_reader =
                     built_reader.map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
+                record_execute_phase("js_build_module_reader", phase_start.elapsed());
+                let phase_start = Instant::now();
                 let execution = self
                     .javascript_engine
                     .start_execution_with_module_reader(
@@ -3232,6 +3460,7 @@ where
                         guest_reader,
                     )
                     .map_err(javascript_error)?;
+                record_execute_phase("js_start_execution", phase_start.elapsed());
                 (ActiveExecution::Javascript(execution), env.clone())
             }
             GuestRuntimeKind::Python => {
@@ -3335,6 +3564,7 @@ where
             }
         };
         let child_pid = execution.child_pid();
+        let phase_start = Instant::now();
         let kernel_stdin_writer_fd = if let Some(master_fd) = tty_master_fd {
             master_fd
         } else {
@@ -3349,6 +3579,9 @@ where
                 .with_host_cwd(resolved.host_cwd.clone()),
         );
         self.bridge.emit_lifecycle(&vm_id, LifecycleState::Busy)?;
+        mark_execute_response_ready(&vm_id, &payload.process_id);
+        record_execute_phase("process_register_and_lifecycle", phase_start.elapsed());
+        record_execute_phase("execute_total", execute_total_start.elapsed());
 
         Ok(DispatchResult {
             response: self.respond(
@@ -3562,6 +3795,63 @@ where
             response: self.respond(
                 request,
                 ResponsePayload::ProcessSnapshot(ProcessSnapshotResponse { processes }),
+            ),
+            events: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn get_resource_snapshot(
+        &mut self,
+        request: &RequestFrame,
+        _payload: GetResourceSnapshotRequest,
+    ) -> Result<DispatchResult, SidecarError> {
+        let (connection_id, session_id, vm_id) = self.vm_scope_for(&request.ownership)?;
+        self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
+        require_vm_inspection_permission(
+            &self.bridge,
+            &vm_id,
+            "process.inspect",
+            "process",
+            "process://resources",
+        )?;
+
+        let snapshot = self
+            .vms
+            .get(&vm_id)
+            .map(|vm| vm.kernel.resource_snapshot())
+            .unwrap_or_default();
+        let queue_snapshots = queue_tracker::queue_snapshot()
+            .into_iter()
+            .map(|queue| QueueSnapshotEntry {
+                name: queue.name.as_str().to_owned(),
+                category: queue.category.as_str().to_owned(),
+                depth: queue.depth as u64,
+                high_water: queue.high_water as u64,
+                capacity: queue.capacity as u64,
+                fill_percent: queue.fill_percent as u64,
+            })
+            .collect();
+
+        Ok(DispatchResult {
+            response: self.respond(
+                request,
+                ResponsePayload::ResourceSnapshot(ResourceSnapshotResponse {
+                    running_processes: snapshot.running_processes as u64,
+                    exited_processes: snapshot.exited_processes as u64,
+                    fd_tables: snapshot.fd_tables as u64,
+                    open_fds: snapshot.open_fds as u64,
+                    pipes: snapshot.pipes as u64,
+                    pipe_buffered_bytes: snapshot.pipe_buffered_bytes as u64,
+                    ptys: snapshot.ptys as u64,
+                    pty_buffered_input_bytes: snapshot.pty_buffered_input_bytes as u64,
+                    pty_buffered_output_bytes: snapshot.pty_buffered_output_bytes as u64,
+                    sockets: snapshot.sockets as u64,
+                    socket_listeners: snapshot.socket_listeners as u64,
+                    socket_connections: snapshot.socket_connections as u64,
+                    socket_buffered_bytes: snapshot.socket_buffered_bytes as u64,
+                    socket_datagram_queue_len: snapshot.socket_datagram_queue_len as u64,
+                    queue_snapshots,
+                }),
             ),
             events: Vec::new(),
         })
@@ -4016,6 +4306,13 @@ where
                     let Some(event) = event else {
                         continue;
                     };
+                    if matches!(&event, ActiveExecutionEvent::Exited(_)) {
+                        record_execute_response_to_exit_milestone(
+                            "execute_response_to_exit_event_polled",
+                            &vm_id,
+                            &process_id,
+                        );
+                    }
 
                     if Self::internal_execution_event(&event) {
                         // These events are sidecar work items, not client-facing
@@ -4295,6 +4592,13 @@ where
                     let Some(event) = event else {
                         break;
                     };
+                    if matches!(&event, ActiveExecutionEvent::Exited(_)) {
+                        record_execute_response_to_exit_milestone(
+                            "execute_response_to_detached_exit_event_polled",
+                            vm_id,
+                            &detached_process_id,
+                        );
+                    }
                     let Some((connection_id, session_id)) = self
                         .vms
                         .get(vm_id)
@@ -4607,13 +4911,23 @@ where
                 Ok(None)
             }
             ActiveExecutionEvent::Exited(exit_code) => {
+                record_execute_response_to_exit_milestone(
+                    "execute_response_to_exit_event_handle",
+                    vm_id,
+                    process_id,
+                );
+                record_execute_response_to_exit(vm_id, process_id);
+                let phase_start = Instant::now();
                 let became_idle = self
                     .finish_active_process_exit(vm_id, process_id, exit_code)?
                     .unwrap_or(false);
+                record_execute_phase("process_exit_cleanup", phase_start.elapsed());
 
+                let phase_start = Instant::now();
                 if became_idle {
                     self.bridge.emit_lifecycle(vm_id, LifecycleState::Ready)?;
                 }
+                record_execute_phase("process_exit_lifecycle_emit", phase_start.elapsed());
 
                 Ok(Some(EventFrame::new(
                     ownership,
@@ -4641,11 +4955,21 @@ where
             return Ok(None);
         }
 
+        let phase_start = Instant::now();
         prune_exited_process_snapshots(vm);
+        record_execute_phase(
+            "process_exit_cleanup_prune_snapshots",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         let process_table = vm.kernel.list_processes();
+        record_execute_phase("process_exit_cleanup_list_processes", phase_start.elapsed());
+        let phase_start = Instant::now();
         let Some(mut process) = vm.active_processes.remove(process_id) else {
             return Ok(None);
         };
+        record_execute_phase("process_exit_cleanup_remove_active", phase_start.elapsed());
+        let phase_start = Instant::now();
         if let Some(info) = process_table.get(&process.kernel_pid) {
             vm.exited_process_snapshots
                 .push_back(ExitedProcessSnapshot {
@@ -4658,20 +4982,60 @@ where
                     ),
                 });
         }
+        record_execute_phase("process_exit_cleanup_build_snapshot", phase_start.elapsed());
+        let phase_start = Instant::now();
         let detached_children = Self::adopt_detached_child_processes(process_id, &mut process);
-        sync_process_host_writes_to_kernel(vm, &process)?;
+        record_execute_phase("process_exit_cleanup_adopt_detached", phase_start.elapsed());
+        let phase_start = Instant::now();
+        let should_sync_host_writes = process.host_write_dirty_recursive()
+            || !process.clean_host_writes_are_observable_recursive();
+        if should_sync_host_writes {
+            sync_process_host_writes_to_kernel(vm, &process)?;
+        } else {
+            record_execute_phase(
+                "process_exit_cleanup_sync_host_writes_clean_skip",
+                Duration::ZERO,
+            );
+        }
+        record_execute_phase(
+            "process_exit_cleanup_sync_host_writes",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         terminate_child_process_tree(&mut vm.kernel, &mut process);
+        record_execute_phase(
+            "process_exit_cleanup_terminate_child_tree",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         process.kernel_handle.finish(exit_code);
+        record_execute_phase("process_exit_cleanup_kernel_finish", phase_start.elapsed());
+        let phase_start = Instant::now();
         let _ = vm.kernel.wait_and_reap(process.kernel_pid);
+        record_execute_phase("process_exit_cleanup_wait_and_reap", phase_start.elapsed());
+        let phase_start = Instant::now();
         vm.signal_states.remove(process_id);
+        record_execute_phase(
+            "process_exit_cleanup_signal_state_remove",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         for (detached_process_id, detached_child) in detached_children {
             vm.detached_child_processes
                 .insert(detached_process_id.clone());
             vm.active_processes
                 .insert(detached_process_id, detached_child);
         }
+        record_execute_phase(
+            "process_exit_cleanup_reinsert_detached",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         let became_idle = vm.active_processes.is_empty();
+        record_execute_phase("process_exit_cleanup_became_idle", phase_start.elapsed());
+        let phase_start = Instant::now();
         self.prune_extension_process_resource(process_id);
+        record_execute_phase("process_exit_cleanup_prune_resource", phase_start.elapsed());
 
         Ok(Some(became_idle))
     }
@@ -4686,7 +5050,7 @@ where
         if max_events == 0 {
             return Ok(events);
         }
-        let mut deadline = Instant::now() + Duration::from_millis(150);
+        let mut deadline = Instant::now() + PROCESS_EXIT_DRAIN_INITIAL_QUIET;
 
         loop {
             if events.len() >= max_events {
@@ -4742,11 +5106,11 @@ where
                     break;
                 };
                 events.push(event);
-                deadline = Instant::now() + Duration::from_millis(150);
+                deadline = Instant::now() + PROCESS_EXIT_DRAIN_TRAILING_QUIET;
                 continue;
             };
             events.push(event);
-            deadline = Instant::now() + Duration::from_millis(150);
+            deadline = Instant::now() + PROCESS_EXIT_DRAIN_TRAILING_QUIET;
         }
 
         Ok(events)
@@ -5720,6 +6084,8 @@ where
         process_id: &str,
         request: JavascriptChildProcessSpawnRequest,
     ) -> Result<Value, SidecarError> {
+        let total_start = Instant::now();
+        let phase_start = Instant::now();
         let resolved = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
             let parent = vm
@@ -5734,6 +6100,7 @@ where
                 &request,
             )?
         };
+        record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
         let (parent_kernel_pid, child_process_id) = {
             let vm = self
                 .vms
@@ -5750,6 +6117,7 @@ where
             .vms
             .get_mut(vm_id)
             .ok_or_else(|| missing_vm_error(vm_id))?;
+        let phase_start = Instant::now();
         let (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd) = if resolved
             .tool_command
         {
@@ -6005,7 +6373,12 @@ where
             };
             (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd)
         };
+        record_execute_phase(
+            "child_process_spawn_and_start_execution",
+            phase_start.elapsed(),
+        );
 
+        let phase_start = Instant::now();
         let process = vm
             .active_processes
             .get_mut(process_id)
@@ -6029,6 +6402,8 @@ where
                 })?
                 .kernel_stdin_writer_fd = Some(kernel_stdin_writer_fd);
         }
+        record_execute_phase("child_process_register", phase_start.elapsed());
+        record_execute_phase("child_process_spawn_total", total_start.elapsed());
         Ok(json!({
             "childId": child_process_id,
             "pid": kernel_pid,
@@ -6170,8 +6545,10 @@ where
         current_process_path: &[&str],
         request: JavascriptChildProcessSpawnRequest,
     ) -> Result<Value, SidecarError> {
+        let total_start = Instant::now();
         let current_process_label =
             Self::child_process_path_label(process_id, current_process_path);
+        let phase_start = Instant::now();
         let (resolved, parent_kernel_pid) = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
             let root = vm
@@ -6195,12 +6572,14 @@ where
                 parent.kernel_pid,
             )
         };
+        record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
 
         let sidecar_requests = self.sidecar_requests.clone();
         let vm = self
             .vms
             .get_mut(vm_id)
             .ok_or_else(|| missing_vm_error(vm_id))?;
+        let phase_start = Instant::now();
         let child_process_id = {
             let root = vm
                 .active_processes
@@ -6470,7 +6849,12 @@ where
             };
             (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd)
         };
+        record_execute_phase(
+            "child_process_spawn_and_start_execution",
+            phase_start.elapsed(),
+        );
 
+        let phase_start = Instant::now();
         let root = vm
             .active_processes
             .get_mut(process_id)
@@ -6500,6 +6884,8 @@ where
                 })?
                 .kernel_stdin_writer_fd = Some(kernel_stdin_writer_fd);
         }
+        record_execute_phase("child_process_register", phase_start.elapsed());
+        record_execute_phase("child_process_spawn_total", total_start.elapsed());
         Ok(json!({
             "childId": child_process_id,
             "pid": kernel_pid,
@@ -6861,6 +7247,7 @@ where
                     }));
                 }
                 ActiveExecutionEvent::Exited(exit_code) => {
+                    let cleanup_start = Instant::now();
                     let had_trailing_events = {
                         let Some(vm) = self.vms.get_mut(vm_id) else {
                             return Ok(Value::Null);
@@ -6875,9 +7262,9 @@ where
                         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                             return Ok(Value::Null);
                         };
-                        let deadline = Instant::now() + Duration::from_millis(150);
+                        let mut quiet_deadline = Instant::now() + PROCESS_EXIT_DRAIN_INITIAL_QUIET;
                         loop {
-                            let wait = deadline.saturating_duration_since(Instant::now());
+                            let wait = quiet_deadline.saturating_duration_since(Instant::now());
                             let next = poll_child_execution_after_exit(child, wait)?;
                             let Some(next) = next else {
                                 break;
@@ -6886,9 +7273,7 @@ where
                                 continue;
                             }
                             child.queue_pending_execution_event(next)?;
-                            if Instant::now() >= deadline {
-                                break;
-                            }
+                            quiet_deadline = Instant::now() + PROCESS_EXIT_DRAIN_TRAILING_QUIET;
                         }
                         if !child.pending_execution_events.is_empty() {
                             child.queue_pending_execution_event(ActiveExecutionEvent::Exited(
@@ -6986,6 +7371,7 @@ where
                     if let Some(signal_name) = signal_name {
                         payload.insert(String::from("signal"), Value::String(signal_name));
                     }
+                    record_execute_phase("child_process_exit_cleanup", cleanup_start.elapsed());
                     return Ok(Value::Object(payload));
                 }
                 ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
@@ -7006,7 +7392,7 @@ where
                             signal,
                             registration,
                         );
-                        Ok(Value::Null)
+                        Ok(Value::Null.into())
                     } else if request.method == "process.kill" {
                         self.handle_descendant_process_kill_rpc(
                             vm_id,
@@ -7015,6 +7401,7 @@ where
                             child_process_id,
                             &request,
                         )
+                        .map(Into::into)
                     } else if request.method.starts_with("child_process.") {
                         self.handle_descendant_javascript_child_process_rpc(
                             vm_id,
@@ -7022,6 +7409,7 @@ where
                             &current_child_path,
                             &request,
                         )
+                        .map(Into::into)
                     } else {
                         let Some(vm) = self.vms.get_mut(vm_id) else {
                             return Ok(Value::Null);
@@ -7064,7 +7452,11 @@ where
                     let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                         return Ok(Value::Null);
                     };
-                    let parent_signal_event = response.as_ref().ok().and_then(|result| {
+                    let parent_signal_event = response
+                        .as_ref()
+                        .ok()
+                        .and_then(JavascriptSyncRpcServiceResponse::as_json)
+                        .and_then(|result| {
                         let target_path_label =
                             Self::child_process_path_label(process_id, current_process_path);
                         if request.method != "process.kill"
@@ -7083,7 +7475,7 @@ where
                     match response {
                         Ok(result) => child
                             .execution
-                            .respond_javascript_sync_rpc_success(request.id, result)
+                            .respond_javascript_sync_rpc_response(request.id, result)
                             .or_else(ignore_stale_javascript_sync_rpc_response)?,
                         Err(error) => child
                             .execution
@@ -10014,6 +10406,7 @@ mod kernel_poll_sync_rpc_tests {
     use secure_exec_kernel::poll::{POLLHUP, POLLIN};
     use secure_exec_kernel::vfs::MemoryFileSystem;
     use serde_json::{json, Value};
+    use std::collections::HashMap;
     #[test]
     fn javascript_kernel_poll_sync_rpc_reports_multiple_kernel_fds() {
         let mut config = KernelVmConfig::new("vm-js-kernel-poll");
@@ -10068,6 +10461,7 @@ mod kernel_poll_sync_rpc_tests {
             &JavascriptSyncRpcRequest {
                 id: 1,
                 method: String::from("__kernel_poll"),
+                raw_bytes_args: HashMap::new(),
                 args: vec![
                     json!([
                         { "fd": 0, "events": POLLIN.bits() },
@@ -14469,6 +14863,136 @@ static SYNC_RPC_STATS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 > = std::sync::OnceLock::new();
 
+#[derive(Default)]
+struct ExecutePhaseStats {
+    calls: u64,
+    total_ns: u128,
+    max_ns: u128,
+}
+
+static EXECUTE_PHASES: OnceLock<Mutex<BTreeMap<String, ExecutePhaseStats>>> = OnceLock::new();
+static EXECUTE_LIFETIMES: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
+static EXECUTE_EXIT_EVENT_QUEUED: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
+
+fn execute_phases_enabled() -> bool {
+    std::env::var("AGENTOS_EXECUTE_PHASES").as_deref() == Ok("1")
+}
+
+fn execute_phase_key(vm_id: &str, process_id: &str) -> String {
+    format!("{vm_id}/{process_id}")
+}
+
+pub(crate) fn record_execute_phase(stage: &str, elapsed: Duration) {
+    if !execute_phases_enabled() {
+        return;
+    }
+    let phases = EXECUTE_PHASES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut phases) = phases.lock() else {
+        return;
+    };
+    let stats = phases.entry(stage.to_string()).or_default();
+    stats.calls += 1;
+    let elapsed_ns = elapsed.as_nanos();
+    stats.total_ns += elapsed_ns;
+    stats.max_ns = stats.max_ns.max(elapsed_ns);
+
+    let Some(path) = std::env::var_os("AGENTOS_EXECUTE_PHASES_FILE") else {
+        return;
+    };
+    let mut output = String::new();
+    for (stage, stats) in phases.iter() {
+        let total_us = stats.total_ns / 1_000;
+        let avg_us = if stats.calls == 0 {
+            0
+        } else {
+            total_us / u128::from(stats.calls)
+        };
+        let max_us = stats.max_ns / 1_000;
+        output.push_str(&format!(
+            "stage={stage} calls={} total_us={total_us} avg_us={avg_us} max_us={max_us}\n",
+            stats.calls
+        ));
+    }
+    let _ = fs::write(path, output);
+}
+
+fn mark_execute_response_ready(vm_id: &str, process_id: &str) {
+    if !execute_phases_enabled() {
+        return;
+    }
+    let lifetimes = EXECUTE_LIFETIMES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(mut lifetimes) = lifetimes.lock() {
+        lifetimes.insert(execute_phase_key(vm_id, process_id), Instant::now());
+    }
+}
+
+pub(crate) fn mark_execute_exit_event_queued(vm_id: &str, process_id: &str) {
+    if !execute_phases_enabled() {
+        return;
+    }
+    let queued = EXECUTE_EXIT_EVENT_QUEUED.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(mut queued) = queued.lock() {
+        let key = execute_phase_key(vm_id, process_id);
+        if !queued.contains_key(&key) {
+            record_execute_response_to_exit_milestone(
+                "execute_response_to_exit_event_queued",
+                vm_id,
+                process_id,
+            );
+            queued.insert(key, Instant::now());
+        }
+    }
+}
+
+pub(crate) fn record_execute_exit_event_queue_wait(stage: &str, vm_id: &str, process_id: &str) {
+    if !execute_phases_enabled() {
+        return;
+    }
+    let Some(queued) = EXECUTE_EXIT_EVENT_QUEUED.get() else {
+        return;
+    };
+    let Ok(mut queued) = queued.lock() else {
+        return;
+    };
+    if let Some(started) = queued.remove(&execute_phase_key(vm_id, process_id)) {
+        record_execute_phase(stage, started.elapsed());
+    }
+}
+
+pub(crate) fn record_execute_response_to_exit_milestone(
+    stage: &str,
+    vm_id: &str,
+    process_id: &str,
+) {
+    if !execute_phases_enabled() {
+        return;
+    }
+    let Some(lifetimes) = EXECUTE_LIFETIMES.get() else {
+        return;
+    };
+    let Ok(lifetimes) = lifetimes.lock() else {
+        return;
+    };
+    if let Some(started) = lifetimes.get(&execute_phase_key(vm_id, process_id)) {
+        record_execute_phase(stage, started.elapsed());
+    }
+}
+
+fn record_execute_response_to_exit(vm_id: &str, process_id: &str) {
+    if !execute_phases_enabled() {
+        return;
+    }
+    let Some(lifetimes) = EXECUTE_LIFETIMES.get() else {
+        return;
+    };
+    let Ok(mut lifetimes) = lifetimes.lock() else {
+        return;
+    };
+    if let Some(started) = lifetimes.remove(&execute_phase_key(vm_id, process_id)) {
+        record_execute_phase("execute_response_to_exit_event", started.elapsed());
+    }
+}
+
 fn sync_rpc_trace_enabled() -> bool {
     std::env::var("AGENTOS_SYNC_RPC_TRACE").as_deref() == Ok("1")
 }
@@ -14494,9 +15018,145 @@ fn record_sync_rpc(method: &str) {
     }
 }
 
+fn net_tcp_trace_enabled(env: &BTreeMap<String, String>) -> bool {
+    env.get("AGENTOS_NET_BRIDGE_TRACE").map(String::as_str) == Some("1")
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn net_tcp_trace_reset() {
+    reset_socket_read_trace();
+    set_socket_read_trace_enabled(true);
+    for counter in [
+        &NET_TCP_TRACE_COUNTERS.socket_read_calls,
+        &NET_TCP_TRACE_COUNTERS.socket_read_zero_wait_calls,
+        &NET_TCP_TRACE_COUNTERS.socket_read_data_events,
+        &NET_TCP_TRACE_COUNTERS.socket_read_bytes,
+        &NET_TCP_TRACE_COUNTERS.socket_read_kernel_us,
+        &NET_TCP_TRACE_COUNTERS.socket_read_end_events,
+        &NET_TCP_TRACE_COUNTERS.socket_read_eagain,
+        &NET_TCP_TRACE_COUNTERS.socket_read_errors,
+        &NET_TCP_TRACE_COUNTERS.socket_write_calls,
+        &NET_TCP_TRACE_COUNTERS.socket_write_bytes,
+        &NET_TCP_TRACE_COUNTERS.socket_write_kernel_us,
+        &NET_TCP_TRACE_COUNTERS.socket_write_errors,
+        &NET_TCP_TRACE_COUNTERS.server_accept_calls,
+        &NET_TCP_TRACE_COUNTERS.server_accept_zero_wait_calls,
+        &NET_TCP_TRACE_COUNTERS.server_accept_connections,
+        &NET_TCP_TRACE_COUNTERS.server_accept_eagain,
+        &NET_TCP_TRACE_COUNTERS.server_accept_errors,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_targets,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_zero_wait_calls,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_wait_us,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_elapsed_us,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_empty,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_ready,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_revents_read,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_revents_hup,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_revents_err,
+        &NET_TCP_TRACE_COUNTERS.kernel_poll_revents_bits_or,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+fn net_tcp_trace_snapshot() -> Value {
+    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    let socket_read = socket_read_trace_snapshot();
+    json!({
+        "socketReadCalls": load(&NET_TCP_TRACE_COUNTERS.socket_read_calls),
+        "socketReadZeroWaitCalls": load(&NET_TCP_TRACE_COUNTERS.socket_read_zero_wait_calls),
+        "socketReadDataEvents": load(&NET_TCP_TRACE_COUNTERS.socket_read_data_events),
+        "socketReadBytes": load(&NET_TCP_TRACE_COUNTERS.socket_read_bytes),
+        "socketReadKernelUs": load(&NET_TCP_TRACE_COUNTERS.socket_read_kernel_us),
+        "socketReadRecordCloneCalls": socket_read.socket_record_clone_calls,
+        "socketReadRecordCloneUs": socket_read.socket_record_clone_us,
+        "socketReadRecvCalls": socket_read.read_recv_calls,
+        "socketReadRecvBytes": socket_read.read_recv_bytes,
+        "socketReadRecvChunks": socket_read.read_recv_chunks,
+        "socketReadRecvCopyUs": socket_read.read_recv_copy_us,
+        "socketReadEndEvents": load(&NET_TCP_TRACE_COUNTERS.socket_read_end_events),
+        "socketReadEagain": load(&NET_TCP_TRACE_COUNTERS.socket_read_eagain),
+        "socketReadErrors": load(&NET_TCP_TRACE_COUNTERS.socket_read_errors),
+        "socketWriteCalls": load(&NET_TCP_TRACE_COUNTERS.socket_write_calls),
+        "socketWriteBytes": load(&NET_TCP_TRACE_COUNTERS.socket_write_bytes),
+        "socketWriteKernelUs": load(&NET_TCP_TRACE_COUNTERS.socket_write_kernel_us),
+        "socketWriteErrors": load(&NET_TCP_TRACE_COUNTERS.socket_write_errors),
+        "serverAcceptCalls": load(&NET_TCP_TRACE_COUNTERS.server_accept_calls),
+        "serverAcceptZeroWaitCalls": load(&NET_TCP_TRACE_COUNTERS.server_accept_zero_wait_calls),
+        "serverAcceptConnections": load(&NET_TCP_TRACE_COUNTERS.server_accept_connections),
+        "serverAcceptEagain": load(&NET_TCP_TRACE_COUNTERS.server_accept_eagain),
+        "serverAcceptErrors": load(&NET_TCP_TRACE_COUNTERS.server_accept_errors),
+        "kernelPollTargets": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_targets),
+        "kernelPollZeroWaitCalls": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_zero_wait_calls),
+        "kernelPollWaitUs": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_wait_us),
+        "kernelPollElapsedUs": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_elapsed_us),
+        "kernelPollEmpty": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_empty),
+        "kernelPollReady": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_ready),
+        "kernelPollReventsRead": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_revents_read),
+        "kernelPollReventsHup": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_revents_hup),
+        "kernelPollReventsErr": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_revents_err),
+        "kernelPollReventsBitsOr": load(&NET_TCP_TRACE_COUNTERS.kernel_poll_revents_bits_or),
+    })
+}
+
+fn record_net_tcp_kernel_poll(
+    enabled: bool,
+    wait: Duration,
+    elapsed: Duration,
+    revents: PollEvents,
+) {
+    if !enabled {
+        return;
+    }
+    NET_TCP_TRACE_COUNTERS
+        .kernel_poll_targets
+        .fetch_add(1, Ordering::Relaxed);
+    if wait.is_zero() {
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_zero_wait_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    NET_TCP_TRACE_COUNTERS
+        .kernel_poll_wait_us
+        .fetch_add(duration_micros_u64(wait), Ordering::Relaxed);
+    NET_TCP_TRACE_COUNTERS
+        .kernel_poll_elapsed_us
+        .fetch_add(duration_micros_u64(elapsed), Ordering::Relaxed);
+    if revents.is_empty() {
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_empty
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_ready
+            .fetch_add(1, Ordering::Relaxed);
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_revents_bits_or
+            .fetch_or(u64::from(revents.bits()), Ordering::Relaxed);
+    }
+    if revents.intersects(POLLIN) {
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_revents_read
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if revents.intersects(POLLHUP) {
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_revents_hup
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if revents.intersects(POLLERR) {
+        NET_TCP_TRACE_COUNTERS
+            .kernel_poll_revents_err
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn service_javascript_sync_rpc<B>(
     request: JavascriptSyncRpcServiceRequest<'_, B>,
-) -> Result<Value, SidecarError>
+) -> Result<JavascriptSyncRpcServiceResponse, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
@@ -14515,7 +15175,13 @@ where
         resource_limits,
         network_counts,
     } = request;
-    match request.method.as_str() {
+    let response = match request.method.as_str() {
+        "__bench.noop" => Ok(Value::Null),
+        "__bench.net_tcp_metrics_reset" => {
+            net_tcp_trace_reset();
+            Ok(Value::Null)
+        }
+        "__bench.net_tcp_metrics_snapshot" => Ok(net_tcp_trace_snapshot()),
         // Module resolution / loading / format detection read the kernel VFS so
         // the resolver sees exactly what the guest and `kernel.readFile()` see.
         "_resolveModule"
@@ -14577,7 +15243,7 @@ where
             service_javascript_dns_sync_rpc(bridge, kernel, vm_id, dns, request)
         }
         "net.http_listen" | "net.http_close" | "net.http_wait" | "net.http_respond" => {
-            service_javascript_net_sync_rpc(JavascriptNetSyncRpcServiceRequest {
+            return service_javascript_net_sync_rpc_response(JavascriptNetSyncRpcServiceRequest {
                 bridge,
                 vm_id,
                 dns,
@@ -14646,7 +15312,7 @@ where
         | "net.destroy"
         | "net.server_close"
         | "tls.get_ciphers" => {
-            service_javascript_net_sync_rpc(JavascriptNetSyncRpcServiceRequest {
+            return service_javascript_net_sync_rpc_response(JavascriptNetSyncRpcServiceRequest {
                 bridge,
                 vm_id,
                 dns,
@@ -14707,7 +15373,7 @@ where
                 kernel
                     .signal_process(EXECUTION_DRIVER_NAME, target_pid, parsed_signal)
                     .map_err(kernel_error)?;
-                return Ok(Value::Null);
+                return Ok(Value::Null.into());
             }
             let process_pid = i32::try_from(process.kernel_pid)
                 .map_err(|_| SidecarError::InvalidState("process pid exceeds i32".into()))?;
@@ -14744,7 +15410,8 @@ where
             Ok(response)
         }
         _ => service_javascript_fs_sync_rpc(kernel, process, process.kernel_pid, request),
-    }
+    }?;
+    Ok(response.into())
 }
 
 fn service_javascript_internal_bridge_sync_rpc(
@@ -17642,7 +18309,7 @@ where
             match response {
                 Ok(result) => process
                     .execution
-                    .respond_javascript_sync_rpc_success(request.id, result)
+                    .respond_javascript_sync_rpc_response(request.id, result)
                     .or_else(ignore_stale_javascript_sync_rpc_response)?,
                 Err(error) => process
                     .execution
@@ -17900,21 +18567,26 @@ where
             )));
         }
         if revents.intersects(POLLIN) {
-            match vm
-                .kernel
-                .socket_read(EXECUTION_DRIVER_NAME, kernel_pid, socket_id, 64 * 1024)
-            {
-                Ok(Some(bytes)) if !bytes.is_empty() => {
-                    response_buffer.extend(bytes);
-                    ensure_vm_fetch_raw_response_buffer_within_limit(
-                        response_buffer.len(),
-                        "vm.fetch",
-                    )?;
+            loop {
+                match vm
+                    .kernel
+                    .socket_read(EXECUTION_DRIVER_NAME, kernel_pid, socket_id, 64 * 1024)
+                {
+                    Ok(Some(bytes)) if !bytes.is_empty() => {
+                        response_buffer.extend(bytes);
+                        ensure_vm_fetch_raw_response_buffer_within_limit(
+                            response_buffer.len(),
+                            "vm.fetch",
+                        )?;
+                    }
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        peer_closed = true;
+                        break;
+                    }
+                    Err(error) if error.code() == "EAGAIN" => break,
+                    Err(error) => return Err(kernel_error(error)),
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => peer_closed = true,
-                Err(error) if error.code() == "EAGAIN" => {}
-                Err(error) => return Err(kernel_error(error)),
             }
         }
         if revents.intersects(POLLHUP) {
@@ -18105,7 +18777,7 @@ where
                 match response {
                     Ok(result) => process
                         .execution
-                        .respond_javascript_sync_rpc_success(request.id, result)
+                        .respond_javascript_sync_rpc_response(request.id, result)
                         .or_else(ignore_stale_javascript_sync_rpc_response)?,
                     Err(error) => process
                         .execution
@@ -20858,6 +21530,52 @@ pub(crate) fn clamp_javascript_net_poll_wait(wait_ms: u64) -> Duration {
     }
 }
 
+fn service_javascript_net_sync_rpc_response<B>(
+    request: JavascriptNetSyncRpcServiceRequest<'_, B>,
+) -> Result<JavascriptSyncRpcServiceResponse, SidecarError>
+where
+    B: NativeSidecarBridge + Send + 'static,
+    BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+{
+    if request.sync_request.method != "net.socket_read" {
+        return service_javascript_net_sync_rpc(request).map(Into::into);
+    }
+
+    let JavascriptNetSyncRpcServiceRequest {
+        kernel,
+        process,
+        sync_request: request,
+        ..
+    } = request;
+    let trace_enabled = net_tcp_trace_enabled(&process.env);
+    let socket_id = javascript_sync_rpc_arg_str(&request.args, 0, "net.socket_read socket id")?;
+    if trace_enabled {
+        NET_TCP_TRACE_COUNTERS
+            .socket_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+        NET_TCP_TRACE_COUNTERS
+            .socket_read_zero_wait_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    let event = if let Some(socket) = process.tcp_sockets.get_mut(socket_id) {
+        socket.poll(kernel, process.kernel_pid, Duration::ZERO, trace_enabled)?
+    } else {
+        let socket = process
+            .unix_sockets
+            .get_mut(socket_id)
+            .ok_or_else(|| SidecarError::InvalidState(format!("unknown net socket {socket_id}")))?;
+        socket.poll(Duration::ZERO)?
+    };
+
+    match event {
+        Some(JavascriptTcpSocketEvent::Data(chunk)) => {
+            Ok(JavascriptSyncRpcServiceResponse::Raw(chunk))
+        }
+        other => javascript_net_read_value(other).map(Into::into),
+    }
+}
+
 pub(crate) fn service_javascript_net_sync_rpc<B>(
     request: JavascriptNetSyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
@@ -20876,6 +21594,7 @@ where
         resource_limits,
         network_counts,
     } = request;
+    let trace_enabled = net_tcp_trace_enabled(&process.env);
     match request.method.as_str() {
         "net.http_listen" => {
             check_network_resource_limit(
@@ -21279,7 +21998,7 @@ where
                     .unwrap_or_default();
             let wait = clamp_javascript_net_poll_wait(wait_ms);
             let event = if let Some(socket) = process.tcp_sockets.get_mut(socket_id) {
-                socket.poll(kernel, process.kernel_pid, wait)?
+                socket.poll(kernel, process.kernel_pid, wait, trace_enabled)?
             } else if let Some(socket) = process.unix_sockets.get_mut(socket_id) {
                 socket.poll(wait)?
             } else {
@@ -21338,11 +22057,20 @@ where
         "net.socket_read" => {
             let socket_id =
                 javascript_sync_rpc_arg_str(&request.args, 0, "net.socket_read socket id")?;
+            if trace_enabled {
+                NET_TCP_TRACE_COUNTERS
+                    .socket_read_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                NET_TCP_TRACE_COUNTERS
+                    .socket_read_zero_wait_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(socket) = process.tcp_sockets.get_mut(socket_id) {
                 javascript_net_read_value(socket.poll(
                     kernel,
                     process.kernel_pid,
                     Duration::ZERO,
+                    trace_enabled,
                 )?)
             } else {
                 let socket = process.unix_sockets.get_mut(socket_id).ok_or_else(|| {
@@ -21444,7 +22172,12 @@ where
                 javascript_sync_rpc_arg_u64_optional(&request.args, 1, "net.server_poll wait ms")?
                     .unwrap_or_default();
             let tcp_event = if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
-                Some(listener.poll(kernel, process.kernel_pid, Duration::from_millis(wait_ms))?)
+                Some(listener.poll(
+                    kernel,
+                    process.kernel_pid,
+                    Duration::from_millis(wait_ms),
+                    trace_enabled,
+                )?)
             } else {
                 None
             };
@@ -21586,8 +22319,21 @@ where
         "net.server_accept" => {
             let listener_id =
                 javascript_sync_rpc_arg_str(&request.args, 0, "net.server_accept listener id")?;
+            if trace_enabled {
+                NET_TCP_TRACE_COUNTERS
+                    .server_accept_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                NET_TCP_TRACE_COUNTERS
+                    .server_accept_zero_wait_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
-                return match listener.poll(kernel, process.kernel_pid, Duration::ZERO)? {
+                return match listener.poll(
+                    kernel,
+                    process.kernel_pid,
+                    Duration::ZERO,
+                    trace_enabled,
+                )? {
                     Some(JavascriptTcpListenerEvent::Connection(pending)) => {
                         let PendingTcpSocket {
                             stream,
@@ -21763,11 +22509,40 @@ where
         }
         "net.write" => {
             let socket_id = javascript_sync_rpc_arg_str(&request.args, 0, "net.write socket id")?;
-            let chunk = javascript_sync_rpc_bytes_arg(&request.args, 1, "net.write chunk")?;
+            let chunk = if let Some(bytes) = request.raw_bytes_args.get(&1) {
+                bytes.clone()
+            } else {
+                javascript_sync_rpc_bytes_arg(&request.args, 1, "net.write chunk")?
+            };
+            if trace_enabled {
+                NET_TCP_TRACE_COUNTERS
+                    .socket_write_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                NET_TCP_TRACE_COUNTERS.socket_write_bytes.fetch_add(
+                    u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             if let Some(socket) = process.tcp_sockets.get(socket_id) {
-                socket
-                    .write_all(kernel, process.kernel_pid, &chunk)
-                    .map(|written| json!(written))
+                let write_started = trace_enabled.then(Instant::now);
+                let write_result = socket.write_all(kernel, process.kernel_pid, &chunk);
+                if let Some(write_started) = write_started {
+                    NET_TCP_TRACE_COUNTERS.socket_write_kernel_us.fetch_add(
+                        duration_micros_u64(write_started.elapsed()),
+                        Ordering::Relaxed,
+                    );
+                }
+                match write_result {
+                    Ok(written) => Ok(json!(written)),
+                    Err(error) => {
+                        if trace_enabled {
+                            NET_TCP_TRACE_COUNTERS
+                                .socket_write_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error)
+                    }
+                }
             } else {
                 let socket = process.unix_sockets.get(socket_id).ok_or_else(|| {
                     SidecarError::InvalidState(format!("unknown net socket {socket_id}"))

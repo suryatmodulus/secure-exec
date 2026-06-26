@@ -42,8 +42,8 @@ use crate::socket_table::{
 };
 use crate::user::{ProcessIdentity, UserConfig, UserManager};
 use crate::vfs::{
-    normalize_path, VfsError, VfsResult, VirtualFileSystem, VirtualStat, VirtualTimeSpec,
-    VirtualUtimeSpec,
+    normalize_path, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat,
+    VirtualTimeSpec, VirtualUtimeSpec,
 };
 use hickory_resolver::proto::rr::RecordType;
 use std::any::Any;
@@ -133,7 +133,7 @@ impl KernelVmConfig {
             user: UserConfig::default(),
             permissions: Permissions::default(),
             dns: DnsConfig::default(),
-            dns_resolver: Arc::new(HickoryDnsResolver),
+            dns_resolver: Arc::new(HickoryDnsResolver::default()),
             resources: ResourceLimits::default(),
             zombie_ttl: Duration::from_secs(60),
         }
@@ -898,6 +898,19 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_not_terminated()?;
         self.assert_driver_owns(requester_driver, pid)?;
         let entries = self.read_dir_internal(Some(pid), path)?;
+        self.resources.check_readdir_entries(entries.len())?;
+        Ok(entries)
+    }
+
+    pub fn read_dir_with_types_for_process(
+        &mut self,
+        requester_driver: &str,
+        pid: u32,
+        path: &str,
+    ) -> KernelResult<Vec<VirtualDirEntry>> {
+        self.assert_not_terminated()?;
+        self.assert_driver_owns(requester_driver, pid)?;
+        let entries = self.read_dir_with_types_internal(Some(pid), path)?;
         self.resources.check_readdir_entries(entries.len())?;
         Ok(entries)
     }
@@ -3341,6 +3354,29 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         } else {
             Ok(self.filesystem.read_dir(path)?)
         }
+    }
+
+    fn read_dir_with_types_internal(
+        &mut self,
+        current_pid: Option<u32>,
+        path: &str,
+    ) -> KernelResult<Vec<VirtualDirEntry>> {
+        if let Some(proc_node) = self.resolve_proc_node(path, current_pid)? {
+            self.filesystem
+                .check_virtual_path(FsOperation::Read, path)
+                .map_err(KernelError::from)?;
+            return Ok(self
+                .proc_read_dir(current_pid, &proc_node)?
+                .into_iter()
+                .map(|name| VirtualDirEntry {
+                    name,
+                    is_directory: false,
+                    is_symbolic_link: false,
+                })
+                .collect());
+        }
+
+        Ok(self.filesystem.read_dir_with_types(path)?)
     }
 
     fn realpath_internal(&self, current_pid: Option<u32>, path: &str) -> KernelResult<String> {

@@ -453,6 +453,7 @@ pub(crate) struct ActiveProcess {
     pub(crate) guest_cwd: String,
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) host_cwd: PathBuf,
+    pub(crate) host_write_dirty: bool,
     pub(crate) mapped_host_fds: BTreeMap<u32, ActiveMappedHostFd>,
     pub(crate) next_mapped_host_fd: u32,
     pub(crate) pending_execution_events: VecDeque<ActiveExecutionEvent>,
