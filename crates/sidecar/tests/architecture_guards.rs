@@ -35,8 +35,9 @@
 //! * Build scripts (`build.rs`, `*_build_support.rs`, ...), `tests/` and
 //!   `benches/` directories, and inline `#[cfg(test)]` modules are excluded
 //!   from the scan (they are not production host-access surface).
-//! * `crates/execution/src/benchmark.rs` and `crates/execution/src/bin/` hold
-//!   benchmarking/dev tooling and are excluded for the same reason.
+//! * `crates/execution/src/benchmark.rs`, `crates/execution/src/bin/`, and
+//!   `crates/native-baseline/` hold benchmarking/dev tooling and are excluded
+//!   for the same reason.
 //!
 //! If you are adding a genuinely new sanctioned chokepoint, add its
 //! repo-relative path to the relevant allowlist below WITH a comment
@@ -108,6 +109,7 @@ fn is_excluded_file(rel: &Path) -> bool {
         || s.ends_with("v8_bridge_build.rs")
         // Benchmarking / dev tooling, not production host-access surface.
         || s == "crates/execution/src/benchmark.rs"
+        || s.starts_with("crates/native-baseline/")
         || s.contains("/src/bin/")
 }
 
@@ -326,6 +328,10 @@ const ENV_ALLOW: &[&str] = &[
     // Node import cache reads an operator timeout knob before materializing
     // host-side runtime assets for VM startup.
     "crates/execution/src/node_import_cache.rs",
+    // Host-side perf phase diagnostics toggles, read from operator env and not
+    // guest-reachable.
+    "crates/execution/src/javascript.rs",
+    "crates/sidecar/src/filesystem.rs",
     "crates/v8-runtime/src/bridge.rs",
     "crates/sidecar/src/execution.rs",
     "crates/sidecar/src/plugins/s3_common.rs",

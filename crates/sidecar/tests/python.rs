@@ -1364,7 +1364,6 @@ print(json.dumps({
     assert_eq!(python_written, "from python");
 }
 
-#[test]
 fn python_runtime_supports_file_delete_and_rename() {
     assert_node_available();
 
@@ -1506,7 +1505,6 @@ print(json.dumps(results))
     );
 }
 
-#[test]
 fn python_runtime_supports_raw_tcp_and_udp_sockets() {
     assert_node_available();
 
@@ -1594,7 +1592,6 @@ print(json.dumps(result))
     assert_eq!(parsed["udp"], "ping udp");
 }
 
-#[test]
 fn python_runtime_supports_symlink_readlink_and_metadata() {
     assert_node_available();
 
@@ -3884,6 +3881,9 @@ fn python_suite() {
     python_runtime_blocks_pyodide_js_escape_hatches();
     concurrent_python_processes_stay_isolated_across_vms();
     python_runtime_mounts_workspace_over_the_kernel_vfs();
+    python_runtime_supports_file_delete_and_rename();
+    python_runtime_supports_raw_tcp_and_udp_sockets();
+    python_runtime_supports_symlink_readlink_and_metadata();
     workspace_files_are_shared_between_javascript_and_python_runtimes();
     python_workspace_mount_respects_read_only_root_permissions();
     python_runtime_blocks_mapped_pyodide_cache_symlink_metadata_escape();

@@ -87,7 +87,7 @@ mod service {
             runtime_child_is_alive,
             service_javascript_net_sync_rpc as service_javascript_net_sync_rpc_inner,
             signal_runtime_process, JavascriptNetSyncRpcServiceRequest,
-            JavascriptSyncRpcServiceRequest,
+            JavascriptSyncRpcServiceRequest, JavascriptSyncRpcServiceResponse,
         };
         use crate::filesystem::service_javascript_fs_sync_rpc;
         use crate::plugins::s3_common::test_support::MockS3Server;
@@ -97,10 +97,10 @@ mod service {
             AuthenticateRequest, BootstrapRootFilesystemRequest, CloseStdinRequest,
             ConfigureVmRequest, CreateVmRequest, DisposeReason, DisposeVmRequest, EventPayload,
             FindBoundUdpRequest, FindListenerRequest, FsPermissionRule, FsPermissionRuleSet,
-            FsPermissionScope, GetProcessSnapshotRequest, GetZombieTimerCountRequest,
-            GuestFilesystemCallRequest, GuestFilesystemOperation, GuestRuntimeKind,
-            HostCallbackResultResponse, MountDescriptor, MountPluginDescriptor, OpenSessionRequest,
-            OwnershipScope, PatternPermissionRule, PatternPermissionRuleSet,
+            FsPermissionScope, GetProcessSnapshotRequest, GetResourceSnapshotRequest,
+            GetZombieTimerCountRequest, GuestFilesystemCallRequest, GuestFilesystemOperation,
+            GuestRuntimeKind, HostCallbackResultResponse, MountDescriptor, MountPluginDescriptor,
+            OpenSessionRequest, OwnershipScope, PatternPermissionRule, PatternPermissionRuleSet,
             PatternPermissionScope, PermissionMode, PermissionsPolicy,
             RegisterHostCallbacksRequest, RegisteredHostCallbackDefinition, RequestFrame,
             RequestPayload, ResponsePayload, RootFilesystemEntry, RootFilesystemEntryEncoding,
@@ -674,6 +674,7 @@ ykAheWCsAteSEWVc0w==\n\
             let error = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("crypto.cipherivCreate"),
                     args: vec![
@@ -706,6 +707,7 @@ ykAheWCsAteSEWVc0w==\n\
             let error = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("crypto.diffieHellmanSessionCreate"),
                     args: vec![json!(r#"{"type":"ecdh","name":"P-256"}"#)],
@@ -717,6 +719,7 @@ ykAheWCsAteSEWVc0w==\n\
             crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 20,
                     method: String::from("crypto.diffieHellmanSessionDestroy"),
                     args: vec![json!(0)],
@@ -726,6 +729,7 @@ ykAheWCsAteSEWVc0w==\n\
             let session_id = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 21,
                     method: String::from("crypto.diffieHellmanSessionCreate"),
                     args: vec![json!(r#"{"type":"ecdh","name":"P-256"}"#)],
@@ -784,6 +788,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-sqlite-handles",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("sqlite.open"),
                     args: vec![json!(":memory:"), json!({})],
@@ -835,6 +840,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-sqlite-handles",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("sqlite.prepare"),
                     args: vec![json!(1), json!("SELECT 1")],
@@ -2256,12 +2262,12 @@ ykAheWCsAteSEWVc0w==\n\
             );
         }
 
-        fn call_javascript_sync_rpc(
+        fn call_javascript_sync_rpc_response(
             sidecar: &mut NativeSidecar<RecordingBridge>,
             vm_id: &str,
             process_id: &str,
             request: JavascriptSyncRpcRequest,
-        ) -> Result<Value, SidecarError> {
+        ) -> Result<JavascriptSyncRpcServiceResponse, SidecarError> {
             let bridge = sidecar.bridge.clone();
             let (dns, socket_paths, counts, limits) = {
                 let vm = sidecar.vms.get(vm_id).expect("javascript vm");
@@ -2292,6 +2298,60 @@ ykAheWCsAteSEWVc0w==\n\
                 resource_limits: &limits,
                 network_counts: counts,
             })
+        }
+
+        fn call_javascript_sync_rpc(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            process_id: &str,
+            request: JavascriptSyncRpcRequest,
+        ) -> Result<Value, SidecarError> {
+            call_javascript_sync_rpc_response(sidecar, vm_id, process_id, request).and_then(
+                |response| match response {
+                    JavascriptSyncRpcServiceResponse::Json(value) => Ok(value),
+                    JavascriptSyncRpcServiceResponse::Raw(_) => Err(SidecarError::Execution(
+                        String::from("expected JSON sync RPC response"),
+                    )),
+                },
+            )
+        }
+
+        fn read_javascript_socket_chunk(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            process_id: &str,
+            socket_id: &str,
+            request_id_start: u64,
+            attempts: u64,
+            context: &str,
+        ) -> Vec<u8> {
+            for attempt in 0..attempts {
+                let response = call_javascript_sync_rpc_response(
+                    sidecar,
+                    vm_id,
+                    process_id,
+                    JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
+                        id: request_id_start + attempt,
+                        method: String::from("net.socket_read"),
+                        args: vec![json!(socket_id)],
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+                match response {
+                    JavascriptSyncRpcServiceResponse::Raw(chunk) => return chunk,
+                    JavascriptSyncRpcServiceResponse::Json(value)
+                        if value == "__secure_exec_net_timeout__" =>
+                    {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    JavascriptSyncRpcServiceResponse::Json(value) => {
+                        panic!("{context}: expected socket data chunk, got {value}");
+                    }
+                }
+            }
+
+            panic!("{context}: timed out waiting for socket data chunk");
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2345,6 +2405,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-kernel-query",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -2364,6 +2425,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-kernel-query",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("dgram.createSocket"),
                     args: vec![json!({ "type": "udp4" })],
@@ -2379,6 +2441,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-kernel-query",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("dgram.bind"),
                     args: vec![
@@ -2512,6 +2575,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-inspect-listener",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -2602,6 +2666,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-inspect-udp",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("dgram.createSocket"),
                     args: vec![json!({ "type": "udp4" })],
@@ -2617,6 +2682,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-inspect-udp",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("dgram.bind"),
                     args: vec![
@@ -2723,6 +2789,85 @@ ykAheWCsAteSEWVc0w==\n\
                 other => panic!("unexpected process snapshot response payload: {other:?}"),
             }
         }
+        fn get_resource_snapshot_rejects_without_process_inspect_permission() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                inspect_permissions(false, false),
+            )
+            .expect("create vm");
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    18,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::GetResourceSnapshot(GetResourceSnapshotRequest {}),
+                ))
+                .expect("dispatch resource snapshot");
+
+            match response.response.payload {
+                ResponsePayload::Rejected(rejected) => {
+                    assert_eq!(rejected.code, "execution_error");
+                    assert!(
+                        rejected
+                            .message
+                            .contains("blocked by process.inspect policy"),
+                        "unexpected rejection: {rejected:?}"
+                    );
+                }
+                other => panic!("expected rejected response, got {other:?}"),
+            }
+        }
+        fn get_resource_snapshot_returns_kernel_and_queue_counts_with_process_inspect_permission() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                inspect_permissions(false, true),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-inspect-resources");
+            write_fixture(&cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
+            start_fake_javascript_process(&mut sidecar, &vm_id, &cwd, "proc-js-inspect-resources");
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    19,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::GetResourceSnapshot(GetResourceSnapshotRequest {}),
+                ))
+                .expect("query resource snapshot");
+
+            match response.response.payload {
+                ResponsePayload::ResourceSnapshot(snapshot) => {
+                    assert!(
+                        snapshot.running_processes >= 1,
+                        "expected running kernel process in snapshot: {snapshot:?}"
+                    );
+                    assert!(
+                        snapshot.fd_tables >= 1,
+                        "expected fd table accounting in snapshot: {snapshot:?}"
+                    );
+                    assert!(
+                        snapshot
+                            .queue_snapshots
+                            .iter()
+                            .any(|entry| entry.name == "pending_process_events"),
+                        "expected sidecar queue gauges in snapshot: {snapshot:?}"
+                    );
+                }
+                other => panic!("unexpected resource snapshot response payload: {other:?}"),
+            }
+        }
         fn vm_network_resource_counts_ignore_duplicate_sidecar_kernel_entries() {
             assert_node_available();
 
@@ -2745,6 +2890,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-kernel-counts",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -2764,6 +2910,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-kernel-counts",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("dgram.createSocket"),
                     args: vec![json!({ "type": "udp4" })],
@@ -2779,6 +2926,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-kernel-counts",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("dgram.bind"),
                     args: vec![
@@ -2857,6 +3005,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm_id,
                     process_id,
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 9_000,
                         method: String::from(method),
                         args: vec![json!(id), json!(25)],
@@ -3258,6 +3407,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-wait-connect",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -3279,6 +3429,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-wait-connect",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -3295,6 +3446,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-wait-connect",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.socket_wait_connect"),
                     args: vec![json!(socket_id.clone())],
@@ -3319,6 +3471,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-net-wait-connect",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 4 + attempt,
                             method: String::from("net.server_accept"),
                             args: vec![json!(server_id.clone())],
@@ -3341,6 +3494,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-wait-connect",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 50,
                     method: String::from("net.destroy"),
                     args: vec![json!(socket_id)],
@@ -3352,6 +3506,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-wait-connect",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 51,
                     method: String::from("net.destroy"),
                     args: vec![json!(accepted_socket_id)],
@@ -3363,6 +3518,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-wait-connect",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 52,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -3392,6 +3548,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -3413,6 +3570,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -3429,6 +3587,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.socket_set_no_delay"),
                     args: vec![json!(socket_id.clone()), Value::Bool(true)],
@@ -3440,6 +3599,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.socket_set_keep_alive"),
                     args: vec![json!(socket_id.clone()), Value::Bool(true), json!(1)],
@@ -3454,6 +3614,7 @@ ykAheWCsAteSEWVc0w==\n\
                     &vm_id,
                     "proc-js-net-read",
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 5 + attempt,
                         method: String::from("net.server_accept"),
                         args: vec![json!(server_id.clone())],
@@ -3499,6 +3660,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 60,
                     method: String::from("net.write"),
                     args: vec![
@@ -3516,6 +3678,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 61,
                     method: String::from("net.shutdown"),
                     args: vec![json!(server_socket_id.clone())],
@@ -3525,25 +3688,33 @@ ykAheWCsAteSEWVc0w==\n\
 
             let mut payload = None;
             for attempt in 0..20 {
-                let value = call_javascript_sync_rpc(
+                let response = call_javascript_sync_rpc_response(
                     &mut sidecar,
                     &vm_id,
                     "proc-js-net-read",
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 10 + attempt,
                         method: String::from("net.socket_read"),
                         args: vec![json!(socket_id.clone())],
                     },
                 )
                 .expect("read bridged socket chunk");
-                if value != "__secure_exec_net_timeout__" {
-                    payload = Some(value);
-                    break;
+                match response {
+                    JavascriptSyncRpcServiceResponse::Raw(chunk) => {
+                        payload = Some(chunk);
+                        break;
+                    }
+                    JavascriptSyncRpcServiceResponse::Json(value)
+                        if value == "__secure_exec_net_timeout__" => {}
+                    JavascriptSyncRpcServiceResponse::Json(value) => {
+                        panic!("expected bridged socket data chunk, got {value}");
+                    }
                 }
                 thread::sleep(std::time::Duration::from_millis(10));
             }
             let payload = payload.expect("eventually receive bridged socket data");
-            assert_eq!(payload, Value::from("cGluZw=="));
+            assert_eq!(payload, b"ping");
 
             let mut end = None;
             for attempt in 0..20 {
@@ -3552,6 +3723,7 @@ ykAheWCsAteSEWVc0w==\n\
                     &vm_id,
                     "proc-js-net-read",
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 40 + attempt,
                         method: String::from("net.socket_read"),
                         args: vec![json!(socket_id.clone())],
@@ -3572,6 +3744,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 99,
                     method: String::from("net.destroy"),
                     args: vec![json!(socket_id)],
@@ -3583,6 +3756,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 100,
                     method: String::from("net.destroy"),
                     args: vec![json!(server_socket_id)],
@@ -3594,6 +3768,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-net-read",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 101,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -3642,6 +3817,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -3664,6 +3840,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -3704,6 +3881,7 @@ ykAheWCsAteSEWVc0w==\n\
                     &vm_id,
                     "proc-server",
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 10 + attempt,
                         method: String::from("net.server_accept"),
                         args: vec![json!(server_id.clone())],
@@ -3732,6 +3910,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 100,
                     method: String::from("net.write"),
                     args: vec![
@@ -3749,6 +3928,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 101,
                     method: String::from("net.shutdown"),
                     args: vec![json!(client_socket_id.clone())],
@@ -3756,29 +3936,17 @@ ykAheWCsAteSEWVc0w==\n\
             )
             .expect("client shutdown write half");
 
-            let mut payload = None;
-            for attempt in 0..40 {
-                let value = call_javascript_sync_rpc(
-                    &mut sidecar,
-                    &vm_id,
-                    "proc-server",
-                    JavascriptSyncRpcRequest {
-                        id: 200 + attempt,
-                        method: String::from("net.socket_read"),
-                        args: vec![json!(server_socket_id.clone())],
-                    },
-                )
-                .expect("server read bridged chunk from the other exec");
-                if value != "__secure_exec_net_timeout__" {
-                    payload = Some(value);
-                    break;
-                }
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let payload = payload.expect("eventually receive the cross-exec payload");
+            let payload = read_javascript_socket_chunk(
+                &mut sidecar,
+                &vm_id,
+                "proc-server",
+                &server_socket_id,
+                200,
+                40,
+                "server read bridged chunk from the other exec",
+            );
             assert_eq!(
-                payload,
-                Value::from("cGluZw=="),
+                payload, b"ping",
                 "server (exec A) must read the byte sent by client (exec B)"
             );
 
@@ -3788,6 +3956,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 300,
                     method: String::from("net.destroy"),
                     args: vec![json!(client_socket_id)],
@@ -3799,6 +3968,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 301,
                     method: String::from("net.destroy"),
                     args: vec![json!(server_socket_id)],
@@ -3810,6 +3980,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 302,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -3839,6 +4010,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -3860,6 +4032,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -3878,6 +4051,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-upgrade-socket",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 10 + attempt,
                             method: String::from("net.server_accept"),
                             args: vec![json!(server_id.clone())],
@@ -3900,6 +4074,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 50,
                     method: String::from("net.upgrade_socket_write"),
                     args: vec![
@@ -3911,33 +4086,23 @@ ykAheWCsAteSEWVc0w==\n\
             .expect("write upgrade socket payload");
             assert_eq!(written, Value::from(4));
 
-            let mut payload = None;
-            for attempt in 0..20 {
-                let value = call_javascript_sync_rpc(
-                    &mut sidecar,
-                    &vm_id,
-                    "proc-js-upgrade-socket",
-                    JavascriptSyncRpcRequest {
-                        id: 60 + attempt,
-                        method: String::from("net.socket_read"),
-                        args: vec![json!(client_socket_id.clone())],
-                    },
-                )
-                .expect("read upgrade socket payload");
-                if value != "__secure_exec_net_timeout__" {
-                    payload = Some(value);
-                    break;
-                }
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let payload = payload.expect("eventually receive upgrade socket data");
-            assert_eq!(payload, Value::from("cGluZw=="));
+            let payload = read_javascript_socket_chunk(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-upgrade-socket",
+                &client_socket_id,
+                60,
+                20,
+                "read upgrade socket payload",
+            );
+            assert_eq!(payload, b"ping");
 
             call_javascript_sync_rpc(
                 &mut sidecar,
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 80,
                     method: String::from("net.upgrade_socket_end"),
                     args: vec![json!(server_socket_id.clone())],
@@ -3952,6 +4117,7 @@ ykAheWCsAteSEWVc0w==\n\
                     &vm_id,
                     "proc-js-upgrade-socket",
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 90 + attempt,
                         method: String::from("net.socket_read"),
                         args: vec![json!(client_socket_id.clone())],
@@ -3972,6 +4138,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 120,
                     method: String::from("net.upgrade_socket_destroy"),
                     args: vec![json!(client_socket_id)],
@@ -3983,6 +4150,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 121,
                     method: String::from("net.upgrade_socket_destroy"),
                     args: vec![json!(server_socket_id)],
@@ -3994,6 +4162,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-upgrade-socket",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 122,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -4023,6 +4192,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("dgram.createSocket"),
                     args: vec![json!({ "type": "udp4" })],
@@ -4039,6 +4209,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("dgram.bind"),
                     args: vec![
@@ -4057,6 +4228,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("dgram.address"),
                     args: vec![json!(socket_id.clone())],
@@ -4078,6 +4250,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("dgram.setBufferSize"),
                     args: vec![json!(socket_id.clone()), json!("recv"), json!(4096)],
@@ -4089,6 +4262,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("dgram.setBufferSize"),
                     args: vec![json!(socket_id.clone()), json!("send"), json!(2048)],
@@ -4101,6 +4275,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("dgram.getBufferSize"),
                     args: vec![json!(socket_id.clone()), json!("recv")],
@@ -4117,6 +4292,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("dgram.getBufferSize"),
                     args: vec![json!(socket_id.clone()), json!("send")],
@@ -4133,6 +4309,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-dgram-options",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 8,
                     method: String::from("dgram.close"),
                     args: vec![json!(socket_id)],
@@ -4195,6 +4372,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("tls.get_ciphers"),
                     args: Vec::new(),
@@ -4215,6 +4393,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -4231,6 +4410,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.socket_upgrade_tls"),
                     args: vec![
@@ -4252,6 +4432,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.socket_tls_query"),
                     args: vec![json!(socket_id.clone()), json!("getProtocol")],
@@ -4272,6 +4453,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("net.socket_tls_query"),
                     args: vec![json!(socket_id.clone()), json!("getCipher")],
@@ -4288,6 +4470,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("net.socket_tls_query"),
                     args: vec![
@@ -4311,6 +4494,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("net.write"),
                     args: vec![
@@ -4324,34 +4508,23 @@ ykAheWCsAteSEWVc0w==\n\
             )
             .expect("write TLS client payload");
 
-            let payload = (0..30)
-                .find_map(|attempt| {
-                    let value = call_javascript_sync_rpc(
-                        &mut sidecar,
-                        &vm_id,
-                        "proc-js-tls-client",
-                        JavascriptSyncRpcRequest {
-                            id: 20 + attempt,
-                            method: String::from("net.socket_read"),
-                            args: vec![json!(socket_id.clone())],
-                        },
-                    )
-                    .expect("read TLS client payload");
-                    if value == "__secure_exec_net_timeout__" {
-                        thread::sleep(Duration::from_millis(10));
-                        None
-                    } else {
-                        Some(value)
-                    }
-                })
-                .expect("eventually receive TLS response");
-            assert_eq!(payload, Value::from("cG9uZw=="));
+            let payload = read_javascript_socket_chunk(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-tls-client",
+                &socket_id,
+                20,
+                30,
+                "read TLS client payload",
+            );
+            assert_eq!(payload, b"pong");
 
             call_javascript_sync_rpc(
                 &mut sidecar,
                 &vm_id,
                 "proc-js-tls-client",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 99,
                     method: String::from("net.destroy"),
                     args: vec![json!(socket_id)],
@@ -4384,6 +4557,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -4404,6 +4578,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -4425,6 +4600,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-tls-server",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 10 + attempt,
                             method: String::from("net.server_accept"),
                             args: vec![json!(server_id.clone())],
@@ -4452,6 +4628,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 40,
                     method: String::from("net.socket_upgrade_tls"),
                     args: vec![
@@ -4475,6 +4652,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-tls-server",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 50 + attempt,
                             method: String::from("net.socket_get_tls_client_hello"),
                             args: vec![json!(socket_id.clone())],
@@ -4505,6 +4683,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 80,
                     method: String::from("net.socket_upgrade_tls"),
                     args: vec![
@@ -4526,6 +4705,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 81,
                     method: String::from("net.socket_tls_query"),
                     args: vec![json!(socket_id.clone()), json!("getCertificate")],
@@ -4544,6 +4724,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-tls-server",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 82 + attempt * 2,
                             method: String::from("net.socket_tls_query"),
                             args: vec![json!(socket_id.clone()), json!("getProtocol")],
@@ -4560,6 +4741,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-tls-server",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 83 + attempt * 2,
                             method: String::from("net.socket_tls_query"),
                             args: vec![json!(client_socket_id.clone()), json!("getProtocol")],
@@ -4585,6 +4767,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 145,
                     method: String::from("net.write"),
                     args: vec![
@@ -4598,28 +4781,16 @@ ykAheWCsAteSEWVc0w==\n\
             )
             .expect("write guest TLS client payload");
 
-            let payload = (0..30)
-                .find_map(|attempt| {
-                    let value = call_javascript_sync_rpc(
-                        &mut sidecar,
-                        &vm_id,
-                        "proc-js-tls-server",
-                        JavascriptSyncRpcRequest {
-                            id: 150 + attempt,
-                            method: String::from("net.socket_read"),
-                            args: vec![json!(socket_id.clone())],
-                        },
-                    )
-                    .expect("read TLS server payload");
-                    if value == "__secure_exec_net_timeout__" {
-                        thread::sleep(Duration::from_millis(10));
-                        None
-                    } else {
-                        Some(value)
-                    }
-                })
-                .expect("eventually receive TLS client payload");
-            assert_eq!(payload, Value::from("cGluZw=="));
+            let payload = read_javascript_socket_chunk(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-tls-server",
+                &socket_id,
+                150,
+                30,
+                "read TLS server payload",
+            );
+            assert_eq!(payload, b"ping");
 
             let protocol = (0..30)
                 .find_map(|attempt| {
@@ -4628,6 +4799,7 @@ ykAheWCsAteSEWVc0w==\n\
                         &vm_id,
                         "proc-js-tls-server",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 190 + attempt,
                             method: String::from("net.socket_tls_query"),
                             args: vec![json!(socket_id.clone()), json!("getProtocol")],
@@ -4656,6 +4828,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 120,
                     method: String::from("net.write"),
                     args: vec![
@@ -4669,34 +4842,23 @@ ykAheWCsAteSEWVc0w==\n\
             )
             .expect("write TLS server payload");
 
-            let client_payload = (0..30)
-                .find_map(|attempt| {
-                    let value = call_javascript_sync_rpc(
-                        &mut sidecar,
-                        &vm_id,
-                        "proc-js-tls-server",
-                        JavascriptSyncRpcRequest {
-                            id: 220 + attempt,
-                            method: String::from("net.socket_read"),
-                            args: vec![json!(client_socket_id.clone())],
-                        },
-                    )
-                    .expect("read guest TLS client payload");
-                    if value == "__secure_exec_net_timeout__" {
-                        thread::sleep(Duration::from_millis(10));
-                        None
-                    } else {
-                        Some(value)
-                    }
-                })
-                .expect("eventually receive TLS server payload");
-            assert_eq!(client_payload, Value::from("cG9uZw=="));
+            let client_payload = read_javascript_socket_chunk(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-tls-server",
+                &client_socket_id,
+                220,
+                30,
+                "read guest TLS client payload",
+            );
+            assert_eq!(client_payload, b"pong");
 
             call_javascript_sync_rpc(
                 &mut sidecar,
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 121,
                     method: String::from("net.destroy"),
                     args: vec![json!(socket_id)],
@@ -4708,6 +4870,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 122,
                     method: String::from("net.destroy"),
                     args: vec![json!(client_socket_id)],
@@ -4719,6 +4882,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-tls-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 123,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -4748,6 +4912,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-server-accept",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -4768,6 +4933,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-server-accept",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.server_accept"),
                     args: vec![json!(server_id.clone())],
@@ -4781,6 +4947,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-server-accept",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -4802,6 +4969,7 @@ ykAheWCsAteSEWVc0w==\n\
                     &vm_id,
                     "proc-js-server-accept",
                     JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 10 + attempt,
                         method: String::from("net.server_accept"),
                         args: vec![json!(server_id.clone())],
@@ -4838,6 +5006,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-server-accept",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 40,
                     method: String::from("net.destroy"),
                     args: vec![json!(client_socket_id)],
@@ -4849,6 +5018,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-server-accept",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 41,
                     method: String::from("net.destroy"),
                     args: vec![json!(parsed["socketId"]
@@ -4947,6 +5117,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-stdin",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("__kernel_stdin_read"),
                     args: vec![json!(1024), json!(10)],
@@ -4978,6 +5149,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-stdin",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("__kernel_stdin_read"),
                     args: vec![json!(1024), json!(10)],
@@ -5013,6 +5185,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-stdin",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("__kernel_stdin_read"),
                     args: vec![json!(1024), json!(10)],
@@ -5115,6 +5288,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-pty",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("__pty_set_raw_mode"),
                     args: vec![json!(true)],
@@ -5140,6 +5314,7 @@ ykAheWCsAteSEWVc0w==\n\
                 &vm_id,
                 "proc-js-pty",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("__pty_set_raw_mode"),
                     args: vec![json!(false)],
@@ -5327,6 +5502,7 @@ ykAheWCsAteSEWVc0w==\n\
             let (connection_id, session_id) =
                 authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
             let request = JavascriptSyncRpcRequest {
+                raw_bytes_args: std::collections::HashMap::new(),
                 id: 1,
                 method: String::from("process.kill"),
                 args: vec![json!(999_999u32), json!("SIGTERM")],
@@ -10434,6 +10610,7 @@ await new Promise(() => {});
                 &mut process,
                 kernel_pid,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("fs.readlinkSync"),
                     args: vec![json!("/proc/self")],
@@ -10447,6 +10624,7 @@ await new Promise(() => {});
                 &mut process,
                 kernel_pid,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("fs.readdirSync"),
                     args: vec![json!("/proc/self/fd")],
@@ -10457,7 +10635,14 @@ await new Promise(() => {});
                 .as_array()
                 .expect("readdir should return an array")
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|entry| {
+                    // Raw sidecar readdir RPCs may return typed entries so the JS
+                    // bridge can implement `withFileTypes` without per-entry stat
+                    // RPCs; plain guest `readdirSync()` normalizes these to names.
+                    entry
+                        .as_str()
+                        .or_else(|| entry.get("name").and_then(Value::as_str))
+                })
                 .collect::<Vec<_>>();
             assert!(entry_names.contains(&"0"));
             assert!(entry_names.contains(&"1"));
@@ -11096,6 +11281,7 @@ await new Promise(() => {});
             let sha256 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("crypto.hashDigest"),
                     args: vec![json!("sha256"), json!("YWdlbnQtb3M=")],
@@ -11110,6 +11296,7 @@ await new Promise(() => {});
             let sha512 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("crypto.hashDigest"),
                     args: vec![json!("sha512"), json!("YWdlbnQtb3M=")],
@@ -11126,6 +11313,7 @@ await new Promise(() => {});
             let sha1 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("crypto.hashDigest"),
                     args: vec![json!("sha1"), json!("YWdlbnQtb3M=")],
@@ -11140,6 +11328,7 @@ await new Promise(() => {});
             let md5 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("crypto.hashDigest"),
                     args: vec![json!("md5"), json!("YWdlbnQtb3M=")],
@@ -11154,6 +11343,7 @@ await new Promise(() => {});
             let hmac = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("crypto.hmacDigest"),
                     args: vec![
@@ -11172,6 +11362,7 @@ await new Promise(() => {});
             let pbkdf2 = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("crypto.pbkdf2"),
                     args: vec![
@@ -11192,6 +11383,7 @@ await new Promise(() => {});
             let scrypt = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("crypto.scrypt"),
                     args: vec![
@@ -11223,6 +11415,7 @@ await new Promise(() => {});
             let cipher_response = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut create_crypto_test_process(),
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 10,
                     method: String::from("crypto.cipheriv"),
                     args: vec![
@@ -11242,6 +11435,7 @@ await new Promise(() => {});
             let decipher_response = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut create_crypto_test_process(),
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 11,
                     method: String::from("crypto.decipheriv"),
                     args: vec![
@@ -11265,6 +11459,7 @@ await new Promise(() => {});
             let session_id = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut streaming_process,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 12,
                     method: String::from("crypto.cipherivCreate"),
                     args: vec![
@@ -11283,6 +11478,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut streaming_process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 13,
                         method: String::from("crypto.cipherivUpdate"),
                         args: vec![
@@ -11297,6 +11493,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut streaming_process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 14,
                         method: String::from("crypto.cipherivFinal"),
                         args: vec![json!(session_id)],
@@ -11327,6 +11524,7 @@ await new Promise(() => {});
             let signature = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut create_crypto_test_process(),
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 15,
                     method: String::from("crypto.sign"),
                     args: vec![
@@ -11340,6 +11538,7 @@ await new Promise(() => {});
             let verified = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut create_crypto_test_process(),
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 16,
                     method: String::from("crypto.verify"),
                     args: vec![
@@ -11356,6 +11555,7 @@ await new Promise(() => {});
             let encrypted = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut create_crypto_test_process(),
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 17,
                     method: String::from("crypto.asymmetricOp"),
                     args: vec![
@@ -11369,6 +11569,7 @@ await new Promise(() => {});
             let decrypted = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut create_crypto_test_process(),
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 18,
                     method: String::from("crypto.asymmetricOp"),
                     args: vec![json!("privateDecrypt"), json!(private_key_json), encrypted],
@@ -11384,6 +11585,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 19,
                         method: String::from("crypto.createKeyObject"),
                         args: vec![json!("createPrivateKey"), json!(private_key_json)],
@@ -11397,6 +11599,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 20,
                         method: String::from("crypto.generateKeyPairSync"),
                         args: vec![
@@ -11414,6 +11617,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 21,
                         method: String::from("crypto.generateKeySync"),
                         args: vec![
@@ -11430,6 +11634,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 22,
                         method: String::from("crypto.generatePrimeSync"),
                         args: vec![
@@ -11446,6 +11651,7 @@ await new Promise(() => {});
             let alice_id = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut alice,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 23,
                     method: String::from("crypto.diffieHellmanSessionCreate"),
                     args: vec![json!(r#"{"type":"ecdh","name":"P-256"}"#)],
@@ -11458,6 +11664,7 @@ await new Promise(() => {});
             let bob_id = crate::execution::service_javascript_crypto_sync_rpc(
                 &mut bob,
                 &JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 24,
                     method: String::from("crypto.diffieHellmanSessionCreate"),
                     args: vec![json!(r#"{"type":"ecdh","name":"P-256"}"#)],
@@ -11470,6 +11677,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut alice,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 25,
                         method: String::from("crypto.diffieHellmanSessionCall"),
                         args: vec![json!(alice_id), json!(r#"{"method":"generateKeys"}"#)],
@@ -11482,6 +11690,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut bob,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 26,
                         method: String::from("crypto.diffieHellmanSessionCall"),
                         args: vec![json!(bob_id), json!(r#"{"method":"generateKeys"}"#)],
@@ -11494,6 +11703,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut alice,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 27,
                         method: String::from("crypto.diffieHellmanSessionCall"),
                         args: vec![
@@ -11512,6 +11722,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut bob,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 28,
                         method: String::from("crypto.diffieHellmanSessionCall"),
                         args: vec![
@@ -11533,6 +11744,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 29,
                         method: String::from("crypto.subtle"),
                         args: vec![json!(
@@ -11551,6 +11763,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 30,
                         method: String::from("crypto.subtle"),
                         args: vec![json!(serde_json::to_string(&json!({
@@ -11573,6 +11786,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 31,
                         method: String::from("crypto.subtle"),
                         args: vec![json!(serde_json::to_string(&json!({
@@ -11593,6 +11807,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 32,
                         method: String::from("crypto.subtle"),
                         args: vec![json!(serde_json::to_string(&json!({
@@ -11615,6 +11830,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 33,
                         method: String::from("crypto.subtle"),
                         args: vec![json!(serde_json::to_string(&json!({
@@ -11640,6 +11856,7 @@ await new Promise(() => {});
                 crate::execution::service_javascript_crypto_sync_rpc(
                     &mut create_crypto_test_process(),
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 34,
                         method: String::from("crypto.subtle"),
                         args: vec![json!(serde_json::to_string(&json!({
@@ -11706,6 +11923,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("sqlite.open"),
                     args: vec![json!("/workspace/app.db"), json!({})],
@@ -11720,6 +11938,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("sqlite.exec"),
                     args: vec![
@@ -11736,6 +11955,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("sqlite.prepare"),
                     args: vec![
@@ -11753,6 +11973,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("sqlite.statement.run"),
                     args: vec![
@@ -11778,6 +11999,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("sqlite.statement.finalize"),
                     args: vec![json!(statement_id)],
@@ -11790,6 +12012,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("sqlite.query"),
                     args: vec![
@@ -11813,6 +12036,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("sqlite.close"),
                     args: vec![json!(database_id)],
@@ -11825,6 +12049,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 8,
                     method: String::from("sqlite.open"),
                     args: vec![json!("/workspace/app.db"), json!({})],
@@ -11839,6 +12064,7 @@ await new Promise(() => {});
                 &vm_id,
                 process_id,
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 9,
                     method: String::from("sqlite.query"),
                     args: vec![
@@ -13192,6 +13418,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-http-listen",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.http_listen"),
                     args: vec![Value::String(String::from(
@@ -13228,6 +13455,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-http-listen",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.http_close"),
                     args: vec![json!(7)],
@@ -13276,6 +13504,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-http-respond",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.http_respond"),
                     args: vec![json!(7), json!(9), Value::String(response_json.clone())],
@@ -13331,6 +13560,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-http-respond-oversized",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("net.http_respond"),
                     args: vec![json!(7), json!(10), Value::String(response_json)],
@@ -13493,6 +13723,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.http2_server_listen"),
                     args: vec![Value::String(String::from(
@@ -13513,6 +13744,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.http2_session_connect"),
                     args: vec![Value::String(format!(
@@ -13547,6 +13779,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.http2_session_request"),
                     args: vec![
@@ -13588,6 +13821,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.http2_stream_respond"),
                     args: vec![
@@ -13606,6 +13840,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("net.http2_stream_write"),
                     args: vec![
@@ -13622,6 +13857,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("net.http2_stream_end"),
                     args: vec![json!(server_stream_id), Value::Null],
@@ -13671,6 +13907,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("net.http2_session_close"),
                     args: vec![json!(client_session_id)],
@@ -13684,6 +13921,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 8,
                     method: String::from("net.http2_server_close"),
                     args: vec![json!(11)],
@@ -13729,6 +13967,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 10,
                     method: String::from("net.http2_server_listen"),
                     args: vec![Value::String(String::from(
@@ -13747,6 +13986,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 11,
                     method: String::from("net.http2_session_connect"),
                     args: vec![Value::String(format!(
@@ -13774,6 +14014,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 12,
                     method: String::from("net.http2_session_settings"),
                     args: vec![
@@ -13804,6 +14045,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 13,
                     method: String::from("net.http2_session_set_local_window_size"),
                     args: vec![json!(session_id), json!(4096)],
@@ -13823,6 +14065,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 14,
                     method: String::from("net.http2_session_request"),
                     args: vec![
@@ -13854,6 +14097,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 15,
                     method: String::from("net.http2_stream_pause"),
                     args: vec![json!(server_stream_id)],
@@ -13866,6 +14110,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 16,
                     method: String::from("net.http2_stream_resume"),
                     args: vec![json!(server_stream_id)],
@@ -13879,6 +14124,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 17,
                     method: String::from("net.http2_stream_push_stream"),
                     args: vec![
@@ -13899,6 +14145,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 18,
                     method: String::from("net.http2_stream_close"),
                     args: vec![json!(pushed_stream_id), json!(0)],
@@ -13912,6 +14159,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 19,
                     method: String::from("net.http2_stream_respond_with_file"),
                     args: vec![
@@ -13937,6 +14185,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 20,
                     method: String::from("net.http2_stream_respond_with_file"),
                     args: vec![
@@ -13979,6 +14228,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 21,
                     method: String::from("net.http2_session_close"),
                     args: vec![json!(session_id), json!(0)],
@@ -13992,6 +14242,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-surfaces",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 22,
                     method: String::from("net.http2_server_close"),
                     args: vec![json!(22)],
@@ -14020,6 +14271,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-secure",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 20,
                     method: String::from("net.http2_server_listen"),
                     args: vec![Value::String(
@@ -14054,6 +14306,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-secure",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 21,
                     method: String::from("net.http2_session_connect"),
                     args: vec![Value::String(
@@ -14100,6 +14353,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-secure",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 22,
                     method: String::from("net.http2_session_request"),
                     args: vec![
@@ -14132,6 +14386,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-secure",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 23,
                     method: String::from("net.http2_stream_respond"),
                     args: vec![
@@ -14150,6 +14405,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-secure",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 24,
                     method: String::from("net.http2_stream_end"),
                     args: vec![
@@ -14228,6 +14484,7 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
                 &vm_id,
                 "proc-js-http2-respond",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 25,
                     method: String::from("net.http2_server_respond"),
                     args: vec![json!(33), json!(44), Value::String(response_json.clone())],
@@ -15331,6 +15588,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -15372,6 +15630,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -15391,6 +15650,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.server_poll"),
                     args: vec![json!(server_id), json!(250)],
@@ -15410,6 +15670,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.write"),
                     args: vec![
@@ -15429,6 +15690,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("net.shutdown"),
                     args: vec![json!(client_socket_id.clone())],
@@ -15441,6 +15703,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("net.poll"),
                     args: vec![json!(socket_id.clone()), json!(250)],
@@ -15459,6 +15722,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("net.write"),
                     args: vec![
@@ -15478,6 +15742,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 8,
                     method: String::from("net.shutdown"),
                     args: vec![json!(socket_id)],
@@ -15490,6 +15755,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 9,
                     method: String::from("net.poll"),
                     args: vec![json!(client_socket_id.clone()), json!(250)],
@@ -15511,6 +15777,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-server",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 10,
                     method: String::from("net.poll"),
                     args: vec![json!(client_socket_id), json!(250)],
@@ -15542,6 +15809,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -15563,6 +15831,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -15582,6 +15851,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -15601,6 +15871,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.server_poll"),
                     args: vec![json!(server_id.clone()), json!(250)],
@@ -15618,6 +15889,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("net.server_connections"),
                     args: vec![json!(server_id.clone())],
@@ -15631,6 +15903,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("net.server_poll"),
                     args: vec![json!(server_id.clone()), json!(50)],
@@ -15644,6 +15917,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("net.server_connections"),
                     args: vec![json!(server_id.clone())],
@@ -15657,6 +15931,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 8,
                     method: String::from("net.destroy"),
                     args: vec![json!(first_socket_id)],
@@ -15668,6 +15943,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 9,
                     method: String::from("net.destroy"),
                     args: vec![json!(first_client_socket_id)],
@@ -15679,6 +15955,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-backlog",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 10,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -15740,6 +16017,7 @@ console.log(JSON.stringify(summary));
                 &poll_vm_id,
                 "proc-js-poll",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -15760,6 +16038,7 @@ console.log(JSON.stringify(summary));
                 &poll_vm_id,
                 "proc-js-poll",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -15779,6 +16058,7 @@ console.log(JSON.stringify(summary));
                 &poll_vm_id,
                 "proc-js-poll",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.server_poll"),
                     args: vec![json!(server_id.clone()), json!(250)],
@@ -15839,6 +16119,7 @@ console.log(JSON.stringify(summary));
                         &poll_vm_id_for_task,
                         "proc-js-poll",
                         JavascriptSyncRpcRequest {
+                            raw_bytes_args: std::collections::HashMap::new(),
                             id: 4,
                             method: String::from("net.poll"),
                             args: vec![json!(server_socket_id_for_task), json!(u64::MAX)],
@@ -15872,6 +16153,7 @@ console.log(JSON.stringify(summary));
                 &cleanup_poll_vm_id,
                 "proc-js-poll",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("net.destroy"),
                     args: vec![json!(cleanup_server_socket_id)],
@@ -15883,6 +16165,7 @@ console.log(JSON.stringify(summary));
                 &cleanup_poll_vm_id,
                 "proc-js-poll",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("net.destroy"),
                     args: vec![json!(client_socket_id)],
@@ -15894,6 +16177,7 @@ console.log(JSON.stringify(summary));
                 &cleanup_poll_vm_id,
                 "proc-js-poll",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("net.server_close"),
                     args: vec![json!(server_id)],
@@ -15941,6 +16225,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -15958,6 +16243,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -15979,6 +16265,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -16000,6 +16287,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 4,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -16021,6 +16309,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 5,
                     method: String::from("dgram.createSocket"),
                     args: vec![json!({ "type": "udp4" })],
@@ -16037,6 +16326,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 6,
                     method: String::from("dgram.bind"),
                     args: vec![
@@ -16057,6 +16347,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-bind-policy",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 7,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -16105,6 +16396,7 @@ console.log(JSON.stringify(summary));
                 &vm_id,
                 "proc-js-privileged",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -16149,6 +16441,7 @@ console.log(JSON.stringify(summary));
                 &vm_a,
                 "proc-a",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -16163,6 +16456,7 @@ console.log(JSON.stringify(summary));
                 &vm_b,
                 "proc-b",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 1,
                     method: String::from("net.listen"),
                     args: vec![json!({
@@ -16180,6 +16474,7 @@ console.log(JSON.stringify(summary));
                 &vm_a,
                 "proc-a",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -16194,6 +16489,7 @@ console.log(JSON.stringify(summary));
                 &vm_b,
                 "proc-b",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 2,
                     method: String::from("net.connect"),
                     args: vec![json!({
@@ -16219,6 +16515,7 @@ console.log(JSON.stringify(summary));
                 &vm_a,
                 "proc-a",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.server_poll"),
                     args: vec![json!(server_id_a), json!(250)],
@@ -16230,6 +16527,7 @@ console.log(JSON.stringify(summary));
                 &vm_b,
                 "proc-b",
                 JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
                     id: 3,
                     method: String::from("net.server_poll"),
                     args: vec![json!(server_id_b), json!(250)],
@@ -16392,6 +16690,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 1,
                         method: String::from("net.listen"),
                         args: vec![json!({
@@ -16457,6 +16756,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 3,
                         method: String::from("net.connect"),
                         args: vec![json!({
@@ -16497,6 +16797,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 4,
                         method: String::from("net.server_poll"),
                         args: vec![json!(server_id), json!(250)],
@@ -16535,6 +16836,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 5,
                         method: String::from("net.server_connections"),
                         args: vec![json!(server_id)],
@@ -16566,6 +16868,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 6,
                         method: String::from("net.write"),
                         args: vec![
@@ -16602,6 +16905,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 7,
                         method: String::from("net.shutdown"),
                         args: vec![json!(client_socket_id)],
@@ -16632,6 +16936,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 8,
                         method: String::from("net.poll"),
                         args: vec![json!(server_socket_id), json!(250)],
@@ -16666,6 +16971,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 9,
                         method: String::from("net.poll"),
                         args: vec![json!(server_socket_id), json!(250)],
@@ -16697,6 +17003,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 10,
                         method: String::from("net.write"),
                         args: vec![
@@ -16733,6 +17040,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 11,
                         method: String::from("net.shutdown"),
                         args: vec![json!(server_socket_id)],
@@ -16763,6 +17071,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 12,
                         method: String::from("net.poll"),
                         args: vec![json!(client_socket_id), json!(250)],
@@ -16797,6 +17106,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 13,
                         method: String::from("net.poll"),
                         args: vec![json!(client_socket_id), json!(250)],
@@ -16828,6 +17138,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: request_id,
                         method: String::from("net.destroy"),
                         args: vec![json!(id)],
@@ -16858,6 +17169,7 @@ console.log(JSON.stringify(summary));
                     &mut vm.kernel,
                     process,
                     &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
                         id: 16,
                         method: String::from("net.server_close"),
                         args: vec![json!(server_id)],
@@ -17441,6 +17753,8 @@ console.log(JSON.stringify({
             find_bound_udp_returns_socket_with_network_inspect_permission();
             get_process_snapshot_rejects_without_process_inspect_permission();
             get_process_snapshot_returns_processes_with_process_inspect_permission();
+            get_resource_snapshot_rejects_without_process_inspect_permission();
+            get_resource_snapshot_returns_kernel_and_queue_counts_with_process_inspect_permission();
             vm_network_resource_counts_ignore_duplicate_sidecar_kernel_entries();
             loopback_tls_transport_survives_concurrent_handshakes_without_panicking();
             loopback_tls_endpoint_read_survives_competing_drain_and_peer_drop();

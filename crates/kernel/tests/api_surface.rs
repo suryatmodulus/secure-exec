@@ -422,6 +422,54 @@ fn kernel_process_umask_applies_to_created_files_and_directories() {
 }
 
 #[test]
+fn read_dir_with_types_for_process_reports_entries_and_enforces_driver_ownership() {
+    let mut config = KernelVmConfig::new("vm-api-readdir-types");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .register_driver(CommandDriver::new("other", ["other"]))
+        .expect("register other driver");
+    kernel
+        .filesystem_mut()
+        .write_file("/tmp/typed-file.txt", b"hello".to_vec())
+        .expect("seed typed file");
+    kernel
+        .filesystem_mut()
+        .mkdir("/tmp/typed-dir", true)
+        .expect("seed typed dir");
+
+    let process = spawn_shell(&mut kernel);
+    let entries = kernel
+        .read_dir_with_types_for_process("shell", process.pid(), "/tmp")
+        .expect("read typed entries");
+
+    let file_entry = entries
+        .iter()
+        .find(|entry| entry.name == "typed-file.txt")
+        .expect("typed file entry");
+    assert!(!file_entry.is_directory);
+    assert!(!file_entry.is_symbolic_link);
+
+    let dir_entry = entries
+        .iter()
+        .find(|entry| entry.name == "typed-dir")
+        .expect("typed dir entry");
+    assert!(dir_entry.is_directory);
+    assert!(!dir_entry.is_symbolic_link);
+
+    assert_kernel_error_code(
+        kernel.read_dir_with_types_for_process("other", process.pid(), "/tmp"),
+        "EPERM",
+    );
+
+    process.finish(0);
+    kernel.waitpid(process.pid()).expect("wait for shell");
+}
+
+#[test]
 fn kernel_fd_surface_reads_exact_byte_counts_from_device_nodes() {
     let mut config = KernelVmConfig::new("vm-api-fd-devices");
     config.permissions = Permissions::allow_all();

@@ -31,6 +31,12 @@
 		"rationale": "Clamps a guest timer delay to the JS setTimeout ceiling (2^31-1 ms); a leak guard so a timer thread cannot outlive its session by pinning the session Arc, mirroring the standard setTimeout max rather than operator policy."
 	},
 	{
+		"name": "NET_BRIDGE_MAX_RAW_WRITE_BYTES",
+		"path": "crates/execution/assets/v8-bridge.source.js",
+		"class": "invariant",
+		"rationale": "Internal socket bridge flush granularity that preserves backpressure under the wired socket buffered-byte limit; not an operator policy cap."
+	},
+	{
 		"name": "JAVASCRIPT_EVENT_CHANNEL_CAPACITY",
 		"path": "crates/execution/src/javascript.rs",
 		"class": "invariant",
@@ -89,6 +95,12 @@
 		"class": "policy",
 		"rationale": "Python VFS RPC timeout.",
 		"wired": "VmLimits.python.vfs_rpc_timeout_ms"
+	},
+	{
+		"name": "PYTHON_SOCKET_MAX_RECV",
+		"path": "crates/sidecar/src/execution.rs",
+		"class": "policy-deferred",
+		"rationale": "Guest Python socket recv request clamp for one synchronous host read; bounded by default, fold into Python/socket VmLimits if operators need to tune it."
 	},
 	{
 		"name": "V8_SESSION_FRAME_CHANNEL_CAPACITY",

@@ -725,6 +725,12 @@ export async function loadPyodide(options) {
                     | PythonVfsRpcMethod::SubprocessRun => {
                         panic!("unexpected non-filesystem Python RPC: {:?}", request.method)
                     }
+                    other => {
+                        panic!(
+                            "unexpected Python VFS RPC method in this test: {other:?} for {}",
+                            request.path
+                        )
+                    }
                 }
             }
             Some(PythonExecutionEvent::JavascriptSyncRpcRequest(request)) => {
