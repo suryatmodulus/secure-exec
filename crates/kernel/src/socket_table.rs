@@ -4,10 +4,87 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 pub type SocketId = u64;
 pub type SocketResult<T> = Result<T, SocketTableError>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SocketReadTraceSnapshot {
+    pub socket_record_clone_calls: u64,
+    pub socket_record_clone_us: u64,
+    pub read_recv_calls: u64,
+    pub read_recv_bytes: u64,
+    pub read_recv_chunks: u64,
+    pub read_recv_copy_us: u64,
+}
+
+struct SocketReadTraceCounters {
+    socket_record_clone_calls: AtomicU64,
+    socket_record_clone_us: AtomicU64,
+    read_recv_calls: AtomicU64,
+    read_recv_bytes: AtomicU64,
+    read_recv_chunks: AtomicU64,
+    read_recv_copy_us: AtomicU64,
+}
+
+impl SocketReadTraceCounters {
+    const fn new() -> Self {
+        Self {
+            socket_record_clone_calls: AtomicU64::new(0),
+            socket_record_clone_us: AtomicU64::new(0),
+            read_recv_calls: AtomicU64::new(0),
+            read_recv_bytes: AtomicU64::new(0),
+            read_recv_chunks: AtomicU64::new(0),
+            read_recv_copy_us: AtomicU64::new(0),
+        }
+    }
+}
+
+static SOCKET_READ_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+static SOCKET_READ_TRACE_COUNTERS: SocketReadTraceCounters = SocketReadTraceCounters::new();
+
+pub fn set_socket_read_trace_enabled(enabled: bool) {
+    SOCKET_READ_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn reset_socket_read_trace() {
+    for counter in [
+        &SOCKET_READ_TRACE_COUNTERS.socket_record_clone_calls,
+        &SOCKET_READ_TRACE_COUNTERS.socket_record_clone_us,
+        &SOCKET_READ_TRACE_COUNTERS.read_recv_calls,
+        &SOCKET_READ_TRACE_COUNTERS.read_recv_bytes,
+        &SOCKET_READ_TRACE_COUNTERS.read_recv_chunks,
+        &SOCKET_READ_TRACE_COUNTERS.read_recv_copy_us,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+pub fn socket_read_trace_snapshot() -> SocketReadTraceSnapshot {
+    SocketReadTraceSnapshot {
+        socket_record_clone_calls: SOCKET_READ_TRACE_COUNTERS
+            .socket_record_clone_calls
+            .load(Ordering::Relaxed),
+        socket_record_clone_us: SOCKET_READ_TRACE_COUNTERS
+            .socket_record_clone_us
+            .load(Ordering::Relaxed),
+        read_recv_calls: SOCKET_READ_TRACE_COUNTERS
+            .read_recv_calls
+            .load(Ordering::Relaxed),
+        read_recv_bytes: SOCKET_READ_TRACE_COUNTERS
+            .read_recv_bytes
+            .load(Ordering::Relaxed),
+        read_recv_chunks: SOCKET_READ_TRACE_COUNTERS
+            .read_recv_chunks
+            .load(Ordering::Relaxed),
+        read_recv_copy_us: SOCKET_READ_TRACE_COUNTERS
+            .read_recv_copy_us
+            .load(Ordering::Relaxed),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InetSocketAddress {
@@ -176,7 +253,7 @@ impl SocketRecord {
     pub fn buffered_read_bytes(&self) -> usize {
         self.connection_state
             .as_ref()
-            .map(|state| state.recv_buffer.len())
+            .map(ConnectionState::buffered_len)
             .unwrap_or(0)
     }
 
@@ -399,10 +476,84 @@ struct ListenerState {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ConnectionState {
     peer_socket_id: Option<SocketId>,
-    recv_buffer: VecDeque<u8>,
+    recv_buffer: VecDeque<Vec<u8>>,
+    recv_buffer_len: usize,
     read_shutdown: bool,
     write_shutdown: bool,
     peer_write_shutdown: bool,
+}
+
+impl ConnectionState {
+    fn buffered_len(&self) -> usize {
+        self.recv_buffer_len
+    }
+
+    fn has_buffered_data(&self) -> bool {
+        self.recv_buffer_len > 0
+    }
+
+    fn push_recv(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.recv_buffer.push_back(data.to_vec());
+        self.recv_buffer_len = self.recv_buffer_len.saturating_add(data.len());
+    }
+
+    fn read_recv(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+        if max_bytes == 0 {
+            return Some(Vec::new());
+        }
+        if self.recv_buffer_len == 0 {
+            return None;
+        }
+
+        let read_len = self.recv_buffer_len.min(max_bytes);
+        self.recv_buffer_len -= read_len;
+
+        let mut remaining = read_len;
+        let mut chunks = 0usize;
+        let trace_started = SOCKET_READ_TRACE_ENABLED
+            .load(Ordering::Relaxed)
+            .then(Instant::now);
+        let mut out = Vec::with_capacity(read_len);
+        while remaining > 0 {
+            let mut chunk = self.recv_buffer.pop_front()?;
+            chunks += 1;
+            if chunk.len() <= remaining {
+                remaining -= chunk.len();
+                out.extend_from_slice(&chunk);
+                continue;
+            }
+
+            let tail = chunk.split_off(remaining);
+            out.extend_from_slice(&chunk);
+            self.recv_buffer.push_front(tail);
+            remaining = 0;
+        }
+        if let Some(started) = trace_started {
+            SOCKET_READ_TRACE_COUNTERS
+                .read_recv_calls
+                .fetch_add(1, Ordering::Relaxed);
+            SOCKET_READ_TRACE_COUNTERS.read_recv_bytes.fetch_add(
+                u64::try_from(read_len).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            SOCKET_READ_TRACE_COUNTERS
+                .read_recv_chunks
+                .fetch_add(u64::try_from(chunks).unwrap_or(u64::MAX), Ordering::Relaxed);
+            SOCKET_READ_TRACE_COUNTERS.read_recv_copy_us.fetch_add(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        Some(out)
+    }
+
+    fn clear_recv(&mut self) {
+        self.recv_buffer.clear();
+        self.recv_buffer_len = 0;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1294,7 +1445,7 @@ impl SocketTable {
                     .peer_socket_id
                     .and_then(|peer_socket_id| table.sockets.get(&peer_socket_id));
 
-                if requested.intersects(POLLIN) && !connection.recv_buffer.is_empty() {
+                if requested.intersects(POLLIN) && connection.has_buffered_data() {
                     events |= POLLIN;
                 }
                 if connection.peer_write_shutdown || peer.is_none() {
@@ -1368,7 +1519,7 @@ impl SocketTable {
             )));
         }
 
-        peer_connection.recv_buffer.extend(data.iter().copied());
+        peer_connection.push_recv(data);
         Ok(data.len())
     }
 
@@ -1416,11 +1567,23 @@ impl SocketTable {
         }
 
         let mut table = lock_or_recover(&self.inner.state);
-        let record = table
+        let record_ref = table
             .sockets
             .get(&socket_id)
-            .cloned()
             .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+        let clone_started = SOCKET_READ_TRACE_ENABLED
+            .load(Ordering::Relaxed)
+            .then(Instant::now);
+        let record = record_ref.clone();
+        if let Some(started) = clone_started {
+            SOCKET_READ_TRACE_COUNTERS
+                .socket_record_clone_calls
+                .fetch_add(1, Ordering::Relaxed);
+            SOCKET_READ_TRACE_COUNTERS.socket_record_clone_us.fetch_add(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         if record.state != SocketState::Connected {
             return Err(SocketTableError::not_connected(format!(
                 "socket {socket_id} is not connected"
@@ -1433,7 +1596,7 @@ impl SocketTable {
         if connection.read_shutdown {
             return Ok(None);
         }
-        if !connection.recv_buffer.is_empty() {
+        if connection.has_buffered_data() {
             let record = table
                 .sockets
                 .get_mut(&socket_id)
@@ -1441,9 +1604,7 @@ impl SocketTable {
             let connection = record.connection_state.as_mut().ok_or_else(|| {
                 SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
             })?;
-            let read_len = connection.recv_buffer.len().min(max_bytes);
-            let bytes = connection.recv_buffer.drain(..read_len).collect::<Vec<_>>();
-            return Ok(Some(bytes));
+            return Ok(connection.read_recv(max_bytes));
         }
 
         let peer_open = connection
@@ -1481,7 +1642,7 @@ impl SocketTable {
         };
 
         if matches!(how, SocketShutdown::Read | SocketShutdown::Both) {
-            connection.recv_buffer.clear();
+            connection.clear_recv();
             connection.read_shutdown = true;
         }
         if matches!(how, SocketShutdown::Write | SocketShutdown::Both) {
@@ -1535,7 +1696,7 @@ impl SocketTable {
             if let Some(connection) = &record.connection_state {
                 snapshot.buffered_bytes = snapshot
                     .buffered_bytes
-                    .saturating_add(connection.recv_buffer.len());
+                    .saturating_add(connection.buffered_len());
             }
             if let Some(datagram_state) = &record.datagram_state {
                 snapshot.datagram_queue_len = snapshot
