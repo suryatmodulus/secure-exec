@@ -76,9 +76,12 @@ const undiciRuntimeFeaturesShim = path.join(
 const undiciRuntimeFeaturesPath = require.resolve(
 	"undici/lib/util/runtime-features.js",
 );
+const nodeStdlibUrlPackageEntry = createRequire(stdLibBrowser.url).resolve("url/");
 
 const alias = {};
 const customAlias = {
+	url: nodeStdlibUrlPackageEntry,
+	"node:url": nodeStdlibUrlPackageEntry,
 	stream: path.join(undiciShimDir, "stream.js"),
 	"node:stream": path.join(undiciShimDir, "stream.js"),
 	"secure-exec-stream-stdlib": stdLibBrowser.stream,
