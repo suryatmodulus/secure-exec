@@ -28,8 +28,9 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{
-    channel, error::TryRecvError as TokioTryRecvError, Receiver as TokioReceiver,
+use tokio::sync::{
+    mpsc::{channel, error::TryRecvError as TokioTryRecvError, Receiver as TokioReceiver},
+    Notify,
 };
 use tokio::time;
 
@@ -60,6 +61,84 @@ const NODE_SYNC_RPC_RESPONSE_FD_ENV: &str = "AGENTOS_NODE_SYNC_RPC_RESPONSE_FD";
 const NODE_SYNC_RPC_DATA_BYTES_ENV: &str = "AGENTOS_NODE_SYNC_RPC_DATA_BYTES";
 const NODE_SYNC_RPC_WAIT_TIMEOUT_MS_ENV: &str = "AGENTOS_NODE_SYNC_RPC_WAIT_TIMEOUT_MS";
 static NEXT_V8_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+#[derive(Default)]
+struct JsStartPhaseStats {
+    calls: u64,
+    total_ns: u128,
+    max_ns: u128,
+}
+
+static JS_START_PHASES: OnceLock<Mutex<BTreeMap<String, JsStartPhaseStats>>> = OnceLock::new();
+static JS_EVENT_PHASES: OnceLock<Mutex<BTreeMap<String, JsStartPhaseStats>>> = OnceLock::new();
+
+fn js_start_phases_enabled() -> bool {
+    std::env::var("AGENTOS_JS_START_PHASES").as_deref() == Ok("1")
+}
+
+fn js_event_phases_enabled() -> bool {
+    std::env::var("AGENTOS_JS_EVENT_PHASES").as_deref() == Ok("1")
+}
+
+fn record_js_start_phase(stage: &str, elapsed: Duration) {
+    if !js_start_phases_enabled() {
+        return;
+    }
+    record_js_phase_stats(
+        &JS_START_PHASES,
+        "AGENTOS_JS_START_PHASES_FILE",
+        stage,
+        elapsed,
+    );
+}
+
+fn record_js_event_phase(stage: &str, elapsed: Duration) {
+    if !js_event_phases_enabled() {
+        return;
+    }
+    record_js_phase_stats(
+        &JS_EVENT_PHASES,
+        "AGENTOS_JS_EVENT_PHASES_FILE",
+        stage,
+        elapsed,
+    );
+}
+
+fn record_js_phase_stats(
+    phases: &OnceLock<Mutex<BTreeMap<String, JsStartPhaseStats>>>,
+    path_env: &str,
+    stage: &str,
+    elapsed: Duration,
+) {
+    let phases = phases.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut phases) = phases.lock() else {
+        return;
+    };
+    let stats = phases.entry(stage.to_string()).or_default();
+    stats.calls += 1;
+    let elapsed_ns = elapsed.as_nanos();
+    stats.total_ns += elapsed_ns;
+    stats.max_ns = stats.max_ns.max(elapsed_ns);
+
+    let Some(path) = std::env::var_os(path_env) else {
+        return;
+    };
+    let mut output = String::new();
+    for (stage, stats) in phases.iter() {
+        let total_us = stats.total_ns / 1_000;
+        let avg_us = if stats.calls == 0 {
+            0
+        } else {
+            total_us / u128::from(stats.calls)
+        };
+        let max_us = stats.max_ns / 1_000;
+        output.push_str(&format!(
+            "stage={stage} calls={} total_us={total_us} avg_us={avg_us} max_us={max_us}\n",
+            stats.calls
+        ));
+    }
+    let _ = fs::write(path, output);
+}
+
 // V8 heap cap migrated to the typed `JavascriptExecutionLimits.v8_heap_limit_mb`
 // request field; the `AGENTOS_V8_HEAP_LIMIT_MB` env const is no longer read.
 /// Opt-in TRUE CPU-time budget (ms) for guest JavaScript. Unset/`0` => no limit.
@@ -96,6 +175,92 @@ const NODE_WARMUP_SPECIFIERS: &[&str] = &[
     "secure-exec:builtin/fs-promises",
     "secure-exec:polyfill/path",
 ];
+
+#[derive(Debug, Default, Clone)]
+struct SyncBridgePhaseStats {
+    calls: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+static SYNC_BRIDGE_PHASES: OnceLock<Mutex<BTreeMap<String, SyncBridgePhaseStats>>> =
+    OnceLock::new();
+static SYNC_BRIDGE_REQUEST_ENQUEUED: OnceLock<Mutex<HashMap<u64, (String, Instant)>>> =
+    OnceLock::new();
+
+fn sync_bridge_phases_enabled() -> bool {
+    std::env::var("AGENTOS_SYNC_BRIDGE_PHASES").as_deref() == Ok("1")
+}
+
+fn record_sync_bridge_phase(method: &str, stage: &str, elapsed: Duration) {
+    if !sync_bridge_phases_enabled() {
+        return;
+    }
+    let stats = SYNC_BRIDGE_PHASES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut stats) = stats.lock() else {
+        return;
+    };
+    let elapsed_us = elapsed.as_micros() as u64;
+    let key = format!("{method}:{stage}");
+    let entry = stats.entry(key).or_default();
+    entry.calls += 1;
+    entry.total_us = entry.total_us.wrapping_add(elapsed_us);
+    entry.max_us = entry.max_us.max(elapsed_us);
+
+    if let Ok(path) = std::env::var("AGENTOS_SYNC_BRIDGE_PHASES_FILE") {
+        let mut lines = String::new();
+        for (key, value) in stats.iter() {
+            let Some((method, stage)) = key.split_once(':') else {
+                continue;
+            };
+            let avg_us = if value.calls == 0 {
+                0
+            } else {
+                value.total_us / value.calls
+            };
+            lines.push_str(&format!(
+                "method={method} stage={stage} calls={} total_us={} avg_us={} max_us={}\n",
+                value.calls, value.total_us, avg_us, value.max_us
+            ));
+        }
+        let _ = fs::write(path, lines);
+    }
+}
+
+pub fn record_sync_bridge_request_enqueued(call_id: u64, method: &str) {
+    if !sync_bridge_phases_enabled() {
+        return;
+    }
+    let requests = SYNC_BRIDGE_REQUEST_ENQUEUED.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut requests) = requests.lock() else {
+        return;
+    };
+    if requests.len() > 4096 {
+        requests.clear();
+    }
+    requests.insert(call_id, (method.to_owned(), Instant::now()));
+}
+
+pub fn record_sync_bridge_request_observed(call_id: u64, fallback_method: &str) {
+    if !sync_bridge_phases_enabled() {
+        return;
+    }
+    let Some(requests) = SYNC_BRIDGE_REQUEST_ENQUEUED.get() else {
+        return;
+    };
+    let Ok(mut requests) = requests.lock() else {
+        return;
+    };
+    let Some((method, started)) = requests.remove(&call_id) else {
+        return;
+    };
+    let method = if method.is_empty() {
+        fallback_method
+    } else {
+        method.as_str()
+    };
+    record_sync_bridge_phase(method, "request_service_observed", started.elapsed());
+}
 const CONTROLLED_STDERR_PREFIXES: &[&str] =
     &[crate::node_import_cache::NODE_IMPORT_CACHE_METRICS_PREFIX];
 const RESERVED_NODE_ENV_KEYS: &[&str] = &[
@@ -156,6 +321,7 @@ pub struct JavascriptSyncRpcRequest {
     pub id: u64,
     pub method: String,
     pub args: Vec<Value>,
+    pub raw_bytes_args: HashMap<usize, Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1387,6 +1553,7 @@ impl JavascriptExecution {
         id: u64,
         result: Value,
     ) -> Result<(), JavascriptExecutionError> {
+        let phase_start = Instant::now();
         match self.clear_pending_sync_rpc(id)? {
             PendingSyncRpcResolution::Pending => {}
             PendingSyncRpcResolution::TimedOut => {
@@ -1394,13 +1561,66 @@ impl JavascriptExecution {
             }
             PendingSyncRpcResolution::Missing => {}
         }
+        record_sync_bridge_phase(
+            "sync_rpc_response",
+            "response_clear_pending",
+            phase_start.elapsed(),
+        );
 
+        let phase_start = Instant::now();
         let payload = translate_legacy_bridge_value_to_v8(&result);
+        record_sync_bridge_phase(
+            "sync_rpc_response",
+            "response_translate_value",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         let payload = v8_runtime::json_to_cbor_payload(&payload)
             .map_err(|e| JavascriptExecutionError::RpcResponse(e.to_string()))?;
-        self.v8_session
+        record_sync_bridge_phase(
+            "sync_rpc_response",
+            "response_encode_cbor",
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
+        let result = self
+            .v8_session
             .send_bridge_response(id, 0, payload)
-            .map_err(|e| JavascriptExecutionError::RpcResponse(e.to_string()))
+            .map_err(|e| JavascriptExecutionError::RpcResponse(e.to_string()));
+        record_sync_bridge_phase("sync_rpc_response", "response_send", phase_start.elapsed());
+        result
+    }
+
+    pub fn respond_sync_rpc_raw_success(
+        &mut self,
+        id: u64,
+        payload: Vec<u8>,
+    ) -> Result<(), JavascriptExecutionError> {
+        let phase_start = Instant::now();
+        match self.clear_pending_sync_rpc(id)? {
+            PendingSyncRpcResolution::Pending => {}
+            PendingSyncRpcResolution::TimedOut => {
+                return Err(JavascriptExecutionError::ExpiredSyncRpcRequest(id));
+            }
+            PendingSyncRpcResolution::Missing => {}
+        }
+        record_sync_bridge_phase(
+            "sync_rpc_raw_response",
+            "response_clear_pending",
+            phase_start.elapsed(),
+        );
+
+        let phase_start = Instant::now();
+        let result = self
+            .v8_session
+            .send_bridge_response(id, 2, payload)
+            .map_err(|e| JavascriptExecutionError::RpcResponse(e.to_string()));
+        record_sync_bridge_phase(
+            "sync_rpc_raw_response",
+            "response_send",
+            phase_start.elapsed(),
+        );
+        result
     }
 
     pub fn respond_sync_rpc_error(
@@ -1690,6 +1910,7 @@ pub struct JavascriptExecutionEngine {
     contexts: BTreeMap<String, JavascriptContext>,
     import_caches: BTreeMap<String, NodeImportCache>,
     v8_host: Option<V8RuntimeHost>,
+    event_notify: Option<Arc<Notify>>,
 }
 
 impl std::fmt::Debug for JavascriptExecutionEngine {
@@ -1704,6 +1925,11 @@ impl std::fmt::Debug for JavascriptExecutionEngine {
 }
 
 impl JavascriptExecutionEngine {
+    #[doc(hidden)]
+    pub fn set_event_notify(&mut self, notify: Option<Arc<Notify>>) {
+        self.event_notify = notify;
+    }
+
     #[doc(hidden)]
     pub fn set_import_cache_base_dir(&mut self, vm_id: impl Into<String>, base_dir: PathBuf) {
         self.import_caches
@@ -1763,17 +1989,20 @@ impl JavascriptExecutionEngine {
             return Err(JavascriptExecutionError::EmptyArgv);
         }
 
+        let phase_start = Instant::now();
         // Ensure import cache is materialized (still needed for module resolution)
         let import_cache = self.import_caches.entry(context.vm_id.clone()).or_default();
         import_cache
             .ensure_materialized()
             .map_err(JavascriptExecutionError::PrepareImportCache)?;
         let import_cache_guard = import_cache.cleanup_guard();
+        record_js_start_phase("js_start_import_cache", phase_start.elapsed());
 
         self.next_execution_id += 1;
         let execution_id = format!("exec-{}", self.next_execution_id);
         let sync_rpc_timeout = javascript_sync_rpc_timeout(&request);
 
+        let phase_start = Instant::now();
         // Lazily spawn the V8 runtime host, or replace a dead shared host.
         let should_spawn_v8_host = match self.v8_host.as_mut() {
             Some(v8_host) => !v8_host
@@ -1785,7 +2014,9 @@ impl JavascriptExecutionEngine {
             self.v8_host = Some(V8RuntimeHost::spawn().map_err(JavascriptExecutionError::Spawn)?);
         }
         let v8_host = self.v8_host.as_ref().unwrap();
+        record_js_start_phase("js_start_v8_host_ready", phase_start.elapsed());
 
+        let phase_start = Instant::now();
         // Create a V8 session
         let session_id = format!(
             "v8-{execution_id}-{}",
@@ -1805,7 +2036,9 @@ impl JavascriptExecutionEngine {
             wall_clock_limit_ms,
             |frame| v8_host.send_frame(frame),
         )?;
+        record_js_start_phase("js_start_v8_session_register", phase_start.elapsed());
 
+        let phase_start = Instant::now();
         // Build user code: prefer inline code, fall back to entrypoint-based
         let translator = GuestPathTranslator::from_request(&request);
         let host_entrypoint = translator.resolve_host_entrypoint(&request.cwd, &request.argv[0]);
@@ -1872,7 +2105,9 @@ impl JavascriptExecutionEngine {
             heap_limit_mb,
             &request.guest_runtime,
         );
+        record_js_start_phase("js_start_build_user_code", phase_start.elapsed());
 
+        let phase_start = Instant::now();
         // Create session handle for sending bridge responses
         let v8_session = v8_host.session_handle(session_id.clone());
 
@@ -1900,8 +2135,11 @@ impl JavascriptExecutionEngine {
             sync_rpc_timeout,
             v8_session.clone(),
             local_bridge,
+            self.event_notify.clone(),
         );
+        record_js_start_phase("js_start_event_bridge", phase_start.elapsed());
 
+        let phase_start = Instant::now();
         // Install the direct module reader on the session thread BEFORE the Execute
         // frame so the SetModuleReader command (routed through the same dispatch
         // queue) arrives first; module loads then read source directly on the V8
@@ -1911,24 +2149,26 @@ impl JavascriptExecutionEngine {
                 .set_module_reader(guest_reader)
                 .map_err(JavascriptExecutionError::Spawn)?;
         }
+        record_js_start_phase("js_start_install_module_reader", phase_start.elapsed());
 
+        let phase_start = Instant::now();
         // Execute bridge code + user code in the V8 isolate
-        v8_host
-            .send_frame(&BinaryFrame::Execute {
-                session_id: session_id.clone(),
-                mode: if use_module_mode { 1 } else { 0 },
-                file_path: guest_entrypoint.clone(),
-                bridge_code: V8RuntimeHost::bridge_code().to_owned(),
-                post_restore_script: String::new(),
-                userland_code: request
+        v8_session
+            .execute(
+                if use_module_mode { 1 } else { 0 },
+                guest_entrypoint.clone(),
+                V8RuntimeHost::bridge_code().to_owned(),
+                String::new(),
+                request
                     .guest_runtime
                     .snapshot_userland_code
                     .clone()
                     .unwrap_or_default(),
                 user_code,
-            })
+            )
             .map_err(JavascriptExecutionError::Spawn)?;
         registration_guard.disarm();
+        record_js_start_phase("js_start_send_execute", phase_start.elapsed());
 
         Ok(JavascriptExecution {
             execution_id,
@@ -2158,6 +2398,7 @@ fn parse_javascript_sync_rpc_request(line: &str) -> Result<JavascriptSyncRpcRequ
         id: wire.id,
         method: wire.method,
         args: wire.args,
+        raw_bytes_args: HashMap::new(),
     })
 }
 
@@ -2740,6 +2981,7 @@ fn spawn_v8_event_bridge(
     _sync_rpc_timeout: Duration,
     v8_session: V8SessionHandle,
     mut local_bridge: LocalBridgeState,
+    event_notify: Option<Arc<Notify>>,
 ) -> TokioReceiver<JavascriptExecutionEvent> {
     let (sender, receiver) = channel(JAVASCRIPT_EVENT_CHANNEL_CAPACITY);
     let event_gauge = register_queue(
@@ -2749,7 +2991,13 @@ fn spawn_v8_event_bridge(
 
     thread::spawn(move || {
         let mut emitted_exit = false;
-        while let Ok(frame) = frame_receiver.recv() {
+        loop {
+            let frame_recv_start = Instant::now();
+            let Ok(frame) = frame_receiver.recv() else {
+                break;
+            };
+            let frame_recv_wait = frame_recv_start.elapsed();
+            let mut exit_frame_start = None;
             let event = match frame {
                 BinaryFrame::BridgeCall {
                     call_id,
@@ -2758,7 +3006,9 @@ fn spawn_v8_event_bridge(
                     ..
                 } => {
                     // Convert CBOR payload to JSON args
+                    let phase_start = Instant::now();
                     let args = v8_runtime::cbor_payload_to_json_args(&payload).unwrap_or_default();
+                    record_sync_bridge_phase(&method, "event_decode_args", phase_start.elapsed());
 
                     // Module resolution / loading must read the mounted
                     // `node_modules` VFS, not host files directly. When the
@@ -2811,6 +3061,7 @@ fn spawn_v8_event_bridge(
                                 &sender,
                                 &v8_session,
                                 &event_gauge,
+                                event_notify.as_deref(),
                                 JavascriptExecutionEvent::Stdout(output),
                             ) {
                                 break;
@@ -2820,6 +3071,7 @@ fn spawn_v8_event_bridge(
                                 &sender,
                                 &v8_session,
                                 &event_gauge,
+                                event_notify.as_deref(),
                                 JavascriptExecutionEvent::Stderr(output),
                             ) {
                                 break;
@@ -2829,19 +3081,38 @@ fn spawn_v8_event_bridge(
                     }
 
                     // Map the bridge method name to the sidecar sync RPC method name
+                    let phase_start = Instant::now();
                     let (sidecar_method, _needs_translation) =
                         v8_runtime::map_bridge_method(&method);
+                    record_sync_bridge_phase(&method, "event_map_method", phase_start.elapsed());
 
                     // Track pending sync RPC
+                    let phase_start = Instant::now();
                     if let Ok(mut pending) = pending_sync_rpc.lock() {
                         *pending = Some(PendingSyncRpcState::Pending(call_id));
                     }
+                    record_sync_bridge_phase(&method, "event_mark_pending", phase_start.elapsed());
 
+                    let phase_start = Instant::now();
+                    let request_args = translate_request_args_for_legacy(sidecar_method, &args);
+                    let mut raw_bytes_args = HashMap::new();
+                    if sidecar_method == "net.write" {
+                        if let Ok(Some(bytes)) = v8_runtime::cbor_payload_raw_byte_arg(&payload, 1)
+                        {
+                            raw_bytes_args.insert(1, bytes);
+                        }
+                    }
+                    record_sync_bridge_phase(
+                        &method,
+                        "event_translate_args",
+                        phase_start.elapsed(),
+                    );
                     Some(JavascriptExecutionEvent::SyncRpcRequest(
                         JavascriptSyncRpcRequest {
                             id: call_id,
                             method: sidecar_method.to_owned(),
-                            args: translate_request_args_for_legacy(sidecar_method, &args),
+                            args: request_args,
+                            raw_bytes_args,
                         },
                     ))
                 }
@@ -2857,6 +3128,9 @@ fn spawn_v8_event_bridge(
                 BinaryFrame::ExecutionResult {
                     exit_code, error, ..
                 } => {
+                    let phase_start = Instant::now();
+                    exit_frame_start = Some(phase_start);
+                    record_js_event_phase("js_exit_frame_recv_wait", frame_recv_wait);
                     let is_process_exit_error = error.as_ref().is_some_and(|err| {
                         err.error_type == "ProcessExitError"
                             || err.message.starts_with("process.exit(")
@@ -2883,12 +3157,17 @@ fn spawn_v8_event_bridge(
                             &sender,
                             &v8_session,
                             &event_gauge,
+                            event_notify.as_deref(),
                             JavascriptExecutionEvent::Stderr(error_msg.into_bytes()),
                         ) {
                             break;
                         }
                     }
                     emitted_exit = true;
+                    record_js_event_phase(
+                        "js_exit_frame_to_event_construct",
+                        phase_start.elapsed(),
+                    );
                     Some(JavascriptExecutionEvent::Exited(resolved_exit_code))
                 }
                 BinaryFrame::StreamCallback { .. } => None,
@@ -2896,19 +3175,54 @@ fn spawn_v8_event_bridge(
             };
 
             if let Some(event) = event {
-                if !send_javascript_event(&sender, &v8_session, &event_gauge, event) {
+                let sync_rpc = match &event {
+                    JavascriptExecutionEvent::SyncRpcRequest(request) => {
+                        Some((request.id, request.method.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((call_id, method)) = sync_rpc.as_ref() {
+                    record_sync_bridge_request_enqueued(*call_id, method);
+                }
+                let phase_start = sync_rpc.as_ref().map(|_| Instant::now());
+                let exit_send_start = if matches!(&event, JavascriptExecutionEvent::Exited(_)) {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                if !send_javascript_event(
+                    &sender,
+                    &v8_session,
+                    &event_gauge,
+                    event_notify.as_deref(),
+                    event,
+                ) {
                     break;
+                }
+                if let (Some((_, method)), Some(start)) = (sync_rpc, phase_start) {
+                    record_sync_bridge_phase(&method, "event_enqueue", start.elapsed());
+                }
+                if let Some(start) = exit_send_start {
+                    record_js_event_phase("js_exit_event_send", start.elapsed());
+                }
+                if let Some(start) = exit_frame_start {
+                    record_js_event_phase("js_exit_frame_to_event_sent", start.elapsed());
                 }
             }
         }
 
         if !emitted_exit {
-            let _ = send_javascript_event(
+            let phase_start = Instant::now();
+            let sent = send_javascript_event(
                 &sender,
                 &v8_session,
                 &event_gauge,
+                event_notify.as_deref(),
                 JavascriptExecutionEvent::Exited(1),
             );
+            if sent {
+                record_js_event_phase("js_exit_fallback_event_send", phase_start.elapsed());
+            }
         }
     });
 
@@ -2919,6 +3233,7 @@ fn send_javascript_event(
     sender: &tokio::sync::mpsc::Sender<JavascriptExecutionEvent>,
     v8_session: &V8SessionHandle,
     gauge: &secure_exec_bridge::queue_tracker::QueueGauge,
+    notify: Option<&Notify>,
     event: JavascriptExecutionEvent,
 ) -> bool {
     if javascript_event_payload_len(&event) > JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES {
@@ -2941,6 +3256,9 @@ fn send_javascript_event(
             // warn before the host consumer falls far enough behind to stall the
             // session (and surface the high-water mark for debugging).
             gauge.observe_depth(sender.max_capacity().saturating_sub(sender.capacity()));
+            if let Some(notify) = notify {
+                notify.notify_one();
+            }
             true
         }
         Err(_closed) => false,
@@ -6763,6 +7081,7 @@ mod tests {
             &sender,
             &session,
             &gauge,
+            None,
             JavascriptExecutionEvent::Exited(1)
         ));
     }
@@ -6805,6 +7124,7 @@ mod tests {
                 &sender,
                 &session,
                 &gauge,
+                None,
                 JavascriptExecutionEvent::Stdout(Vec::new())
             ));
         }
@@ -6843,6 +7163,7 @@ mod tests {
             &sender,
             &session,
             &gauge,
+            None,
             JavascriptExecutionEvent::Stdout(vec![0; JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES + 1])
         ));
 

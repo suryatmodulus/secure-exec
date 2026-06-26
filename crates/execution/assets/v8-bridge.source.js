@@ -3334,6 +3334,11 @@ var __bridge = (() => {
       rationale: "Host WebCrypto subtle bridge reference."
     },
     {
+      name: "_benchNoop",
+      classification: "hardened",
+      rationale: "Benchmark-only sync bridge diagnostic."
+    },
+    {
       name: "_fsReadFile",
       classification: "hardened",
       rationale: "Host filesystem bridge reference."
@@ -3557,6 +3562,16 @@ var __bridge = (() => {
       name: "_childProcessSpawnSync",
       classification: "hardened",
       rationale: "Host child_process bridge reference."
+    },
+    {
+      name: "_benchNetTcpMetricsResetRaw",
+      classification: "hardened",
+      rationale: "Benchmark-only TCP readiness counter reset bridge reference."
+    },
+    {
+      name: "_benchNetTcpMetricsSnapshotRaw",
+      classification: "hardened",
+      rationale: "Benchmark-only TCP readiness counter snapshot bridge reference."
     },
     {
       name: "_networkDnsLookupRaw",
@@ -17262,14 +17277,201 @@ ${headerLines}\r
   }
   var NET_SOCKET_REGISTRY_PREFIX = "__secureExecNetSocket:";
   var NET_SERVER_HANDLE_PREFIX = "net-server:";
+  var registeredNetSockets = /* @__PURE__ */ new Map();
+  var registeredNetServersByPort = /* @__PURE__ */ new Map();
   function getRegisteredNetSocket(socketId) {
     return globalThis[`${NET_SOCKET_REGISTRY_PREFIX}${socketId}`];
   }
   function registerNetSocket(socketId, socket) {
     globalThis[`${NET_SOCKET_REGISTRY_PREFIX}${socketId}`] = socket;
+    registeredNetSockets.set(socketId, socket);
   }
   function unregisterNetSocket(socketId) {
     delete globalThis[`${NET_SOCKET_REGISTRY_PREFIX}${socketId}`];
+    registeredNetSockets.delete(socketId);
+  }
+  function registerNetServer(server) {
+    const port = server?._address?.port;
+    if (typeof port === "number") {
+      registeredNetServersByPort.set(port, server);
+    }
+  }
+  function unregisterNetServer(server) {
+    const port = server?._address?.port;
+    if (typeof port === "number" && registeredNetServersByPort.get(port) === server) {
+      registeredNetServersByPort.delete(port);
+    }
+  }
+  function wakeSocketBridgeReads(socket) {
+    countNetBridgeMetric("readWakeAttempts");
+    if (!socket || socket.destroyed || socket._socketId === 0 || socket._loopbackServer || socket._loopbackHttpTarget) {
+      countNetBridgeMetric("readWakeInvalidTargets");
+      return;
+    }
+    if (socket._bridgeReadLoopRunning) {
+      countNetBridgeMetric("readWakeAlreadyRunning");
+    }
+    if (!socket._bridgeReadPollTimer) {
+      countNetBridgeMetric("readWakeNoTimer");
+      countNetBridgeMetric(socket._bridgeReadPumpStarted ? "readWakeNoTimerAfterFirstPump" : "readWakeNoTimerBeforeFirstPump");
+      if (socket._connected) {
+        countNetBridgeMetric("readWakeNoTimerConnected");
+      }
+      if (socket.connecting) {
+        countNetBridgeMetric("readWakeNoTimerConnecting");
+      }
+      countNetBridgeMetric(socket._refed ? "readWakeNoTimerRefed" : "readWakeNoTimerUnrefed");
+      const hasDataListener = (socket._listeners?.data?.length ?? 0) > 0;
+      const hasReadableListener = (socket._listeners?.readable?.length ?? 0) > 0;
+      if (hasDataListener) {
+        countNetBridgeMetric("readWakeNoTimerHasDataListener");
+      }
+      if (hasReadableListener) {
+        countNetBridgeMetric("readWakeNoTimerHasReadableListener");
+      }
+      if (socket._bridgeWriteFlushScheduled) {
+        countNetBridgeMetric("readWakeNoTimerPendingWriteFlush");
+        countNetBridgeMetric("readWakeNoTimerPendingWriteBytes", socket._pendingBridgeWriteBytes);
+      }
+      if (!socket._bridgeReadPumpStarted && socket._firstReadNoTimerWakeAtUs === 0 && isNetBridgeMetricsEnabled()) {
+        socket._firstReadNoTimerWakeAtUs = netBridgeNowUs();
+      }
+      if (
+        isNetBridgeMetricsEnabled() &&
+        !socket._bridgeReadPumpStarted &&
+        socket._connected &&
+        socket._refed &&
+        (hasDataListener || hasReadableListener)
+      ) {
+        countNetBridgeMetric("readFirstPumpScheduleCandidates");
+        if (socket._bridgeReadFirstPumpBenchmarkScheduled) {
+          countNetBridgeMetric("readFirstPumpScheduleAlreadyScheduled");
+        } else {
+          countNetBridgeMetric("readFirstPumpScheduleQueued");
+          socket._bridgeReadFirstPumpBenchmarkScheduled = true;
+          const queuedAtUs = netBridgeNowUs();
+          queueMicrotask(() => {
+            countNetBridgeMetric("readFirstPumpScheduleRuns");
+            const runAtUs = netBridgeNowUs();
+            const queuedToRunUs = Math.max(0, runAtUs - queuedAtUs);
+            countNetBridgeMetric("readFirstPumpScheduleQueuedToRunUs", queuedToRunUs);
+            maxNetBridgeMetric("readFirstPumpScheduleQueuedToRunMaxUs", queuedToRunUs);
+            socket._bridgeReadFirstPumpBenchmarkScheduled = false;
+            if (socket.destroyed) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipDestroyed");
+              return;
+            }
+            if (socket._tlsUpgrading) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipTlsUpgrading");
+              return;
+            }
+            if (socket._bridgeReadPumpStarted) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipPumpStarted");
+              return;
+            }
+            if (socket._bridgeReadLoopRunning) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipLoopRunning");
+              return;
+            }
+            if (socket._socketId === 0) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipSocketClosed");
+              return;
+            }
+            countNetBridgeMetric("readFirstPumpSchedulePumpCalls");
+            socket._nextReadPumpOrigin = "eventWake";
+            socket._readFirstPumpScheduleActive = true;
+            socket._readFirstPumpScheduleQueuedAtUs = queuedAtUs;
+            void socket._pumpBridgeReads();
+          });
+        }
+      }
+      return;
+    }
+	    clearTimeout(socket._bridgeReadPollTimer);
+	    socket._bridgeReadPollTimer = null;
+	    countNetBridgeMetric("readEventWakeups");
+	    if (isNetBridgeMetricsEnabled()) {
+	      socket._readWakeQueuedAtUs = netBridgeNowUs();
+	    }
+	    queueMicrotask(() => {
+	      if (!socket.destroyed) {
+	        socket._nextReadPumpOrigin = "eventWake";
+	        void socket._pumpBridgeReads();
+      }
+    });
+  }
+  function wakePeerBridgeReads(socket) {
+    countNetBridgeMetric("peerWakeScans");
+    if (!socket || socket._socketId === 0 || socket.remotePort === void 0 || socket.localPort === void 0) {
+      countNetBridgeMetric("peerWakeInvalidTargets");
+      return;
+    }
+    for (const peer of registeredNetSockets.values()) {
+      if (peer === socket || peer.destroyed) {
+        continue;
+      }
+      if (peer.localPort === socket.remotePort && peer.remotePort === socket.localPort) {
+        countNetBridgeMetric("peerWakeFound");
+        wakeSocketBridgeReads(peer);
+        return;
+      }
+    }
+    countNetBridgeMetric("peerWakeMiss");
+  }
+  function wakeNetServerAccept(server) {
+    countNetBridgeMetric("acceptWakeAttempts");
+    if (!server || !server.listening || server._serverId === 0 || !server._acceptPollTimer) {
+      if (!server || !server.listening || server._serverId === 0) {
+        countNetBridgeMetric("acceptWakeInvalidTargets");
+      } else {
+        countNetBridgeMetric("acceptWakeNoTimer");
+        countNetBridgeMetric(server._acceptPumpStarted ? "acceptWakeNoTimerAfterFirstPump" : "acceptWakeNoTimerBeforeFirstPump");
+        if (server._acceptLoopRunning) {
+          countNetBridgeMetric("acceptWakeNoTimerLoopRunning");
+        }
+        if (server._acceptLoopActive) {
+          countNetBridgeMetric("acceptWakeNoTimerLoopActive");
+        }
+        countNetBridgeMetric(server._refed ? "acceptWakeNoTimerRefed" : "acceptWakeNoTimerUnrefed");
+        const connectionCount = server._connections?.size ?? 0;
+        countNetBridgeMetric("acceptWakeNoTimerConnections", connectionCount);
+        maxNetBridgeMetric("acceptWakeNoTimerConnectionsMax", connectionCount);
+        if (!server._acceptPumpStarted && server._firstAcceptNoTimerWakeAtUs === 0 && isNetBridgeMetricsEnabled()) {
+          server._firstAcceptNoTimerWakeAtUs = netBridgeNowUs();
+        }
+      }
+      return;
+    }
+    if (server._acceptLoopRunning) {
+      countNetBridgeMetric("acceptWakeAlreadyRunning");
+    }
+	    clearTimeout(server._acceptPollTimer);
+	    server._acceptPollTimer = null;
+	    countNetBridgeMetric("acceptEventWakeups");
+	    if (isNetBridgeMetricsEnabled()) {
+	      server._acceptWakeQueuedAtUs = netBridgeNowUs();
+	    }
+	    queueMicrotask(() => {
+      if (server.listening && server._serverId !== 0) {
+        server._nextAcceptPumpOrigin = "eventWake";
+        void server._pumpAccepts();
+      }
+    });
+  }
+  function wakeNetServerAcceptForSocket(socket) {
+    countNetBridgeMetric("acceptWakeSocketScans");
+    const port = socket?.remotePort;
+    if (typeof port !== "number") {
+      countNetBridgeMetric("acceptWakeSocketInvalidTargets");
+      return;
+    }
+    const server = registeredNetServersByPort.get(port);
+    if (server) {
+      countNetBridgeMetric("acceptWakeSocketFound");
+    } else {
+      countNetBridgeMetric("acceptWakeSocketMiss");
+    }
+    wakeNetServerAccept(server);
   }
   function isTruthySocketOption(value) {
     return value === void 0 ? true : Boolean(value);
@@ -17908,6 +18110,7 @@ ${headerLines}\r
       socket._emitNet("secure");
     }
     if (!socket.destroyed && !socket._bridgeReadLoopRunning) {
+      socket._nextReadPumpOrigin = "tls";
       void socket._pumpBridgeReads();
     }
   }
@@ -17960,6 +18163,300 @@ ${headerLines}\r
   }
   var NET_BRIDGE_TIMEOUT_SENTINEL = "__secure_exec_net_timeout__";
   var NET_BRIDGE_POLL_DELAY_MS = 10;
+  var netBridgePollDelayOverrideMs = null;
+  function isNetBridgeTraceEnabled() {
+    const env = typeof process !== "undefined" ? process.env : globalThis.__agentOSProcessConfigEnv;
+    return env?.AGENTOS_NET_BRIDGE_TRACE === "1";
+  }
+  function normalizeNetBridgePollDelayMs(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return NET_BRIDGE_POLL_DELAY_MS;
+    }
+    return Math.trunc(numeric);
+  }
+  function netBridgePollDelayMs() {
+    return netBridgePollDelayOverrideMs ?? NET_BRIDGE_POLL_DELAY_MS;
+  }
+  function isNetRetainOwnedWriteBufferEnabled() {
+    const processEnv = typeof process !== "undefined" ? process.env : undefined;
+    const configEnv = globalThis.__agentOSProcessConfigEnv;
+    return processEnv?.AGENTOS_NET_RETAIN_OWNED_WRITE_BUFFER !== "0" && configEnv?.AGENTOS_NET_RETAIN_OWNED_WRITE_BUFFER !== "0";
+  }
+  function createNetBridgeMetrics() {
+    return {
+      userWriteCalls: 0,
+      userWriteBytes: 0,
+      queuedWriteChunks: 0,
+      queuedWriteBytes: 0,
+      queuedWriteCopiedChunks: 0,
+      queuedWriteCopiedBytes: 0,
+      queuedWriteRetainedChunks: 0,
+      queuedWriteRetainedBytes: 0,
+      flushCalls: 0,
+      flushChunks: 0,
+      flushBytes: 0,
+      writeBufferedBytesMax: 0,
+      writeBufferedChunksMax: 0,
+      writeBase64EncodeCalls: 0,
+      writeBase64EncodeBytes: 0,
+      writeBase64EncodeUs: 0,
+      writeRawCalls: 0,
+      writeRawBytes: 0,
+      writeRawElapsedUs: 0,
+      readRawCalls: 0,
+      readRawElapsedUs: 0,
+      readPumpRuns: 0,
+      readTimeoutSentinels: 0,
+      readPollTimersScheduled: 0,
+      readPollTimerFires: 0,
+      readPollTimerFireLagUs: 0,
+      readPollTimerFireLagMaxUs: 0,
+      readDataEvents: 0,
+      readBytes: 0,
+      readBase64DecodeCalls: 0,
+      readBase64DecodeBytes: 0,
+      readBase64DecodeChars: 0,
+      readBase64DecodeUs: 0,
+      readPayloadMaterializeCalls: 0,
+      readPayloadMaterializeBytes: 0,
+      readPayloadMaterializeUs: 0,
+      readEndEvents: 0,
+      readMacrotaskYields: 0,
+      readMacrotaskYieldElapsedUs: 0,
+      readMacrotaskYieldMaxUs: 0,
+      queueReadablePayloads: 0,
+      queueReadablePayloadElapsedUs: 0,
+      queueReadablePayloadMaxUs: 0,
+      queueReadableBytes: 0,
+      queueReadableBytesMax: 0,
+      queueReadableImmediateReadCalls: 0,
+      queueReadableImmediateReadUs: 0,
+      queueReadableImmediateReadMaxUs: 0,
+      socketReadableEmits: 0,
+      socketReadableEmitUs: 0,
+      socketReadableEmitMaxUs: 0,
+      socketDataEmits: 0,
+      socketDataEmitUs: 0,
+      socketDataEmitMaxUs: 0,
+      readPostDeliveryProbeCalls: 0,
+      readPostDeliveryProbeTimeoutSentinels: 0,
+      readPostDeliveryProbeDataEvents: 0,
+      readPostDeliveryNextRawCalls: 0,
+      readPostDeliveryNextRawTimeoutSentinels: 0,
+      readPostDeliveryNextRawDataEvents: 0,
+      readPostDeliveryToProbeStartUs: 0,
+      readPostDeliveryProbeElapsedUs: 0,
+      readPostDeliveryProbeMaxUs: 0,
+      readPostDeliveryPendingWriteFlushes: 0,
+      readPostDeliveryPendingWriteBytes: 0,
+      userWriteDuringDataEmitCalls: 0,
+      dataEmitStartToUserWriteUs: 0,
+      dataEmitEndToUserWriteUs: 0,
+      writeQueuedToFlushStartUs: 0,
+      writeQueuedToFlushStartMaxUs: 0,
+      writeFlushQueuedToRawUs: 0,
+      writeFlushQueuedToRawMaxUs: 0,
+      readWakeQueuedToPumpStartUs: 0,
+      readWakeQueuedToPumpStartMaxUs: 0,
+      acceptWakeQueuedToPumpStartUs: 0,
+      acceptWakeQueuedToPumpStartMaxUs: 0,
+      socketEndEmits: 0,
+      socketCloseEmits: 0,
+      socketConnectEmits: 0,
+      acceptRawCalls: 0,
+      acceptRawElapsedUs: 0,
+      acceptPumpRuns: 0,
+      acceptLoopAlreadyRunning: 0,
+      acceptTimeoutSentinels: 0,
+      acceptPollTimersScheduled: 0,
+      acceptPollTimerFires: 0,
+      acceptPollTimerFireLagUs: 0,
+      acceptPollTimerFireLagMaxUs: 0,
+      acceptConnections: 0,
+      acceptJsonParseUs: 0,
+      acceptOnConnectionUs: 0,
+      connectionEmits: 0,
+      readEventWakeups: 0,
+      readWakeAttempts: 0,
+      readWakeInvalidTargets: 0,
+      readWakeAlreadyRunning: 0,
+      readWakeNoTimer: 0,
+      readWakeNoTimerBeforeFirstPump: 0,
+      readWakeNoTimerAfterFirstPump: 0,
+      readWakeNoTimerConnected: 0,
+      readWakeNoTimerConnecting: 0,
+      readWakeNoTimerRefed: 0,
+      readWakeNoTimerUnrefed: 0,
+      readWakeNoTimerHasDataListener: 0,
+      readWakeNoTimerHasReadableListener: 0,
+      readWakeNoTimerPendingWriteFlush: 0,
+      readWakeNoTimerPendingWriteBytes: 0,
+      readFirstPumpAfterNoTimerWakeCalls: 0,
+      readFirstPumpAfterNoTimerWakeUs: 0,
+      readFirstPumpAfterNoTimerWakeMaxUs: 0,
+      readFirstPumpOriginConnectWait: 0,
+      readFirstPumpOriginAcceptedHandle: 0,
+      readFirstPumpOriginEventWake: 0,
+      readFirstPumpOriginTimer: 0,
+      readFirstPumpOriginRef: 0,
+      readFirstPumpOriginTls: 0,
+      readFirstPumpOriginUnknown: 0,
+      readFirstPumpResultData: 0,
+      readFirstPumpResultEnd: 0,
+      readFirstPumpResultTimeout: 0,
+      readFirstPumpScheduleCandidates: 0,
+      readFirstPumpScheduleQueued: 0,
+      readFirstPumpScheduleAlreadyScheduled: 0,
+      readFirstPumpScheduleRuns: 0,
+      readFirstPumpSchedulePumpCalls: 0,
+      readFirstPumpScheduleSkipDestroyed: 0,
+      readFirstPumpScheduleSkipTlsUpgrading: 0,
+      readFirstPumpScheduleSkipPumpStarted: 0,
+      readFirstPumpScheduleSkipLoopRunning: 0,
+      readFirstPumpScheduleSkipSocketClosed: 0,
+      readFirstPumpScheduleQueuedToRunUs: 0,
+      readFirstPumpScheduleQueuedToRunMaxUs: 0,
+      readFirstPumpScheduleQueuedToPumpStartUs: 0,
+      readFirstPumpScheduleQueuedToPumpStartMaxUs: 0,
+      readFirstPumpScheduleResultData: 0,
+      readFirstPumpScheduleResultTimeout: 0,
+      readFirstPumpScheduleResultEnd: 0,
+      peerWakeScans: 0,
+      peerWakeInvalidTargets: 0,
+      peerWakeFound: 0,
+      peerWakeMiss: 0,
+      acceptEventWakeups: 0,
+      acceptWakeAttempts: 0,
+      acceptWakeInvalidTargets: 0,
+      acceptWakeNoTimer: 0,
+      acceptWakeNoTimerBeforeFirstPump: 0,
+      acceptWakeNoTimerAfterFirstPump: 0,
+      acceptWakeNoTimerLoopRunning: 0,
+      acceptWakeNoTimerLoopActive: 0,
+      acceptWakeNoTimerRefed: 0,
+      acceptWakeNoTimerUnrefed: 0,
+      acceptWakeNoTimerConnections: 0,
+      acceptWakeNoTimerConnectionsMax: 0,
+      acceptFirstPumpAfterNoTimerWakeCalls: 0,
+      acceptFirstPumpAfterNoTimerWakeUs: 0,
+      acceptFirstPumpAfterNoTimerWakeMaxUs: 0,
+      acceptFirstPumpOriginListen: 0,
+      acceptFirstPumpOriginEventWake: 0,
+      acceptFirstPumpOriginTimer: 0,
+      acceptFirstPumpOriginRef: 0,
+      acceptFirstPumpOriginUnknown: 0,
+      acceptFirstPumpResultConnection: 0,
+      acceptFirstPumpResultTimeout: 0,
+      acceptFirstPumpResultEmpty: 0,
+      acceptWakeAlreadyRunning: 0,
+      acceptWakeSocketScans: 0,
+      acceptWakeSocketInvalidTargets: 0,
+      acceptWakeSocketFound: 0,
+      acceptWakeSocketMiss: 0
+    };
+  }
+  var netBridgeTraceForced = false;
+  var netBridgeMetrics = createNetBridgeMetrics();
+  function isNetBridgeMetricsEnabled() {
+    return netBridgeTraceForced || isNetBridgeTraceEnabled();
+  }
+  function netBridgeNowUs() {
+    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+      return Math.round(performance.now() * 1000);
+    }
+    return Date.now() * 1000;
+  }
+  function countNetBridgeMetric(name, amount = 1) {
+    if (!isNetBridgeMetricsEnabled()) return;
+    netBridgeMetrics[name] = (netBridgeMetrics[name] ?? 0) + amount;
+  }
+  function maxNetBridgeMetric(name, value) {
+    if (!isNetBridgeMetricsEnabled()) return;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return;
+    netBridgeMetrics[name] = Math.max(netBridgeMetrics[name] ?? 0, numeric);
+  }
+  function countReadFirstPumpOrigin(origin) {
+    switch (origin) {
+      case "connectWait":
+        countNetBridgeMetric("readFirstPumpOriginConnectWait");
+        break;
+      case "acceptedHandle":
+        countNetBridgeMetric("readFirstPumpOriginAcceptedHandle");
+        break;
+      case "eventWake":
+        countNetBridgeMetric("readFirstPumpOriginEventWake");
+        break;
+      case "timer":
+        countNetBridgeMetric("readFirstPumpOriginTimer");
+        break;
+      case "ref":
+        countNetBridgeMetric("readFirstPumpOriginRef");
+        break;
+      case "tls":
+        countNetBridgeMetric("readFirstPumpOriginTls");
+        break;
+      default:
+        countNetBridgeMetric("readFirstPumpOriginUnknown");
+        break;
+    }
+  }
+  function countAcceptFirstPumpOrigin(origin) {
+    switch (origin) {
+      case "listen":
+        countNetBridgeMetric("acceptFirstPumpOriginListen");
+        break;
+      case "eventWake":
+        countNetBridgeMetric("acceptFirstPumpOriginEventWake");
+        break;
+      case "timer":
+        countNetBridgeMetric("acceptFirstPumpOriginTimer");
+        break;
+      case "ref":
+        countNetBridgeMetric("acceptFirstPumpOriginRef");
+        break;
+      default:
+        countNetBridgeMetric("acceptFirstPumpOriginUnknown");
+        break;
+    }
+  }
+  exposeCustomGlobal("__agentOSNetBridgeMetrics", {
+    get enabled() {
+      return isNetBridgeMetricsEnabled();
+    },
+    enable() {
+      netBridgeTraceForced = true;
+    },
+    disable() {
+      netBridgeTraceForced = false;
+    },
+    setPollDelayMs(value) {
+      netBridgePollDelayOverrideMs = normalizeNetBridgePollDelayMs(value);
+    },
+    resetPollDelayMs() {
+      netBridgePollDelayOverrideMs = null;
+    },
+    pollDelayMs() {
+      return netBridgePollDelayMs();
+    },
+    reset() {
+      netBridgeMetrics = createNetBridgeMetrics();
+      if (typeof _benchNetTcpMetricsResetRaw !== "undefined") {
+        _benchNetTcpMetricsResetRaw.applySync(void 0, []);
+      }
+    },
+    snapshot() {
+      let sidecarNetTrace = void 0;
+      if (typeof _benchNetTcpMetricsSnapshotRaw !== "undefined") {
+        sidecarNetTrace = _benchNetTcpMetricsSnapshotRaw.applySync(void 0, []);
+      }
+      return {
+        ...netBridgeMetrics,
+        ...(sidecarNetTrace ? { sidecarNetTrace } : {})
+      };
+    }
+  });
   function yieldBridgeMacrotask() {
     return new Promise((resolve) => {
       if (typeof setImmediate === "function") {
@@ -18046,6 +18543,7 @@ ${headerLines}\r
     }
   }
   exposeCustomGlobal("_netSocketDispatch", netSocketDispatch);
+  const NET_BRIDGE_MAX_RAW_WRITE_BYTES = 256 * 1024;
   var NetSocket = class _NetSocket {
     _listeners = {};
     _onceListeners = {};
@@ -18064,9 +18562,24 @@ ${headerLines}\r
     _refed = true;
     _bridgeReadLoopRunning = false;
     _bridgeReadPollTimer = null;
+    _bridgeReadPumpStarted = false;
+    _bridgeReadFirstPumpBenchmarkScheduled = false;
+    _readFirstPumpScheduleActive = false;
+    _readFirstPumpScheduleQueuedAtUs = 0;
+    _nextReadPumpOrigin = null;
+    _firstReadNoTimerWakeAtUs = 0;
     _timeoutMs = 0;
     _timeoutTimer = null;
-    _tlsUpgrading = false;
+    _pendingBridgeWriteChunks = null;
+	    _pendingBridgeWriteCallbacks = null;
+	    _pendingBridgeWriteBytes = 0;
+	    _bridgeWriteFlushScheduled = false;
+	    _bridgeWriteFlushQueuedAtUs = 0;
+	    _lastReadDeliveryEndUs = 0;
+	    _currentDataEmitStartUs = 0;
+	    _lastDataEmitEndUs = 0;
+	    _readWakeQueuedAtUs = 0;
+	    _tlsUpgrading = false;
     _remoteEnded = false;
     _writableEnded = false;
     _closeEmitted = false;
@@ -18161,6 +18674,7 @@ ${headerLines}\r
       this._handle = createConnectedSocketHandle(this._socketId);
       this._applySocketInfo(handle);
       registerNetSocket(this._socketId, this);
+      wakeNetServerAcceptForSocket(this);
       void this._waitForConnect();
       if (keepAlive) {
         this.once("connect", () => {
@@ -18171,11 +18685,13 @@ ${headerLines}\r
     }
     write(data, encodingOrCallback, callback) {
       let buf;
+      let canRetainWriteBuffer = false;
       if (Buffer.isBuffer(data)) {
         buf = data;
       } else if (typeof data === "string") {
         const enc = typeof encodingOrCallback === "string" ? encodingOrCallback : "utf-8";
         buf = Buffer.from(data, enc);
+        canRetainWriteBuffer = isNetRetainOwnedWriteBufferEnabled();
       } else {
         buf = Buffer.from(data);
       }
@@ -18197,17 +18713,21 @@ ${headerLines}\r
         return true;
       }
       if (typeof _netSocketWriteRaw === "undefined") return false;
-      if (this.destroyed || !this._socketId) return false;
-      const base64 = buf.toString("base64");
-      debugBridgeNetwork("socket write", this._socketId, buf.length, base64.slice(0, 64));
-      this.bytesWritten += buf.length;
-      _netSocketWriteRaw.applySync(void 0, [this._socketId, {
-        __agentOSType: "bytes",
-        base64
-      }]);
-      this._touchTimeout();
+	      if (this.destroyed || !this._socketId) return false;
+	      countNetBridgeMetric("userWriteCalls");
+	      countNetBridgeMetric("userWriteBytes", buf.length);
+	      if (isNetBridgeMetricsEnabled()) {
+	        const nowUs = netBridgeNowUs();
+	        if (this._currentDataEmitStartUs > 0) {
+	          countNetBridgeMetric("userWriteDuringDataEmitCalls");
+	          countNetBridgeMetric("dataEmitStartToUserWriteUs", nowUs - this._currentDataEmitStartUs);
+	        } else if (this._lastDataEmitEndUs > 0) {
+	          countNetBridgeMetric("dataEmitEndToUserWriteUs", nowUs - this._lastDataEmitEndUs);
+	        }
+	      }
+	      this.bytesWritten += buf.length;
       const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
-      if (cb) cb();
+      this._queueBridgeWrite(buf, cb, canRetainWriteBuffer);
       return true;
     }
     end(dataOrCallback, encodingOrCallback, callback) {
@@ -18242,6 +18762,7 @@ ${headerLines}\r
         return this;
       }
       if (typeof _netSocketEndRaw !== "undefined" && this._socketId && !this.destroyed) {
+        this._flushBridgeWrites();
         debugBridgeNetwork("socket end", this._socketId);
         _netSocketEndRaw.applySync(void 0, [this._socketId]);
         this._touchTimeout();
@@ -18281,6 +18802,102 @@ ${headerLines}\r
       }
       this._emitSocketClose(Boolean(error));
       return this;
+    }
+    _queueBridgeWrite(buf, callback, retainInput = false) {
+      if (!this._pendingBridgeWriteChunks) {
+        this._pendingBridgeWriteChunks = [];
+        this._pendingBridgeWriteCallbacks = [];
+      }
+      const chunk = retainInput ? buf : Buffer.from(buf);
+      this._pendingBridgeWriteChunks.push(chunk);
+      this._pendingBridgeWriteBytes += chunk.length;
+      countNetBridgeMetric("queuedWriteChunks");
+      countNetBridgeMetric("queuedWriteBytes", chunk.length);
+      if (retainInput) {
+        countNetBridgeMetric("queuedWriteRetainedChunks");
+        countNetBridgeMetric("queuedWriteRetainedBytes", chunk.length);
+      } else {
+        countNetBridgeMetric("queuedWriteCopiedChunks");
+        countNetBridgeMetric("queuedWriteCopiedBytes", chunk.length);
+      }
+      maxNetBridgeMetric("writeBufferedBytesMax", this._pendingBridgeWriteBytes);
+      maxNetBridgeMetric("writeBufferedChunksMax", this._pendingBridgeWriteChunks.length);
+      if (callback) {
+        this._pendingBridgeWriteCallbacks.push(callback);
+      }
+	      if (!this._bridgeWriteFlushScheduled) {
+	        this._bridgeWriteFlushScheduled = true;
+	        if (isNetBridgeMetricsEnabled()) {
+	          this._bridgeWriteFlushQueuedAtUs = netBridgeNowUs();
+	        }
+	        queueMicrotask(() => {
+	          this._flushBridgeWrites();
+	        });
+      }
+    }
+    _flushBridgeWrites() {
+	      const chunks = this._pendingBridgeWriteChunks;
+	      if (!chunks || chunks.length === 0) {
+	        this._bridgeWriteFlushScheduled = false;
+	        this._bridgeWriteFlushQueuedAtUs = 0;
+	        return;
+	      }
+      const callbacks = this._pendingBridgeWriteCallbacks ?? [];
+      const totalBytes = this._pendingBridgeWriteBytes;
+      this._pendingBridgeWriteChunks = null;
+      this._pendingBridgeWriteCallbacks = null;
+      this._pendingBridgeWriteBytes = 0;
+      this._bridgeWriteFlushScheduled = false;
+      if (this.destroyed || !this._socketId || typeof _netSocketWriteRaw === "undefined") {
+        return;
+      }
+	      const traceMetrics = isNetBridgeMetricsEnabled();
+	      if (traceMetrics && this._bridgeWriteFlushQueuedAtUs > 0) {
+	        const queuedToFlushUs = Math.max(0, netBridgeNowUs() - this._bridgeWriteFlushQueuedAtUs);
+	        countNetBridgeMetric("writeQueuedToFlushStartUs", queuedToFlushUs);
+	        maxNetBridgeMetric("writeQueuedToFlushStartMaxUs", queuedToFlushUs);
+	        countNetBridgeMetric("writeFlushQueuedToRawUs", queuedToFlushUs);
+	        maxNetBridgeMetric("writeFlushQueuedToRawMaxUs", queuedToFlushUs);
+	        this._bridgeWriteFlushQueuedAtUs = 0;
+	      }
+	      debugBridgeNetwork("socket write", this._socketId, totalBytes, chunks.length);
+      countNetBridgeMetric("flushCalls");
+      countNetBridgeMetric("flushChunks", chunks.length);
+      countNetBridgeMetric("flushBytes", totalBytes);
+      const writeStartUs = traceMetrics ? netBridgeNowUs() : 0;
+      let pending = [];
+      let pendingBytes = 0;
+      const flushPending = () => {
+        if (pendingBytes === 0) return;
+        const payload = pending.length === 1 ? pending[0] : Buffer.concat(pending, pendingBytes);
+        countNetBridgeMetric("writeRawCalls");
+        countNetBridgeMetric("writeRawBytes", payload.length);
+        _netSocketWriteRaw.applySync(void 0, [this._socketId, payload]);
+        pending = [];
+        pendingBytes = 0;
+      };
+      for (const chunk of chunks) {
+        for (let offset = 0; offset < chunk.length; offset += NET_BRIDGE_MAX_RAW_WRITE_BYTES) {
+          const piece = chunk.subarray(offset, offset + NET_BRIDGE_MAX_RAW_WRITE_BYTES);
+          if (pendingBytes > 0 && pendingBytes + piece.length > NET_BRIDGE_MAX_RAW_WRITE_BYTES) {
+            flushPending();
+          }
+          pending.push(piece);
+          pendingBytes += piece.length;
+          if (pendingBytes >= NET_BRIDGE_MAX_RAW_WRITE_BYTES) {
+            flushPending();
+          }
+        }
+      }
+      flushPending();
+      if (traceMetrics) {
+        countNetBridgeMetric("writeRawElapsedUs", netBridgeNowUs() - writeStartUs);
+      }
+      wakePeerBridgeReads(this);
+      this._touchTimeout();
+      for (const callback of callbacks) {
+        callback();
+      }
     }
     _emitSocketClose(hadError = false) {
       if (this._closeEmitted) {
@@ -18352,6 +18969,7 @@ ${headerLines}\r
       registerNetSocket(handle.socketId, socket);
       queueMicrotask(() => {
         if (!socket.destroyed && !socket._tlsUpgrading) {
+          socket._nextReadPumpOrigin = "acceptedHandle";
           void socket._pumpBridgeReads();
         }
       });
@@ -18402,6 +19020,7 @@ ${headerLines}\r
         this._timeoutTimer.ref();
       }
       if (!this.destroyed && this._connected && !this._loopbackServer && !this._loopbackHttpTarget && !this._bridgeReadLoopRunning) {
+        this._nextReadPumpOrigin = "ref";
         void this._pumpBridgeReads();
       }
       return this;
@@ -18566,46 +19185,97 @@ ${headerLines}\r
     rawListeners(event) {
       return this.listeners(event);
     }
-    emit(event, ...args) {
-      return this._emitNet(event, ...args);
-    }
-    _emitNet(event, ...args) {
-      if (event === "data" && this._encoding && args[0] && Buffer.isBuffer(args[0])) {
-        args[0] = args[0].toString(this._encoding);
+	    emit(event, ...args) {
+	      return this._emitNet(event, ...args);
+	    }
+	    _emitNet(event, ...args) {
+	      const traceEmit = isNetBridgeMetricsEnabled() && (event === "readable" || event === "data");
+	      const emitStartUs = traceEmit ? netBridgeNowUs() : 0;
+	      if (traceEmit && event === "data") {
+	        this._currentDataEmitStartUs = emitStartUs;
+	      }
+	      if (event === "readable") {
+	        countNetBridgeMetric("socketReadableEmits");
+	      } else if (event === "data") {
+        countNetBridgeMetric("socketDataEmits");
+      } else if (event === "end") {
+        countNetBridgeMetric("socketEndEmits");
+      } else if (event === "close") {
+        countNetBridgeMetric("socketCloseEmits");
+      } else if (event === "connect") {
+        countNetBridgeMetric("socketConnectEmits");
       }
-      let handled = false;
-      const listeners = this._listeners[event];
-      if (listeners) {
-        for (const fn of [...listeners]) {
-          fn.call(this, ...args);
-          handled = true;
-        }
-      }
-      const onceListeners = this._onceListeners[event];
-      if (onceListeners) {
-        const fns = [...onceListeners];
-        this._onceListeners[event] = [];
-        for (const fn of fns) {
-          fn.call(this, ...args);
-          handled = true;
-        }
-      }
-      return handled;
-    }
-    _queueReadablePayload(payload) {
-      if (!payload || payload.length === 0) {
-        return;
-      }
-      this._readQueue.push(payload);
-      this.readableLength += payload.length;
-      this._emitNet("readable");
-      if (this.listenerCount("data") > 0) {
-        const chunk = this.read();
-        if (chunk !== null) {
-          this._emitNet("data", chunk);
-        }
-      }
-    }
+	      if (event === "data" && this._encoding && args[0] && Buffer.isBuffer(args[0])) {
+	        args[0] = args[0].toString(this._encoding);
+	      }
+	      let handled = false;
+	      try {
+	        const listeners = this._listeners[event];
+	        if (listeners) {
+	          for (const fn of [...listeners]) {
+	            fn.call(this, ...args);
+	            handled = true;
+	          }
+	        }
+	        const onceListeners = this._onceListeners[event];
+	        if (onceListeners) {
+	          const fns = [...onceListeners];
+	          this._onceListeners[event] = [];
+	          for (const fn of fns) {
+	            fn.call(this, ...args);
+	            handled = true;
+	          }
+	        }
+	      } finally {
+	        if (traceEmit) {
+	          const elapsedUs = netBridgeNowUs() - emitStartUs;
+	          if (event === "readable") {
+	            countNetBridgeMetric("socketReadableEmitUs", elapsedUs);
+	            maxNetBridgeMetric("socketReadableEmitMaxUs", elapsedUs);
+	          } else if (event === "data") {
+	            countNetBridgeMetric("socketDataEmitUs", elapsedUs);
+	            maxNetBridgeMetric("socketDataEmitMaxUs", elapsedUs);
+	            this._lastDataEmitEndUs = netBridgeNowUs();
+	            this._currentDataEmitStartUs = 0;
+	          }
+	        }
+	      }
+	      return handled;
+	    }
+	    _queueReadablePayload(payload) {
+	      if (!payload || payload.length === 0) {
+	        return;
+	      }
+	      const traceMetrics = isNetBridgeMetricsEnabled();
+	      const queueStartUs = traceMetrics ? netBridgeNowUs() : 0;
+	      try {
+	        this._readQueue.push(payload);
+	        this.readableLength += payload.length;
+	        countNetBridgeMetric("queueReadablePayloads");
+	        countNetBridgeMetric("queueReadableBytes", payload.length);
+	        maxNetBridgeMetric("queueReadableBytesMax", this.readableLength);
+	        this._emitNet("readable");
+	        if (this.listenerCount("data") > 0) {
+	          const readStartUs = traceMetrics ? netBridgeNowUs() : 0;
+	          const chunk = this.read();
+	          if (traceMetrics) {
+	            const readElapsedUs = netBridgeNowUs() - readStartUs;
+	            countNetBridgeMetric("queueReadableImmediateReadCalls");
+	            countNetBridgeMetric("queueReadableImmediateReadUs", readElapsedUs);
+	            maxNetBridgeMetric("queueReadableImmediateReadMaxUs", readElapsedUs);
+	          }
+	          if (chunk !== null) {
+	            this._emitNet("data", chunk);
+	          }
+	        }
+	      } finally {
+	        if (traceMetrics) {
+	          const queueElapsedUs = netBridgeNowUs() - queueStartUs;
+	          countNetBridgeMetric("queueReadablePayloadElapsedUs", queueElapsedUs);
+	          maxNetBridgeMetric("queueReadablePayloadMaxUs", queueElapsedUs);
+	        }
+	      }
+	    }
     async _waitForConnect() {
       if (typeof _netSocketWaitConnectRaw === "undefined" || this._socketId === 0) {
         return;
@@ -18629,6 +19299,7 @@ ${headerLines}\r
         debugBridgeNetwork("socket emit ready", this._socketId, this.listenerCount("ready"));
         this._emitNet("ready");
         if (!this._tlsUpgrading) {
+          this._nextReadPumpOrigin = "connectWait";
           await this._pumpBridgeReads();
         }
       } catch (error) {
@@ -18641,33 +19312,148 @@ ${headerLines}\r
         this.destroy();
       }
     }
-    async _pumpBridgeReads() {
-      if (this._bridgeReadLoopRunning || typeof _netSocketReadRaw === "undefined" || this._socketId === 0) {
-        return;
-      }
-      this._bridgeReadLoopRunning = true;
-      try {
-        while (!this.destroyed) {
-          const chunkBase64 = _netSocketReadRaw.applySync(void 0, [this._socketId]);
+	    async _pumpBridgeReads() {
+	      if (this._bridgeReadLoopRunning || typeof _netSocketReadRaw === "undefined" || this._socketId === 0) {
+	        return;
+	      }
+	      countNetBridgeMetric("readPumpRuns");
+	      const firstPumpRun = !this._bridgeReadPumpStarted;
+	      const scheduleActive = this._readFirstPumpScheduleActive === true;
+	      if (firstPumpRun) {
+	        countReadFirstPumpOrigin(this._nextReadPumpOrigin);
+	        if (this._firstReadNoTimerWakeAtUs > 0 && isNetBridgeMetricsEnabled()) {
+	          const elapsedUs = Math.max(0, netBridgeNowUs() - this._firstReadNoTimerWakeAtUs);
+	          countNetBridgeMetric("readFirstPumpAfterNoTimerWakeCalls");
+	          countNetBridgeMetric("readFirstPumpAfterNoTimerWakeUs", elapsedUs);
+	          maxNetBridgeMetric("readFirstPumpAfterNoTimerWakeMaxUs", elapsedUs);
+	        }
+	        if (scheduleActive && this._readFirstPumpScheduleQueuedAtUs > 0 && isNetBridgeMetricsEnabled()) {
+	          const queuedToPumpStartUs = Math.max(0, netBridgeNowUs() - this._readFirstPumpScheduleQueuedAtUs);
+	          countNetBridgeMetric("readFirstPumpScheduleQueuedToPumpStartUs", queuedToPumpStartUs);
+	          maxNetBridgeMetric("readFirstPumpScheduleQueuedToPumpStartMaxUs", queuedToPumpStartUs);
+	        }
+	      }
+	      this._readFirstPumpScheduleActive = false;
+	      this._readFirstPumpScheduleQueuedAtUs = 0;
+	      this._nextReadPumpOrigin = null;
+	      this._bridgeReadPumpStarted = true;
+	      let firstPumpResultRecorded = false;
+	      let scheduleResultRecorded = false;
+	      if (isNetBridgeMetricsEnabled() && this._readWakeQueuedAtUs > 0) {
+	        const queuedToPumpUs = Math.max(0, netBridgeNowUs() - this._readWakeQueuedAtUs);
+	        countNetBridgeMetric("readWakeQueuedToPumpStartUs", queuedToPumpUs);
+	        maxNetBridgeMetric("readWakeQueuedToPumpStartMaxUs", queuedToPumpUs);
+	        this._readWakeQueuedAtUs = 0;
+	      }
+	      this._bridgeReadLoopRunning = true;
+	      try {
+	        while (!this.destroyed) {
+	          countNetBridgeMetric("readRawCalls");
+	          const traceMetrics = isNetBridgeMetricsEnabled();
+	          const postDeliveryProbeStartUs = traceMetrics && this._lastReadDeliveryEndUs > 0 ? netBridgeNowUs() : 0;
+	          if (postDeliveryProbeStartUs > 0) {
+	            countNetBridgeMetric("readPostDeliveryProbeCalls");
+	            countNetBridgeMetric("readPostDeliveryNextRawCalls");
+	            countNetBridgeMetric("readPostDeliveryToProbeStartUs", postDeliveryProbeStartUs - this._lastReadDeliveryEndUs);
+	            if (this._bridgeWriteFlushScheduled) {
+	              countNetBridgeMetric("readPostDeliveryPendingWriteFlushes");
+	              countNetBridgeMetric("readPostDeliveryPendingWriteBytes", this._pendingBridgeWriteBytes);
+	            }
+	            this._lastReadDeliveryEndUs = 0;
+	          }
+	          const readStartUs = traceMetrics ? netBridgeNowUs() : 0;
+	          const chunk = _netSocketReadRaw.applySync(void 0, [this._socketId]);
+	          if (traceMetrics) {
+	            const readElapsedUs = netBridgeNowUs() - readStartUs;
+	            countNetBridgeMetric("readRawElapsedUs", readElapsedUs);
+	            if (postDeliveryProbeStartUs > 0) {
+	              countNetBridgeMetric("readPostDeliveryProbeElapsedUs", readElapsedUs);
+	              maxNetBridgeMetric("readPostDeliveryProbeMaxUs", readElapsedUs);
+	            }
+	          }
           if (this.destroyed) {
             return;
           }
-          if (chunkBase64 === NET_BRIDGE_TIMEOUT_SENTINEL) {
+	          if (chunk === NET_BRIDGE_TIMEOUT_SENTINEL) {
+	            if (firstPumpRun && !firstPumpResultRecorded) {
+	              firstPumpResultRecorded = true;
+	              countNetBridgeMetric("readFirstPumpResultTimeout");
+	            }
+	            if (scheduleActive && !scheduleResultRecorded) {
+	              scheduleResultRecorded = true;
+	              countNetBridgeMetric("readFirstPumpScheduleResultTimeout");
+	            }
+	            countNetBridgeMetric("readTimeoutSentinels");
+	            if (postDeliveryProbeStartUs > 0) {
+	              countNetBridgeMetric("readPostDeliveryProbeTimeoutSentinels");
+	              countNetBridgeMetric("readPostDeliveryNextRawTimeoutSentinels");
+	            }
             if (!this._refed) {
               return;
-            }
-            this._bridgeReadPollTimer = setTimeout(() => {
-              this._bridgeReadPollTimer = null;
-              void this._pumpBridgeReads();
-            }, NET_BRIDGE_POLL_DELAY_MS);
+	            }
+	            countNetBridgeMetric("readPollTimersScheduled");
+	            const pollDelayMs = netBridgePollDelayMs();
+	            const scheduledAtUs = isNetBridgeMetricsEnabled() ? netBridgeNowUs() : 0;
+	            this._bridgeReadPollTimer = setTimeout(() => {
+	              if (isNetBridgeMetricsEnabled()) {
+	                const lagUs = Math.max(0, netBridgeNowUs() - scheduledAtUs - pollDelayMs * 1000);
+	                countNetBridgeMetric("readPollTimerFires");
+	                countNetBridgeMetric("readPollTimerFireLagUs", lagUs);
+	                maxNetBridgeMetric("readPollTimerFireLagMaxUs", lagUs);
+	              }
+	              this._bridgeReadPollTimer = null;
+	              this._nextReadPumpOrigin = "timer";
+	              void this._pumpBridgeReads();
+	            }, pollDelayMs);
             return;
           }
-          if (chunkBase64 === null) {
+          if (chunk === null) {
+            if (firstPumpRun && !firstPumpResultRecorded) {
+              firstPumpResultRecorded = true;
+              countNetBridgeMetric("readFirstPumpResultEnd");
+            }
+            if (scheduleActive && !scheduleResultRecorded) {
+              scheduleResultRecorded = true;
+              countNetBridgeMetric("readFirstPumpScheduleResultEnd");
+            }
+            countNetBridgeMetric("readEndEvents");
             this._handleRemoteReadableEnd();
             return;
+	          }
+	          if (postDeliveryProbeStartUs > 0) {
+	            countNetBridgeMetric("readPostDeliveryProbeDataEvents");
+	            countNetBridgeMetric("readPostDeliveryNextRawDataEvents");
+	          }
+	          if (firstPumpRun && !firstPumpResultRecorded) {
+	            firstPumpResultRecorded = true;
+	            countNetBridgeMetric("readFirstPumpResultData");
+	          }
+	          if (scheduleActive && !scheduleResultRecorded) {
+	            scheduleResultRecorded = true;
+	            countNetBridgeMetric("readFirstPumpScheduleResultData");
+	          }
+	          let payload;
+          if (typeof chunk === "string") {
+            const decodeStartUs = traceMetrics ? netBridgeNowUs() : 0;
+            payload = Buffer.from(chunk, "base64");
+            if (traceMetrics) {
+              countNetBridgeMetric("readBase64DecodeCalls");
+              countNetBridgeMetric("readBase64DecodeBytes", payload.length);
+              countNetBridgeMetric("readBase64DecodeChars", chunk.length);
+              countNetBridgeMetric("readBase64DecodeUs", netBridgeNowUs() - decodeStartUs);
+            }
+          } else {
+            const materializeStartUs = traceMetrics ? netBridgeNowUs() : 0;
+            payload = Buffer.from(chunk);
+            if (traceMetrics) {
+              countNetBridgeMetric("readPayloadMaterializeCalls");
+              countNetBridgeMetric("readPayloadMaterializeBytes", payload.length);
+              countNetBridgeMetric("readPayloadMaterializeUs", netBridgeNowUs() - materializeStartUs);
+            }
           }
-          const payload = Buffer.from(chunkBase64, "base64");
           debugBridgeNetwork("socket data", this._socketId, payload.length);
+          countNetBridgeMetric("readDataEvents");
+          countNetBridgeMetric("readBytes", payload.length);
           this.bytesRead += payload.length;
           this._touchTimeout();
           // Yield to a macrotask before delivering each payload so that socket
@@ -18680,13 +19466,23 @@ ${headerLines}\r
           // before the caller's microtask dispatches the next request, so the
           // pool keeps every Client at kNeedDrain and allocates a fresh
           // Client+socket per request — leaking EventEmitter listeners
-          // (MaxListenersExceededWarning) and unbounded memory until the VM dies.
-          await yieldBridgeMacrotask();
-          if (this.destroyed) {
-            return;
-          }
-          this._queueReadablePayload(payload);
-        }
+	          // (MaxListenersExceededWarning) and unbounded memory until the VM dies.
+	          countNetBridgeMetric("readMacrotaskYields");
+	          const yieldStartUs = traceMetrics ? netBridgeNowUs() : 0;
+	          await yieldBridgeMacrotask();
+	          if (traceMetrics) {
+	            const yieldElapsedUs = netBridgeNowUs() - yieldStartUs;
+	            countNetBridgeMetric("readMacrotaskYieldElapsedUs", yieldElapsedUs);
+	            maxNetBridgeMetric("readMacrotaskYieldMaxUs", yieldElapsedUs);
+	          }
+	          if (this.destroyed) {
+	            return;
+	          }
+	          this._queueReadablePayload(payload);
+	          if (traceMetrics) {
+	            this._lastReadDeliveryEndUs = netBridgeNowUs();
+	          }
+	        }
       } finally {
         this._bridgeReadLoopRunning = false;
       }
@@ -18907,10 +19703,14 @@ ${headerLines}\r
     _onceListeners = {};
     _serverId = 0;
     _address = null;
-    _acceptLoopActive = false;
-    _acceptLoopRunning = false;
-    _acceptPollTimer = null;
-    _handleRefId = null;
+	    _acceptLoopActive = false;
+	    _acceptLoopRunning = false;
+	    _acceptPollTimer = null;
+	    _acceptPumpStarted = false;
+	    _nextAcceptPumpOrigin = null;
+	    _firstAcceptNoTimerWakeAtUs = 0;
+	    _acceptWakeQueuedAtUs = 0;
+	    _handleRefId = null;
     _connections = /* @__PURE__ */ new Set();
     _refed = true;
     listening = false;
@@ -18965,6 +19765,7 @@ ${headerLines}\r
           if (this.keepAlive) {
             socket._applyAcceptedKeepAlive(this.keepAliveInitialDelay);
           }
+          countNetBridgeMetric("connectionEmits");
           this._emit("connection", socket);
         }
       };
@@ -18996,6 +19797,7 @@ ${headerLines}\r
           port: address.localPort
         };
         this.listening = true;
+        registerNetServer(this);
         this._syncHandleRef();
         this._acceptLoopActive = true;
         queueMicrotask(() => {
@@ -19003,6 +19805,7 @@ ${headerLines}\r
             return;
           }
           this._emit("listening");
+          this._nextAcceptPumpOrigin = "listen";
           void this._pumpAccepts();
         });
       } catch (error) {
@@ -19024,6 +19827,7 @@ ${headerLines}\r
       }
       this.listening = false;
       this._acceptLoopActive = false;
+      unregisterNetServer(this);
       if (this._acceptPollTimer) {
         clearTimeout(this._acceptPollTimer);
         this._acceptPollTimer = null;
@@ -19059,6 +19863,7 @@ ${headerLines}\r
       this._refed = true;
       this._syncHandleRef();
       if (this.listening && this._acceptLoopActive && !this._acceptLoopRunning) {
+        this._nextAcceptPumpOrigin = "ref";
         void this._pumpAccepts();
       }
       return this;
@@ -19124,31 +19929,92 @@ ${headerLines}\r
         _registerHandle(this._handleRefId, "net server");
       }
     }
-    async _pumpAccepts() {
-      if (typeof _netServerAcceptRaw === "undefined" || this._acceptLoopRunning) {
-        return;
-      }
-      this._acceptLoopRunning = true;
-      try {
+	    async _pumpAccepts() {
+	      if (typeof _netServerAcceptRaw === "undefined" || this._acceptLoopRunning) {
+	        if (this._acceptLoopRunning) {
+	          countNetBridgeMetric("acceptLoopAlreadyRunning");
+	        }
+	        return;
+	      }
+	      countNetBridgeMetric("acceptPumpRuns");
+	      const firstPumpRun = !this._acceptPumpStarted;
+	      if (firstPumpRun) {
+	        countAcceptFirstPumpOrigin(this._nextAcceptPumpOrigin);
+	        if (this._firstAcceptNoTimerWakeAtUs > 0 && isNetBridgeMetricsEnabled()) {
+	          const elapsedUs = Math.max(0, netBridgeNowUs() - this._firstAcceptNoTimerWakeAtUs);
+	          countNetBridgeMetric("acceptFirstPumpAfterNoTimerWakeCalls");
+	          countNetBridgeMetric("acceptFirstPumpAfterNoTimerWakeUs", elapsedUs);
+	          maxNetBridgeMetric("acceptFirstPumpAfterNoTimerWakeMaxUs", elapsedUs);
+	        }
+	      }
+	      this._nextAcceptPumpOrigin = null;
+	      this._acceptPumpStarted = true;
+	      let firstPumpResultRecorded = false;
+	      if (isNetBridgeMetricsEnabled() && this._acceptWakeQueuedAtUs > 0) {
+	        const queuedToPumpUs = Math.max(0, netBridgeNowUs() - this._acceptWakeQueuedAtUs);
+	        countNetBridgeMetric("acceptWakeQueuedToPumpStartUs", queuedToPumpUs);
+	        maxNetBridgeMetric("acceptWakeQueuedToPumpStartMaxUs", queuedToPumpUs);
+	        this._acceptWakeQueuedAtUs = 0;
+	      }
+	      this._acceptLoopRunning = true;
+	      try {
         while (this._acceptLoopActive && this._serverId !== 0) {
+          countNetBridgeMetric("acceptRawCalls");
+          const traceMetrics = isNetBridgeMetricsEnabled();
+          const acceptStartUs = traceMetrics ? netBridgeNowUs() : 0;
           const payload = _netServerAcceptRaw.applySync(void 0, [this._serverId]);
+          if (traceMetrics) {
+            countNetBridgeMetric("acceptRawElapsedUs", netBridgeNowUs() - acceptStartUs);
+          }
           if (payload === NET_BRIDGE_TIMEOUT_SENTINEL) {
+            if (firstPumpRun && !firstPumpResultRecorded) {
+              firstPumpResultRecorded = true;
+              countNetBridgeMetric("acceptFirstPumpResultTimeout");
+            }
+            countNetBridgeMetric("acceptTimeoutSentinels");
             if (!this._refed) {
               return;
-            }
-            this._acceptPollTimer = setTimeout(() => {
-              this._acceptPollTimer = null;
-              void this._pumpAccepts();
-            }, NET_BRIDGE_POLL_DELAY_MS);
+	            }
+	            countNetBridgeMetric("acceptPollTimersScheduled");
+	            const pollDelayMs = netBridgePollDelayMs();
+	            const scheduledAtUs = isNetBridgeMetricsEnabled() ? netBridgeNowUs() : 0;
+	            this._acceptPollTimer = setTimeout(() => {
+	              if (isNetBridgeMetricsEnabled()) {
+	                const lagUs = Math.max(0, netBridgeNowUs() - scheduledAtUs - pollDelayMs * 1000);
+	                countNetBridgeMetric("acceptPollTimerFires");
+	                countNetBridgeMetric("acceptPollTimerFireLagUs", lagUs);
+	                maxNetBridgeMetric("acceptPollTimerFireLagMaxUs", lagUs);
+	              }
+	              this._acceptPollTimer = null;
+	              this._nextAcceptPumpOrigin = "timer";
+	              void this._pumpAccepts();
+	            }, pollDelayMs);
             return;
           }
           if (!payload) {
+            if (firstPumpRun && !firstPumpResultRecorded) {
+              firstPumpResultRecorded = true;
+              countNetBridgeMetric("acceptFirstPumpResultEmpty");
+            }
             return;
           }
           try {
+            const parseStartUs = traceMetrics ? netBridgeNowUs() : 0;
             const accepted = JSON.parse(payload);
+            if (traceMetrics) {
+              countNetBridgeMetric("acceptJsonParseUs", netBridgeNowUs() - parseStartUs);
+            }
+            countNetBridgeMetric("acceptConnections");
+            if (firstPumpRun && !firstPumpResultRecorded) {
+              firstPumpResultRecorded = true;
+              countNetBridgeMetric("acceptFirstPumpResultConnection");
+            }
             const clientHandle = createAcceptedClientHandle(accepted.socketId, accepted.info);
+            const onConnectionStartUs = traceMetrics ? netBridgeNowUs() : 0;
             this._handle.onconnection(null, clientHandle);
+            if (traceMetrics) {
+              countNetBridgeMetric("acceptOnConnectionUs", netBridgeNowUs() - onConnectionStartUs);
+            }
           } catch (error) {
             this._emit("error", error);
           }

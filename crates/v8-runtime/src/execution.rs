@@ -4335,7 +4335,8 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                bridge::resolve_pending_promise(scope, &pending, 1, Some(result_v8), None).unwrap();
+                bridge::resolve_pending_promise(scope, &pending, 1, 0, Some(result_v8), None)
+                    .unwrap();
             }
 
             assert_eq!(pending.len(), 0);
@@ -4396,6 +4397,7 @@ export const file = new File([], "empty.txt");
                     scope,
                     &pending,
                     1,
+                    0,
                     None,
                     Some("ENOENT: file not found".into()),
                 )
@@ -4465,7 +4467,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                bridge::resolve_pending_promise(scope, &pending, 2, Some(r2), None).unwrap();
+                bridge::resolve_pending_promise(scope, &pending, 2, 0, Some(r2), None).unwrap();
             }
             assert_eq!(pending.len(), 1);
 
@@ -4474,7 +4476,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                bridge::resolve_pending_promise(scope, &pending, 1, Some(r1), None).unwrap();
+                bridge::resolve_pending_promise(scope, &pending, 1, 0, Some(r1), None).unwrap();
             }
             assert_eq!(pending.len(), 0);
 
@@ -4540,7 +4542,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                bridge::resolve_pending_promise(scope, &pending, 1, None, None).unwrap();
+                bridge::resolve_pending_promise(scope, &pending, 1, 0, None, None).unwrap();
             }
 
             // Promise should be fulfilled with undefined
@@ -4599,7 +4601,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                bridge::resolve_pending_promise(scope, &pending, 1, None, None).unwrap();
+                bridge::resolve_pending_promise(scope, &pending, 1, 0, None, None).unwrap();
             }
 
             // After resolution + microtask flush, _thenRan should be true

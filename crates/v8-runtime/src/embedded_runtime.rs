@@ -6,8 +6,11 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::thread;
+use std::time::Instant;
 
-use crate::host_call::CallIdRouter;
+use crate::host_call::{
+    record_sync_bridge_host_phase, record_sync_bridge_response_channel_send_start, CallIdRouter,
+};
 use crate::ipc_binary::BinaryFrame;
 use crate::runtime_protocol::{
     validate_bridge_response_status, BridgeResponse, ModuleReaderHandle, RuntimeCommand,
@@ -267,6 +270,29 @@ pub struct EmbeddedV8SessionHandle {
 }
 
 impl EmbeddedV8SessionHandle {
+    pub fn execute(
+        &self,
+        mode: u8,
+        file_path: String,
+        bridge_code: String,
+        post_restore_script: String,
+        userland_code: String,
+        user_code: String,
+    ) -> io::Result<()> {
+        validate_execute_mode(mode)?;
+        self.runtime.dispatch(RuntimeCommand::SendToSession {
+            session_id: self.session_id.clone(),
+            message: SessionMessage::Execute {
+                mode,
+                file_path,
+                bridge_code,
+                post_restore_script,
+                userland_code,
+                user_code,
+            },
+        })
+    }
+
     pub fn send_bridge_response(
         &self,
         call_id: u64,
@@ -325,6 +351,16 @@ impl EmbeddedV8SessionHandle {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+}
+
+fn validate_execute_mode(mode: u8) -> io::Result<()> {
+    if mode > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown Execute mode: {mode}"),
+        ));
+    }
+    Ok(())
 }
 
 impl Clone for EmbeddedV8SessionHandle {
@@ -569,26 +605,58 @@ fn dispatch_runtime_command(
             // Resolve the sender and apply terminate side effects under the
             // lock, then send after releasing it so a full session command
             // channel cannot block the manager mutex.
+            let is_bridge_response = matches!(&message, SessionMessage::BridgeResponse(_));
             let sender = {
                 let mgr = session_mgr.lock().expect("session manager lock poisoned");
                 let routed_session_id = match &message {
-                    SessionMessage::BridgeResponse(response) => mgr
-                        .call_id_router()
-                        .lock()
-                        .expect("call_id router lock poisoned")
-                        .remove(&response.call_id)
-                        .unwrap_or(session_id),
+                    SessionMessage::BridgeResponse(response) => {
+                        let phase_start = Instant::now();
+                        let routed_session_id = mgr
+                            .call_id_router()
+                            .lock()
+                            .expect("call_id router lock poisoned")
+                            .remove(&response.call_id)
+                            .unwrap_or(session_id);
+                        record_sync_bridge_host_phase(
+                            "sync_rpc_dispatch",
+                            "dispatch_route_lookup",
+                            phase_start.elapsed(),
+                        );
+                        routed_session_id
+                    }
                     SessionMessage::InjectGlobals { .. }
                     | SessionMessage::Execute { .. }
                     | SessionMessage::StreamEvent(_)
                     | SessionMessage::TerminateExecution => session_id,
                 };
-                mgr.session_command_sender(&routed_session_id, &message)
-                    .map_err(other_io_error)?
+                let phase_start = Instant::now();
+                let sender = mgr
+                    .session_command_sender(&routed_session_id, &message)
+                    .map_err(other_io_error)?;
+                if is_bridge_response {
+                    record_sync_bridge_host_phase(
+                        "sync_rpc_dispatch",
+                        "dispatch_sender_lookup",
+                        phase_start.elapsed(),
+                    );
+                }
+                sender
             };
-            sender
+            if let SessionMessage::BridgeResponse(response) = &message {
+                record_sync_bridge_response_channel_send_start(response.call_id);
+            }
+            let phase_start = Instant::now();
+            let result = sender
                 .send(SessionCommand::Message(message))
-                .map_err(|e| other_io_error(format!("session thread disconnected: {}", e)))
+                .map_err(|e| other_io_error(format!("session thread disconnected: {}", e)));
+            if is_bridge_response {
+                record_sync_bridge_host_phase(
+                    "sync_rpc_dispatch",
+                    "dispatch_channel_send",
+                    phase_start.elapsed(),
+                );
+            }
+            result
         }
         RuntimeCommand::SetSessionModuleReader { session_id, reader } => {
             // Resolve the sender under the lock, release, then forward the live

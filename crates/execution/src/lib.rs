@@ -18,6 +18,7 @@ pub mod python;
 pub mod wasm;
 
 pub use javascript::{
+    record_sync_bridge_request_enqueued, record_sync_bridge_request_observed,
     CreateJavascriptContextRequest, GuestRuntimeConfig, JavascriptContext, JavascriptExecution,
     JavascriptExecutionEngine, JavascriptExecutionError, JavascriptExecutionEvent,
     JavascriptExecutionLimits, JavascriptExecutionResult, JavascriptSyncRpcRequest,

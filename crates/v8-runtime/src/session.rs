@@ -1547,6 +1547,10 @@ pub(crate) const SYNC_BRIDGE_FNS: &[&str] = &[
     // Console
     "_log",
     "_error",
+    // Benchmark diagnostics
+    "_benchNoop",
+    "_benchNetTcpMetricsResetRaw",
+    "_benchNetTcpMetricsSnapshotRaw",
     // Python guest VFS RPC bridge
     "_pythonRpc",
     "_pythonStdinRead",
@@ -1952,13 +1956,15 @@ fn dispatch_event_loop_frame(
         }) => {
             let (result, error) = if status == 1 {
                 (None, Some(String::from_utf8_lossy(&payload).to_string()))
-            } else if !payload.is_empty() {
+            } else if status == 2 || !payload.is_empty() {
                 // status=0: V8-serialized, status=2: raw binary (Uint8Array)
                 (Some(payload), None)
             } else {
                 (None, None)
             };
-            let _ = crate::bridge::resolve_pending_promise(scope, pending, call_id, result, error);
+            let _ = crate::bridge::resolve_pending_promise(
+                scope, pending, call_id, status, result, error,
+            );
             // Microtasks already flushed in resolve_pending_promise
             EventLoopStatus::Completed
         }
@@ -2053,6 +2059,7 @@ impl crate::host_call::BridgeResponseReceiver for ChannelResponseReceiver {
                     if let SessionMessage::BridgeResponse(response) = &frame {
                         let call_id = response.call_id;
                         if call_id == expected_call_id {
+                            crate::host_call::record_sync_bridge_response_channel_received(call_id);
                             return Ok(response.clone());
                         }
                         push_deferred_sync_message(&self.deferred, frame)?;

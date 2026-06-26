@@ -8,6 +8,16 @@
       "names": ["_log", "_error"]
     },
     {
+      "convention": "sync",
+      "argumentTypes": ["...args: unknown[]"],
+      "returnType": "unknown",
+      "names": [
+        "_benchNoop",
+        "_benchNetTcpMetricsResetRaw",
+        "_benchNetTcpMetricsSnapshotRaw"
+      ]
+    },
+    {
       "convention": "syncPromise",
       "argumentTypes": ["request: string"],
       "returnType": "string | null",

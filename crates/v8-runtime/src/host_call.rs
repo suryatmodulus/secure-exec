@@ -1,11 +1,11 @@
 // Sync-blocking bridge call: serialize, write to socket, block on read, deserialize
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ipc_binary::{self, BinaryFrame};
 use crate::runtime_protocol::{BridgeResponse, RuntimeEvent};
@@ -45,6 +45,123 @@ fn record_syncrpc_lat(ns: u64) {
             );
         }
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SyncBridgeHostPhaseStats {
+    calls: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+static SYNC_BRIDGE_HOST_PHASES: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<String, SyncBridgeHostPhaseStats>>,
+> = std::sync::OnceLock::new();
+static SYNC_BRIDGE_CALL_METHODS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
+    std::sync::OnceLock::new();
+static SYNC_BRIDGE_RESPONSE_CHANNEL_SENDS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, (String, Instant)>>,
+> = std::sync::OnceLock::new();
+
+fn sync_bridge_host_phases_enabled() -> bool {
+    std::env::var("AGENTOS_SYNC_BRIDGE_HOST_PHASES").as_deref() == Ok("1")
+}
+
+pub(crate) fn record_sync_bridge_host_phase(method: &str, stage: &str, elapsed: Duration) {
+    if !sync_bridge_host_phases_enabled() {
+        return;
+    }
+    let stats = SYNC_BRIDGE_HOST_PHASES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let Ok(mut stats) = stats.lock() else {
+        return;
+    };
+    let elapsed_us = elapsed.as_micros() as u64;
+    let key = format!("{method}:{stage}");
+    let entry = stats.entry(key).or_default();
+    entry.calls += 1;
+    entry.total_us = entry.total_us.wrapping_add(elapsed_us);
+    entry.max_us = entry.max_us.max(elapsed_us);
+
+    if let Ok(path) = std::env::var("AGENTOS_SYNC_BRIDGE_HOST_PHASES_FILE") {
+        let mut lines = String::new();
+        for (key, value) in stats.iter() {
+            let Some((method, stage)) = key.split_once(':') else {
+                continue;
+            };
+            let avg_us = if value.calls == 0 {
+                0
+            } else {
+                value.total_us / value.calls
+            };
+            lines.push_str(&format!(
+                "method={method} stage={stage} calls={} total_us={} avg_us={} max_us={}\n",
+                value.calls, value.total_us, avg_us, value.max_us
+            ));
+        }
+        let _ = std::fs::write(path, lines);
+    }
+}
+
+fn track_sync_bridge_call_method(call_id: u64, method: &str) {
+    if !sync_bridge_host_phases_enabled() {
+        return;
+    }
+    let methods = SYNC_BRIDGE_CALL_METHODS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let Ok(mut methods) = methods.lock() else {
+        return;
+    };
+    if methods.len() > 4096 {
+        methods.clear();
+    }
+    methods.insert(call_id, method.to_owned());
+}
+
+fn cleanup_sync_bridge_call_tracking(call_id: u64) {
+    if let Some(methods) = SYNC_BRIDGE_CALL_METHODS.get() {
+        if let Ok(mut methods) = methods.lock() {
+            methods.remove(&call_id);
+        }
+    }
+    if let Some(starts) = SYNC_BRIDGE_RESPONSE_CHANNEL_SENDS.get() {
+        if let Ok(mut starts) = starts.lock() {
+            starts.remove(&call_id);
+        }
+    }
+}
+
+pub(crate) fn record_sync_bridge_response_channel_send_start(call_id: u64) {
+    if !sync_bridge_host_phases_enabled() {
+        return;
+    }
+    let method = SYNC_BRIDGE_CALL_METHODS
+        .get()
+        .and_then(|methods| methods.lock().ok()?.get(&call_id).cloned())
+        .unwrap_or_else(|| String::from("sync_rpc_response"));
+    let starts =
+        SYNC_BRIDGE_RESPONSE_CHANNEL_SENDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let Ok(mut starts) = starts.lock() else {
+        return;
+    };
+    if starts.len() > 4096 {
+        starts.clear();
+    }
+    starts.insert(call_id, (method, Instant::now()));
+}
+
+pub(crate) fn record_sync_bridge_response_channel_received(call_id: u64) {
+    if !sync_bridge_host_phases_enabled() {
+        return;
+    }
+    let Some(starts) = SYNC_BRIDGE_RESPONSE_CHANNEL_SENDS.get() else {
+        return;
+    };
+    let Ok(mut starts) = starts.lock() else {
+        return;
+    };
+    let Some((method, started)) = starts.remove(&call_id) else {
+        return;
+    };
+    record_sync_bridge_host_phase(&method, "host_response_channel_recv", started.elapsed());
 }
 
 /// Trait for sending serialized frames to the host without holding a shared mutex.
@@ -107,6 +224,12 @@ impl RuntimeEventSender for WriterRuntimeEventSender {
 /// Production code uses a channel-based implementation; tests use a buffer-based one.
 pub trait BridgeResponseReceiver: Send {
     fn recv_response(&self, expected_call_id: u64) -> Result<BridgeResponse, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncBridgeCallResponse {
+    pub status: u8,
+    pub payload: Vec<u8>,
 }
 
 /// ResponseReceiver that reads frames from a byte buffer via ipc_binary::read_frame.
@@ -181,6 +304,10 @@ pub struct BridgeCallContext {
     next_call_id: Arc<AtomicU64>,
     /// Set of in-flight call_ids (for duplicate rejection)
     pending_calls: Mutex<HashSet<u64>>,
+    /// Opt-in diagnostic tracking for sync call_ids. The atomic call_id counter
+    /// plus recv_response(call_id) validation are the correctness path; this set
+    /// is only needed when inspecting in-flight calls.
+    track_pending_calls: bool,
     /// Optional routing table for call_id → session_id mapping.
     /// When set, call_ids are registered here so the connection handler
     /// can route BridgeResponse messages to the correct session.
@@ -225,6 +352,7 @@ impl BridgeCallContext {
             session_id: "stub".into(),
             next_call_id: Arc::new(AtomicU64::new(1)),
             pending_calls: Mutex::new(HashSet::new()),
+            track_pending_calls: should_track_pending_sync_calls(),
             call_id_router: None,
         }
     }
@@ -244,6 +372,7 @@ impl BridgeCallContext {
             session_id,
             next_call_id: Arc::new(AtomicU64::new(1)),
             pending_calls: Mutex::new(HashSet::new()),
+            track_pending_calls: should_track_pending_sync_calls(),
             call_id_router: None,
         }
     }
@@ -264,6 +393,7 @@ impl BridgeCallContext {
             session_id,
             next_call_id: shared_call_id,
             pending_calls: Mutex::new(HashSet::new()),
+            track_pending_calls: should_track_pending_sync_calls(),
             call_id_router: Some(router),
         }
     }
@@ -273,11 +403,17 @@ impl BridgeCallContext {
     /// Generates a unique call_id, sends a BridgeCall message over IPC,
     /// blocks on read() for the BridgeResponse, and returns the result.
     /// Error responses from the host are returned as Err.
-    pub fn sync_call(&self, method: &str, args: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+    pub fn sync_call_response(
+        &self,
+        method: &str,
+        args: Vec<u8>,
+    ) -> Result<Option<SyncBridgeCallResponse>, String> {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        track_sync_bridge_call_method(call_id, method);
 
-        // Register call_id in pending set (reject duplicates)
-        {
+        // Optional diagnostic tracking. Correctness comes from the atomic
+        // counter and recv_response(call_id) identity validation.
+        if self.track_pending_calls {
             let mut pending = self.pending_calls.lock().unwrap();
             if !pending.insert(call_id) {
                 return Err(format!("duplicate call_id: {}", call_id));
@@ -286,10 +422,12 @@ impl BridgeCallContext {
 
         // Register call_id → session_id for BridgeResponse routing
         if let Some(ref router) = self.call_id_router {
+            let phase_start = Instant::now();
             router
                 .lock()
                 .unwrap()
                 .insert(call_id, self.session_id.clone());
+            record_sync_bridge_host_phase(method, "host_register_route", phase_start.elapsed());
         }
 
         // Send BridgeCall to host
@@ -301,19 +439,29 @@ impl BridgeCallContext {
         };
 
         let __lat = syncrpc_lat_enabled().then(Instant::now);
+        let phase_start = Instant::now();
         if let Err(e) = self.sender.send_event(bridge_call) {
-            self.pending_calls.lock().unwrap().remove(&call_id);
+            self.remove_pending_call(call_id);
             self.remove_call_route(call_id);
             return Err(format!("failed to write BridgeCall: {}", e));
         }
+        record_sync_bridge_host_phase(method, "host_send_event", phase_start.elapsed());
 
         // Receive BridgeResponse directly (no re-serialization)
         let response = {
             let rx = self.response_rx.lock().unwrap();
+            let phase_start = Instant::now();
             match rx.recv_response(call_id) {
-                Ok(frame) => frame,
+                Ok(frame) => {
+                    record_sync_bridge_host_phase(
+                        method,
+                        "host_recv_response",
+                        phase_start.elapsed(),
+                    );
+                    frame
+                }
                 Err(e) => {
-                    self.pending_calls.lock().unwrap().remove(&call_id);
+                    self.remove_pending_call(call_id);
                     self.remove_call_route(call_id);
                     return Err(e);
                 }
@@ -323,19 +471,33 @@ impl BridgeCallContext {
             record_syncrpc_lat(t.elapsed().as_nanos() as u64);
         }
 
-        // Remove from pending
-        self.pending_calls.lock().unwrap().remove(&call_id);
+        let phase_start = Instant::now();
+        self.remove_pending_call(call_id);
         self.remove_call_route(call_id);
+        record_sync_bridge_host_phase(method, "host_cleanup", phase_start.elapsed());
 
         // Validate and extract BridgeResponse
+        let phase_start = Instant::now();
         if response.status == 1 {
-            Err(String::from_utf8_lossy(&response.payload).to_string())
-        } else if response.payload.is_empty() {
+            let result = Err(String::from_utf8_lossy(&response.payload).to_string());
+            record_sync_bridge_host_phase(method, "host_extract_response", phase_start.elapsed());
+            result
+        } else if response.payload.is_empty() && response.status != 2 {
+            record_sync_bridge_host_phase(method, "host_extract_response", phase_start.elapsed());
             Ok(None)
         } else {
-            // status=0: V8-serialized result, status=2: raw binary (Uint8Array)
-            Ok(Some(response.payload))
+            let result = Ok(Some(SyncBridgeCallResponse {
+                status: response.status,
+                payload: response.payload,
+            }));
+            record_sync_bridge_host_phase(method, "host_extract_response", phase_start.elapsed());
+            result
         }
+    }
+
+    pub fn sync_call(&self, method: &str, args: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+        self.sync_call_response(method, args)
+            .map(|response| response.map(|response| response.payload))
     }
 
     /// Send a BridgeCall without blocking for a response.
@@ -373,15 +535,32 @@ impl BridgeCallContext {
         }
     }
 
+    fn remove_pending_call(&self, call_id: u64) {
+        cleanup_sync_bridge_call_tracking(call_id);
+        if self.track_pending_calls {
+            self.pending_calls.lock().unwrap().remove(&call_id);
+        }
+    }
+
     /// Check if a call_id is currently pending.
     pub fn is_call_pending(&self, call_id: u64) -> bool {
+        if !self.track_pending_calls {
+            return false;
+        }
         self.pending_calls.lock().unwrap().contains(&call_id)
     }
 
     /// Number of pending calls.
     pub fn pending_count(&self) -> usize {
+        if !self.track_pending_calls {
+            return 0;
+        }
         self.pending_calls.lock().unwrap().len()
     }
+}
+
+fn should_track_pending_sync_calls() -> bool {
+    std::env::var("AGENTOS_TRACK_PENDING_SYNC_CALLS").as_deref() == Ok("1")
 }
 
 #[cfg(test)]

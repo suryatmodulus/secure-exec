@@ -180,6 +180,11 @@ pub fn map_bridge_method(method: &str) -> (&str, bool) {
     // For methods where the polyfill arg format matches the sidecar format exactly,
     // needs_arg_translation is false.
     match method {
+        // Benchmark diagnostics
+        "_benchNoop" => ("__bench.noop", false),
+        "_benchNetTcpMetricsResetRaw" => ("__bench.net_tcp_metrics_reset", false),
+        "_benchNetTcpMetricsSnapshotRaw" => ("__bench.net_tcp_metrics_snapshot", false),
+
         // Filesystem operations
         "_fsReadFile" => ("fs.readFileSync", false),
         "_fsWriteFile" => ("fs.writeFileSync", false),
@@ -401,6 +406,22 @@ pub fn cbor_payload_to_json_args(payload: &[u8]) -> io::Result<Vec<Value>> {
     }
 }
 
+pub fn cbor_payload_raw_byte_arg(payload: &[u8], index: usize) -> io::Result<Option<Vec<u8>>> {
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let cbor_value: ciborium::value::Value = ciborium::de::from_reader(payload).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to deserialize CBOR bridge call payload: {e}"),
+        )
+    })?;
+    let Some(value) = cbor_array_arg(&cbor_value, index) else {
+        return Ok(None);
+    };
+    Ok(cbor_raw_bytes(value).map(ToOwned::to_owned))
+}
+
 /// Serialize a JSON value to CBOR bytes for bridge responses.
 pub fn json_to_cbor_payload(value: &Value) -> io::Result<Vec<u8>> {
     let cbor_value = json_to_cbor(value);
@@ -412,6 +433,22 @@ pub fn json_to_cbor_payload(value: &Value) -> io::Result<Vec<u8>> {
         )
     })?;
     Ok(buf)
+}
+
+fn cbor_array_arg(value: &ciborium::value::Value, index: usize) -> Option<&ciborium::value::Value> {
+    match value {
+        ciborium::value::Value::Array(values) => values.get(index),
+        value if index == 0 => Some(value),
+        _ => None,
+    }
+}
+
+fn cbor_raw_bytes(value: &ciborium::value::Value) -> Option<&[u8]> {
+    match value {
+        ciborium::value::Value::Bytes(bytes) => Some(bytes),
+        ciborium::value::Value::Tag(_, inner) => cbor_raw_bytes(inner),
+        _ => None,
+    }
 }
 
 fn cbor_to_json(value: ciborium::value::Value) -> Value {

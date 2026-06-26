@@ -184,6 +184,27 @@ impl V8SessionHandle {
         self.inner.set_module_reader(reader)
     }
 
+    /// Execute bridge code + user code in this V8 session without routing through
+    /// the legacy binary frame encode/decode path.
+    pub fn execute(
+        &self,
+        mode: u8,
+        file_path: String,
+        bridge_code: String,
+        post_restore_script: String,
+        userland_code: String,
+        user_code: String,
+    ) -> io::Result<()> {
+        self.inner.execute(
+            mode,
+            file_path,
+            bridge_code,
+            post_restore_script,
+            userland_code,
+            user_code,
+        )
+    }
+
     /// Terminate execution in this session.
     pub fn terminate(&self) -> io::Result<()> {
         self.inner.terminate()

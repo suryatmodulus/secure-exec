@@ -590,6 +590,43 @@ fn cbor_to_v8_inner<'s>(
     }
 }
 
+fn raw_bytes_to_uint8array<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    bytes: &[u8],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let len = bytes.len();
+    let ab = v8::ArrayBuffer::new(scope, len);
+    if len > 0 {
+        let bs = ab.get_backing_store();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), bs.data()?.as_ptr() as *mut u8, len);
+        }
+    }
+    v8::Uint8Array::new(scope, ab, 0, len).map(Into::into)
+}
+
+fn bridge_response_payload_to_v8<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    status: u8,
+    payload: &[u8],
+) -> Option<v8::Local<'s, v8::Value>> {
+    if status == 2 {
+        return raw_bytes_to_uint8array(scope, payload);
+    }
+
+    let v8_val = {
+        let tc = &mut v8::TryCatch::new(scope);
+        deserialize_v8_value(tc, payload).ok()
+    };
+    if v8_val.is_some() {
+        return v8_val;
+    }
+
+    // Preserve the historical compatibility fallback for malformed/non-native
+    // status=0 responses, but never let status=2 raw bytes take this path.
+    raw_bytes_to_uint8array(scope, payload)
+}
+
 /// Serialize a V8 value to CBOR bytes.
 pub fn serialize_cbor_value(
     scope: &mut v8::HandleScope,
@@ -1821,33 +1858,15 @@ fn sync_bridge_callback<'s>(
     };
 
     // Perform sync-blocking bridge call
-    match ctx.sync_call(&data.method, encoded_args) {
-        Ok(Some(result_bytes)) => {
-            // Try V8 deserialization in a TryCatch scope; if it fails,
-            // treat as raw binary (Uint8Array) — covers status=2 raw binary
-            // and V8 version incompatibilities for typed arrays.
-            let v8_val = {
-                let tc = &mut v8::TryCatch::new(scope);
-                deserialize_v8_value(tc, &result_bytes).ok()
-            };
+    match ctx.sync_call_response(&data.method, encoded_args) {
+        Ok(Some(response)) => {
+            let v8_val = bridge_response_payload_to_v8(scope, response.status, &response.payload);
             if let Some(val) = v8_val {
                 rv.set(val);
             } else {
-                // Fallback: raw binary data → Uint8Array
-                let len = result_bytes.len();
-                let ab = v8::ArrayBuffer::new(scope, len);
-                if len > 0 {
-                    let bs = ab.get_backing_store();
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            result_bytes.as_ptr(),
-                            bs.data().unwrap().as_ptr() as *mut u8,
-                            len,
-                        );
-                    }
-                }
-                let arr = v8::Uint8Array::new(scope, ab, 0, len).unwrap();
-                rv.set(arr.into());
+                let msg = v8::String::new(scope, "bridge response conversion failed").unwrap();
+                let exc = v8::Exception::error(scope, msg);
+                scope.throw_exception(exc);
             }
         }
         Ok(None) => {
@@ -2147,6 +2166,7 @@ pub fn resolve_pending_promise(
     scope: &mut v8::HandleScope,
     pending: &PendingPromises,
     call_id: u64,
+    status: u8,
     result: Option<Vec<u8>>,
     error: Option<String>,
 ) -> Result<(), String> {
@@ -2166,29 +2186,13 @@ pub fn resolve_pending_promise(
         }
         resolver.reject(scope, exc);
     } else if let Some(result_bytes) = result {
-        // Try V8 deserialization in a TryCatch scope; fallback to raw binary
-        let v8_val = {
-            let tc = &mut v8::TryCatch::new(scope);
-            deserialize_v8_value(tc, &result_bytes).ok()
-        };
+        let v8_val = bridge_response_payload_to_v8(scope, status, &result_bytes);
         if let Some(val) = v8_val {
             resolver.resolve(scope, val);
         } else {
-            // Fallback: raw binary data → Uint8Array
-            let len = result_bytes.len();
-            let ab = v8::ArrayBuffer::new(scope, len);
-            if len > 0 {
-                let bs = ab.get_backing_store();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        result_bytes.as_ptr(),
-                        bs.data().unwrap().as_ptr() as *mut u8,
-                        len,
-                    );
-                }
-            }
-            let arr = v8::Uint8Array::new(scope, ab, 0, len).unwrap();
-            resolver.resolve(scope, arr.into());
+            let msg = v8::String::new(scope, "bridge response conversion failed").unwrap();
+            let exc = v8::Exception::error(scope, msg);
+            resolver.reject(scope, exc);
         }
     } else {
         let undef = v8::undefined(scope);

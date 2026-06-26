@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -8777,6 +8777,49 @@ if (!modulePath) {
   throw new Error('AGENTOS_WASM_MODULE_PATH is required');
 }
 const moduleBase64 = process.env.AGENTOS_WASM_MODULE_BASE64;
+const __agentOSWasmPhaseDebug = process.env.AGENTOS_WASM_WARMUP_DEBUG === '1';
+const __agentOSWasmPhaseTimings = [];
+
+function __agentOSWasmNowNs() {
+  return process.hrtime.bigint();
+}
+
+function __agentOSWasmRecordPhase(name, startedNs) {
+  if (!__agentOSWasmPhaseDebug) {
+    return;
+  }
+  const elapsedNs = __agentOSWasmNowNs() - startedNs;
+  __agentOSWasmPhaseTimings.push({
+    name,
+    ms: Number(elapsedNs) / 1000000,
+  });
+}
+
+function __agentOSWasmMeasurePhase(name, run) {
+  const startedNs = __agentOSWasmNowNs();
+  try {
+    return run();
+  } finally {
+    __agentOSWasmRecordPhase(name, startedNs);
+  }
+}
+
+function __agentOSWasmEmitPhaseMetrics(reason, extra = {}) {
+  if (!__agentOSWasmPhaseDebug || typeof process?.stderr?.write !== 'function') {
+    return;
+  }
+  try {
+    process.stderr.write(`__AGENTOS_WASM_PHASE_METRICS__:${JSON.stringify({
+      reason,
+      modulePath,
+      moduleBytes: typeof moduleBinary !== 'undefined' ? moduleBinary.byteLength : null,
+      phases: __agentOSWasmPhaseTimings,
+      ...extra,
+    })}\n`);
+  } catch {
+    // Diagnostics must never change command behavior.
+  }
+}
 
 const guestArgv = JSON.parse(process.env.AGENTOS_GUEST_ARGV ?? '[]');
 const guestEnv = JSON.parse(process.env.AGENTOS_GUEST_ENV ?? '{}');
@@ -9220,12 +9263,7 @@ function enforceMemoryLimit(moduleBytes, limitPages) {
 }
 
 function decodeBase64ToUint8Array(value) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index) & 0xff;
-  }
-  return bytes;
+  return Buffer.from(value, 'base64');
 }
 
 function readKernelStdinChunk(maxBytes, timeoutMs = 10) {
@@ -9255,12 +9293,13 @@ const moduleSource =
     : fsModule.readFileSync(resolveModulePath(modulePath));
 const moduleBytes =
   typeof moduleSource === 'string'
-    ? decodeBase64ToUint8Array(moduleSource)
+    ? __agentOSWasmMeasurePhase('decodeBase64ToUint8Array', () => decodeBase64ToUint8Array(moduleSource))
     : moduleSource;
-const moduleBinary = enforceMemoryLimit(moduleBytes, maxMemoryPages);
-const module = new WebAssembly.Module(moduleBinary);
+const moduleBinary = __agentOSWasmMeasurePhase('enforceMemoryLimit', () => enforceMemoryLimit(moduleBytes, maxMemoryPages));
+const module = __agentOSWasmMeasurePhase('WebAssembly.Module', () => new WebAssembly.Module(moduleBinary));
 
 if (prewarmOnly) {
+  __agentOSWasmEmitPhaseMetrics('prewarm');
   process.exit(0);
 }
 
@@ -13696,7 +13735,7 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
   return writeGuestUint32(neventsPtr, readyEvents.length);
 };
 
-const instance = new WebAssembly.Instance(module, {
+const instance = __agentOSWasmMeasurePhase('WebAssembly.Instance', () => new WebAssembly.Instance(module, {
   wasi_snapshot_preview1: wasiImport,
   wasi_unstable: wasiImport,
   // Read-write commands like DuckDB need fd_dup_min from the patched
@@ -13712,7 +13751,7 @@ const instance = new WebAssembly.Instance(module, {
   host_user: hostUserImport,
   host_tty: hostTtyImport,
   host_fs: hostFsImport,
-});
+}));
 
 if (instance.exports.memory instanceof WebAssembly.Memory) {
   instanceMemory = instance.exports.memory;
@@ -13750,14 +13789,18 @@ if (typeof instance.exports._start === 'function') {
   // observe the ready event before we exit the runner.
   let exitCode;
   try {
-    exitCode = wasi.start(instance);
+    exitCode = __agentOSWasmMeasurePhase('wasi.start', () => wasi.start(instance));
   } catch (error) {
+    __agentOSWasmEmitPhaseMetrics('wasi.start.error', {
+      error: error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error),
+    });
     if (maxStackBytes !== null && isWasmStackExhaustionTrap(error)) {
       reportConfiguredStackLimitExceeded(error);
       process.exit(1);
     }
     throw error;
   }
+  __agentOSWasmEmitPhaseMetrics('complete', { exitCode });
   process.exit(typeof exitCode === 'number' ? exitCode : 0);
 } else if (typeof instance.exports.run === 'function') {
   const result = await instance.exports.run();
@@ -13982,6 +14025,7 @@ const PATH_POLYFILL_INIT_COUNTER_KEY: &str = "__agentOSPolyfillPathInitCount";
 pub(crate) struct NodeImportCache {
     root_dir: PathBuf,
     cleanup: Arc<NodeImportCacheCleanup>,
+    materialized: AtomicBool,
     cache_path: PathBuf,
     loader_path: PathBuf,
     register_path: PathBuf,
@@ -14096,6 +14140,7 @@ impl NodeImportCache {
             cleanup: Arc::new(NodeImportCacheCleanup {
                 root_dir: root_dir.clone(),
             }),
+            materialized: AtomicBool::new(false),
             cache_path: root_dir.join("state.json"),
             loader_path: root_dir.join("loader.mjs"),
             register_path: root_dir.join("register.mjs"),
@@ -14171,6 +14216,10 @@ impl NodeImportCache {
         &self,
         timeout: Duration,
     ) -> Result<(), io::Error> {
+        if self.materialized.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let materialization = NodeImportCacheMaterialization::from(self);
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -14178,7 +14227,11 @@ impl NodeImportCache {
         });
 
         match receiver.recv_timeout(timeout) {
-            Ok(result) => result,
+            Ok(result) => {
+                result?;
+                self.materialized.store(true, Ordering::Release);
+                Ok(())
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -16022,6 +16075,21 @@ export async function loadPyodide(options) {
         );
 
         std::thread::sleep(Duration::from_millis(75));
+    }
+
+    #[test]
+    fn ensure_materialized_skips_repeated_materialization_after_success() {
+        let temp_root = tempdir().expect("create node import cache temp root");
+        let import_cache = NodeImportCache::new_in(temp_root.path().to_path_buf());
+
+        import_cache
+            .ensure_materialized()
+            .expect("initial materialization should succeed");
+
+        NODE_IMPORT_CACHE_TEST_MATERIALIZE_DELAY_MS.store(50, Ordering::Relaxed);
+        let result = import_cache.ensure_materialized_with_timeout(Duration::from_millis(5));
+        NODE_IMPORT_CACHE_TEST_MATERIALIZE_DELAY_MS.store(0, Ordering::Relaxed);
+        result.expect("second materialization should use memoized success");
     }
 
     #[test]
