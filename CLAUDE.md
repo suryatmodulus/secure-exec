@@ -121,6 +121,8 @@ Dispatch `.github/workflows/publish.yaml` (workflow_dispatch) with no version in
 
 - This checkout is jj colocated (jj over git). Prefer `jj` for commits/branches; avoid `git commit`/`git checkout`, which fight jj's working-copy commit.
 - Large pyodide/sandbox assets exceed jj's default snapshot size limit. Commit them with `jj --config snapshot.max-new-file-size=16777216 ...`, or gitignore them.
+- **Commit titles and PR titles are pure conventional commits** (`feat`, `fix`, `chore`, `docs`, `refactor`, etc.) with an optional scope, e.g. `fix(sidecar): handle empty ack batch`. Never indicate that a change was written by a coding agent: no model name, no agent name, no `[SLOP(...)]` prefix, and no `Co-Authored-By:` or `Generated with` trailer. The title must read exactly as a human-authored conventional commit. jj descriptions stay single-line.
+- **PR descriptions are a simple, high-level bullet list of what changed.** One bullet per meaningful change in plain language. No per-file or line-by-line detail, no implementation narration, and no mention of an agent.
 
 ## CLAUDE.md Convention
 
