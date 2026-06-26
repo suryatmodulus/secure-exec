@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DnsConfig {
@@ -211,109 +211,239 @@ pub trait DnsResolver {
 
 pub type SharedDnsResolver = Arc<dyn DnsResolver + Send + Sync>;
 
-#[derive(Debug, Default)]
-pub struct HickoryDnsResolver;
+pub struct HickoryDnsResolver {
+    worker: Mutex<mpsc::Sender<DnsWorkerRequest>>,
+}
+
+enum DnsWorkerRequest {
+    LookupIp {
+        hostname: String,
+        name_servers: Vec<SocketAddr>,
+        response: mpsc::Sender<Result<Vec<IpAddr>, DnsResolverError>>,
+    },
+    LookupRecords {
+        hostname: String,
+        name_servers: Vec<SocketAddr>,
+        record_type: RecordType,
+        response: mpsc::Sender<Result<Vec<Record>, DnsResolverError>>,
+    },
+}
+
+impl Default for HickoryDnsResolver {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("secure-exec-dns-resolver".to_owned())
+            .spawn(move || run_dns_worker(receiver))
+            .expect("failed to spawn DNS resolver worker");
+        Self {
+            worker: Mutex::new(sender),
+        }
+    }
+}
+
+impl HickoryDnsResolver {
+    fn send_lookup_ip(
+        &self,
+        hostname: String,
+        name_servers: Vec<SocketAddr>,
+    ) -> Result<Vec<IpAddr>, DnsResolverError> {
+        let (response, receiver) = mpsc::channel();
+        self.worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .send(DnsWorkerRequest::LookupIp {
+                hostname,
+                name_servers,
+                response,
+            })
+            .map_err(|_| DnsResolverError::lookup_failed("dns resolver worker stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| DnsResolverError::lookup_failed("dns resolver worker stopped"))?
+    }
+
+    fn send_lookup_records(
+        &self,
+        hostname: String,
+        name_servers: Vec<SocketAddr>,
+        record_type: RecordType,
+    ) -> Result<Vec<Record>, DnsResolverError> {
+        let (response, receiver) = mpsc::channel();
+        self.worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .send(DnsWorkerRequest::LookupRecords {
+                hostname,
+                name_servers,
+                record_type,
+                response,
+            })
+            .map_err(|_| DnsResolverError::lookup_failed("dns resolver worker stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| DnsResolverError::lookup_failed("dns resolver worker stopped"))?
+    }
+}
 
 impl DnsResolver for HickoryDnsResolver {
     fn lookup_ip(&self, request: &DnsLookupRequest) -> Result<Vec<IpAddr>, DnsResolverError> {
-        let resolver_config = resolver_config_from_name_servers(request.name_servers());
-        let hostname = request.hostname().to_owned();
-        std::thread::spawn(move || -> Result<Vec<IpAddr>, DnsResolverError> {
-            let runtime = tokio::runtime::Runtime::new().map_err(|error| {
-                DnsResolverError::lookup_failed(format!("failed to create DNS runtime: {error}"))
-            })?;
-
-            runtime.block_on(async move {
-                let builder = if let Some(config) = resolver_config {
-                    TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
-                } else {
-                    TokioResolver::builder_tokio().map_err(|error| {
-                        DnsResolverError::lookup_failed(format!(
-                            "failed to initialize DNS resolver from system configuration: {error}"
-                        ))
-                    })?
-                };
-
-                let resolver = builder.build().map_err(|error| {
-                    DnsResolverError::lookup_failed(format!(
-                        "failed to build DNS resolver: {error}"
-                    ))
-                })?;
-                let lookup = resolver.lookup_ip(&hostname).await.map_err(|error| {
-                    DnsResolverError::lookup_failed(format!(
-                        "failed to resolve DNS address {hostname}: {error}"
-                    ))
-                })?;
-
-                let mut addresses = Vec::new();
-                let mut seen = BTreeSet::new();
-                for ip in lookup.iter() {
-                    if seen.insert(ip) {
-                        addresses.push(ip);
-                    }
-                }
-
-                if addresses.is_empty() {
-                    return Err(DnsResolverError::lookup_failed(format!(
-                        "failed to resolve DNS address {hostname}"
-                    )));
-                }
-
-                Ok(addresses)
-            })
-        })
-        .join()
-        .map_err(|_| DnsResolverError::lookup_failed("dns resolver thread panicked"))?
+        self.send_lookup_ip(
+            request.hostname().to_owned(),
+            request.name_servers().to_vec(),
+        )
     }
 
     fn lookup_records(
         &self,
         request: &DnsRecordLookupRequest,
     ) -> Result<Vec<Record>, DnsResolverError> {
-        let resolver_config = resolver_config_from_name_servers(request.name_servers());
-        let hostname = request.hostname().to_owned();
-        let record_type = request.record_type();
-        std::thread::spawn(move || -> Result<Vec<Record>, DnsResolverError> {
-            let runtime = tokio::runtime::Runtime::new().map_err(|error| {
-                DnsResolverError::lookup_failed(format!("failed to create DNS runtime: {error}"))
-            })?;
-
-            runtime.block_on(async move {
-                let builder = if let Some(config) = resolver_config {
-                    TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
-                } else {
-                    TokioResolver::builder_tokio().map_err(|error| {
-                        DnsResolverError::lookup_failed(format!(
-                            "failed to initialize DNS resolver from system configuration: {error}"
-                        ))
-                    })?
-                };
-
-                let resolver = builder.build().map_err(|error| {
-                    DnsResolverError::lookup_failed(format!(
-                        "failed to build DNS resolver: {error}"
-                    ))
-                })?;
-                let lookup = resolver
-                    .lookup(&hostname, record_type)
-                    .await
-                    .map_err(|error| {
-                        DnsResolverError::lookup_failed(format!(
-                            "failed to resolve DNS {record_type} record {hostname}: {error}"
-                        ))
-                    })?;
-                let records = lookup.answers().to_vec();
-                if records.is_empty() {
-                    return Err(DnsResolverError::lookup_failed(format!(
-                        "failed to resolve DNS {record_type} record {hostname}"
-                    )));
-                }
-                Ok(records)
-            })
-        })
-        .join()
-        .map_err(|_| DnsResolverError::lookup_failed("dns resolver thread panicked"))?
+        self.send_lookup_records(
+            request.hostname().to_owned(),
+            request.name_servers().to_vec(),
+            request.record_type(),
+        )
     }
+}
+
+fn run_dns_worker(receiver: mpsc::Receiver<DnsWorkerRequest>) {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            for request in receiver {
+                request.respond_with_error(DnsResolverError::lookup_failed(format!(
+                    "failed to create DNS runtime: {error}"
+                )));
+            }
+            return;
+        }
+    };
+    let mut resolvers = BTreeMap::new();
+    for request in receiver {
+        match request {
+            DnsWorkerRequest::LookupIp {
+                hostname,
+                name_servers,
+                response,
+            } => {
+                let result = worker_lookup_ip(&runtime, &mut resolvers, hostname, name_servers);
+                let _ = response.send(result);
+            }
+            DnsWorkerRequest::LookupRecords {
+                hostname,
+                name_servers,
+                record_type,
+                response,
+            } => {
+                let result = worker_lookup_records(
+                    &runtime,
+                    &mut resolvers,
+                    hostname,
+                    name_servers,
+                    record_type,
+                );
+                let _ = response.send(result);
+            }
+        }
+    }
+}
+
+impl DnsWorkerRequest {
+    fn respond_with_error(self, error: DnsResolverError) {
+        match self {
+            Self::LookupIp { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::LookupRecords { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+        }
+    }
+}
+
+fn worker_resolver_for(
+    resolvers: &mut BTreeMap<Vec<SocketAddr>, TokioResolver>,
+    name_servers: &[SocketAddr],
+) -> Result<TokioResolver, DnsResolverError> {
+    let key = name_servers.to_vec();
+    if let Some(resolver) = resolvers.get(&key).cloned() {
+        return Ok(resolver);
+    }
+
+    let resolver_config = resolver_config_from_name_servers(name_servers);
+    let builder = if let Some(config) = resolver_config {
+        TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+    } else {
+        TokioResolver::builder_tokio().map_err(|error| {
+            DnsResolverError::lookup_failed(format!(
+                "failed to initialize DNS resolver from system configuration: {error}"
+            ))
+        })?
+    };
+    let resolver = builder.build().map_err(|error| {
+        DnsResolverError::lookup_failed(format!("failed to build DNS resolver: {error}"))
+    })?;
+    let resolver = resolvers.entry(key).or_insert_with(|| resolver).clone();
+    Ok(resolver)
+}
+
+fn worker_lookup_ip(
+    runtime: &tokio::runtime::Runtime,
+    resolvers: &mut BTreeMap<Vec<SocketAddr>, TokioResolver>,
+    hostname: String,
+    name_servers: Vec<SocketAddr>,
+) -> Result<Vec<IpAddr>, DnsResolverError> {
+    let resolver = worker_resolver_for(resolvers, &name_servers)?;
+    runtime.block_on(async move {
+        let lookup = resolver.lookup_ip(&hostname).await.map_err(|error| {
+            DnsResolverError::lookup_failed(format!(
+                "failed to resolve DNS address {hostname}: {error}"
+            ))
+        })?;
+
+        let mut addresses = Vec::new();
+        let mut seen = BTreeSet::new();
+        for ip in lookup.iter() {
+            if seen.insert(ip) {
+                addresses.push(ip);
+            }
+        }
+
+        if addresses.is_empty() {
+            return Err(DnsResolverError::lookup_failed(format!(
+                "failed to resolve DNS address {hostname}"
+            )));
+        }
+
+        Ok(addresses)
+    })
+}
+
+fn worker_lookup_records(
+    runtime: &tokio::runtime::Runtime,
+    resolvers: &mut BTreeMap<Vec<SocketAddr>, TokioResolver>,
+    hostname: String,
+    name_servers: Vec<SocketAddr>,
+    record_type: RecordType,
+) -> Result<Vec<Record>, DnsResolverError> {
+    let resolver = worker_resolver_for(resolvers, &name_servers)?;
+    runtime.block_on(async move {
+        let lookup = resolver
+            .lookup(&hostname, record_type)
+            .await
+            .map_err(|error| {
+                DnsResolverError::lookup_failed(format!(
+                    "failed to resolve DNS {record_type} record {hostname}: {error}"
+                ))
+            })?;
+        let records = lookup.answers().to_vec();
+        if records.is_empty() {
+            return Err(DnsResolverError::lookup_failed(format!(
+                "failed to resolve DNS {record_type} record {hostname}"
+            )));
+        }
+        Ok(records)
+    })
 }
 
 pub fn normalize_dns_hostname(hostname: &str) -> Result<String, DnsResolverError> {
