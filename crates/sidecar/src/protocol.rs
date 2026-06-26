@@ -441,6 +441,9 @@ fn to_generated_request_payload(
         RequestPayload::GetProcessSnapshot(_) => {
             generated_protocol::RequestPayload::GetProcessSnapshotRequest
         }
+        RequestPayload::GetResourceSnapshot(_) => {
+            generated_protocol::RequestPayload::GetResourceSnapshotRequest
+        }
         RequestPayload::FindListener(inner) => {
             generated_protocol::RequestPayload::FindListenerRequest(inner.clone())
         }
@@ -540,6 +543,9 @@ fn from_generated_request_payload(
         }
         generated_protocol::RequestPayload::GetProcessSnapshotRequest => {
             RequestPayload::GetProcessSnapshot(GetProcessSnapshotRequest {})
+        }
+        generated_protocol::RequestPayload::GetResourceSnapshotRequest => {
+            RequestPayload::GetResourceSnapshot(GetResourceSnapshotRequest {})
         }
         generated_protocol::RequestPayload::FindListenerRequest(inner) => {
             RequestPayload::FindListener(inner)
@@ -667,6 +673,9 @@ fn to_generated_response_payload(
                         .collect(),
                 },
             )
+        }
+        ResponsePayload::ResourceSnapshot(inner) => {
+            generated_protocol::ResponsePayload::ResourceSnapshotResponse(inner.clone())
         }
         ResponsePayload::ListenerSnapshot(inner) => {
             generated_protocol::ResponsePayload::ListenerSnapshotResponse(inner.clone())
@@ -800,6 +809,9 @@ fn from_generated_response_payload(
                     .map(from_generated_process_snapshot_entry)
                     .collect(),
             })
+        }
+        generated_protocol::ResponsePayload::ResourceSnapshotResponse(inner) => {
+            ResponsePayload::ResourceSnapshot(inner)
         }
         generated_protocol::ResponsePayload::ListenerSnapshotResponse(inner) => {
             ResponsePayload::ListenerSnapshot(inner)
@@ -1195,6 +1207,7 @@ pub enum RequestPayload {
     CloseStdin(CloseStdinRequest),
     KillProcess(KillProcessRequest),
     GetProcessSnapshot(GetProcessSnapshotRequest),
+    GetResourceSnapshot(GetResourceSnapshotRequest),
     FindListener(FindListenerRequest),
     FindBoundUdp(FindBoundUdpRequest),
     VmFetch(VmFetchRequest),
@@ -1228,6 +1241,7 @@ pub enum ResponsePayload {
     StdinClosed(StdinClosedResponse),
     ProcessKilled(ProcessKilledResponse),
     ProcessSnapshot(ProcessSnapshotResponse),
+    ResourceSnapshot(ResourceSnapshotResponse),
     ListenerSnapshot(ListenerSnapshotResponse),
     BoundUdpSnapshot(BoundUdpSnapshotResponse),
     VmFetchResult(VmFetchResponse),
@@ -1364,6 +1378,9 @@ pub type KillProcessRequest = crate::wire::KillProcessRequest;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GetProcessSnapshotRequest {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GetResourceSnapshotRequest {}
+
 pub type FindListenerRequest = crate::wire::FindListenerRequest;
 
 pub type FindBoundUdpRequest = crate::wire::FindBoundUdpRequest;
@@ -1438,6 +1455,10 @@ pub type ProcessSnapshotStatus = crate::wire::ProcessSnapshotStatus;
 pub type ProcessSnapshotEntry = crate::wire::ProcessSnapshotEntry;
 
 pub type ProcessSnapshotResponse = crate::wire::ProcessSnapshotResponse;
+
+pub type QueueSnapshotEntry = crate::wire::QueueSnapshotEntry;
+
+pub type ResourceSnapshotResponse = crate::wire::ResourceSnapshotResponse;
 
 pub type SocketStateEntry = crate::wire::SocketStateEntry;
 
@@ -1524,6 +1545,7 @@ impl_bare_newtype_union_enum!(
         PersistenceFlush(PersistenceFlushRequest) = 26,
         VmFetch(VmFetchRequest) = 27,
         Ext(ExtEnvelope) = 28,
+        GetResourceSnapshot(GetResourceSnapshotRequest) = 29,
     }
 );
 
@@ -1563,6 +1585,7 @@ impl_bare_newtype_union_enum!(
         Rejected(RejectedResponse) = 28,
         VmFetchResult(VmFetchResponse) = 29,
         ExtResult(ExtEnvelope) = 30,
+        ResourceSnapshot(ResourceSnapshotResponse) = 31,
     }
 );
 
@@ -2127,6 +2150,7 @@ enum ExpectedResponseKind {
     StdinClosed,
     ProcessKilled,
     ProcessSnapshot,
+    ResourceSnapshot,
     ListenerSnapshot,
     BoundUdpSnapshot,
     VmFetchResult,
@@ -2172,6 +2196,7 @@ impl ExpectedResponseKind {
             Self::StdinClosed => "stdin_closed",
             Self::ProcessKilled => "process_killed",
             Self::ProcessSnapshot => "process_snapshot",
+            Self::ResourceSnapshot => "resource_snapshot",
             Self::ListenerSnapshot => "listener_snapshot",
             Self::BoundUdpSnapshot => "bound_udp_snapshot",
             Self::VmFetchResult => "vm_fetch_result",
@@ -2231,6 +2256,7 @@ impl RequestPayload {
             | Self::CloseStdin(_)
             | Self::KillProcess(_)
             | Self::GetProcessSnapshot(_)
+            | Self::GetResourceSnapshot(_)
             | Self::FindListener(_)
             | Self::FindBoundUdp(_)
             | Self::VmFetch(_)
@@ -2263,6 +2289,7 @@ impl RequestPayload {
             Self::CloseStdin(_) => ExpectedResponseKind::StdinClosed,
             Self::KillProcess(_) => ExpectedResponseKind::ProcessKilled,
             Self::GetProcessSnapshot(_) => ExpectedResponseKind::ProcessSnapshot,
+            Self::GetResourceSnapshot(_) => ExpectedResponseKind::ResourceSnapshot,
             Self::FindListener(_) => ExpectedResponseKind::ListenerSnapshot,
             Self::FindBoundUdp(_) => ExpectedResponseKind::BoundUdpSnapshot,
             Self::VmFetch(_) => ExpectedResponseKind::VmFetchResult,
@@ -2315,6 +2342,7 @@ impl ResponsePayload {
             | Self::StdinClosed(_)
             | Self::ProcessKilled(_)
             | Self::ProcessSnapshot(_)
+            | Self::ResourceSnapshot(_)
             | Self::ListenerSnapshot(_)
             | Self::BoundUdpSnapshot(_)
             | Self::VmFetchResult(_)
@@ -2348,6 +2376,7 @@ impl ResponsePayload {
             Self::StdinClosed(_) => "stdin_closed",
             Self::ProcessKilled(_) => "process_killed",
             Self::ProcessSnapshot(_) => "process_snapshot",
+            Self::ResourceSnapshot(_) => "resource_snapshot",
             Self::ListenerSnapshot(_) => "listener_snapshot",
             Self::BoundUdpSnapshot(_) => "bound_udp_snapshot",
             Self::VmFetchResult(_) => "vm_fetch_result",

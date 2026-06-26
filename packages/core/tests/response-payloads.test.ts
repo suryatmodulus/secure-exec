@@ -119,6 +119,66 @@ describe("response payload conversion", () => {
 		});
 	});
 
+	it("maps resource snapshots", () => {
+		expect(
+			fromGeneratedResponsePayload({
+				tag: "ResourceSnapshotResponse",
+				val: {
+					runningProcesses: 2n,
+					exitedProcesses: 1n,
+					fdTables: 2n,
+					openFds: 6n,
+					pipes: 1n,
+					pipeBufferedBytes: 12n,
+					ptys: 0n,
+					ptyBufferedInputBytes: 0n,
+					ptyBufferedOutputBytes: 0n,
+					sockets: 3n,
+					socketListeners: 1n,
+					socketConnections: 2n,
+					socketBufferedBytes: 256n,
+					socketDatagramQueueLen: 4n,
+					queueSnapshots: [
+						{
+							name: "pending_process_events",
+							category: "queue",
+							depth: 1n,
+							highWater: 3n,
+							capacity: 128n,
+							fillPercent: 2n,
+						},
+					],
+				},
+			}),
+		).toEqual({
+			type: "resource_snapshot",
+			running_processes: 2,
+			exited_processes: 1,
+			fd_tables: 2,
+			open_fds: 6,
+			pipes: 1,
+			pipe_buffered_bytes: 12,
+			ptys: 0,
+			pty_buffered_input_bytes: 0,
+			pty_buffered_output_bytes: 0,
+			sockets: 3,
+			socket_listeners: 1,
+			socket_connections: 2,
+			socket_buffered_bytes: 256,
+			socket_datagram_queue_len: 4,
+			queue_snapshots: [
+				{
+					name: "pending_process_events",
+					category: "queue",
+					depth: 1,
+					high_water: 3,
+					capacity: 128,
+					fill_percent: 2,
+				},
+			],
+		});
+	});
+
 	it("maps generated toolkit registration to host callback registration", () => {
 		expect(
 			fromGeneratedResponsePayload({

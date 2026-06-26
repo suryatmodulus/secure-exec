@@ -123,6 +123,33 @@ export interface SidecarProcessSnapshotEntry {
 	exitCode: number | null;
 }
 
+export interface SidecarQueueSnapshotEntry {
+	name: string;
+	category: string;
+	depth: number;
+	highWater: number;
+	capacity: number;
+	fillPercent: number;
+}
+
+export interface SidecarResourceSnapshot {
+	runningProcesses: number;
+	exitedProcesses: number;
+	fdTables: number;
+	openFds: number;
+	pipes: number;
+	pipeBufferedBytes: number;
+	ptys: number;
+	ptyBufferedInputBytes: number;
+	ptyBufferedOutputBytes: number;
+	sockets: number;
+	socketListeners: number;
+	socketConnections: number;
+	socketBufferedBytes: number;
+	socketDatagramQueueLen: number;
+	queueSnapshots: SidecarQueueSnapshotEntry[];
+}
+
 export interface SidecarZombieTimerCount {
 	count: number;
 }
@@ -1138,6 +1165,52 @@ export class SidecarProcess {
 			);
 		}
 		return response.payload.processes.map(toSidecarProcessSnapshotEntry);
+	}
+
+	async getResourceSnapshot(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+	): Promise<SidecarResourceSnapshot> {
+		const response = await this.sendRequest({
+			ownership: {
+				scope: "vm",
+				connection_id: session.connectionId,
+				session_id: session.sessionId,
+				vm_id: vm.vmId,
+			},
+			payload: {
+				type: "get_resource_snapshot",
+			},
+		});
+		if (response.payload.type !== "resource_snapshot") {
+			throw new Error(
+				`unexpected get_resource_snapshot response: ${response.payload.type}`,
+			);
+		}
+		return {
+			runningProcesses: response.payload.running_processes,
+			exitedProcesses: response.payload.exited_processes,
+			fdTables: response.payload.fd_tables,
+			openFds: response.payload.open_fds,
+			pipes: response.payload.pipes,
+			pipeBufferedBytes: response.payload.pipe_buffered_bytes,
+			ptys: response.payload.ptys,
+			ptyBufferedInputBytes: response.payload.pty_buffered_input_bytes,
+			ptyBufferedOutputBytes: response.payload.pty_buffered_output_bytes,
+			sockets: response.payload.sockets,
+			socketListeners: response.payload.socket_listeners,
+			socketConnections: response.payload.socket_connections,
+			socketBufferedBytes: response.payload.socket_buffered_bytes,
+			socketDatagramQueueLen: response.payload.socket_datagram_queue_len,
+			queueSnapshots: response.payload.queue_snapshots.map((queue) => ({
+				name: queue.name,
+				category: queue.category,
+				depth: queue.depth,
+				highWater: queue.high_water,
+				capacity: queue.capacity,
+				fillPercent: queue.fill_percent,
+			})),
+		};
 	}
 
 	async findBoundUdp(

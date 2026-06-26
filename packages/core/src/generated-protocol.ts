@@ -1781,6 +1781,8 @@ export function writeKillProcessRequest(bc: bare.ByteCursor, x: KillProcessReque
 
 export type GetProcessSnapshotRequest = null
 
+export type GetResourceSnapshotRequest = null
+
 function read22(bc: bare.ByteCursor): u16 | null {
     return bare.readBool(bc) ? bare.readU16(bc) : null
 }
@@ -2020,6 +2022,7 @@ export type RequestPayload =
     | { readonly tag: "PersistenceFlushRequest"; readonly val: PersistenceFlushRequest }
     | { readonly tag: "VmFetchRequest"; readonly val: VmFetchRequest }
     | { readonly tag: "ExtEnvelope"; readonly val: ExtEnvelope }
+    | { readonly tag: "GetResourceSnapshotRequest"; readonly val: GetResourceSnapshotRequest }
 
 export function readRequestPayload(bc: bare.ByteCursor): RequestPayload {
     const offset = bc.offset
@@ -2083,6 +2086,8 @@ export function readRequestPayload(bc: bare.ByteCursor): RequestPayload {
             return { tag: "VmFetchRequest", val: readVmFetchRequest(bc) }
         case 28:
             return { tag: "ExtEnvelope", val: readExtEnvelope(bc) }
+        case 29:
+            return { tag: "GetResourceSnapshotRequest", val: null }
         default: {
             bc.offset = offset
             throw new bare.BareError(offset, "invalid tag")
@@ -2231,6 +2236,10 @@ export function writeRequestPayload(bc: bare.ByteCursor, x: RequestPayload): voi
         case "ExtEnvelope": {
             bare.writeU8(bc, 28)
             writeExtEnvelope(bc, x.val)
+            break
+        }
+        case "GetResourceSnapshotRequest": {
+            bare.writeU8(bc, 29)
             break
         }
     }
@@ -2793,6 +2802,110 @@ export function writeProcessSnapshotResponse(bc: bare.ByteCursor, x: ProcessSnap
     write27(bc, x.processes)
 }
 
+export type QueueSnapshotEntry = {
+    readonly name: string
+    readonly category: string
+    readonly depth: u64
+    readonly highWater: u64
+    readonly capacity: u64
+    readonly fillPercent: u64
+}
+
+export function readQueueSnapshotEntry(bc: bare.ByteCursor): QueueSnapshotEntry {
+    return {
+        name: bare.readString(bc),
+        category: bare.readString(bc),
+        depth: bare.readU64(bc),
+        highWater: bare.readU64(bc),
+        capacity: bare.readU64(bc),
+        fillPercent: bare.readU64(bc),
+    }
+}
+
+export function writeQueueSnapshotEntry(bc: bare.ByteCursor, x: QueueSnapshotEntry): void {
+    bare.writeString(bc, x.name)
+    bare.writeString(bc, x.category)
+    bare.writeU64(bc, x.depth)
+    bare.writeU64(bc, x.highWater)
+    bare.writeU64(bc, x.capacity)
+    bare.writeU64(bc, x.fillPercent)
+}
+
+function read28(bc: bare.ByteCursor): readonly QueueSnapshotEntry[] {
+    const len = bare.readUintSafe(bc)
+    if (len === 0) {
+        return []
+    }
+    const result = [readQueueSnapshotEntry(bc)]
+    for (let i = 1; i < len; i++) {
+        result[i] = readQueueSnapshotEntry(bc)
+    }
+    return result
+}
+
+function write28(bc: bare.ByteCursor, x: readonly QueueSnapshotEntry[]): void {
+    bare.writeUintSafe(bc, x.length)
+    for (let i = 0; i < x.length; i++) {
+        writeQueueSnapshotEntry(bc, x[i])
+    }
+}
+
+export type ResourceSnapshotResponse = {
+    readonly runningProcesses: u64
+    readonly exitedProcesses: u64
+    readonly fdTables: u64
+    readonly openFds: u64
+    readonly pipes: u64
+    readonly pipeBufferedBytes: u64
+    readonly ptys: u64
+    readonly ptyBufferedInputBytes: u64
+    readonly ptyBufferedOutputBytes: u64
+    readonly sockets: u64
+    readonly socketListeners: u64
+    readonly socketConnections: u64
+    readonly socketBufferedBytes: u64
+    readonly socketDatagramQueueLen: u64
+    readonly queueSnapshots: readonly QueueSnapshotEntry[]
+}
+
+export function readResourceSnapshotResponse(bc: bare.ByteCursor): ResourceSnapshotResponse {
+    return {
+        runningProcesses: bare.readU64(bc),
+        exitedProcesses: bare.readU64(bc),
+        fdTables: bare.readU64(bc),
+        openFds: bare.readU64(bc),
+        pipes: bare.readU64(bc),
+        pipeBufferedBytes: bare.readU64(bc),
+        ptys: bare.readU64(bc),
+        ptyBufferedInputBytes: bare.readU64(bc),
+        ptyBufferedOutputBytes: bare.readU64(bc),
+        sockets: bare.readU64(bc),
+        socketListeners: bare.readU64(bc),
+        socketConnections: bare.readU64(bc),
+        socketBufferedBytes: bare.readU64(bc),
+        socketDatagramQueueLen: bare.readU64(bc),
+        queueSnapshots: read28(bc),
+    }
+}
+
+export function writeResourceSnapshotResponse(bc: bare.ByteCursor, x: ResourceSnapshotResponse): void {
+    bare.writeU64(bc, x.runningProcesses)
+    bare.writeU64(bc, x.exitedProcesses)
+    bare.writeU64(bc, x.fdTables)
+    bare.writeU64(bc, x.openFds)
+    bare.writeU64(bc, x.pipes)
+    bare.writeU64(bc, x.pipeBufferedBytes)
+    bare.writeU64(bc, x.ptys)
+    bare.writeU64(bc, x.ptyBufferedInputBytes)
+    bare.writeU64(bc, x.ptyBufferedOutputBytes)
+    bare.writeU64(bc, x.sockets)
+    bare.writeU64(bc, x.socketListeners)
+    bare.writeU64(bc, x.socketConnections)
+    bare.writeU64(bc, x.socketBufferedBytes)
+    bare.writeU64(bc, x.socketDatagramQueueLen)
+    write28(bc, x.queueSnapshots)
+}
+
 export type SocketStateEntry = {
     readonly processId: string
     readonly host: string | null
@@ -2816,11 +2929,11 @@ export function writeSocketStateEntry(bc: bare.ByteCursor, x: SocketStateEntry):
     write0(bc, x.path)
 }
 
-function read28(bc: bare.ByteCursor): SocketStateEntry | null {
+function read29(bc: bare.ByteCursor): SocketStateEntry | null {
     return bare.readBool(bc) ? readSocketStateEntry(bc) : null
 }
 
-function write28(bc: bare.ByteCursor, x: SocketStateEntry | null): void {
+function write29(bc: bare.ByteCursor, x: SocketStateEntry | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writeSocketStateEntry(bc, x)
@@ -2833,12 +2946,12 @@ export type ListenerSnapshotResponse = {
 
 export function readListenerSnapshotResponse(bc: bare.ByteCursor): ListenerSnapshotResponse {
     return {
-        listener: read28(bc),
+        listener: read29(bc),
     }
 }
 
 export function writeListenerSnapshotResponse(bc: bare.ByteCursor, x: ListenerSnapshotResponse): void {
-    write28(bc, x.listener)
+    write29(bc, x.listener)
 }
 
 export type BoundUdpSnapshotResponse = {
@@ -2847,12 +2960,12 @@ export type BoundUdpSnapshotResponse = {
 
 export function readBoundUdpSnapshotResponse(bc: bare.ByteCursor): BoundUdpSnapshotResponse {
     return {
-        socket: read28(bc),
+        socket: read29(bc),
     }
 }
 
 export function writeBoundUdpSnapshotResponse(bc: bare.ByteCursor, x: BoundUdpSnapshotResponse): void {
-    write28(bc, x.socket)
+    write29(bc, x.socket)
 }
 
 export enum SignalDispositionAction {
@@ -2915,7 +3028,7 @@ export function writeSignalHandlerRegistration(bc: bare.ByteCursor, x: SignalHan
     bare.writeU32(bc, x.flags)
 }
 
-function read29(bc: bare.ByteCursor): ReadonlyMap<u32, SignalHandlerRegistration> {
+function read30(bc: bare.ByteCursor): ReadonlyMap<u32, SignalHandlerRegistration> {
     const len = bare.readUintSafe(bc)
     const result = new Map<u32, SignalHandlerRegistration>()
     for (let i = 0; i < len; i++) {
@@ -2930,7 +3043,7 @@ function read29(bc: bare.ByteCursor): ReadonlyMap<u32, SignalHandlerRegistration
     return result
 }
 
-function write29(bc: bare.ByteCursor, x: ReadonlyMap<u32, SignalHandlerRegistration>): void {
+function write30(bc: bare.ByteCursor, x: ReadonlyMap<u32, SignalHandlerRegistration>): void {
     bare.writeUintSafe(bc, x.size)
     for (const kv of x) {
         bare.writeU32(bc, kv[0])
@@ -2946,13 +3059,13 @@ export type SignalStateResponse = {
 export function readSignalStateResponse(bc: bare.ByteCursor): SignalStateResponse {
     return {
         processId: bare.readString(bc),
-        handlers: read29(bc),
+        handlers: read30(bc),
     }
 }
 
 export function writeSignalStateResponse(bc: bare.ByteCursor, x: SignalStateResponse): void {
     bare.writeString(bc, x.processId)
-    write29(bc, x.handlers)
+    write30(bc, x.handlers)
 }
 
 export type ZombieTimerCountResponse = {
@@ -3106,6 +3219,7 @@ export type ResponsePayload =
     | { readonly tag: "RejectedResponse"; readonly val: RejectedResponse }
     | { readonly tag: "VmFetchResponse"; readonly val: VmFetchResponse }
     | { readonly tag: "ExtEnvelope"; readonly val: ExtEnvelope }
+    | { readonly tag: "ResourceSnapshotResponse"; readonly val: ResourceSnapshotResponse }
 
 export function readResponsePayload(bc: bare.ByteCursor): ResponsePayload {
     const offset = bc.offset
@@ -3173,6 +3287,8 @@ export function readResponsePayload(bc: bare.ByteCursor): ResponsePayload {
             return { tag: "VmFetchResponse", val: readVmFetchResponse(bc) }
         case 30:
             return { tag: "ExtEnvelope", val: readExtEnvelope(bc) }
+        case 31:
+            return { tag: "ResourceSnapshotResponse", val: readResourceSnapshotResponse(bc) }
         default: {
             bc.offset = offset
             throw new bare.BareError(offset, "invalid tag")
@@ -3335,6 +3451,11 @@ export function writeResponsePayload(bc: bare.ByteCursor, x: ResponsePayload): v
         case "ExtEnvelope": {
             bare.writeU8(bc, 30)
             writeExtEnvelope(bc, x.val)
+            break
+        }
+        case "ResourceSnapshotResponse": {
+            bare.writeU8(bc, 31)
+            writeResourceSnapshotResponse(bc, x.val)
             break
         }
     }
@@ -3707,11 +3828,11 @@ export function writeSidecarRequestFrame(bc: bare.ByteCursor, x: SidecarRequestF
     writeSidecarRequestPayload(bc, x.payload)
 }
 
-function read30(bc: bare.ByteCursor): JsonUtf8 | null {
+function read31(bc: bare.ByteCursor): JsonUtf8 | null {
     return bare.readBool(bc) ? readJsonUtf8(bc) : null
 }
 
-function write30(bc: bare.ByteCursor, x: JsonUtf8 | null): void {
+function write31(bc: bare.ByteCursor, x: JsonUtf8 | null): void {
     bare.writeBool(bc, x != null)
     if (x != null) {
         writeJsonUtf8(bc, x)
@@ -3727,14 +3848,14 @@ export type HostCallbackResultResponse = {
 export function readHostCallbackResultResponse(bc: bare.ByteCursor): HostCallbackResultResponse {
     return {
         invocationId: bare.readString(bc),
-        result: read30(bc),
+        result: read31(bc),
         error: read0(bc),
     }
 }
 
 export function writeHostCallbackResultResponse(bc: bare.ByteCursor, x: HostCallbackResultResponse): void {
     bare.writeString(bc, x.invocationId)
-    write30(bc, x.result)
+    write31(bc, x.result)
     write0(bc, x.error)
 }
 
@@ -3747,14 +3868,14 @@ export type JsBridgeResultResponse = {
 export function readJsBridgeResultResponse(bc: bare.ByteCursor): JsBridgeResultResponse {
     return {
         callId: bare.readString(bc),
-        result: read30(bc),
+        result: read31(bc),
         error: read0(bc),
     }
 }
 
 export function writeJsBridgeResultResponse(bc: bare.ByteCursor, x: JsBridgeResultResponse): void {
     bare.writeString(bc, x.callId)
-    write30(bc, x.result)
+    write31(bc, x.result)
     write0(bc, x.error)
 }
 

@@ -30,6 +30,33 @@ export interface LiveSignalHandlerRegistration {
 	flags: number;
 }
 
+export interface LiveQueueSnapshotEntry {
+	name: string;
+	category: string;
+	depth: number;
+	high_water: number;
+	capacity: number;
+	fill_percent: number;
+}
+
+export interface LiveResourceSnapshot {
+	running_processes: number;
+	exited_processes: number;
+	fd_tables: number;
+	open_fds: number;
+	pipes: number;
+	pipe_buffered_bytes: number;
+	ptys: number;
+	pty_buffered_input_bytes: number;
+	pty_buffered_output_bytes: number;
+	sockets: number;
+	socket_listeners: number;
+	socket_connections: number;
+	socket_buffered_bytes: number;
+	socket_datagram_queue_len: number;
+	queue_snapshots: LiveQueueSnapshotEntry[];
+}
+
 export type LiveResponsePayload =
 	| {
 			type: "authenticated";
@@ -128,6 +155,9 @@ export type LiveResponsePayload =
 			type: "process_snapshot";
 			processes: LiveProcessSnapshotEntry[];
 	  }
+	| ({
+			type: "resource_snapshot";
+	  } & LiveResourceSnapshot)
 	| {
 			type: "listener_snapshot";
 			listener?: LiveSocketStateEntry;
@@ -287,6 +317,77 @@ export function fromGeneratedResponsePayload(
 			return {
 				type: "process_snapshot",
 				processes: payload.val.processes.map(fromGeneratedProcessSnapshotEntry),
+			};
+		case "ResourceSnapshotResponse":
+			return {
+				type: "resource_snapshot",
+				running_processes: bigIntToSafeNumber(
+					payload.val.runningProcesses,
+					"resource_snapshot.running_processes",
+				),
+				exited_processes: bigIntToSafeNumber(
+					payload.val.exitedProcesses,
+					"resource_snapshot.exited_processes",
+				),
+				fd_tables: bigIntToSafeNumber(
+					payload.val.fdTables,
+					"resource_snapshot.fd_tables",
+				),
+				open_fds: bigIntToSafeNumber(
+					payload.val.openFds,
+					"resource_snapshot.open_fds",
+				),
+				pipes: bigIntToSafeNumber(payload.val.pipes, "resource_snapshot.pipes"),
+				pipe_buffered_bytes: bigIntToSafeNumber(
+					payload.val.pipeBufferedBytes,
+					"resource_snapshot.pipe_buffered_bytes",
+				),
+				ptys: bigIntToSafeNumber(payload.val.ptys, "resource_snapshot.ptys"),
+				pty_buffered_input_bytes: bigIntToSafeNumber(
+					payload.val.ptyBufferedInputBytes,
+					"resource_snapshot.pty_buffered_input_bytes",
+				),
+				pty_buffered_output_bytes: bigIntToSafeNumber(
+					payload.val.ptyBufferedOutputBytes,
+					"resource_snapshot.pty_buffered_output_bytes",
+				),
+				sockets: bigIntToSafeNumber(
+					payload.val.sockets,
+					"resource_snapshot.sockets",
+				),
+				socket_listeners: bigIntToSafeNumber(
+					payload.val.socketListeners,
+					"resource_snapshot.socket_listeners",
+				),
+				socket_connections: bigIntToSafeNumber(
+					payload.val.socketConnections,
+					"resource_snapshot.socket_connections",
+				),
+				socket_buffered_bytes: bigIntToSafeNumber(
+					payload.val.socketBufferedBytes,
+					"resource_snapshot.socket_buffered_bytes",
+				),
+				socket_datagram_queue_len: bigIntToSafeNumber(
+					payload.val.socketDatagramQueueLen,
+					"resource_snapshot.socket_datagram_queue_len",
+				),
+				queue_snapshots: payload.val.queueSnapshots.map((queue) => ({
+					name: queue.name,
+					category: queue.category,
+					depth: bigIntToSafeNumber(queue.depth, "resource_snapshot.queue.depth"),
+					high_water: bigIntToSafeNumber(
+						queue.highWater,
+						"resource_snapshot.queue.high_water",
+					),
+					capacity: bigIntToSafeNumber(
+						queue.capacity,
+						"resource_snapshot.queue.capacity",
+					),
+					fill_percent: bigIntToSafeNumber(
+						queue.fillPercent,
+						"resource_snapshot.queue.fill_percent",
+					),
+				})),
 			};
 		case "ListenerSnapshotResponse":
 			return {

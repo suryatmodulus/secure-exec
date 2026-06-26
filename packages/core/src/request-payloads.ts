@@ -171,6 +171,9 @@ export type LiveRequestPayload =
 			type: "get_process_snapshot";
 	  }
 	| {
+			type: "get_resource_snapshot";
+	  }
+	| {
 			type: "find_listener";
 			host?: string;
 			port?: number;
@@ -408,6 +411,8 @@ export function toGeneratedRequestPayload(
 			};
 		case "get_process_snapshot":
 			return { tag: "GetProcessSnapshotRequest", val: null };
+		case "get_resource_snapshot":
+			return { tag: "GetResourceSnapshotRequest", val: null };
 		case "find_listener":
 			return {
 				tag: "FindListenerRequest",

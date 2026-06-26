@@ -334,6 +334,8 @@ type KillProcessRequest struct {
 
 type GetProcessSnapshotRequest void
 
+type GetResourceSnapshotRequest void
+
 type FindListenerRequest struct {
   host: optional<str>
   port: optional<u16>
@@ -413,7 +415,8 @@ type RequestPayload union {
   PersistenceLoadRequest |
   PersistenceFlushRequest |
   VmFetchRequest |
-  ExtEnvelope
+  ExtEnvelope |
+  GetResourceSnapshotRequest
 }
 
 type RequestFrame struct {
@@ -558,6 +561,33 @@ type ProcessSnapshotResponse struct {
   processes: list<ProcessSnapshotEntry>
 }
 
+type QueueSnapshotEntry struct {
+  name: str
+  category: str
+  depth: u64
+  highWater: u64
+  capacity: u64
+  fillPercent: u64
+}
+
+type ResourceSnapshotResponse struct {
+  runningProcesses: u64
+  exitedProcesses: u64
+  fdTables: u64
+  openFds: u64
+  pipes: u64
+  pipeBufferedBytes: u64
+  ptys: u64
+  ptyBufferedInputBytes: u64
+  ptyBufferedOutputBytes: u64
+  sockets: u64
+  socketListeners: u64
+  socketConnections: u64
+  socketBufferedBytes: u64
+  socketDatagramQueueLen: u64
+  queueSnapshots: list<QueueSnapshotEntry>
+}
+
 type SocketStateEntry struct {
   processId: str
   host: optional<str>
@@ -656,7 +686,8 @@ type ResponsePayload union {
   PersistenceFlushedResponse |
   RejectedResponse |
   VmFetchResponse |
-  ExtEnvelope
+  ExtEnvelope |
+  ResourceSnapshotResponse
 }
 
 type ResponseFrame struct {

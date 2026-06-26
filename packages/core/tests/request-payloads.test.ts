@@ -108,6 +108,14 @@ describe("request payload conversion", () => {
 		});
 	});
 
+	it("maps resource snapshot requests", () => {
+		expect(
+			toGeneratedRequestPayload({
+				type: "get_resource_snapshot",
+			}),
+		).toEqual({ tag: "GetResourceSnapshotRequest", val: null });
+	});
+
 	it("maps host callback registration JSON fields", () => {
 		expect(
 			toGeneratedRequestPayload({
