@@ -11,6 +11,7 @@ members = [
     "crates/sidecar-browser",
     "crates/vm-config",
     "crates/v8-runtime",
+    "crates/native-baseline",
 ]
 
 [workspace.package]
