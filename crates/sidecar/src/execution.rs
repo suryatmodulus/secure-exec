@@ -39,12 +39,13 @@ use crate::state::{
     JavascriptTlsBridgeOptions, JavascriptTlsClientHello, JavascriptTlsDataValue,
     JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
     JavascriptUnixListenerEvent, NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket,
-    ProcNetEntry, ProcessEventEnvelope, ResolvedChildProcessExecution, ResolvedTcpConnectAddr,
-    SharedBridge, SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution,
-    VmDnsConfig, VmListenPolicy, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
-    EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV,
-    MAPPED_HOST_FD_START, PYTHON_COMMAND, TOOL_DRIVER_NAME,
-    VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
+    ProcNetEntry, ProcessEventEnvelope, PythonHostSocket, ResolvedChildProcessExecution,
+    ResolvedTcpConnectAddr, SharedBridge, SharedSidecarRequestClient, SidecarKernel,
+    SocketQueryKind, ToolExecution, VmDnsConfig, VmListenPolicy, VmState,
+    DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME, EXECUTION_SANDBOX_ROOT_ENV,
+    JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV, MAPPED_HOST_FD_START, PYTHON_COMMAND,
+    TOOL_DRIVER_NAME, VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND,
+    WASM_STDIO_SYNC_RPC_ENV,
 };
 use crate::tools::{
     format_tool_failure_output, is_tool_command, normalized_tool_command_name,
@@ -367,6 +368,8 @@ impl ActiveProcess {
             next_unix_socket_id: 0,
             udp_sockets: BTreeMap::new(),
             next_udp_socket_id: 0,
+            python_sockets: BTreeMap::new(),
+            next_python_socket_id: 0,
             cipher_sessions: BTreeMap::new(),
             next_cipher_session_id: 0,
             diffie_hellman_sessions: BTreeMap::new(),
@@ -479,7 +482,8 @@ impl ActiveProcess {
                 + self.tcp_sockets.len()
                 + self.unix_listeners.len()
                 + self.unix_sockets.len()
-                + self.udp_sockets.len(),
+                + self.udp_sockets.len()
+                + self.python_sockets.len(),
             connections: self.tcp_sockets.len() + self.unix_sockets.len(),
         };
         if let Ok(http2) = self.http2.shared.lock() {
@@ -515,7 +519,8 @@ impl ActiveProcess {
                     .udp_sockets
                     .values()
                     .filter(|socket| socket.kernel_socket_id.is_none())
-                    .count(),
+                    .count()
+                + self.python_sockets.len(),
             connections: self
                 .tcp_sockets
                 .values()
@@ -4757,11 +4762,15 @@ where
             PythonVfsRpcMethod::Read
             | PythonVfsRpcMethod::Write
             | PythonVfsRpcMethod::Stat
+            | PythonVfsRpcMethod::Lstat
             | PythonVfsRpcMethod::ReadDir
             | PythonVfsRpcMethod::Mkdir
             | PythonVfsRpcMethod::Unlink
             | PythonVfsRpcMethod::Rmdir
-            | PythonVfsRpcMethod::Rename => {
+            | PythonVfsRpcMethod::Rename
+            | PythonVfsRpcMethod::Symlink
+            | PythonVfsRpcMethod::ReadLink
+            | PythonVfsRpcMethod::Setattr => {
                 filesystem_handle_python_vfs_rpc_request(self, vm_id, process_id, request)
             }
             PythonVfsRpcMethod::HttpRequest => {
@@ -4772,6 +4781,15 @@ where
             }
             PythonVfsRpcMethod::SubprocessRun => {
                 self.handle_python_subprocess_rpc_request(vm_id, process_id, request)
+            }
+            PythonVfsRpcMethod::SocketConnect
+            | PythonVfsRpcMethod::SocketSend
+            | PythonVfsRpcMethod::SocketRecv
+            | PythonVfsRpcMethod::SocketClose
+            | PythonVfsRpcMethod::UdpCreate
+            | PythonVfsRpcMethod::UdpSendto
+            | PythonVfsRpcMethod::UdpRecvfrom => {
+                self.handle_python_socket_rpc_request(vm_id, process_id, request)
             }
         }
     }
@@ -5034,6 +5052,258 @@ where
             });
 
         self.respond_python_rpc(vm_id, process_id, request.id, response)
+    }
+
+    fn handle_python_socket_rpc_request(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        request: PythonVfsRpcRequest,
+    ) -> Result<(), SidecarError> {
+        if self.vms.get(vm_id).is_none() {
+            return Ok(());
+        }
+        let response = self.python_socket_op(vm_id, process_id, &request);
+        self.respond_python_rpc(vm_id, process_id, request.id, response)
+    }
+
+    fn python_socket_op(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        request: &PythonVfsRpcRequest,
+    ) -> Result<PythonVfsRpcResponsePayload, SidecarError> {
+        match request.method {
+            PythonVfsRpcMethod::SocketConnect => {
+                let host = python_socket_host(request)?;
+                let port = python_socket_port(request)?;
+                self.check_python_socket_limit(vm_id)?;
+                self.bridge.require_network_access(
+                    vm_id,
+                    NetworkOperation::Http,
+                    format_tcp_resource(&host, port),
+                )?;
+                let pinned = self.python_socket_pinned_addrs(vm_id, &host, port)?;
+                let stream = python_connect_tcp(&pinned, port)?;
+                stream
+                    .set_read_timeout(Some(PYTHON_SOCKET_READ_POLL))
+                    .map_err(python_socket_io_error)?;
+                // Bound writes too: without a write timeout `write_all` on a
+                // stalled peer would block the shared event loop indefinitely.
+                stream
+                    .set_write_timeout(Some(PYTHON_SOCKET_WRITE_TIMEOUT))
+                    .map_err(python_socket_io_error)?;
+                let socket_id =
+                    self.store_python_socket(vm_id, process_id, PythonHostSocket::Tcp(stream))?;
+                Ok(PythonVfsRpcResponsePayload::SocketCreated { socket_id })
+            }
+            PythonVfsRpcMethod::SocketSend => {
+                let data = python_socket_payload(request)?;
+                let socket = self.python_socket_mut(vm_id, process_id, request)?;
+                let PythonHostSocket::Tcp(stream) = socket else {
+                    return Err(python_socket_kind_error("send", "TCP"));
+                };
+                stream.write_all(&data).map_err(python_socket_io_error)?;
+                Ok(PythonVfsRpcResponsePayload::SocketSent {
+                    bytes_sent: data.len(),
+                })
+            }
+            PythonVfsRpcMethod::SocketRecv => {
+                let max = python_socket_recv_len(request);
+                let socket = self.python_socket_mut(vm_id, process_id, request)?;
+                let PythonHostSocket::Tcp(stream) = socket else {
+                    return Err(python_socket_kind_error("recv", "TCP"));
+                };
+                let mut buf = vec![0u8; max];
+                match stream.read(&mut buf) {
+                    Ok(0) => Ok(PythonVfsRpcResponsePayload::SocketReceived {
+                        data_base64: String::new(),
+                        closed: true,
+                        timed_out: false,
+                    }),
+                    Ok(n) => Ok(PythonVfsRpcResponsePayload::SocketReceived {
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
+                        closed: false,
+                        timed_out: false,
+                    }),
+                    Err(error) if python_socket_would_block(&error) => {
+                        Ok(PythonVfsRpcResponsePayload::SocketReceived {
+                            data_base64: String::new(),
+                            closed: false,
+                            timed_out: true,
+                        })
+                    }
+                    Err(error) => Err(python_socket_io_error(error)),
+                }
+            }
+            PythonVfsRpcMethod::SocketClose => {
+                self.remove_python_socket(vm_id, process_id, request);
+                Ok(PythonVfsRpcResponsePayload::Empty)
+            }
+            PythonVfsRpcMethod::UdpCreate => {
+                self.check_python_socket_limit(vm_id)?;
+                let socket = UdpSocket::bind("0.0.0.0:0").map_err(python_socket_io_error)?;
+                socket
+                    .set_read_timeout(Some(PYTHON_SOCKET_READ_POLL))
+                    .map_err(python_socket_io_error)?;
+                let socket_id =
+                    self.store_python_socket(vm_id, process_id, PythonHostSocket::Udp(socket))?;
+                Ok(PythonVfsRpcResponsePayload::SocketCreated { socket_id })
+            }
+            PythonVfsRpcMethod::UdpSendto => {
+                let host = python_socket_host(request)?;
+                let port = python_socket_port(request)?;
+                let data = python_socket_payload(request)?;
+                self.bridge.require_network_access(
+                    vm_id,
+                    NetworkOperation::Http,
+                    format_tcp_resource(&host, port),
+                )?;
+                let pinned = self.python_socket_pinned_addrs(vm_id, &host, port)?;
+                let target = pinned
+                    .first()
+                    .map(|ip| SocketAddr::new(*ip, port))
+                    .ok_or_else(|| {
+                        SidecarError::Execution(format!("EAI_NONAME: cannot resolve {host}"))
+                    })?;
+                let socket = self.python_socket_mut(vm_id, process_id, request)?;
+                let PythonHostSocket::Udp(udp) = socket else {
+                    return Err(python_socket_kind_error("sendto", "UDP"));
+                };
+                let sent = udp.send_to(&data, target).map_err(python_socket_io_error)?;
+                Ok(PythonVfsRpcResponsePayload::SocketSent { bytes_sent: sent })
+            }
+            PythonVfsRpcMethod::UdpRecvfrom => {
+                let max = python_socket_recv_len(request);
+                let socket = self.python_socket_mut(vm_id, process_id, request)?;
+                let PythonHostSocket::Udp(udp) = socket else {
+                    return Err(python_socket_kind_error("recvfrom", "UDP"));
+                };
+                let mut buf = vec![0u8; max];
+                match udp.recv_from(&mut buf) {
+                    Ok((n, addr)) => Ok(PythonVfsRpcResponsePayload::UdpReceived {
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
+                        host: addr.ip().to_string(),
+                        port: addr.port(),
+                        timed_out: false,
+                    }),
+                    Err(error) if python_socket_would_block(&error) => {
+                        Ok(PythonVfsRpcResponsePayload::UdpReceived {
+                            data_base64: String::new(),
+                            host: String::new(),
+                            port: 0,
+                            timed_out: true,
+                        })
+                    }
+                    Err(error) => Err(python_socket_io_error(error)),
+                }
+            }
+            _ => Err(SidecarError::InvalidState(String::from(
+                "non-socket python RPC reached the socket dispatcher unexpectedly",
+            ))),
+        }
+    }
+
+    /// Resolve `host` to the egress-guard-approved IP set, then apply the same
+    /// loopback-connect gate the JS raw-TCP path uses (`filter_tcp_connect_ip_addrs`)
+    /// so a rebinding DNS server can't map an allowlisted hostname onto a
+    /// sidecar-local loopback port the VM policy didn't open.
+    fn python_socket_pinned_addrs(
+        &self,
+        vm_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<Vec<IpAddr>, SidecarError> {
+        let Some(vm) = self.vms.get(vm_id) else {
+            return Err(SidecarError::InvalidState(String::from(
+                "python socket op for unknown vm",
+            )));
+        };
+        let context = build_javascript_socket_path_context(vm)?;
+        if let Ok(literal_ip) = host.parse::<IpAddr>() {
+            filter_tcp_connect_ip_addrs(vec![literal_ip], host, port, &context)
+        } else {
+            filter_tcp_connect_ip_addrs(
+                resolve_dns_ip_addrs(
+                    &self.bridge,
+                    &vm.kernel,
+                    vm_id,
+                    &vm.dns,
+                    host,
+                    DnsLookupPolicy::SkipPermissions,
+                )?,
+                host,
+                port,
+                &context,
+            )
+        }
+    }
+
+    /// Enforce the VM's `max_sockets` resource limit before opening another
+    /// host socket for the guest (the registry is otherwise unbounded — a
+    /// hostile guest could exhaust the sidecar's fds/memory).
+    fn check_python_socket_limit(&self, vm_id: &str) -> Result<(), SidecarError> {
+        let Some(vm) = self.vms.get(vm_id) else {
+            return Ok(());
+        };
+        let limit = vm.kernel.resource_limits().max_sockets;
+        let current = vm_network_resource_counts(vm).sockets;
+        check_network_resource_limit(limit, current, 1, "socket")
+    }
+
+    fn store_python_socket(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        socket: PythonHostSocket,
+    ) -> Result<u64, SidecarError> {
+        let process = self
+            .vms
+            .get_mut(vm_id)
+            .and_then(|vm| vm.active_processes.get_mut(process_id))
+            .ok_or_else(|| {
+                SidecarError::InvalidState(String::from("python socket op for reaped vm/process"))
+            })?;
+        let socket_id = process.next_python_socket_id;
+        process.next_python_socket_id = process.next_python_socket_id.wrapping_add(1);
+        process.python_sockets.insert(socket_id, socket);
+        Ok(socket_id)
+    }
+
+    fn python_socket_mut(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        request: &PythonVfsRpcRequest,
+    ) -> Result<&mut PythonHostSocket, SidecarError> {
+        let socket_id = request.socket_id.ok_or_else(|| {
+            SidecarError::InvalidState(String::from("python socket op requires socketId"))
+        })?;
+        self.vms
+            .get_mut(vm_id)
+            .and_then(|vm| vm.active_processes.get_mut(process_id))
+            .and_then(|process| process.python_sockets.get_mut(&socket_id))
+            .ok_or_else(|| {
+                SidecarError::Execution(format!("EBADF: unknown python socket {socket_id}"))
+            })
+    }
+
+    fn remove_python_socket(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        request: &PythonVfsRpcRequest,
+    ) {
+        let Some(socket_id) = request.socket_id else {
+            return;
+        };
+        if let Some(process) = self
+            .vms
+            .get_mut(vm_id)
+            .and_then(|vm| vm.active_processes.get_mut(process_id))
+        {
+            process.python_sockets.remove(&socket_id);
+        }
     }
 
     fn respond_python_rpc(
@@ -12004,6 +12274,82 @@ pub(crate) fn format_dns_resource(hostname: &str) -> String {
 
 pub(crate) fn format_tcp_resource(host: &str, port: u16) -> String {
     format!("tcp://{host}:{port}")
+}
+
+// --- Guest Python socket bridge helpers ------------------------------------
+
+/// Host-socket read timeout for one `recv`/`recvfrom` RPC. Kept short so the
+/// synchronous RPC returns promptly (data, or a `timed_out` flag the Python
+/// shim re-polls on) and never stalls the shared sidecar event loop.
+// Short so a recv/recvfrom RPC holds the shared event loop only briefly; the
+// guest shim adds a capped backoff between polls to bound the poll rate.
+const PYTHON_SOCKET_READ_POLL: Duration = Duration::from_millis(25);
+const PYTHON_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const PYTHON_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const PYTHON_SOCKET_DEFAULT_RECV: usize = 65536;
+const PYTHON_SOCKET_MAX_RECV: usize = 4 * 1024 * 1024;
+
+fn python_socket_host(request: &PythonVfsRpcRequest) -> Result<String, SidecarError> {
+    request
+        .hostname
+        .clone()
+        .ok_or_else(|| SidecarError::InvalidState(String::from("python socket op requires a host")))
+}
+
+fn python_socket_port(request: &PythonVfsRpcRequest) -> Result<u16, SidecarError> {
+    request
+        .port
+        .ok_or_else(|| SidecarError::InvalidState(String::from("python socket op requires a port")))
+}
+
+fn python_socket_payload(request: &PythonVfsRpcRequest) -> Result<Vec<u8>, SidecarError> {
+    let Some(body) = request.body_base64.as_deref() else {
+        return Ok(Vec::new());
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|error| {
+            SidecarError::InvalidState(format!("invalid base64 python socket payload: {error}"))
+        })
+}
+
+fn python_socket_recv_len(request: &PythonVfsRpcRequest) -> usize {
+    request
+        .max_buffer
+        .unwrap_or(PYTHON_SOCKET_DEFAULT_RECV)
+        .clamp(1, PYTHON_SOCKET_MAX_RECV)
+}
+
+fn python_connect_tcp(addrs: &[IpAddr], port: u16) -> Result<TcpStream, SidecarError> {
+    let mut last_error: Option<String> = None;
+    for ip in addrs {
+        let addr = SocketAddr::new(*ip, port);
+        match TcpStream::connect_timeout(&addr, PYTHON_SOCKET_CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(SidecarError::Execution(format!(
+        "ECONNREFUSED: {}",
+        last_error.unwrap_or_else(|| String::from("no resolved addresses"))
+    )))
+}
+
+fn python_socket_would_block(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn python_socket_io_error(error: std::io::Error) -> SidecarError {
+    SidecarError::Execution(format!("EIO: python socket: {error}"))
+}
+
+fn python_socket_kind_error(op: &str, expected: &str) -> SidecarError {
+    SidecarError::Execution(format!(
+        "EOPNOTSUPP: python socket {op} requires a {expected} socket"
+    ))
 }
 
 fn is_loopback_ip(ip: IpAddr) -> bool {
