@@ -40,6 +40,17 @@ Every bound that protects a shared resource — memory/heap, CPU/wall-clock, fd/
 - **Clear, typed error on breach.** Fail with a typed error that names the limit and the observed-vs-cap value **with units**, plus how to raise it: `"<limit> exceeded: <observed><unit> > <cap><unit> (raise via limits.<wired>)"`. Map consistently — errno for kernel limits (but attach the limit name; no bare/opaque `EAGAIN`), `ExecutionAbortReason` for runtime kills, `SidecarError`/codec errors for config/protocol. No generic "invalid"/silent failure that hides which limit fired.
 - **No catastrophic reaction to transient fullness.** A full bounded queue/buffer applies **backpressure** (block the producer until the consumer drains) or returns the named error — never silently drop, silently evict, destroy the session, or crash the process. Raising a capacity is not a fix by itself; the warning + typed error must exist first. See PR #123 (event channel + stdout frame queue) for the reference pattern; audit every other channel/`VecDeque`/buffer against it.
 
+## Performance
+
+- **No expensive objects per-call.** Build once, reuse via a pool/persistent worker. Never construct per-operation: Tokio runtime, OS thread, V8 isolate/snapshot, DNS resolver, HTTP client, connection pool. Construct-then-teardown every call IS the bug.
+- **No serialize→deserialize in-process.** Pass the typed struct directly; wire encoding is for the wire only. Don't encode a frame to bytes only to re-parse it into a command.
+- **No whole-buffer copies per I/O.** Use chunked `Vec<u8>` + `extend_from_slice`, not byte-by-byte fills; move/`Arc`/slice payloads — never clone a record that carries its full buffer on each read/write.
+- **No per-call allocs/locks/clones** on the sync hot path.
+- **Avoid polling**, prefer readiness/event-driven. But a read-probe can be load-bearing for protocol correctness — measure before removing one, and keep its semantic test.
+- **No baseline, no merge.** Capture native + unoptimized numbers BEFORE touching code, gate every change on a measured before/after delta, and keep it measure-gated.
+- **Revert no-wins.** A change with a flat or negative delta is a liability, not a win.
+- **Perf must not regress correctness.** Respect existing caps/bounds and land the regression test in the same change as the optimization.
+
 ## Project Boundaries
 
 - Keep the secure-exec runtime Agent OS-agnostic: no ACP, sessions, `agentos-protocol`, `agentos-client`, or `agentos-sidecar` dependencies in runtime code.
