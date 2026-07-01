@@ -810,10 +810,6 @@ fn session_thread(
     #[cfg(not(test))]
     let mut isolate_userland_code: Option<String> = None;
 
-    // Pre-allocated serialization buffers for V8 ValueSerializer output
-    #[cfg(not(test))]
-    let session_buffers = std::cell::RefCell::new(bridge::SessionBuffers::new());
-
     // Process commands until shutdown or channel close
     loop {
         let next_command = if let Some(command) = deferred_commands.pop_front() {
@@ -1048,8 +1044,6 @@ fn session_thread(
                                 scope,
                                 &bridge_ctx as *const BridgeCallContext,
                                 &pending as *const bridge::PendingPromises,
-                                &session_buffers
-                                    as *const std::cell::RefCell<bridge::SessionBuffers>,
                                 sync_bridge_fns,
                                 async_bridge_fns,
                             );
@@ -2399,10 +2393,9 @@ mod tests {
     /// the cleanup happens, it does not saturate `MAX_PENDING_PROMISES`.
     #[test]
     fn reset_pending_promises_drops_resolver_globals_before_isolate_teardown() {
-        use crate::bridge::{register_async_bridge_fns, PendingPromises, SessionBuffers};
+        use crate::bridge::{register_async_bridge_fns, PendingPromises};
         use crate::host_call::BridgeCallContext;
         use crate::isolate;
-        use std::cell::RefCell;
         use std::process::Command;
 
         // V8 isolates must be created in an isolated process: doing it inline in a
@@ -2436,7 +2429,6 @@ mod tests {
         let context = v8::Local::new(scope, &context);
         let scope = &mut v8::ContextScope::new(scope, context);
 
-        let session_buffers = RefCell::new(SessionBuffers::new());
         let bridge_ctx = BridgeCallContext::new(
             Box::new(std::io::sink()),
             Box::new(std::io::empty()),
@@ -2453,7 +2445,6 @@ mod tests {
             scope,
             &bridge_ctx as *const BridgeCallContext,
             &pending as *const PendingPromises,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_asyncFn"],
         );
         let source = format!("for (let i = 0; i < {REGISTERED}; i++) {{ _asyncFn(i); }}");

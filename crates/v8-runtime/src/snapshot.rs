@@ -721,11 +721,8 @@ pub fn run_snapshot_consolidated_checks() {
     // Verifies that FunctionTemplates registered on a restored isolate
     // correctly dispatch to Rust bridge callbacks via external_refs().
     {
-        use crate::bridge::{
-            register_async_bridge_fns, register_sync_bridge_fns, PendingPromises, SessionBuffers,
-        };
+        use crate::bridge::{register_async_bridge_fns, register_sync_bridge_fns, PendingPromises};
         use crate::host_call::BridgeCallContext;
-        use std::cell::RefCell;
 
         let bridge_code = "(function() { globalThis.__ext_ref_test = true; })();";
         let blob = create_snapshot(bridge_code).expect("snapshot creation");
@@ -750,7 +747,6 @@ pub fn run_snapshot_consolidated_checks() {
             call_id_router,
             Arc::new(std::sync::atomic::AtomicU64::new(1)),
         );
-        let session_buffers = RefCell::new(SessionBuffers::new());
         let pending = PendingPromises::new();
 
         let scope = &mut v8::HandleScope::new(&mut isolate);
@@ -761,14 +757,12 @@ pub fn run_snapshot_consolidated_checks() {
         let _sync_store = register_sync_bridge_fns(
             scope,
             &bridge_ctx as *const BridgeCallContext,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_testSync"],
         );
         let _async_store = register_async_bridge_fns(
             scope,
             &bridge_ctx as *const BridgeCallContext,
             &pending as *const PendingPromises,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_testAsync"],
         );
 
@@ -1104,9 +1098,8 @@ pub fn run_snapshot_consolidated_checks() {
     // stubs, restore, replace stubs with real bridge functions, verify the
     // replaced functions dispatch to the real Rust callbacks.
     {
-        use crate::bridge::{replace_bridge_fns, PendingPromises, SessionBuffers};
+        use crate::bridge::{replace_bridge_fns, PendingPromises};
         use crate::host_call::BridgeCallContext;
-        use std::cell::RefCell;
 
         // Create snapshot with stubs + simple bridge IIFE
         let bridge_code = r#"
@@ -1139,7 +1132,6 @@ pub fn run_snapshot_consolidated_checks() {
             call_id_router,
             Arc::new(std::sync::atomic::AtomicU64::new(1)),
         );
-        let session_buffers = RefCell::new(SessionBuffers::new());
         let pending = PendingPromises::new();
 
         // Restore context and replace bridge functions
@@ -1151,7 +1143,6 @@ pub fn run_snapshot_consolidated_checks() {
             scope,
             &bridge_ctx as *const BridgeCallContext,
             &pending as *const PendingPromises,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_log", "_fsReadFile"],
             &["_scheduleTimer"],
         );

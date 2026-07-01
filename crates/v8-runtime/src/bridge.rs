@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -121,22 +121,6 @@ pub fn serialize_v8_wire_value(
         .write_value(context, value)
         .ok_or_else(|| "V8 ValueSerializer: failed to serialize value".to_string())?;
     Ok(serializer.release())
-}
-
-/// Serialize a V8 value into a pre-allocated buffer.
-///
-/// The buffer is cleared (not deallocated) before use, preserving capacity.
-/// V8's serializer allocates internally; the result is copied into the buffer
-/// so the buffer grows to high-water mark across calls.
-pub fn serialize_v8_value_into(
-    scope: &mut v8::HandleScope,
-    value: v8::Local<v8::Value>,
-    buf: &mut Vec<u8>,
-) -> Result<(), String> {
-    let released = serialize_v8_value(scope, value)?;
-    buf.clear();
-    buf.extend_from_slice(&released);
-    Ok(())
 }
 
 /// Deserialize bytes back to a V8 value using V8's built-in ValueDeserializer.
@@ -648,32 +632,10 @@ pub fn deserialize_cbor_value<'s>(
     cbor_to_v8(scope, &cbor_val)
 }
 
-/// Pre-allocated serialization buffers reused across bridge calls within a session.
-/// Grows to high-water mark; cleared (not deallocated) between calls via buf.clear().
-pub struct SessionBuffers {
-    /// Buffer for V8 ValueSerializer output (args serialization)
-    pub ser_buf: Vec<u8>,
-}
-
-impl SessionBuffers {
-    pub fn new() -> Self {
-        SessionBuffers {
-            ser_buf: Vec::with_capacity(256),
-        }
-    }
-}
-
-impl Default for SessionBuffers {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Data attached to each sync bridge function via v8::External.
 /// BridgeFnStore keeps these heap allocations alive for the session.
 struct SyncBridgeFnData {
     ctx: *const BridgeCallContext,
-    buffers: *const RefCell<SessionBuffers>,
     method: String,
 }
 
@@ -689,7 +651,6 @@ pub struct BridgeFnStore {
 struct AsyncBridgeFnData {
     ctx: *const BridgeCallContext,
     pending: *const PendingPromises,
-    buffers: *const RefCell<SessionBuffers>,
     method: String,
 }
 
@@ -1763,7 +1724,6 @@ fn handle_local_bridge_call<'s>(
 pub fn register_sync_bridge_fns(
     scope: &mut v8::HandleScope,
     ctx: *const BridgeCallContext,
-    buffers: *const RefCell<SessionBuffers>,
     methods: &[&str],
 ) -> BridgeFnStore {
     let context = scope.get_current_context();
@@ -1773,7 +1733,6 @@ pub fn register_sync_bridge_fns(
     for &method_name in methods {
         let boxed = Box::new(SyncBridgeFnData {
             ctx,
-            buffers,
             method: method_name.to_string(),
         });
         // Pointer to heap allocation — stable while Box exists in data vec
@@ -1815,7 +1774,6 @@ fn sync_bridge_callback<'s>(
     // SAFETY: pointer is valid while BridgeFnStore is alive (same session lifetime)
     let data = unsafe { &*(external.value() as *const SyncBridgeFnData) };
     let ctx = unsafe { &*data.ctx };
-    let buffers = unsafe { &*data.buffers };
 
     {
         let tc = &mut v8::TryCatch::new(scope);
@@ -1842,8 +1800,8 @@ fn sync_bridge_callback<'s>(
         }
     }
 
-    // Serialize V8 arguments into reusable buffer (avoids per-call allocation)
-    let encoded_args = match serialize_v8_args_with_session_buffer(scope, &args, buffers) {
+    // Serialize V8 arguments using the Vec released by V8's serializer directly.
+    let encoded_args = match serialize_v8_args(scope, &args) {
         Ok(encoded_args) => encoded_args,
         Err(err) => {
             let msg =
@@ -1897,7 +1855,6 @@ pub fn register_async_bridge_fns(
     scope: &mut v8::HandleScope,
     ctx: *const BridgeCallContext,
     pending: *const PendingPromises,
-    buffers: *const RefCell<SessionBuffers>,
     methods: &[&str],
 ) -> AsyncBridgeFnStore {
     let context = scope.get_current_context();
@@ -1908,7 +1865,6 @@ pub fn register_async_bridge_fns(
         let boxed = Box::new(AsyncBridgeFnData {
             ctx,
             pending,
-            buffers,
             method: method_name.to_string(),
         });
         // Pointer to heap allocation — stable while Box exists in data vec
@@ -1962,26 +1918,6 @@ fn build_bridge_apply_wrapper<'s>(
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
 }
 
-fn serialize_v8_args_with_session_buffer(
-    scope: &mut v8::HandleScope,
-    args: &v8::FunctionCallbackArguments,
-    buffers: &RefCell<SessionBuffers>,
-) -> Result<Vec<u8>, String> {
-    let mut ser_buf = {
-        let mut bufs = buffers.borrow_mut();
-        mem::take(&mut bufs.ser_buf)
-    };
-
-    let result = serialize_v8_args_into(scope, args, &mut ser_buf).map(|()| ser_buf.clone());
-
-    {
-        let mut bufs = buffers.borrow_mut();
-        bufs.ser_buf = ser_buf;
-    }
-
-    result
-}
-
 fn reject_promise_with_error(
     scope: &mut v8::HandleScope,
     resolver: v8::Local<v8::PromiseResolver>,
@@ -2020,7 +1956,6 @@ fn async_bridge_callback(
     let data = unsafe { &*(external.value() as *const AsyncBridgeFnData) };
     let ctx = unsafe { &*data.ctx };
     let pending = unsafe { &*data.pending };
-    let buffers = unsafe { &*data.buffers };
 
     // Create PromiseResolver
     let resolver = match v8::PromiseResolver::new(scope) {
@@ -2050,8 +1985,8 @@ fn async_bridge_callback(
         }
     };
 
-    // Serialize V8 arguments into reusable buffer (avoids per-call allocation)
-    let encoded_args = match serialize_v8_args_with_session_buffer(scope, &args, buffers) {
+    // Serialize V8 arguments using the Vec released by V8's serializer directly.
+    let encoded_args = match serialize_v8_args(scope, &args) {
         Ok(encoded_args) => encoded_args,
         Err(err) => {
             let msg =
@@ -2081,7 +2016,7 @@ fn async_bridge_callback(
 
 /// Replace stub bridge functions on a snapshot-restored context with real
 /// session-local bridge functions. Overwrites the 38 stub globals with
-/// functions backed by session-local BridgeCallContext and SessionBuffers.
+/// functions backed by session-local BridgeCallContext.
 ///
 /// Returns (BridgeFnStore, AsyncBridgeFnStore) that must be kept alive
 /// for the lifetime of the V8 context.
@@ -2089,7 +2024,6 @@ pub fn replace_bridge_fns(
     scope: &mut v8::HandleScope,
     ctx: *const BridgeCallContext,
     pending: *const PendingPromises,
-    buffers: *const RefCell<SessionBuffers>,
     sync_fns: &[&str],
     async_fns: &[&str],
 ) -> (BridgeFnStore, AsyncBridgeFnStore) {
@@ -2100,8 +2034,8 @@ pub fn replace_bridge_fns(
     // accumulate across executions toward `MAX_VM_CONTEXTS`. The session should
     // also hold a `VmContextRegistryGuard` to evict its own slots at teardown.
     reset_vm_context_registry();
-    let sync_store = register_sync_bridge_fns(scope, ctx, buffers, sync_fns);
-    let async_store = register_async_bridge_fns(scope, ctx, pending, buffers, async_fns);
+    let sync_store = register_sync_bridge_fns(scope, ctx, sync_fns);
+    let async_store = register_async_bridge_fns(scope, ctx, pending, async_fns);
     (sync_store, async_store)
 }
 
@@ -2140,19 +2074,17 @@ pub fn register_stub_bridge_fns(
     }
 }
 
-/// Serialize V8 function arguments into a pre-allocated buffer.
-/// The buffer is cleared and reused across calls (grows to high-water mark).
-fn serialize_v8_args_into(
+/// Serialize V8 function arguments as an array.
+fn serialize_v8_args(
     scope: &mut v8::HandleScope,
     args: &v8::FunctionCallbackArguments,
-    buf: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let count = args.length();
     let array = v8::Array::new(scope, count);
     for i in 0..count {
         array.set_index(scope, i as u32, args.get(i));
     }
-    serialize_v8_value_into(scope, array.into(), buf)
+    serialize_v8_value(scope, array.into())
 }
 
 /// Resolve or reject a pending async bridge promise by call_id.
@@ -2241,13 +2173,12 @@ mod tests {
         fill_vm_context_registry_for_test, register_async_bridge_fns, register_sync_bridge_fns,
         reserve_vm_context_slot, reset_vm_context_registry, serialize_cbor_value,
         vm_context_capacity_error, vm_context_registry_len_for_test, PendingPromises,
-        SessionBuffers, VmContextRegistryGuard, MAX_CBOR_BRIDGE_CONTAINER_ITEMS,
-        MAX_CBOR_BRIDGE_DEPTH, MAX_PENDING_PROMISES, MAX_VM_CONTEXTS,
+        VmContextRegistryGuard, MAX_CBOR_BRIDGE_CONTAINER_ITEMS, MAX_CBOR_BRIDGE_DEPTH,
+        MAX_PENDING_PROMISES, MAX_VM_CONTEXTS,
     };
     use crate::host_call::BridgeCallContext;
     use crate::ipc_binary::{self, BinaryFrame};
     use crate::isolate;
-    use std::cell::RefCell;
     use std::io::{Cursor, Write};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
@@ -2392,11 +2323,9 @@ mod tests {
             Box::new(Cursor::new(Vec::new())),
             String::from("test-session"),
         );
-        let session_buffers = RefCell::new(SessionBuffers::new());
         let _bridge_fns = register_sync_bridge_fns(
             scope,
             &bridge_ctx as *const BridgeCallContext,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_vmCreateContext"],
         );
 
@@ -2507,7 +2436,6 @@ mod tests {
             scope,
             &async_bridge_ctx as *const BridgeCallContext,
             &async_pending as *const PendingPromises,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_asyncFn"],
         );
         let source = format!(
@@ -2557,7 +2485,6 @@ mod tests {
             scope,
             &reentrant_bridge_ctx as *const BridgeCallContext,
             &reentrant_pending as *const PendingPromises,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_asyncFn"],
         );
         let source = format!(
@@ -2617,7 +2544,6 @@ mod tests {
             scope,
             &buffer_reentry_bridge_ctx as *const BridgeCallContext,
             &buffer_reentry_pending as *const PendingPromises,
-            &session_buffers as *const RefCell<SessionBuffers>,
             &["_asyncFn"],
         );
         let source = r#"
