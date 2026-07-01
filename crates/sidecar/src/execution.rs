@@ -953,14 +953,22 @@ fn wait_for_loopback_peer_socket_id(
     kernel: &SidecarKernel,
     socket_id: SocketId,
 ) -> Option<SocketId> {
-    for _ in 0..50 {
+    // Keep the total wait budget aligned with the previous ~500ms poll window.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut backoff = Duration::from_micros(100);
+    loop {
         if let Some(peer_socket_id) = kernel
             .socket_get(socket_id)
             .and_then(|record| record.peer_socket_id())
         {
             return Some(peer_socket_id);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
+        backoff = (backoff * 2).min(Duration::from_millis(10));
     }
     None
 }
