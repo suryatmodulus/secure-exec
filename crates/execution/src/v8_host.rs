@@ -49,36 +49,21 @@ impl V8RuntimeHost {
         let thread_name = format!("secure-exec-v8-session-{session_id}");
         let runtime = Arc::clone(&self.shared.runtime);
         let runtime_for_thread = Arc::clone(&runtime);
-        let thread_session_id = session_id.to_owned();
 
         let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
             while let Ok(frame) = runtime_receiver.recv() {
-                match from_runtime_event(frame) {
-                    Ok(frame) => {
-                        // Apply backpressure instead of destroying the session when
-                        // the downstream consumer is slow. This thread is dedicated
-                        // to one session, so a blocking send safely parks it — and,
-                        // in turn, backpressures the V8 runtime — until a slot frees.
-                        // Previously a `try_send` that hit the full channel called
-                        // destroy_session_if_output_current(), tearing the session
-                        // down on a transient backlog (the same anti-pattern fixed
-                        // for the event/stdout queues). Only a dropped receiver
-                        // (the consumer is gone for good) is terminal.
-                        if sender.send(frame).is_err() {
-                            let _ =
-                                runtime_for_thread.destroy_session_if_output_current(&registration);
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            session_id = %thread_session_id,
-                            "embedded v8 runtime frame conversion failed"
-                        );
-                        let _ = runtime_for_thread.destroy_session_if_output_current(&registration);
-                        break;
-                    }
+                // Apply backpressure instead of destroying the session when
+                // the downstream consumer is slow. This thread is dedicated
+                // to one session, so a blocking send safely parks it — and,
+                // in turn, backpressures the V8 runtime — until a slot frees.
+                // Previously a `try_send` that hit the full channel called
+                // destroy_session_if_output_current(), tearing the session
+                // down on a transient backlog (the same anti-pattern fixed
+                // for the event/stdout queues). Only a dropped receiver
+                // (the consumer is gone for good) is terminal.
+                if sender.send(from_runtime_event(frame)).is_err() {
+                    let _ = runtime_for_thread.destroy_session_if_output_current(&registration);
+                    break;
                 }
             }
         });
@@ -293,10 +278,60 @@ fn to_runtime_command(frame: &BinaryFrame) -> io::Result<RuntimeCommand> {
     RuntimeCommand::try_from(runtime_frame)
 }
 
-fn from_runtime_event(event: RuntimeEvent) -> io::Result<BinaryFrame> {
-    let frame: secure_exec_v8_runtime::ipc_binary::BinaryFrame = event.into();
-    let bytes = secure_exec_v8_runtime::ipc_binary::frame_to_bytes(&frame)?;
-    v8_ipc::decode_frame(&bytes[4..])
+fn from_runtime_event(event: RuntimeEvent) -> BinaryFrame {
+    match event {
+        RuntimeEvent::BridgeCall {
+            session_id,
+            call_id,
+            method,
+            payload,
+        } => BinaryFrame::BridgeCall {
+            session_id,
+            call_id,
+            method,
+            payload,
+        },
+        RuntimeEvent::ExecutionResult {
+            session_id,
+            exit_code,
+            exports,
+            error,
+        } => BinaryFrame::ExecutionResult {
+            session_id,
+            exit_code,
+            exports,
+            error: error.map(from_runtime_execution_error),
+        },
+        RuntimeEvent::Log {
+            session_id,
+            channel,
+            message,
+        } => BinaryFrame::Log {
+            session_id,
+            channel,
+            message,
+        },
+        RuntimeEvent::StreamCallback {
+            session_id,
+            callback_type,
+            payload,
+        } => BinaryFrame::StreamCallback {
+            session_id,
+            callback_type,
+            payload,
+        },
+    }
+}
+
+fn from_runtime_execution_error(
+    error: secure_exec_v8_runtime::ipc_binary::ExecutionErrorBin,
+) -> v8_ipc::ExecutionErrorBin {
+    v8_ipc::ExecutionErrorBin {
+        error_type: error.error_type,
+        message: error.message,
+        stack: error.stack,
+        code: error.code,
+    }
 }
 
 #[cfg(test)]
