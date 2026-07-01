@@ -994,14 +994,14 @@ impl Read for crate::state::LoopbackTlsEndpoint {
             };
 
             if !incoming.is_empty() {
-                let mut count = 0;
-                while count < buffer.len() {
-                    let Some(byte) = incoming.pop_front() else {
-                        break;
-                    };
-                    buffer[count] = byte;
-                    count += 1;
+                let count = incoming.len().min(buffer.len());
+                let (head, tail) = incoming.as_slices();
+                let head_count = head.len().min(count);
+                buffer[..head_count].copy_from_slice(&head[..head_count]);
+                if head_count < count {
+                    buffer[head_count..count].copy_from_slice(&tail[..count - head_count]);
                 }
+                incoming.drain(..count);
                 return Ok(count);
             }
 
