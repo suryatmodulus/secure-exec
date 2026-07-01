@@ -19004,12 +19004,18 @@ fn push_http2_server_event(
     server_id: u64,
     event: Http2BridgeEvent,
 ) {
-    if let Ok(mut state) = shared.lock() {
+    let ready = if let Ok(mut state) = shared.lock() {
         state
             .server_events
             .entry(server_id)
             .or_default()
             .push_back(event);
+        Some(Arc::clone(&state.ready))
+    } else {
+        None
+    };
+    if let Some(ready) = ready {
+        ready.notify_all();
     }
 }
 
@@ -19018,12 +19024,18 @@ fn push_http2_session_event(
     session_id: u64,
     event: Http2BridgeEvent,
 ) {
-    if let Ok(mut state) = shared.lock() {
+    let ready = if let Ok(mut state) = shared.lock() {
         state
             .session_events
             .entry(session_id)
             .or_default()
             .push_back(event);
+        Some(Arc::clone(&state.ready))
+    } else {
+        None
+    };
+    if let Some(ready) = ready {
+        ready.notify_all();
     }
 }
 
@@ -19041,21 +19053,29 @@ fn wait_for_http2_event(
     wait_ms: u64,
 ) -> Option<Http2BridgeEvent> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let mut state = shared.lock().ok()?;
     loop {
-        if let Ok(mut state) = shared.lock() {
-            let queue = if is_server {
-                &mut state.server_events
-            } else {
-                &mut state.session_events
-            };
-            if let Some(event) = pop_http2_event(queue, id) {
-                return Some(event);
-            }
+        let queue = if is_server {
+            &mut state.server_events
+        } else {
+            &mut state.session_events
+        };
+        if let Some(event) = pop_http2_event(queue, id) {
+            return Some(event);
         }
-        if wait_ms == 0 || Instant::now() >= deadline {
+        if wait_ms == 0 {
             return None;
         }
-        thread::sleep(HTTP2_POLL_DELAY);
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return None;
+        }
+        let ready = Arc::clone(&state.ready);
+        state = ready.wait_timeout(state, remaining).ok()?.0;
     }
 }
 
@@ -19596,6 +19616,7 @@ fn spawn_http2_client_session(
                                         ActiveHttp2Stream {
                                             session_id,
                                             paused: Arc::new(AtomicBool::new(false)),
+                                            resume_notify: Arc::new(tokio::sync::Notify::new()),
                                         },
                                     );
                                     stream_id
@@ -19629,13 +19650,22 @@ fn spawn_http2_client_session(
                                                     while let Some(chunk) = body.data().await {
                                                         match chunk {
                                                             Ok(bytes) => {
-                                                                let paused = {
+                                                                let pause_state = {
                                                                     let state = shared_clone.lock().expect("http2 shared state");
-                                                                    state.streams.get(&stream_id).map(|stream| Arc::clone(&stream.paused))
+                                                                    state.streams.get(&stream_id).map(|stream| {
+                                                                        (
+                                                                            Arc::clone(&stream.paused),
+                                                                            Arc::clone(&stream.resume_notify),
+                                                                        )
+                                                                    })
                                                                 };
-                                                                if let Some(paused) = paused {
+                                                                if let Some((paused, resume_notify)) = pause_state {
                                                                     while paused.load(Ordering::SeqCst) {
-                                                                        tokio::time::sleep(HTTP2_POLL_DELAY).await;
+                                                                        let notified = resume_notify.notified();
+                                                                        tokio::pin!(notified);
+                                                                        notified.as_mut().enable();
+                                                                        if !paused.load(Ordering::SeqCst) { break; }
+                                                                        let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
                                                                     }
                                                                 }
                                                                 let _ = body.flow_control().release_capacity(bytes.len());
@@ -20090,6 +20120,7 @@ fn spawn_http2_server_session(
                                         ActiveHttp2Stream {
                                             session_id,
                                             paused: Arc::new(AtomicBool::new(false)),
+                                            resume_notify: Arc::new(tokio::sync::Notify::new()),
                                         },
                                     );
                                     stream_id
@@ -20124,13 +20155,22 @@ fn spawn_http2_server_session(
                                     while let Some(chunk) = body.data().await {
                                         match chunk {
                                             Ok(bytes) => {
-                                                let paused = {
+                                                let pause_state = {
                                                     let state = shared_clone.lock().expect("http2 shared state");
-                                                    state.streams.get(&stream_id).map(|stream| Arc::clone(&stream.paused))
+                                                    state.streams.get(&stream_id).map(|stream| {
+                                                        (
+                                                            Arc::clone(&stream.paused),
+                                                            Arc::clone(&stream.resume_notify),
+                                                        )
+                                                    })
                                                 };
-                                                if let Some(paused) = paused {
+                                                if let Some((paused, resume_notify)) = pause_state {
                                                     while paused.load(Ordering::SeqCst) {
-                                                        tokio::time::sleep(HTTP2_POLL_DELAY).await;
+                                                        let notified = resume_notify.notified();
+                                                        tokio::pin!(notified);
+                                                        notified.as_mut().enable();
+                                                        if !paused.load(Ordering::SeqCst) { break; }
+                                                        let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
                                                     }
                                                 }
                                                 let _ = body.flow_control().release_capacity(bytes.len());
@@ -20346,6 +20386,7 @@ fn spawn_http2_server_session(
                                                 ActiveHttp2Stream {
                                                     session_id,
                                                     paused: Arc::new(AtomicBool::new(false)),
+                                                    resume_notify: Arc::new(tokio::sync::Notify::new()),
                                                 },
                                             );
                                             pushed_stream_id
@@ -21211,6 +21252,7 @@ where
                 javascript_sync_rpc_arg_u64(&request.args, 0, "net.http2_stream_resume stream id")?;
             let stream = http2_stream_for_id(process, stream_id)?;
             stream.paused.store(false, Ordering::SeqCst);
+            stream.resume_notify.notify_waiters();
             Ok(Value::Null)
         }
         "net.http2_stream_respond_with_file" => {

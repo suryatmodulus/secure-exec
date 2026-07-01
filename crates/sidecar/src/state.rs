@@ -546,6 +546,7 @@ pub(crate) struct ActiveHttp2State {
 pub(crate) struct Http2SharedState {
     pub(crate) next_session_id: u64,
     pub(crate) next_stream_id: u64,
+    pub(crate) ready: Arc<Condvar>,
     pub(crate) servers: BTreeMap<u64, ActiveHttp2Server>,
     pub(crate) sessions: BTreeMap<u64, ActiveHttp2Session>,
     pub(crate) streams: BTreeMap<u64, ActiveHttp2Stream>,
@@ -571,6 +572,7 @@ pub(crate) struct ActiveHttp2Session {
 pub(crate) struct ActiveHttp2Stream {
     pub(crate) session_id: u64,
     pub(crate) paused: Arc<AtomicBool>,
+    pub(crate) resume_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
