@@ -1,14 +1,21 @@
+use hickory_proto::rr::domain::Name;
+use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::{RData, Record, RecordType};
+#[cfg(not(target_arch = "wasm32"))]
 use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+#[cfg(not(target_arch = "wasm32"))]
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::proto::rr::domain::Name;
-use hickory_resolver::proto::rr::rdata::{A, AAAA};
-use hickory_resolver::proto::rr::{RData, Record, RecordType};
+#[cfg(not(target_arch = "wasm32"))]
 use hickory_resolver::TokioResolver;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{mpsc, Arc, Mutex};
+use std::net::{IpAddr, SocketAddr};
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{mpsc, Mutex};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DnsConfig {
@@ -211,10 +218,18 @@ pub trait DnsResolver {
 
 pub type SharedDnsResolver = Arc<dyn DnsResolver + Send + Sync>;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct HickoryDnsResolver {
     worker: Mutex<mpsc::Sender<DnsWorkerRequest>>,
 }
 
+/// On wasm the kernel has no tokio runtime or host DNS stack, so the resolver is
+/// a unit type whose `DnsResolver` impl reports that name resolution is
+/// unavailable; guests must supply DNS overrides or literal addresses.
+#[cfg(target_arch = "wasm32")]
+pub struct HickoryDnsResolver;
+
+#[cfg(not(target_arch = "wasm32"))]
 enum DnsWorkerRequest {
     LookupIp {
         hostname: String,
@@ -229,6 +244,7 @@ enum DnsWorkerRequest {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for HickoryDnsResolver {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -242,6 +258,14 @@ impl Default for HickoryDnsResolver {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl Default for HickoryDnsResolver {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl HickoryDnsResolver {
     fn send_lookup_ip(
         &self,
@@ -286,6 +310,7 @@ impl HickoryDnsResolver {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl DnsResolver for HickoryDnsResolver {
     fn lookup_ip(&self, request: &DnsLookupRequest) -> Result<Vec<IpAddr>, DnsResolverError> {
         self.send_lookup_ip(
@@ -306,6 +331,7 @@ impl DnsResolver for HickoryDnsResolver {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_dns_worker(receiver: mpsc::Receiver<DnsWorkerRequest>) {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -348,6 +374,7 @@ fn run_dns_worker(receiver: mpsc::Receiver<DnsWorkerRequest>) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl DnsWorkerRequest {
     fn respond_with_error(self, error: DnsResolverError) {
         match self {
@@ -361,6 +388,7 @@ impl DnsWorkerRequest {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn worker_resolver_for(
     resolvers: &mut BTreeMap<Vec<SocketAddr>, TokioResolver>,
     name_servers: &[SocketAddr],
@@ -387,6 +415,7 @@ fn worker_resolver_for(
     Ok(resolver)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn worker_lookup_ip(
     runtime: &tokio::runtime::Runtime,
     resolvers: &mut BTreeMap<Vec<SocketAddr>, TokioResolver>,
@@ -419,6 +448,7 @@ fn worker_lookup_ip(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn worker_lookup_records(
     runtime: &tokio::runtime::Runtime,
     resolvers: &mut BTreeMap<Vec<SocketAddr>, TokioResolver>,
@@ -444,6 +474,26 @@ fn worker_lookup_records(
         }
         Ok(records)
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+impl DnsResolver for HickoryDnsResolver {
+    fn lookup_ip(&self, request: &DnsLookupRequest) -> Result<Vec<IpAddr>, DnsResolverError> {
+        Err(DnsResolverError::lookup_failed(format!(
+            "browser sidecar DNS resolver is unavailable for {}; configure DNS overrides or pass a literal address",
+            request.hostname()
+        )))
+    }
+
+    fn lookup_records(
+        &self,
+        request: &DnsRecordLookupRequest,
+    ) -> Result<Vec<Record>, DnsResolverError> {
+        Err(DnsResolverError::lookup_failed(format!(
+            "browser sidecar DNS record resolver is unavailable for {}; configure DNS overrides or pass a literal address",
+            request.hostname()
+        )))
+    }
 }
 
 pub fn normalize_dns_hostname(hostname: &str) -> Result<String, DnsResolverError> {
@@ -557,6 +607,7 @@ fn canonical_dns_subject(hostname: &str) -> Result<String, DnsResolverError> {
     normalize_dns_hostname(trimmed)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolver_config_from_name_servers(name_servers: &[SocketAddr]) -> Option<ResolverConfig> {
     if name_servers.is_empty() {
         return None;

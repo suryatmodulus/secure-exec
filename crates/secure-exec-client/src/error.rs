@@ -1,4 +1,4 @@
-pub use secure_exec_sidecar::wire::ProtocolCodecError;
+pub use secure_exec_sidecar_protocol::wire::ProtocolCodecError;
 
 /// Errors produced by the low-level sidecar transport.
 #[derive(thiserror::Error, Debug)]

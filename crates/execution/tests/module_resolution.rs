@@ -1,4 +1,5 @@
 use secure_exec_execution::javascript::ModuleResolutionTestHarness;
+use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -67,6 +68,84 @@ fn assert_require(fixture: &Fixture, specifier: &str, from_path: &str, expected:
         resolver.resolve_require(specifier, from_path),
         Some(String::from(expected))
     );
+}
+
+fn assert_require_missing(fixture: &Fixture, specifier: &str, from_path: &str) {
+    let mut resolver = fixture.resolver();
+    assert_eq!(resolver.resolve_require(specifier, from_path), None);
+}
+
+#[derive(Debug, Deserialize)]
+struct SharedModuleResolutionFixture {
+    cases: Vec<SharedModuleResolutionCase>,
+    formats: Vec<SharedModuleFormatCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SharedModuleResolutionCase {
+    name: String,
+    files: std::collections::BTreeMap<String, String>,
+    resolves: Vec<SharedModuleResolutionExpectation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SharedModuleResolutionExpectation {
+    specifier: String,
+    from: String,
+    mode: String,
+    expected: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SharedModuleFormatCase {
+    name: String,
+    files: std::collections::BTreeMap<String, String>,
+    path: String,
+    expected: Option<String>,
+}
+
+#[test]
+fn matches_shared_native_browser_conformance_fixture() {
+    let fixture: SharedModuleResolutionFixture = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/module-resolution-conformance.json"
+    ))
+    .expect("parse shared module resolution fixture");
+
+    for test_case in fixture.cases {
+        let fs_fixture = Fixture::new();
+        for (path, contents) in &test_case.files {
+            fs_fixture.write(path, contents);
+        }
+
+        for resolution in &test_case.resolves {
+            let mut resolver = fs_fixture.resolver();
+            let actual = match resolution.mode.as_str() {
+                "import" => resolver.resolve_import(&resolution.specifier, &resolution.from),
+                "require" => resolver.resolve_require(&resolution.specifier, &resolution.from),
+                other => panic!("unsupported shared fixture mode {other}"),
+            };
+            assert_eq!(
+                actual, resolution.expected,
+                "{}: {} from {} in {} mode",
+                test_case.name, resolution.specifier, resolution.from, resolution.mode
+            );
+        }
+    }
+
+    for format_case in fixture.formats {
+        let fs_fixture = Fixture::new();
+        for (path, contents) in &format_case.files {
+            fs_fixture.write(path, contents);
+        }
+
+        let mut resolver = fs_fixture.resolver();
+        let actual = resolver.module_format(&format_case.path).map(String::from);
+        assert_eq!(
+            actual, format_case.expected,
+            "{}: format for {}",
+            format_case.name, format_case.path
+        );
+    }
 }
 
 #[test]
@@ -543,7 +622,7 @@ fn main_field_still_beats_nonstandard_module_field() {
 }
 
 #[test]
-fn pnpm_candidate_dir_is_checked_without_flattened_package_symlink() {
+fn pnpm_store_dir_is_not_checked_without_flattened_package_symlink() {
     let fixture = Fixture::new();
     fixture.write_json(
         "project/node_modules/.pnpm/node_modules/pkg/package.json",
@@ -553,12 +632,7 @@ fn pnpm_candidate_dir_is_checked_without_flattened_package_symlink() {
         "project/node_modules/.pnpm/node_modules/pkg/index.js",
         "module.exports = 1;",
     );
-    assert_require(
-        &fixture,
-        "pkg",
-        "/root/project/src/index.js",
-        "/root/project/node_modules/.pnpm/node_modules/pkg/index.js",
-    );
+    assert_require_missing(&fixture, "pkg", "/root/project/src/index.js");
 }
 
 #[test]

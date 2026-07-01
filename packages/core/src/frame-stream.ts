@@ -1,4 +1,5 @@
 import type { Readable, Writable } from "node:stream";
+import type { ByteArray } from "./framing.js";
 import {
 	encodeLengthPrefixedPayload,
 	tryDecodeLengthPrefixedPayload,
@@ -11,7 +12,17 @@ export interface StdioFrameTransportOptions<TReadFrame, TWriteFrame> {
 	decodeFrame: (payload: Uint8Array) => TReadFrame;
 }
 
-export class StdioFrameTransport<TReadFrame, TWriteFrame = TReadFrame> {
+export interface FrameTransport<TReadFrame, TWriteFrame = TReadFrame> {
+	onFrame(handler: (frame: TReadFrame) => void): () => void;
+	onError(handler: (error: Error) => void): () => void;
+	onEnd(handler: () => void): () => void;
+	writeFrame(frame: TWriteFrame): Promise<void>;
+	dispose(): void;
+}
+
+export class StdioFrameTransport<TReadFrame, TWriteFrame = TReadFrame>
+	implements FrameTransport<TReadFrame, TWriteFrame>
+{
 	private readonly stdin: Writable;
 	private readonly stdout: Readable;
 	private readonly encodeFrame: (frame: TWriteFrame) => Uint8Array;
@@ -19,7 +30,7 @@ export class StdioFrameTransport<TReadFrame, TWriteFrame = TReadFrame> {
 	private readonly frameListeners = new Set<(frame: TReadFrame) => void>();
 	private readonly errorListeners = new Set<(error: Error) => void>();
 	private readonly endListeners = new Set<() => void>();
-	private stdoutBuffer: Buffer = Buffer.alloc(0);
+	private stdoutBuffer: ByteArray = new Uint8Array(0);
 
 	constructor(options: StdioFrameTransportOptions<TReadFrame, TWriteFrame>) {
 		this.stdin = options.stdin;
@@ -75,14 +86,12 @@ export class StdioFrameTransport<TReadFrame, TWriteFrame = TReadFrame> {
 		this.endListeners.clear();
 	}
 
-	private readonly handleData = (chunk: Buffer | string): void => {
-		const bytes =
+	private readonly handleData = (chunk: ByteArray | string): void => {
+		const bytes: ByteArray =
 			typeof chunk === "string"
-				? Buffer.from(chunk)
-				: Buffer.isBuffer(chunk)
-					? chunk
-					: Buffer.from(chunk);
-		this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, bytes]);
+				? new TextEncoder().encode(chunk)
+				: new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+		this.stdoutBuffer = concatBytes(this.stdoutBuffer, bytes);
 		this.drainFrames();
 	};
 
@@ -118,4 +127,17 @@ export class StdioFrameTransport<TReadFrame, TWriteFrame = TReadFrame> {
 			}
 		}
 	}
+}
+
+function concatBytes(left: ByteArray, right: ByteArray): ByteArray {
+	if (left.length === 0) {
+		return right;
+	}
+	if (right.length === 0) {
+		return left;
+	}
+	const combined = new Uint8Array(left.length + right.length);
+	combined.set(left);
+	combined.set(right, left.length);
+	return combined;
 }

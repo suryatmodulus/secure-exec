@@ -813,6 +813,12 @@ fn javascript_execution_virtual_os_identity_comes_from_guest_runtime_not_env() {
                 os_cpu_count: Some(7),
                 os_totalmem: Some(8_000_000_000),
                 os_freemem: Some(4_000_000_000),
+                os_hostname: Some(String::from("vm-hostname")),
+                os_tmpdir: Some(String::from("/vm-tmp")),
+                os_type: Some(String::from("VMType")),
+                os_release: Some(String::from("1.2.3-vm")),
+                os_version: Some(String::from("VM secure-exec build 42")),
+                os_machine: Some(String::from("vm64")),
                 ..Default::default()
             },
             vm_id: String::from("vm-js"),
@@ -835,6 +841,12 @@ import os from "node:os";
 if (os.cpus().length !== 7) throw new Error(`cpus=${os.cpus().length}`);
 if (os.totalmem() !== 8000000000) throw new Error(`totalmem=${os.totalmem()}`);
 if (os.freemem() !== 4000000000) throw new Error(`freemem=${os.freemem()}`);
+if (os.hostname() !== "vm-hostname") throw new Error(`hostname=${os.hostname()}`);
+if (os.tmpdir() !== "/vm-tmp") throw new Error(`tmpdir=${os.tmpdir()}`);
+if (os.type() !== "VMType") throw new Error(`type=${os.type()}`);
+if (os.release() !== "1.2.3-vm") throw new Error(`release=${os.release()}`);
+if (os.version() !== "VM secure-exec build 42") throw new Error(`version=${os.version()}`);
+if (os.machine() !== "vm64") throw new Error(`machine=${os.machine()}`);
 "#,
             )),
         })
@@ -3268,6 +3280,7 @@ if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.te
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
 }
 
+#[test]
 fn javascript_execution_v8_crypto_basic_operations_emit_expected_sync_rpcs() {
     assert_eq!(
         map_bridge_method("_cryptoHashDigest"),

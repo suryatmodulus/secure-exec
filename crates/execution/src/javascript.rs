@@ -483,6 +483,16 @@ pub struct GuestRuntimeConfig {
     pub os_homedir: Option<String>,
     /// `os.hostname()`.
     pub os_hostname: Option<String>,
+    /// `os.tmpdir()`.
+    pub os_tmpdir: Option<String>,
+    /// `os.type()`.
+    pub os_type: Option<String>,
+    /// `os.release()`.
+    pub os_release: Option<String>,
+    /// `os.version()`.
+    pub os_version: Option<String>,
+    /// `os.machine()`.
+    pub os_machine: Option<String>,
     /// Default login shell.
     pub os_shell: Option<String>,
     /// `os.userInfo().username`.
@@ -700,6 +710,8 @@ struct GuestPathTranslator {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct LocalPackageJson {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     main: Option<String>,
     #[serde(default)]
@@ -1161,6 +1173,12 @@ impl ModuleResolutionTestHarness {
     pub fn resolve_require(&mut self, specifier: &str, from_path: &str) -> Option<String> {
         self.local_bridge
             .resolve_module(specifier, from_path, ModuleResolveMode::Require)
+    }
+
+    pub fn module_format(&mut self, path: &str) -> Option<&'static str> {
+        self.local_bridge
+            .module_format(path)
+            .map(LocalResolvedModuleFormat::as_str)
     }
 }
 
@@ -2743,6 +2761,11 @@ fn prepend_v8_runtime_shim(
         "freemem": guest_runtime.os_freemem,
         "homedir": guest_runtime.os_homedir,
         "hostname": guest_runtime.os_hostname,
+        "tmpdir": guest_runtime.os_tmpdir,
+        "type": guest_runtime.os_type,
+        "release": guest_runtime.os_release,
+        "version": guest_runtime.os_version,
+        "machine": guest_runtime.os_machine,
         "shell": guest_runtime.os_shell,
         "user": guest_runtime.os_user,
     })
@@ -3754,7 +3777,8 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
         } else if specifier.starts_with('#') {
             self.resolve_package_imports(specifier, &normalized_from, mode)
         } else {
-            self.resolve_node_modules(specifier, &normalized_from, mode)
+            self.resolve_package_self_reference(specifier, &normalized_from, mode)
+                .or_else(|| self.resolve_node_modules(specifier, &normalized_from, mode))
         };
 
         self.cache
@@ -3867,6 +3891,29 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
         None
     }
 
+    fn resolve_package_self_reference(
+        &mut self,
+        request: &str,
+        from_dir: &str,
+        mode: ModuleResolveMode,
+    ) -> Option<String> {
+        let (package_name, subpath) = split_package_request(request)?;
+        let mut dir = normalize_guest_path(from_dir);
+        loop {
+            let pkg_json_path = join_guest_path(&dir, "package.json");
+            if let Some(pkg_json) = self.read_package_json(&pkg_json_path) {
+                if pkg_json.name.as_deref() == Some(package_name) {
+                    return self.resolve_package_entry_from_dir(&dir, subpath, mode);
+                }
+            }
+            if dir == "/" {
+                break;
+            }
+            dir = dirname_guest_path(&dir);
+        }
+        None
+    }
+
     fn resolve_node_modules(
         &mut self,
         request: &str,
@@ -3877,21 +3924,12 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
 
         // Standard Node resolution over the faithful VFS: walk ancestor
         // `node_modules` directories (following symlinks via the importer's
-        // realpath), checking directly-addressable package dirs plus the
-        // deterministic pnpm hoist location at each level. There is intentionally
-        // no package-manager-aware `.pnpm` virtual-store scan — pnpm/yarn layouts
-        // resolve because the VFS exposes their symlinks, not because the resolver
-        // understands their internals (see CLAUDE.md npm Compatibility).
+        // realpath). pnpm/yarn layouts resolve because the VFS exposes their
+        // symlinks, not because the resolver understands package-manager
+        // internals (see CLAUDE.md npm Compatibility).
         let mut dir = normalize_guest_path(from_dir);
         loop {
             for package_dir in node_modules_direct_candidate_dirs(&dir, package_name) {
-                if let Some(entry) =
-                    self.resolve_package_entry_from_dir(&package_dir, subpath, mode)
-                {
-                    return Some(entry);
-                }
-            }
-            for package_dir in node_modules_pnpm_fallback_candidate_dirs(&dir, package_name) {
                 if let Some(entry) =
                     self.resolve_package_entry_from_dir(&package_dir, subpath, mode)
                 {
@@ -4066,10 +4104,6 @@ fn percent_decode(raw: &str) -> Option<String> {
     let mut decoded = Vec::with_capacity(bytes.len());
     while index < bytes.len() {
         match bytes[index] {
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
             b'%' if index + 2 < bytes.len() => {
                 if let (Some(high), Some(low)) =
                     (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
@@ -6750,24 +6784,6 @@ fn node_modules_direct_candidate_dirs(dir: &str, package_name: &str) -> Vec<Stri
     ));
     if dir == "/node_modules" || dir.ends_with("/node_modules") {
         candidates.insert(join_guest_path(dir, package_name));
-    }
-    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
-    candidates.sort();
-    candidates
-}
-
-fn node_modules_pnpm_fallback_candidate_dirs(dir: &str, package_name: &str) -> Vec<String> {
-    let mut candidates = HashSet::new();
-    candidates.insert(join_guest_path(
-        dir,
-        &format!("node_modules/.pnpm/node_modules/{package_name}"),
-    ));
-    if let Some(index) = dir.rfind("/node_modules/") {
-        let root = &dir[..index + "/node_modules".len()];
-        candidates.insert(join_guest_path(
-            root,
-            &format!(".pnpm/node_modules/{package_name}"),
-        ));
     }
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort();

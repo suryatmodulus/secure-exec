@@ -23,6 +23,7 @@ run_step() {
 
 run_step pnpm install --frozen-lockfile
 run_step pnpm build
+run_step pnpm run check-generated
 run_step pnpm check-types
 run_step node --test scripts/check-secure-exec-boundary.test.mjs
 run_step node scripts/check-secure-exec-boundary.mjs

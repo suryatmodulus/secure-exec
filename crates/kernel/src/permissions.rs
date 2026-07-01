@@ -359,6 +359,10 @@ impl<F> PermissionedFileSystem<F> {
         &mut self.inner
     }
 
+    pub fn set_permissions(&mut self, permissions: Permissions) {
+        self.permissions = permissions;
+    }
+
     fn check(&self, op: FsOperation, path: &str) -> VfsResult<()> {
         validate_path(path)?;
         // Standard emulated character devices (/dev/null, /dev/zero, /dev/urandom,

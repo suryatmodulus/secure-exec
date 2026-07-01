@@ -14,7 +14,7 @@ test("playground harness boots a real browser runtime in Chromium", async ({
 	expect(result.stdio).toEqual([
 		{
 			channel: "stdout",
-			message: "harness-ready",
+			message: "harness-ready\n",
 		},
 	]);
 });

@@ -62,12 +62,25 @@
 		}
 	},
 	"scripts": {
-		"check-types": "tsc --noEmit",
+		"check:bridge-contract": "node ./scripts/check-bridge-contract.mjs",
+		"check:signals": "node ./scripts/check-signal-table.mjs",
+		"check:wasi-surface": "node ./scripts/check-wasi-surface.mjs",
+		"check-types": "pnpm check:bridge-contract && pnpm check:signals && pnpm check:wasi-surface && tsc --noEmit",
 		"build": "tsc",
+		"build:sidecar-wasm": "node ./scripts/build-sidecar-wasm.mjs",
+		"build:dist-wasm": "node ./scripts/build-dist-wasm.mjs",
+		"build:dist": "pnpm build && pnpm build:dist-wasm",
+		"generate:wasi-polyfill": "node ./scripts/generate-wasi-polyfill.mjs",
 		"test:browser": "node ./scripts/run-browser-tests.mjs",
-		"test": "pnpm build"
+		"test:converged": "pnpm test && pnpm test:browser",
+		"test:integration": "pnpm build:sidecar-wasm && vitest run tests/integration",
+		"test:unit": "vitest run tests/runtime tests/runtime-driver",
+		"test": "pnpm check:bridge-contract && pnpm check:signals && pnpm check:wasi-surface && node --check ./scripts/build-browser-test-assets.mjs && node --check ./scripts/serve-browser-tests.mjs && pnpm test:unit && pnpm build"
 	},
 	"dependencies": {
+		"@secure-exec/core": "workspace:*",
+		"@noble/ciphers": "^2.2.0",
+		"@noble/hashes": "^2.2.0",
 		"sucrase": "^3.35.0"
 	},
 	"devDependencies": {

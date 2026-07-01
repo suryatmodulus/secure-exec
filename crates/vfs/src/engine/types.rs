@@ -1,6 +1,6 @@
 use crate::engine::error::{VfsError, VfsResult};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_PATH: usize = 4096;
 pub const MAX_SYMLINK_DEPTH: usize = 40;

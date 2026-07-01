@@ -337,6 +337,34 @@ fn window_size_reports_default_and_resize_updates() {
 }
 
 #[test]
+fn control_character_without_foreground_process_group_clears_canonical_line() {
+    let manager = PtyManager::new();
+    let pty = manager.create_pty();
+
+    manager
+        .write(pty.master.description.id(), b"partial command")
+        .expect("write partial line");
+    manager
+        .write(pty.master.description.id(), [0x03])
+        .expect("write intr char");
+
+    let line = manager
+        .read(pty.slave.description.id(), 64)
+        .expect("read canonical interrupt fallback")
+        .expect("fallback line should be available");
+    assert_eq!(line, b"\n");
+
+    let echo = manager
+        .read(pty.master.description.id(), 64)
+        .expect("read interrupt echo")
+        .expect("echo should be available");
+    assert_eq!(
+        String::from_utf8(echo).expect("valid utf8"),
+        "partial command^C\r\n"
+    );
+}
+
+#[test]
 fn peer_close_returns_hangup_instead_of_blocking() {
     let manager = PtyManager::new();
     let pty = manager.create_pty();

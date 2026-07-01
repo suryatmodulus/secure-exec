@@ -211,7 +211,7 @@ fn udp_send_and_receive_require_bound_sockets_and_bound_targets() {
             b"payload",
         )
         .expect_err("missing receiver should fail");
-    assert_eq!(missing_target_error.code(), "ECONNREFUSED");
+    assert_eq!(missing_target_error.code(), "EPERM");
 
     let unbound_recv_error = kernel
         .socket_recv_datagram("shell", receiver.pid(), receiver_socket, 64)

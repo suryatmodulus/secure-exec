@@ -4,15 +4,10 @@ mod acp;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/json_rpc.rs"]
 mod json_rpc;
-mod generated_protocol {
-    pub use secure_exec_sidecar::generated_protocol::*;
-}
-mod wire {
-    pub use secure_exec_sidecar::wire::*;
-}
 #[allow(dead_code, unused_imports, clippy::enum_variant_names)]
-#[path = "../src/protocol.rs"]
-mod protocol;
+mod protocol {
+    pub use secure_exec_sidecar_protocol::protocol::*;
+}
 
 use acp::compat::{
     is_cancel_method_not_found, maybe_normalize_permission_response,

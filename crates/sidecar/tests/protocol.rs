@@ -16,8 +16,9 @@ use serde_json::json;
 use std::hint::black_box;
 use std::time::Instant;
 
-const BARE_SCHEMA_V1: &str = include_str!("../protocol/secure_exec_sidecar_v1.bare");
-const BARE_MIGRATION_PLAN: &str = include_str!("../protocol/README.md");
+const BARE_SCHEMA_V1: &str =
+    include_str!("../../sidecar-protocol/protocol/secure_exec_sidecar_v1.bare");
+const BARE_MIGRATION_PLAN: &str = include_str!("../../sidecar-protocol/protocol/README.md");
 
 #[test]
 fn guest_runtime_kind_round_trips_through_generated_codec() {

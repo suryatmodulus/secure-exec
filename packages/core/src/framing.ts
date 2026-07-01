@@ -1,33 +1,36 @@
 export const LENGTH_PREFIX_BYTES = 4;
 
+export type ByteArray = Uint8Array<ArrayBufferLike>;
+
 export interface LengthPrefixedPayload {
-	payload: Buffer;
-	remaining: Buffer;
+	payload: ByteArray;
+	remaining: ByteArray;
 }
 
-export function encodeLengthPrefixedPayload(payload: Uint8Array): Buffer {
-	const encoded = Buffer.allocUnsafe(LENGTH_PREFIX_BYTES + payload.length);
-	encoded.writeUInt32BE(payload.length, 0);
+export function encodeLengthPrefixedPayload(payload: Uint8Array): Uint8Array {
+	const encoded = new Uint8Array(LENGTH_PREFIX_BYTES + payload.length);
+	const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+	view.setUint32(0, payload.length, false);
 	encoded.set(payload, LENGTH_PREFIX_BYTES);
 	return encoded;
 }
 
 export function tryDecodeLengthPrefixedPayload(
-	buffer: Uint8Array,
+	buffer: ByteArray,
 ): LengthPrefixedPayload | null {
-	const source = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-	if (source.length < LENGTH_PREFIX_BYTES) {
+	if (buffer.length < LENGTH_PREFIX_BYTES) {
 		return null;
 	}
 
-	const declaredLength = source.readUInt32BE(0);
+	const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+	const declaredLength = view.getUint32(0, false);
 	const frameEnd = LENGTH_PREFIX_BYTES + declaredLength;
-	if (source.length < frameEnd) {
+	if (buffer.length < frameEnd) {
 		return null;
 	}
 
 	return {
-		payload: source.subarray(LENGTH_PREFIX_BYTES, frameEnd),
-		remaining: source.subarray(frameEnd),
+		payload: buffer.subarray(LENGTH_PREFIX_BYTES, frameEnd),
+		remaining: buffer.subarray(frameEnd),
 	};
 }

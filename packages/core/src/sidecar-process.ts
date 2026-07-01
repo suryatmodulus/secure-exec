@@ -12,13 +12,7 @@ import {
 	type LiveRootFilesystemLowerDescriptor,
 } from "./filesystem.js";
 import type { CreateVmConfig } from "./generated/CreateVmConfig.js";
-import {
-	DEFAULT_SIDECAR_EVENT_BUFFER_CAPACITY,
-	DEFAULT_SIDECAR_FORCE_EXIT_MS,
-	DEFAULT_SIDECAR_FRAME_TIMEOUT_MS,
-	DEFAULT_SIDECAR_GRACEFUL_EXIT_MS,
-	StdioSidecarProtocolClient,
-} from "./native-client.js";
+import type { SidecarProcessTransport } from "./sidecar-client.js";
 import { type LiveOwnershipScope } from "./ownership.js";
 import {
 	type LiveFsPermissionRule,
@@ -52,7 +46,7 @@ import {
 export {
 	SidecarProcessError,
 	SidecarProcessExited,
-} from "./process.js";
+} from "./sidecar-errors.js";
 export { SidecarEventBufferOverflow } from "./event-buffer.js";
 // `Sidecar` is the public name for the native sidecar process client. The class
 // is `SidecarProcess` internally; consumers import it as `Sidecar` via the
@@ -61,7 +55,10 @@ export { SidecarProcess as Sidecar };
 
 const BRIDGE_CONTRACT_VERSION = 1;
 
-export const NATIVE_SIDECAR_FRAME_TIMEOUT_MS = DEFAULT_SIDECAR_FRAME_TIMEOUT_MS;
+export const NATIVE_SIDECAR_FRAME_TIMEOUT_MS = 120_000;
+const DEFAULT_SIDECAR_EVENT_BUFFER_CAPACITY = 4_096;
+const DEFAULT_SIDECAR_GRACEFUL_EXIT_MS = 5_000;
+const DEFAULT_SIDECAR_FORCE_EXIT_MS = 2_000;
 
 type OwnershipScope = LiveOwnershipScope;
 
@@ -203,6 +200,30 @@ export interface SidecarSpawnOptions {
 	payloadCodec?: NativeTransportPayloadCodec;
 }
 
+export interface ResolvedSidecarSpawnOptions {
+	cwd?: string;
+	command?: string;
+	args: string[];
+	frameTimeoutMs: number;
+	eventBufferCapacity: number;
+	gracefulExitMs: number;
+	forceExitMs: number;
+	disposedErrorMessage: string;
+	payloadCodec: NativeTransportPayloadCodec;
+}
+
+type SidecarProcessSpawnFactory = (
+	options: ResolvedSidecarSpawnOptions,
+) => SidecarProcessTransport;
+
+let sidecarProcessSpawnFactory: SidecarProcessSpawnFactory | null = null;
+
+export function registerSidecarProcessSpawnFactory(
+	factory: SidecarProcessSpawnFactory,
+): void {
+	sidecarProcessSpawnFactory = factory;
+}
+
 export interface AuthenticatedSession {
 	connectionId: string;
 	sessionId: string;
@@ -284,16 +305,25 @@ export interface SidecarPersistenceFlushed {
 }
 
 export class SidecarProcess {
-	private readonly protocolClient: StdioSidecarProtocolClient;
+	private readonly protocolClient: SidecarProcessTransport;
 
-	private constructor(protocolClient: StdioSidecarProtocolClient) {
+	private constructor(protocolClient: SidecarProcessTransport) {
 		this.protocolClient = protocolClient;
+	}
+
+	static fromClient(protocolClient: SidecarProcessTransport): SidecarProcess {
+		return new SidecarProcess(protocolClient);
 	}
 
 	static spawn(
 		options: SidecarSpawnOptions = {},
 	): SidecarProcess {
-		const protocolClient = StdioSidecarProtocolClient.spawn({
+		if (!sidecarProcessSpawnFactory) {
+			throw new Error(
+				"native sidecar spawn is not registered; import @secure-exec/core/native-client before calling SidecarProcess.spawn, or use SidecarProcess.fromClient",
+			);
+		}
+		const protocolClient = sidecarProcessSpawnFactory({
 			command: options.command,
 			args: options.args ?? [],
 			cwd: options.cwd,
@@ -305,7 +335,7 @@ export class SidecarProcess {
 			disposedErrorMessage: "native sidecar disposed",
 			payloadCodec: options.payloadCodec ?? "bare",
 		});
-		return new SidecarProcess(protocolClient);
+		return SidecarProcess.fromClient(protocolClient);
 	}
 
 	setSidecarRequestHandler(handler: SidecarRequestHandler | null): void {
@@ -764,7 +794,7 @@ export class SidecarProcess {
 			operation: "read_dir",
 			path,
 		});
-		return response.entries ?? [];
+		return (response.entries ?? []).map((entry) => entry.name);
 	}
 
 	async exists(
@@ -1029,7 +1059,7 @@ export class SidecarProcess {
 			payload: {
 				type: "write_stdin",
 				process_id: processId,
-				chunk: typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk,
+				chunk: typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk,
 			},
 		});
 		if (response.payload.type !== "stdin_written") {

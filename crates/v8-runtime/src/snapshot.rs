@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 
-use openssl::sha::sha256;
+use sha2::{Digest, Sha256};
 
 use crate::bridge::{external_refs, register_stub_bridge_fns};
 use crate::isolate::init_v8_platform;
-use crate::session::{ASYNC_BRIDGE_FNS, SYNC_BRIDGE_FNS};
+use crate::session::{async_bridge_fns, sync_bridge_fns};
 
 /// Maximum allowed snapshot blob size (50MB).
 /// Prevents resource exhaustion from degenerate bridge code.
@@ -180,8 +180,10 @@ fn create_snapshot_inner(
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
 
-        // Register stub bridge functions so the IIFE can reference them
-        register_stub_bridge_fns(scope, SYNC_BRIDGE_FNS, ASYNC_BRIDGE_FNS);
+        // Register stub bridge functions so the IIFE can reference them.
+        let sync_bridge_fns = sync_bridge_fns();
+        let async_bridge_fns = async_bridge_fns();
+        register_stub_bridge_fns(scope, sync_bridge_fns, async_bridge_fns);
 
         // Inject default config globals for bridge IIFE setup
         inject_snapshot_defaults(scope);
@@ -437,17 +439,23 @@ impl SnapshotCache {
 }
 
 /// Cache key over bridge + optional userland code. With no userland this is just
-/// `sha256(bridge_code)` (a NUL separator is only added when userland is present),
-/// so existing bridge-only entries keep their historical keys.
+/// the sha256 of the bridge code (a NUL separator is only added when userland is
+/// present), so existing bridge-only entries keep their historical keys.
 fn snapshot_cache_key(bridge_code: &str, userland_code: Option<&str>) -> SnapshotCacheKey {
     match userland_code {
-        None => sha256(bridge_code.as_bytes()),
+        None => {
+            let mut hasher = Sha256::new();
+            hasher.update(bridge_code.as_bytes());
+            hasher.finalize().into()
+        }
         Some(userland_code) => {
             let mut buf = Vec::with_capacity(bridge_code.len() + 1 + userland_code.len());
             buf.extend_from_slice(bridge_code.as_bytes());
             buf.push(0);
             buf.extend_from_slice(userland_code.as_bytes());
-            sha256(&buf)
+            let mut hasher = Sha256::new();
+            hasher.update(&buf);
+            hasher.finalize().into()
         }
     }
 }
@@ -843,8 +851,10 @@ pub fn run_snapshot_consolidated_checks() {
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
 
-            // Register all 38 bridge functions as stubs (no External data)
-            register_stub_bridge_fns(scope, SYNC_BRIDGE_FNS, ASYNC_BRIDGE_FNS);
+            // Register bridge functions as stubs (no External data).
+            let sync_bridge_fns = sync_bridge_fns();
+            let async_bridge_fns = async_bridge_fns();
+            register_stub_bridge_fns(scope, sync_bridge_fns, async_bridge_fns);
 
             // Simulate bridge IIFE: reference all bridge functions, set up
             // closures and getter facade, but never call any bridge function

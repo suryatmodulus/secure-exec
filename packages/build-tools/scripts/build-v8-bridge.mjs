@@ -35,6 +35,12 @@ const bridgeSource = path.join(
 	"assets",
 	"v8-bridge.source.js",
 );
+const bridgeContract = path.join(
+	workspaceRoot,
+	"crates",
+	"bridge",
+	"bridge-contract.json",
+);
 const defaultBridgeOutput = path.join(
 	workspaceRoot,
 	"crates",
@@ -135,12 +141,138 @@ await mkdir(path.dirname(bridgeOutput), { recursive: true });
 await mkdir(path.dirname(zlibBridgeOutput), { recursive: true });
 
 let bridgeSourceText = await readFile(bridgeSource, "utf8");
+await validateBridgeContractGlobals(bridgeSourceText);
 bridgeSourceText = bridgeSourceText.replace(/\n\s*rationale:\s*"[^"]*",?/g, "");
 bridgeSourceText = bridgeSourceText
 	.replace(/classification:\s*"hardened"/g, 'c:"h"')
 	.replace(/classification:\s*"mutable-runtime-state"/g, 'c:"m"')
 	.replace(/entry\.classification === "hardened"/g, 'entry.c==="h"')
 	.replace(/entry\.classification === "mutable-runtime-state"/g, 'entry.c==="m"');
+
+async function validateBridgeContractGlobals(sourceText) {
+	const contract = JSON.parse(await readFile(bridgeContract, "utf8"));
+	const runtimeOnlyInventoryNames = new Set([
+		"_processConfig",
+		"_osConfig",
+		"bridge",
+		"_registerHandle",
+		"_unregisterHandle",
+		"_waitForActiveHandles",
+		"_getActiveHandles",
+		"_childProcessDispatch",
+		"_childProcessModule",
+		"_osModule",
+		"_moduleModule",
+		"_httpModule",
+		"_httpsModule",
+		"_http2Module",
+		"_dnsModule",
+		"_dgramModule",
+		"_netModule",
+		"_tlsModule",
+		"_netSocketDispatch",
+		"_httpServerDispatch",
+		"_httpServerUpgradeDispatch",
+		"_httpServerConnectDispatch",
+		"_http2Dispatch",
+		"_timerDispatch",
+		"_upgradeSocketData",
+		"_upgradeSocketEnd",
+		"ProcessExitError",
+		"_fs",
+		"require",
+		"_requireFrom",
+		"__dynamicImport",
+		"_moduleCache",
+		"_pendingModules",
+		"_currentModule",
+		"_stdinData",
+		"_stdinPosition",
+		"_stdinEnded",
+		"_stdinFlowMode",
+		"module",
+		"exports",
+		"__filename",
+		"__dirname",
+		"fetch",
+		"Headers",
+		"Request",
+		"Response",
+		"DOMException",
+		"__importMetaResolve",
+		"Blob",
+		"File",
+		"FormData",
+	]);
+	const contractNames = new Set();
+	const duplicateContractNames = new Set();
+	for (const group of contract.groups ?? []) {
+		for (const name of group.names ?? []) {
+			if (contractNames.has(name)) {
+				duplicateContractNames.add(name);
+			}
+			contractNames.add(name);
+		}
+	}
+
+	const inventoryMatch = sourceText.match(
+		/var\s+NODE_CUSTOM_GLOBAL_INVENTORY\s*=\s*\[([\s\S]*?)\n\s*\];/,
+	);
+	if (!inventoryMatch) {
+		throw new Error(
+			"Failed to find NODE_CUSTOM_GLOBAL_INVENTORY in v8-bridge.source.js",
+		);
+	}
+
+	const inventoryNames = new Set();
+	const duplicateInventoryNames = new Set();
+	for (const match of inventoryMatch[1].matchAll(/\bname:\s*"([^"]+)"/g)) {
+		const name = match[1];
+		if (inventoryNames.has(name)) {
+			duplicateInventoryNames.add(name);
+		}
+		inventoryNames.add(name);
+	}
+
+	const missingInventoryNames = [...contractNames].filter(
+		(name) => !inventoryNames.has(name),
+	);
+	const unexpectedInventoryNames = [...inventoryNames].filter(
+		(name) => !contractNames.has(name) && !runtimeOnlyInventoryNames.has(name),
+	);
+	const staleRuntimeOnlyNames = [...runtimeOnlyInventoryNames].filter(
+		(name) => !inventoryNames.has(name),
+	);
+	const errors = [];
+	if (duplicateContractNames.size > 0) {
+		errors.push(
+			`duplicate names in bridge-contract.json: ${[...duplicateContractNames].sort().join(", ")}`,
+		);
+	}
+	if (duplicateInventoryNames.size > 0) {
+		errors.push(
+			`duplicate names in NODE_CUSTOM_GLOBAL_INVENTORY: ${[...duplicateInventoryNames].sort().join(", ")}`,
+		);
+	}
+	if (missingInventoryNames.length > 0) {
+		errors.push(
+			`contract names missing from NODE_CUSTOM_GLOBAL_INVENTORY: ${missingInventoryNames.sort().join(", ")}`,
+		);
+	}
+	if (unexpectedInventoryNames.length > 0) {
+		errors.push(
+			`NODE_CUSTOM_GLOBAL_INVENTORY names missing from bridge-contract.json or the runtime-only allowlist: ${unexpectedInventoryNames.sort().join(", ")}`,
+		);
+	}
+	if (staleRuntimeOnlyNames.length > 0) {
+		errors.push(
+			`runtime-only inventory allowlist names missing from NODE_CUSTOM_GLOBAL_INVENTORY: ${staleRuntimeOnlyNames.sort().join(", ")}`,
+		);
+	}
+	if (errors.length > 0) {
+		throw new Error(`V8 bridge contract drift detected:\n  - ${errors.join("\n  - ")}`);
+	}
+}
 
 async function rewriteUndiciRuntimeFeaturesBundle(bundlePath, { required } = { required: false }) {
 	const bundleText = await readFile(bundlePath, "utf8");

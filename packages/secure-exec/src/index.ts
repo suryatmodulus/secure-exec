@@ -21,4 +21,4 @@ export type {
 	NodeRuntimeSpawnOptions,
 	NodeRuntimeWaitForListenerOptions,
 } from "@secure-exec/core";
-export { Sidecar, NodeRuntime } from "@secure-exec/core";
+export { SidecarProcess as Sidecar, NodeRuntime } from "@secure-exec/core";

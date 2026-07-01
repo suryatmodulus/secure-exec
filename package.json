@@ -9,6 +9,7 @@
 	},
 	"scripts": {
 		"build": "turbo run build",
+		"check-generated": "node scripts/check-generated-artifacts.mjs",
 		"check-types": "turbo run check-types",
 		"test": "turbo run test",
 		"lint": "pnpm biome check ."

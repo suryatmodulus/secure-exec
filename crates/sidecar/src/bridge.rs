@@ -3,9 +3,7 @@
 #![cfg_attr(test, allow(dead_code))]
 
 use crate::plugins::register_native_mount_plugins;
-use crate::service::{
-    audit_fields, emit_security_audit_event, filesystem_permission_capability, plugin_error,
-};
+use crate::service::{audit_fields, emit_security_audit_event, plugin_error};
 use crate::state::{BridgeError, SharedBridge, SharedSidecarRequestClient};
 use crate::{NativeSidecarBridge, SidecarError};
 
@@ -19,6 +17,7 @@ use secure_exec_kernel::permissions::{
     PermissionDecision, Permissions,
 };
 use secure_exec_kernel::vfs::MemoryFileSystem;
+use secure_exec_sidecar_core::permissions::filesystem_permission_capability;
 use std::fmt;
 use std::sync::Arc;
 
@@ -1074,12 +1073,12 @@ where
                 FsOperation::Remove => FilesystemAccess::Remove,
                 FsOperation::Rename => FilesystemAccess::Rename,
                 FsOperation::Symlink => FilesystemAccess::Symlink,
-                FsOperation::ReadLink => FilesystemAccess::Read,
+                FsOperation::ReadLink => FilesystemAccess::ReadLink,
                 FsOperation::Link => FilesystemAccess::Write,
                 FsOperation::Chmod => FilesystemAccess::Write,
                 FsOperation::Chown => FilesystemAccess::Write,
                 FsOperation::Utimes => FilesystemAccess::Write,
-                FsOperation::Truncate => FilesystemAccess::Write,
+                FsOperation::Truncate => FilesystemAccess::Truncate,
                 FsOperation::MountSensitive => FilesystemAccess::Write,
             };
             let policy = if request.op == FsOperation::MountSensitive {

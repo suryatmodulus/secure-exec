@@ -3,6 +3,7 @@ mod bridge_support;
 
 use bridge_support::RecordingBridge;
 use secure_exec_kernel::kernel::KernelVmConfig;
+use secure_exec_kernel::permissions::Permissions;
 use secure_exec_sidecar_browser::{
     scaffold, BrowserExtension, BrowserExtensionContext, BrowserExtensionRequest, BrowserSidecar,
     BrowserSidecarConfig, BrowserWorkerBridge, BrowserWorkerHandle, BrowserWorkerHandleRequest,
@@ -52,6 +53,12 @@ impl BrowserWorkerBridge for RecordingBridge {
     }
 }
 
+fn permissive_config(vm_id: &str) -> KernelVmConfig {
+    let mut config = KernelVmConfig::new(vm_id);
+    config.permissions = Permissions::allow_all();
+    config
+}
+
 #[test]
 fn browser_sidecar_scaffold_stays_on_main_thread_with_shared_kernel() {
     let scaffold = scaffold();
@@ -95,6 +102,8 @@ fn browser_sidecar_dispatches_extension_requests_by_namespace() {
         .dispatch_extension_request(BrowserExtensionRequest {
             namespace: String::from("dev.rivet.agentos.browser-smoke"),
             payload: b"ping".to_vec(),
+            vm_id: None,
+            connection_id: None,
         })
         .expect("dispatch extension request");
     assert_eq!(response.namespace, "dev.rivet.agentos.browser-smoke");
@@ -104,6 +113,8 @@ fn browser_sidecar_dispatches_extension_requests_by_namespace() {
         .dispatch_extension_request(BrowserExtensionRequest {
             namespace: String::from("missing"),
             payload: Vec::new(),
+            vm_id: None,
+            connection_id: None,
         })
         .expect_err("unknown extension namespace should fail");
     assert!(error
@@ -120,13 +131,15 @@ fn browser_extension_context_exposes_vm_filesystem_primitives() {
     )
     .expect("construct browser sidecar with extension");
     sidecar
-        .create_vm(KernelVmConfig::new("vm-ext"))
+        .create_vm(permissive_config("vm-ext"))
         .expect("create vm for extension context");
 
     let response = sidecar
         .dispatch_extension_request(BrowserExtensionRequest {
             namespace: String::from("dev.rivet.agentos.browser-smoke"),
             payload: b"context-fs".to_vec(),
+            vm_id: Some(String::from("vm-ext")),
+            connection_id: Some(String::from("conn-ext")),
         })
         .expect("dispatch extension request through context");
 

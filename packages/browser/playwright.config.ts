@@ -10,7 +10,7 @@ export default defineConfig({
 		trace: "retain-on-failure",
 	},
 	webServer: {
-		command: `sh -c 'PORT=${PLAYGROUND_PORT} pnpm build && PORT=${PLAYGROUND_PORT} pnpm --dir ../playground dev'`,
+		command: `sh -c 'pnpm build && node ./scripts/build-browser-test-assets.mjs && PORT=${PLAYGROUND_PORT} node ./scripts/serve-browser-tests.mjs'`,
 		port: PLAYGROUND_PORT,
 		reuseExistingServer: false,
 		timeout: 120_000,

@@ -2526,4 +2526,73 @@ fn wasm_suite() {
     // SE-EXEC-05 (B.1) SAFEGUARD [x-ref FAILURES.md#F-002]: the configured WASM
     // stack byte cap must now bound runaway recursion and attribute the failure.
     wasm_deep_recursion_respects_configured_stack_byte_limit();
+
+    // Convergence item C: the official WASI preview1 conformance subset runs on
+    // the native backend of the SINGLE shared runner (same manifest the browser
+    // backend runs in packages/browser/tests/browser/wasi-testsuite.spec.ts).
+    wasi_testsuite_subset_runs_on_native_shared_runner();
+}
+
+fn wasi_testsuite_subset_runs_on_native_shared_runner() {
+    assert_node_available();
+
+    let manifest_source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/wasi-testsuite-subset.json"
+    ));
+    let manifest: serde_json::Value =
+        serde_json::from_str(manifest_source).expect("parse wasi-testsuite manifest");
+    let cases = manifest
+        .get("cases")
+        .and_then(serde_json::Value::as_array)
+        .expect("wasi-testsuite manifest cases");
+    assert!(!cases.is_empty(), "wasi-testsuite subset must not be empty");
+
+    for case in cases {
+        let name = case
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .expect("case name");
+        let expected_exit = case
+            .get("exitCode")
+            .and_then(serde_json::Value::as_i64)
+            .expect("case exitCode") as i32;
+        let expected_stdout = case.get("stdout").and_then(serde_json::Value::as_str);
+        let wasm = base64::engine::general_purpose::STANDARD
+            .decode(
+                case.get("wasmBase64")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("case wasmBase64"),
+            )
+            .expect("decode case wasm");
+
+        let temp = tempdir().expect("create temp dir");
+        write_fixture(&temp.path().join("guest.wasm"), &wasm);
+
+        let mut engine = WasmExecutionEngine::default();
+        let context = engine.create_context(CreateWasmContextRequest {
+            vm_id: String::from("vm-wasm"),
+            module_path: Some(String::from("./guest.wasm")),
+        });
+
+        let (stdout, stderr, exit_code) = run_wasm_execution(
+            &mut engine,
+            context.context_id,
+            temp.path(),
+            Vec::new(),
+            BTreeMap::new(),
+            WasmPermissionTier::Full,
+        );
+
+        assert_eq!(
+            exit_code, expected_exit,
+            "wasi-testsuite {name}: exit {exit_code} != {expected_exit} (stdout={stdout} stderr={stderr})"
+        );
+        if let Some(expected) = expected_stdout {
+            assert!(
+                stdout.contains(expected),
+                "wasi-testsuite {name}: stdout {stdout:?} missing {expected:?} (stderr={stderr})"
+            );
+        }
+    }
 }

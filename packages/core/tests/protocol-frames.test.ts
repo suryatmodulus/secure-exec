@@ -13,10 +13,20 @@ import {
 import * as protocol from "../src/generated-protocol.js";
 import { SIDECAR_PROTOCOL_SCHEMA } from "../src/protocol-schema.js";
 
+const textDecoder = new TextDecoder();
+
 const ownership = {
 	scope: "connection" as const,
 	connection_id: "conn",
 };
+
+const generatedAuthOwnership = {
+	scope: "connection" as const,
+	connection_id: "conn-1",
+};
+
+const GENERATED_AUTH_FRAME_HEX =
+	"00137365637572652d657865632d73696465636172070007000000000000000006636f6e6e2d31000e67656e6572617465642d7465737405746f6b656e070001000000";
 
 const hostCallbackRequest = {
 	frame_type: "sidecar_request" as const,
@@ -164,6 +174,31 @@ describe("protocol frame conversion", () => {
 		).toBe("SidecarResponseFrame");
 	});
 
+	it("matches native generated auth frame BARE bytes", () => {
+		const encoded = encodeBareProtocolFrame({
+			frame_type: "request",
+			schema: SIDECAR_PROTOCOL_SCHEMA,
+			request_id: 7,
+			ownership: generatedAuthOwnership,
+			payload: {
+				type: "authenticate",
+				client_name: "generated-test",
+				auth_token: "token",
+				protocol_version: SIDECAR_PROTOCOL_SCHEMA.version,
+				bridge_version: 1,
+			},
+		});
+
+		expect(Buffer.from(encoded).toString("hex")).toBe(GENERATED_AUTH_FRAME_HEX);
+		expect(protocol.decodeProtocolFrame(new Uint8Array(encoded))).toMatchObject({
+			tag: "RequestFrame",
+			val: {
+				requestId: 7n,
+				payload: { tag: "AuthenticateRequest" },
+			},
+		});
+	});
+
 	it("decodes sidecar-written response frames from generated protocol frames", () => {
 		expect(
 			fromGeneratedSidecarWrittenProtocolFrame({
@@ -237,7 +272,7 @@ describe("protocol frame conversion", () => {
 			"json",
 		);
 
-		expect(JSON.parse(encoded.toString("utf8")).payload.chunk).toEqual([
+		expect(JSON.parse(textDecoder.decode(encoded)).payload.chunk).toEqual([
 			1, 2, 3,
 		]);
 

@@ -613,6 +613,7 @@ fn vm_layer_rpcs_and_module_access_mounts_are_scoped_per_vm() {
                 entries: vec![
                     root_dir("/workspace"),
                     root_file("/workspace/lower.txt", "lower"),
+                    root_file("/workspace/shared.txt", "lower"),
                 ],
             }),
         ))
@@ -631,6 +632,7 @@ fn vm_layer_rpcs_and_module_access_mounts_are_scoped_per_vm() {
                 entries: vec![
                     root_dir("/workspace"),
                     root_file("/workspace/upper.txt", "upper"),
+                    root_file("/workspace/shared.txt", "upper"),
                 ],
             }),
         ))
@@ -679,6 +681,10 @@ fn vm_layer_rpcs_and_module_access_mounts_are_scoped_per_vm() {
     assert!(overlay_entries
         .iter()
         .any(|entry| entry.path == "/workspace/upper.txt"));
+    assert!(overlay_entries
+        .iter()
+        .any(|entry| entry.path == "/workspace/shared.txt"
+            && entry.content.as_deref() == Some("upper")));
 
     let (other_vm_id, _) = create_vm_wire(
         &mut sidecar,

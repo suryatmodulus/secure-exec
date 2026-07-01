@@ -34,7 +34,8 @@ export type LiveGuestFilesystemOperation =
 	| "chown"
 	| "utimes"
 	| "truncate"
-	| "pread";
+	| "pread"
+	| "pwrite";
 export type LiveFilesystemOperation =
 	| "read"
 	| "write"
@@ -186,6 +187,8 @@ export function toGeneratedGuestFilesystemOperation(
 			return protocol.GuestFilesystemOperation.Truncate;
 		case "pread":
 			return protocol.GuestFilesystemOperation.Pread;
+		case "pwrite":
+			return protocol.GuestFilesystemOperation.Pwrite;
 	}
 }
 
@@ -353,5 +356,7 @@ export function fromGeneratedGuestFilesystemOperation(
 			return "truncate";
 		case protocol.GuestFilesystemOperation.Pread:
 			return "pread";
+		case protocol.GuestFilesystemOperation.Pwrite:
+			return "pwrite";
 	}
 }

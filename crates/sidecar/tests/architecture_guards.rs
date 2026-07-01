@@ -290,6 +290,10 @@ const FS_ALLOW: &[&str] = &[
 const NET_ALLOW: &[&str] = &[
     // kernel network plane
     "crates/kernel/src/dns.rs",
+    // Shared IP classifier only; no host sockets are opened here.
+    "crates/kernel/src/network_policy.rs",
+    // Shared socket-address formatting only; no host sockets are opened here.
+    "crates/sidecar-core/src/net.rs",
     "crates/kernel/src/socket_table.rs",
     "crates/kernel/src/kernel.rs",
     // sidecar host-net chokepoint + bootstrap
@@ -343,6 +347,9 @@ const ENV_ALLOW: &[&str] = &[
     "crates/v8-runtime/src/execution.rs",
     "crates/v8-runtime/src/host_call.rs",
     "crates/v8-runtime/src/snapshot.rs",
+    // Browser sidecar reads a test-only vm.fetch timeout override (bucket 1:
+    // process-wide test/debug knob, native-only); not VM policy.
+    "crates/sidecar-browser/src/service.rs",
 ];
 
 fn fs_class() -> BannedClass {

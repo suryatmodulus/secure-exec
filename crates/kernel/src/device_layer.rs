@@ -2,7 +2,7 @@ use crate::vfs::{
     VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat, VirtualUtimeSpec,
 };
 use getrandom::getrandom;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 const DEVICE_PATHS: &[&str] = &[
     "/dev/null",

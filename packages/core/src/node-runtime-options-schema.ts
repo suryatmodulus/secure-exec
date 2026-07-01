@@ -52,7 +52,7 @@ export const nodeRuntimePermissionsSchema = z
 	.strict();
 
 const uint8ArraySchema = z.custom<Uint8Array>(
-	(value) => value instanceof Uint8Array,
+	(value: unknown) => value instanceof Uint8Array,
 	{ message: "Expected Uint8Array" },
 );
 
@@ -82,14 +82,14 @@ const bindingDefinitionSchema = z
 	.object({
 		description: z.string(),
 		inputSchema: z.custom<object>(
-			(value) => typeof value === "object" && value !== null,
+			(value: unknown) => typeof value === "object" && value !== null,
 			{ message: "Expected JSON Schema object" },
 		),
 		timeoutMs: z.number().int().nonnegative().optional(),
 		examples: z.array(bindingExampleSchema).optional(),
 		commandAliases: stringArray.optional(),
 		handler: z.custom<(input: unknown) => unknown | Promise<unknown>>(
-			(value) => typeof value === "function",
+			(value: unknown) => typeof value === "function",
 			{ message: "Expected function" },
 		),
 	})
@@ -111,13 +111,13 @@ export const nodeRuntimeCreateOptionsSchema = z
 		permissions: nodeRuntimePermissionsSchema.optional(),
 		commandsDir: z.string().optional(),
 		sidecar: z
-			.custom((value) => typeof value === "object" && value !== null, {
+			.custom((value: unknown) => typeof value === "object" && value !== null, {
 				message: "Expected SidecarProcess object",
 			})
 			.optional(),
 		onBootTiming: z
 			.custom<(timing: unknown) => void>(
-				(value) => typeof value === "function",
+				(value: unknown) => typeof value === "function",
 				{ message: "Expected function" },
 			)
 			.optional(),

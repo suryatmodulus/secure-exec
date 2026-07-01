@@ -21,6 +21,9 @@ use secure_exec_bridge::{
     StructuredEventRecord, SymlinkRequest, TruncateRequest, WriteExecutionStdinRequest,
     WriteFileRequest,
 };
+use secure_exec_sidecar_core::{
+    generated_wire_blocking_extension_interrupt, BlockingExtensionInterrupt,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -487,58 +490,24 @@ fn extension_interrupt_response(
 ) -> Option<ExtensionInterruptDispatch> {
     match frame {
         ProtocolFrame::RequestFrame(request) => {
-            if request.ownership != active_request.ownership {
+            let Some(interrupt) = generated_wire_blocking_extension_interrupt(
+                active_request,
+                &blocking_request.namespace,
+                request,
+            ) else {
                 return None;
-            }
-            let interrupt = match &request.payload {
-                RequestPayload::ExtEnvelope(envelope)
-                    if envelope.namespace == blocking_request.namespace =>
-                {
-                    blocking_request.extension.interrupt_blocking_request(
-                        &blocking_request.payload,
-                        ExtensionInterruptRequest::ExtensionPayload(&envelope.payload),
-                    )?
-                }
-                RequestPayload::ExtEnvelope(_) => return None,
-                RequestPayload::KillProcessRequest(_) => {
-                    blocking_request.extension.interrupt_blocking_request(
-                        &blocking_request.payload,
-                        ExtensionInterruptRequest::KillProcess,
-                    )?
-                }
-                // Control-plane setup, inspection, filesystem, process plumbing, and
-                // persistence requests run concurrently with an in-flight prompt and
-                // must not interrupt it. DisposeVm is deliberately non-interrupting for
-                // now; see the todo entry about dispose racing a blocked prompt.
-                RequestPayload::AuthenticateRequest(_)
-                | RequestPayload::OpenSessionRequest(_)
-                | RequestPayload::CreateVmRequest(_)
-                | RequestPayload::DisposeVmRequest(_)
-                | RequestPayload::BootstrapRootFilesystemRequest(_)
-                | RequestPayload::ConfigureVmRequest(_)
-                | RequestPayload::RegisterHostCallbacksRequest(_)
-                | RequestPayload::CreateLayerRequest
-                | RequestPayload::SealLayerRequest(_)
-                | RequestPayload::ImportSnapshotRequest(_)
-                | RequestPayload::ExportSnapshotRequest(_)
-                | RequestPayload::CreateOverlayRequest(_)
-                | RequestPayload::GuestFilesystemCallRequest(_)
-                | RequestPayload::SnapshotRootFilesystemRequest
-                | RequestPayload::ExecuteRequest(_)
-                | RequestPayload::WriteStdinRequest(_)
-                | RequestPayload::ResizePtyRequest(_)
-                | RequestPayload::CloseStdinRequest(_)
-                | RequestPayload::GetProcessSnapshotRequest
-                | RequestPayload::GetResourceSnapshotRequest
-                | RequestPayload::FindListenerRequest(_)
-                | RequestPayload::FindBoundUdpRequest(_)
-                | RequestPayload::VmFetchRequest(_)
-                | RequestPayload::GetSignalStateRequest(_)
-                | RequestPayload::GetZombieTimerCountRequest
-                | RequestPayload::HostFilesystemCallRequest(_)
-                | RequestPayload::PersistenceLoadRequest(_)
-                | RequestPayload::PersistenceFlushRequest(_) => return None,
             };
+            let interrupt = blocking_request.extension.interrupt_blocking_request(
+                &blocking_request.payload,
+                match interrupt {
+                    BlockingExtensionInterrupt::ExtensionPayload(payload) => {
+                        ExtensionInterruptRequest::ExtensionPayload(payload)
+                    }
+                    BlockingExtensionInterrupt::KillProcess => {
+                        ExtensionInterruptRequest::KillProcess
+                    }
+                },
+            )?;
             let interrupted_dispatch = interrupted_extension_dispatch(
                 active_request,
                 &blocking_request.namespace,
@@ -576,48 +545,17 @@ fn interrupted_extension_dispatch(
     namespace: &str,
     payload: Vec<u8>,
 ) -> WireDispatchResult {
-    match &request.payload {
-        RequestPayload::ExtEnvelope(_) => {
-            let response = ResponsePayload::ExtEnvelope(ExtEnvelope {
-                namespace: namespace.to_string(),
-                payload,
-            });
-            WireDispatchResult {
-                response: response_frame(request.request_id, request.ownership.clone(), response),
-                events: Vec::new(),
-            }
-        }
-        RequestPayload::AuthenticateRequest(_)
-        | RequestPayload::OpenSessionRequest(_)
-        | RequestPayload::CreateVmRequest(_)
-        | RequestPayload::DisposeVmRequest(_)
-        | RequestPayload::BootstrapRootFilesystemRequest(_)
-        | RequestPayload::ConfigureVmRequest(_)
-        | RequestPayload::RegisterHostCallbacksRequest(_)
-        | RequestPayload::CreateLayerRequest
-        | RequestPayload::SealLayerRequest(_)
-        | RequestPayload::ImportSnapshotRequest(_)
-        | RequestPayload::ExportSnapshotRequest(_)
-        | RequestPayload::CreateOverlayRequest(_)
-        | RequestPayload::GuestFilesystemCallRequest(_)
-        | RequestPayload::SnapshotRootFilesystemRequest
-        | RequestPayload::ExecuteRequest(_)
-        | RequestPayload::WriteStdinRequest(_)
-        | RequestPayload::ResizePtyRequest(_)
-        | RequestPayload::CloseStdinRequest(_)
-        | RequestPayload::KillProcessRequest(_)
-        | RequestPayload::GetProcessSnapshotRequest
-        | RequestPayload::GetResourceSnapshotRequest
-        | RequestPayload::FindListenerRequest(_)
-        | RequestPayload::FindBoundUdpRequest(_)
-        | RequestPayload::VmFetchRequest(_)
-        | RequestPayload::GetSignalStateRequest(_)
-        | RequestPayload::GetZombieTimerCountRequest
-        | RequestPayload::HostFilesystemCallRequest(_)
-        | RequestPayload::PersistenceLoadRequest(_)
-        | RequestPayload::PersistenceFlushRequest(_) => {
-            unreachable!("interrupted extension dispatch requires an extension request");
-        }
+    if !matches!(request.payload, RequestPayload::ExtEnvelope(_)) {
+        unreachable!("interrupted extension dispatch requires an extension request");
+    }
+
+    let response = ResponsePayload::ExtEnvelope(ExtEnvelope {
+        namespace: namespace.to_string(),
+        payload,
+    });
+    WireDispatchResult {
+        response: response_frame(request.request_id, request.ownership.clone(), response),
+        events: Vec::new(),
     }
 }
 

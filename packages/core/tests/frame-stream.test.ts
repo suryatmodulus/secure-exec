@@ -3,6 +3,17 @@ import { describe, expect, test } from "vitest";
 import { StdioFrameTransport } from "../src/frame-stream.js";
 import { encodeLengthPrefixedPayload } from "../src/framing.js";
 
+function concatBytes(...chunks: Uint8Array[]): Uint8Array {
+	const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+	const combined = new Uint8Array(totalLength);
+	let offset = 0;
+	for (const chunk of chunks) {
+		combined.set(chunk, offset);
+		offset += chunk.length;
+	}
+	return combined;
+}
+
 describe("stdio frame transport", () => {
 	test("decodes complete frames from partial stdout chunks", async () => {
 		const stdin = new PassThrough();
@@ -24,7 +35,7 @@ describe("stdio frame transport", () => {
 		});
 		const first = encodeLengthPrefixedPayload(Buffer.from("one"));
 		const second = encodeLengthPrefixedPayload(Buffer.from("two"));
-		const combined = Buffer.concat([first, second]);
+		const combined = concatBytes(first, second);
 
 		stdout.write(combined.subarray(0, 5));
 		stdout.write(combined.subarray(5));
@@ -48,9 +59,9 @@ describe("stdio frame transport", () => {
 
 		await transport.writeFrame("hello");
 
-		expect(await written).toEqual(
-			encodeLengthPrefixedPayload(Buffer.from("hello")),
-		);
+		expect([...(await written)]).toEqual([
+			...encodeLengthPrefixedPayload(Buffer.from("hello")),
+		]);
 		transport.dispose();
 	});
 

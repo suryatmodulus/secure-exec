@@ -5,8 +5,8 @@ use crate::execution::{
     sync_active_process_host_writes_to_kernel,
 };
 use crate::protocol::{
-    GuestFilesystemCallRequest, GuestFilesystemOperation, GuestFilesystemResultResponse,
-    GuestFilesystemStat, RequestFrame, ResponsePayload, RootFilesystemEntryEncoding,
+    GuestFilesystemCallRequest, GuestFilesystemOperation, GuestRuntimeKind, RequestFrame,
+    ResponsePayload,
 };
 use crate::service::{
     javascript_sync_rpc_arg_str, javascript_sync_rpc_arg_u32, javascript_sync_rpc_arg_u32_optional,
@@ -17,7 +17,7 @@ use crate::service::{
 };
 use crate::state::{
     ActiveExecutionEvent, ActiveProcess, BridgeError, SidecarKernel, VmState,
-    EXECUTION_DRIVER_NAME, PYTHON_VFS_RPC_GUEST_ROOT,
+    EXECUTION_DRIVER_NAME, EXECUTION_SANDBOX_ROOT_ENV, PYTHON_VFS_RPC_GUEST_ROOT,
 };
 use crate::{DispatchResult, NativeSidecar, NativeSidecarBridge, SidecarError};
 
@@ -48,6 +48,9 @@ use secure_exec_execution::{
     PythonVfsRpcStat,
 };
 use secure_exec_kernel::vfs::{VirtualStat, VirtualTimeSpec, VirtualUtimeSpec};
+use secure_exec_sidecar_core::{
+    decode_guest_filesystem_content, handle_guest_filesystem_call as core_guest_filesystem_call,
+};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -346,314 +349,143 @@ where
     let (connection_id, session_id, vm_id) = sidecar.vm_scope_for(&request.ownership)?;
     sidecar.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
-    let vm = match sidecar.vms.get_mut(&vm_id) {
-        Some(vm) => vm,
-        None => {
-            return Err(stale_filesystem_request_error(
-                sidecar,
-                &vm_id,
-                None,
-                "guest filesystem dispatch",
-            ));
-        }
+    let response = {
+        let vm = match sidecar.vms.get_mut(&vm_id) {
+            Some(vm) => vm,
+            None => {
+                return Err(stale_filesystem_request_error(
+                    sidecar,
+                    &vm_id,
+                    None,
+                    "guest filesystem dispatch",
+                ));
+            }
+        };
+        sync_guest_filesystem_shadow_before_call(vm, &payload)?;
+        let response = core_guest_filesystem_call(&mut vm.kernel, payload.clone())
+            .map_err(native_guest_filesystem_core_error)?;
+        mirror_guest_filesystem_shadow_after_call(vm, &payload)?;
+        response
     };
-    let response = match payload.operation {
-        GuestFilesystemOperation::ReadFile => {
+
+    Ok(DispatchResult {
+        response: sidecar.respond(request, ResponsePayload::GuestFilesystemResult(response)),
+        events: Vec::new(),
+    })
+}
+
+fn native_guest_filesystem_core_error(
+    error: secure_exec_sidecar_core::SidecarCoreError,
+) -> SidecarError {
+    let message = error.to_string();
+    if message
+        .split_once(':')
+        .is_some_and(|(code, _)| is_posix_errno_code(code))
+    {
+        SidecarError::Kernel(message)
+    } else {
+        SidecarError::InvalidState(message)
+    }
+}
+
+fn is_posix_errno_code(code: &str) -> bool {
+    code.len() >= 2
+        && code.starts_with('E')
+        && code[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn sync_guest_filesystem_shadow_before_call(
+    vm: &mut VmState,
+    payload: &GuestFilesystemCallRequest,
+) -> Result<(), SidecarError> {
+    match payload.operation {
+        GuestFilesystemOperation::ReadFile
+        | GuestFilesystemOperation::Pread
+        | GuestFilesystemOperation::Pwrite
+        | GuestFilesystemOperation::Exists
+        | GuestFilesystemOperation::Stat
+        | GuestFilesystemOperation::Lstat => {
+            // Pwrite is a partial write that preserves the unmodified bytes, so
+            // the existing shadow content must be present in the kernel before
+            // the call, exactly like a read.
             sync_active_shadow_path_to_kernel(vm, &payload.path)?;
-            let bytes = vm.kernel.read_file(&payload.path).map_err(kernel_error)?;
-            let (content, encoding) = encode_guest_filesystem_content(bytes);
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: Some(content),
-                encoding: Some(encoding),
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
-        GuestFilesystemOperation::Pread => {
-            sync_active_shadow_path_to_kernel(vm, &payload.path)?;
-            let offset = payload.offset.ok_or_else(|| {
-                SidecarError::InvalidState(String::from("guest filesystem pread requires offset"))
-            })?;
-            let len = payload.len.ok_or_else(|| {
-                SidecarError::InvalidState(String::from("guest filesystem pread requires len"))
-            })?;
-            let length = usize::try_from(len).map_err(|_| {
-                SidecarError::InvalidState(String::from(
-                    "guest filesystem pread len must fit within usize",
-                ))
-            })?;
-            let bytes = vm
-                .kernel
-                .pread_file(&payload.path, offset, length)
-                .map_err(kernel_error)?;
-            let (content, encoding) = encode_guest_filesystem_content(bytes);
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: Some(content),
-                encoding: Some(encoding),
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
-        }
+        GuestFilesystemOperation::WriteFile
+        | GuestFilesystemOperation::CreateDir
+        | GuestFilesystemOperation::Mkdir
+        | GuestFilesystemOperation::ReadDir
+        | GuestFilesystemOperation::RemoveFile
+        | GuestFilesystemOperation::RemoveDir
+        | GuestFilesystemOperation::Rename
+        | GuestFilesystemOperation::Realpath
+        | GuestFilesystemOperation::Symlink
+        | GuestFilesystemOperation::ReadLink
+        | GuestFilesystemOperation::Link
+        | GuestFilesystemOperation::Chmod
+        | GuestFilesystemOperation::Chown
+        | GuestFilesystemOperation::Utimes
+        | GuestFilesystemOperation::Truncate => {}
+    }
+    Ok(())
+}
+
+fn mirror_guest_filesystem_shadow_after_call(
+    vm: &mut VmState,
+    payload: &GuestFilesystemCallRequest,
+) -> Result<(), SidecarError> {
+    match payload.operation {
         GuestFilesystemOperation::WriteFile => {
             let bytes = decode_guest_filesystem_content(
                 &payload.path,
                 payload.content.as_deref(),
-                payload.encoding,
-            )?;
-            vm.kernel
-                .write_file(&payload.path, bytes.clone())
-                .map_err(kernel_error)?;
+                payload.encoding.clone(),
+            )
+            .map_err(|error| SidecarError::InvalidState(error.to_string()))?;
             mirror_guest_file_write_to_shadow(vm, &payload.path, &bytes)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
-        GuestFilesystemOperation::CreateDir => {
-            vm.kernel.create_dir(&payload.path).map_err(kernel_error)?;
+        GuestFilesystemOperation::Pwrite => {
+            // A positional write only carries the changed region; mirror the
+            // full post-write file from the kernel so the shadow stays faithful.
+            let bytes = vm.kernel.read_file(&payload.path).map_err(kernel_error)?;
+            mirror_guest_file_write_to_shadow(vm, &payload.path, &bytes)?;
+        }
+        GuestFilesystemOperation::CreateDir | GuestFilesystemOperation::Mkdir => {
             mirror_guest_directory_write_to_shadow(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
-        GuestFilesystemOperation::Mkdir => {
-            vm.kernel
-                .mkdir(&payload.path, payload.recursive)
-                .map_err(kernel_error)?;
-            mirror_guest_directory_write_to_shadow(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
-        }
-        GuestFilesystemOperation::Exists => {
-            sync_active_shadow_path_to_kernel(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path.clone(),
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: Some(vm.kernel.exists(&payload.path).map_err(kernel_error)?),
-                target: None,
-            }
-        }
-        GuestFilesystemOperation::Stat => {
-            sync_active_shadow_path_to_kernel(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path.clone(),
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: Some(guest_filesystem_stat(
-                    vm.kernel.stat(&payload.path).map_err(kernel_error)?,
-                )),
-                exists: None,
-                target: None,
-            }
-        }
-        GuestFilesystemOperation::Lstat => {
-            sync_active_shadow_path_to_kernel(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path.clone(),
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: Some(guest_filesystem_stat(
-                    vm.kernel.lstat(&payload.path).map_err(kernel_error)?,
-                )),
-                exists: None,
-                target: None,
-            }
-        }
-        GuestFilesystemOperation::ReadDir => GuestFilesystemResultResponse {
-            operation: payload.operation,
-            path: payload.path.clone(),
-            content: None,
-            encoding: None,
-            entries: Some(vm.kernel.read_dir(&payload.path).map_err(kernel_error)?),
-            stat: None,
-            exists: None,
-            target: None,
-        },
-        GuestFilesystemOperation::RemoveFile => {
-            vm.kernel.remove_file(&payload.path).map_err(kernel_error)?;
+        GuestFilesystemOperation::RemoveFile | GuestFilesystemOperation::RemoveDir => {
             remove_guest_shadow_path(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
-        }
-        GuestFilesystemOperation::RemoveDir => {
-            vm.kernel.remove_dir(&payload.path).map_err(kernel_error)?;
-            remove_guest_shadow_path(vm, &payload.path)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
         GuestFilesystemOperation::Rename => {
-            let destination = payload.destination_path.ok_or_else(|| {
+            let destination = payload.destination_path.as_deref().ok_or_else(|| {
                 SidecarError::InvalidState(String::from(
                     "guest filesystem rename requires a destination_path",
                 ))
             })?;
-            vm.kernel
-                .rename(&payload.path, &destination)
-                .map_err(kernel_error)?;
-            rename_guest_shadow_path(vm, &payload.path, &destination)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: Some(destination),
-            }
+            rename_guest_shadow_path(vm, &payload.path, destination)?;
         }
-        GuestFilesystemOperation::Realpath => GuestFilesystemResultResponse {
-            operation: payload.operation,
-            path: payload.path.clone(),
-            content: None,
-            encoding: None,
-            entries: None,
-            stat: None,
-            exists: None,
-            target: Some(vm.kernel.realpath(&payload.path).map_err(kernel_error)?),
-        },
         GuestFilesystemOperation::Symlink => {
-            let target = payload.target.ok_or_else(|| {
+            let target = payload.target.as_deref().ok_or_else(|| {
                 SidecarError::InvalidState(String::from(
                     "guest filesystem symlink requires a target",
                 ))
             })?;
-            vm.kernel
-                .symlink(&target, &payload.path)
-                .map_err(kernel_error)?;
-            mirror_guest_symlink_to_shadow(vm, &payload.path, &target)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: Some(target),
-            }
+            mirror_guest_symlink_to_shadow(vm, &payload.path, target)?;
         }
-        GuestFilesystemOperation::ReadLink => GuestFilesystemResultResponse {
-            operation: payload.operation,
-            path: payload.path.clone(),
-            content: None,
-            encoding: None,
-            entries: None,
-            stat: None,
-            exists: None,
-            target: Some(vm.kernel.read_link(&payload.path).map_err(kernel_error)?),
-        },
         GuestFilesystemOperation::Link => {
-            let destination = payload.destination_path.ok_or_else(|| {
+            let destination = payload.destination_path.as_deref().ok_or_else(|| {
                 SidecarError::InvalidState(String::from(
                     "guest filesystem link requires a destination_path",
                 ))
             })?;
-            vm.kernel
-                .link(&payload.path, &destination)
-                .map_err(kernel_error)?;
-            mirror_guest_link_to_shadow(vm, &payload.path, &destination)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: Some(destination),
-            }
+            mirror_guest_link_to_shadow(vm, &payload.path, destination)?;
         }
         GuestFilesystemOperation::Chmod => {
             let mode = payload.mode.ok_or_else(|| {
                 SidecarError::InvalidState(String::from("guest filesystem chmod requires a mode"))
             })?;
-            vm.kernel.chmod(&payload.path, mode).map_err(kernel_error)?;
             mirror_guest_chmod_to_shadow(vm, &payload.path, mode)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
-        }
-        GuestFilesystemOperation::Chown => {
-            let uid = payload.uid.ok_or_else(|| {
-                SidecarError::InvalidState(String::from("guest filesystem chown requires a uid"))
-            })?;
-            let gid = payload.gid.ok_or_else(|| {
-                SidecarError::InvalidState(String::from("guest filesystem chown requires a gid"))
-            })?;
-            vm.kernel
-                .chown(&payload.path, uid, gid)
-                .map_err(kernel_error)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
         GuestFilesystemOperation::Utimes => {
             let atime_ms = payload.atime_ms.ok_or_else(|| {
@@ -666,9 +498,6 @@ where
                     "guest filesystem utimes requires mtime_ms",
                 ))
             })?;
-            vm.kernel
-                .utimes(&payload.path, atime_ms, mtime_ms)
-                .map_err(kernel_error)?;
             mirror_guest_utimes_to_shadow(
                 vm,
                 &payload.path,
@@ -676,42 +505,24 @@ where
                 VirtualUtimeSpec::Set(VirtualTimeSpec::from_millis(mtime_ms)),
                 true,
             )?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
         GuestFilesystemOperation::Truncate => {
             let len = payload.len.ok_or_else(|| {
                 SidecarError::InvalidState(String::from("guest filesystem truncate requires len"))
             })?;
-            vm.kernel
-                .truncate(&payload.path, len)
-                .map_err(kernel_error)?;
             mirror_guest_truncate_to_shadow(vm, &payload.path, len)?;
-            GuestFilesystemResultResponse {
-                operation: payload.operation,
-                path: payload.path,
-                content: None,
-                encoding: None,
-                entries: None,
-                stat: None,
-                exists: None,
-                target: None,
-            }
         }
-    };
-
-    Ok(DispatchResult {
-        response: sidecar.respond(request, ResponsePayload::GuestFilesystemResult(response)),
-        events: Vec::new(),
-    })
+        GuestFilesystemOperation::ReadFile
+        | GuestFilesystemOperation::Pread
+        | GuestFilesystemOperation::Exists
+        | GuestFilesystemOperation::Stat
+        | GuestFilesystemOperation::Lstat
+        | GuestFilesystemOperation::ReadDir
+        | GuestFilesystemOperation::Realpath
+        | GuestFilesystemOperation::ReadLink
+        | GuestFilesystemOperation::Chown => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_python_vfs_rpc_request<B>(
@@ -961,18 +772,6 @@ where
     SidecarError::InvalidState(message)
 }
 
-pub(crate) fn encode_guest_filesystem_content(
-    content: Vec<u8>,
-) -> (String, RootFilesystemEntryEncoding) {
-    match String::from_utf8(content) {
-        Ok(text) => (text, RootFilesystemEntryEncoding::Utf8),
-        Err(error) => (
-            base64::engine::general_purpose::STANDARD.encode(error.into_bytes()),
-            RootFilesystemEntryEncoding::Base64,
-        ),
-    }
-}
-
 pub(crate) fn normalize_python_vfs_rpc_path(path: &str) -> Result<String, SidecarError> {
     if !path.starts_with('/') {
         return Err(SidecarError::InvalidState(format!(
@@ -1197,7 +996,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
     }
     match request.method.as_str() {
         "fs.open" | "fs.openSync" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem open path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem open path")?;
+            let path = path.as_str();
             let flags = javascript_sync_rpc_arg_u32(&request.args, 1, "filesystem open flags")?;
             let mode =
                 javascript_sync_rpc_arg_u32_optional(&request.args, 2, "filesystem open mode")?;
@@ -1279,13 +1080,17 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     .fd_write(EXECUTION_DRIVER_NAME, kernel_pid, fd, &contents)
                     .map_err(kernel_error)?,
             };
-            if position.is_none() && kernel_fd_surfaces_stdio_event(kernel, kernel_pid, fd)? {
+            let surfaces_stdio =
+                position.is_none() && kernel_fd_surfaces_stdio_event(kernel, kernel_pid, fd)?;
+            if surfaces_stdio {
                 let event = if fd == 1 {
                     ActiveExecutionEvent::Stdout(contents.clone())
                 } else {
                     ActiveExecutionEvent::Stderr(contents.clone())
                 };
                 process.queue_pending_execution_event(event)?;
+            } else {
+                mirror_kernel_fd_contents_to_process_shadow(kernel, process, kernel_pid, fd)?;
             }
             Ok(json!(written))
         }
@@ -1318,8 +1123,68 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map(javascript_sync_rpc_stat_value)
                 .map_err(kernel_error)
         }
+        "fs.fsyncSync" | "fs.fdatasyncSync" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem sync fd")?;
+            if let Some(mapped) = process.mapped_host_fd(fd) {
+                return mapped
+                    .file
+                    .sync_all()
+                    .map(|()| Value::Null)
+                    .map_err(|error| {
+                        SidecarError::Io(format!(
+                            "failed to sync mapped guest fd {fd} -> {}: {error}",
+                            mapped.path.display()
+                        ))
+                    });
+            }
+            kernel
+                .fd_stat(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+                .map(|_| Value::Null)
+                .map_err(kernel_error)
+        }
+        "fs.ftruncateSync" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem ftruncate fd")?;
+            let length = javascript_sync_rpc_arg_u64_optional(
+                &request.args,
+                1,
+                "filesystem ftruncate length",
+            )?
+            .unwrap_or(0);
+            if let Some(mapped) = process.mapped_host_fd_mut(fd) {
+                return mapped
+                    .file
+                    .set_len(length)
+                    .map(|()| Value::Null)
+                    .map_err(|error| {
+                        SidecarError::Io(format!(
+                            "failed to truncate mapped guest fd {fd} -> {}: {error}",
+                            mapped.path.display()
+                        ))
+                    });
+            }
+            let fd_stat = kernel
+                .fd_stat(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+                .map_err(kernel_error)?;
+            if (fd_stat.flags & libc::O_ACCMODE as u32) == libc::O_RDONLY as u32 {
+                return Err(SidecarError::Execution(format!(
+                    "EBADF: file descriptor {fd} is not open for writing"
+                )));
+            }
+            let path = kernel
+                .fd_path(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+                .map_err(kernel_error)?;
+            kernel.truncate(&path, length).map_err(kernel_error)?;
+            mirror_kernel_path_to_process_shadow(kernel, process, kernel_pid, &path)?;
+            Ok(Value::Null)
+        }
         "fs.readFileSync" | "fs.promises.readFile" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem readFile path")?;
+            let path = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                0,
+                "filesystem readFile path",
+            )?;
+            let path = path.as_str();
             let encoding = javascript_sync_rpc_encoding(&request.args);
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
                 materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
@@ -1354,7 +1219,13 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.writeFileSync" | "fs.promises.writeFile" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem writeFile path")?;
+            let path = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                0,
+                "filesystem writeFile path",
+            )?;
+            let path = path.as_str();
             let contents =
                 javascript_sync_rpc_bytes_arg(&request.args, 1, "filesystem writeFile contents")?;
             match mapped_runtime_host_path(process, path, true) {
@@ -1390,11 +1261,14 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     contents,
                     javascript_sync_rpc_option_u32(&request.args, 2, "mode")?,
                 )
-                .map(|()| Value::Null)
-                .map_err(|error| kernel_path_error("fs.writeFile", path, error))
+                .map_err(|error| kernel_path_error("fs.writeFile", path, error))?;
+            mirror_kernel_path_to_process_shadow(kernel, process, kernel_pid, path)?;
+            Ok(Value::Null)
         }
         "fs.statSync" | "fs.promises.stat" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem stat path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem stat path")?;
+            let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
                 materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
                 let opened = open_mapped_runtime_beneath(
@@ -1418,7 +1292,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.lstatSync" | "fs.promises.lstat" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem lstat path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem lstat path")?;
+            let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
                 materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
                 let metadata = mapped_runtime_symlink_metadata(&mapped_host, "fs.lstat")?;
@@ -1430,7 +1306,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.readdirSync" | "fs.promises.readdir" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem readdir path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem readdir path")?;
+            let path = path.as_str();
             if let Some(MappedRuntimeHostAccess::Writable(mapped_host)) =
                 mapped_runtime_host_path(process, path, false)
             {
@@ -1505,7 +1383,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.mkdirSync" | "fs.promises.mkdir" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem mkdir path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem mkdir path")?;
+            let path = path.as_str();
             let recursive =
                 javascript_sync_rpc_option_bool(&request.args, 1, "recursive").unwrap_or(false);
             match mapped_runtime_host_path(process, path, true) {
@@ -1543,7 +1423,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.accessSync" | "fs.promises.access" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem access path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem access path")?;
+            let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
                 materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
                 let opened = open_mapped_runtime_beneath(
@@ -1567,10 +1449,20 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.copyFileSync" | "fs.promises.copyFile" => {
-            let source =
-                javascript_sync_rpc_arg_str(&request.args, 0, "filesystem copyFile source")?;
-            let destination =
-                javascript_sync_rpc_arg_str(&request.args, 1, "filesystem copyFile destination")?;
+            let source = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                0,
+                "filesystem copyFile source",
+            )?;
+            let source = source.as_str();
+            let destination = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                1,
+                "filesystem copyFile destination",
+            )?;
+            let destination = destination.as_str();
             let source_host = mapped_runtime_host_path(process, source, false);
             let destination_host = mapped_runtime_host_path(process, destination, true);
             if matches!(destination_host, Some(MappedRuntimeHostAccess::ReadOnly(_))) {
@@ -1660,7 +1552,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.existsSync" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem exists path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem exists path")?;
+            let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
                 let exists = match open_mapped_runtime_beneath(
                     &mapped_host,
@@ -1679,7 +1573,13 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.readlinkSync" | "fs.promises.readlink" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem readlink path")?;
+            let path = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                0,
+                "filesystem readlink path",
+            )?;
+            let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
                 let target = read_mapped_runtime_link(&mapped_host, path, "fs.readlink")?;
                 return Ok(Value::String(target.to_string_lossy().into_owned()));
@@ -1693,7 +1593,8 @@ pub(crate) fn service_javascript_fs_sync_rpc(
             let target =
                 javascript_sync_rpc_arg_str(&request.args, 0, "filesystem symlink target")?;
             let link_path =
-                javascript_sync_rpc_arg_str(&request.args, 1, "filesystem symlink path")?;
+                javascript_sync_rpc_path_arg(process, &request.args, 1, "filesystem symlink path")?;
+            let link_path = link_path.as_str();
             match mapped_runtime_host_path(process, link_path, true) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
                     ensure_mapped_runtime_parent_dirs(&mapped_host, "fs.symlink")?;
@@ -1720,18 +1621,32 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.linkSync" | "fs.promises.link" => {
-            let source = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem link source")?;
+            let source =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem link source")?;
+            let source = source.as_str();
             let destination =
-                javascript_sync_rpc_arg_str(&request.args, 1, "filesystem link path")?;
+                javascript_sync_rpc_path_arg(process, &request.args, 1, "filesystem link path")?;
+            let destination = destination.as_str();
             kernel
                 .link(source, destination)
                 .map(|()| Value::Null)
                 .map_err(kernel_error)
         }
         "fs.renameSync" | "fs.promises.rename" => {
-            let source = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem rename source")?;
-            let destination =
-                javascript_sync_rpc_arg_str(&request.args, 1, "filesystem rename destination")?;
+            let source = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                0,
+                "filesystem rename source",
+            )?;
+            let source = source.as_str();
+            let destination = javascript_sync_rpc_path_arg(
+                process,
+                &request.args,
+                1,
+                "filesystem rename destination",
+            )?;
+            let destination = destination.as_str();
             let source_host = mapped_runtime_host_path(process, source, true);
             let destination_host = mapped_runtime_host_path(process, destination, true);
             if matches!(source_host, Some(MappedRuntimeHostAccess::ReadOnly(_))) {
@@ -1749,7 +1664,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.rmdirSync" | "fs.promises.rmdir" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem rmdir path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem rmdir path")?;
+            let path = path.as_str();
             match mapped_runtime_host_path(process, path, true) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
                     let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.rmdir")?;
@@ -1775,7 +1692,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.unlinkSync" | "fs.promises.unlink" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem unlink path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem unlink path")?;
+            let path = path.as_str();
             match mapped_runtime_host_path(process, path, true) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
                     let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.unlink")?;
@@ -1801,7 +1720,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.chmodSync" | "fs.promises.chmod" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem chmod path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem chmod path")?;
+            let path = path.as_str();
             let mode = javascript_sync_rpc_arg_u32(&request.args, 1, "filesystem chmod mode")?;
             match mapped_runtime_host_path(process, path, true) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
@@ -1847,7 +1768,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.chownSync" | "fs.promises.chown" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem chown path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem chown path")?;
+            let path = path.as_str();
             let uid = javascript_sync_rpc_arg_u32(&request.args, 1, "filesystem chown uid")?;
             let gid = javascript_sync_rpc_arg_u32(&request.args, 2, "filesystem chown gid")?;
             kernel
@@ -1856,7 +1779,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map_err(kernel_error)
         }
         "fs.utimesSync" | "fs.promises.utimes" | "fs.lutimesSync" | "fs.promises.lutimes" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem utimes path")?;
+            let path =
+                javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem utimes path")?;
+            let path = path.as_str();
             let atime = parse_utime_arg(&request.args, 1, "filesystem utimes atime")?;
             let mtime = parse_utime_arg(&request.args, 2, "filesystem utimes mtime")?;
             let follow_symlinks = !matches!(
@@ -2007,47 +1932,158 @@ fn kernel_fd_surfaces_stdio_event(
     ))
 }
 
-fn guest_filesystem_stat(stat: VirtualStat) -> GuestFilesystemStat {
-    GuestFilesystemStat {
-        mode: stat.mode,
-        size: stat.size,
-        blocks: stat.blocks,
-        dev: stat.dev,
-        rdev: stat.rdev,
-        is_directory: stat.is_directory,
-        is_symbolic_link: stat.is_symbolic_link,
-        atime_ms: stat.atime_ms,
-        mtime_ms: stat.mtime_ms,
-        ctime_ms: stat.ctime_ms,
-        birthtime_ms: stat.birthtime_ms,
-        ino: stat.ino,
-        nlink: stat.nlink,
-        uid: stat.uid,
-        gid: stat.gid,
-    }
+fn javascript_sync_rpc_path_arg(
+    process: &ActiveProcess,
+    args: &[Value],
+    index: usize,
+    label: &str,
+) -> Result<String, SidecarError> {
+    let path = javascript_sync_rpc_arg_str(args, index, label)?;
+    Ok(normalize_process_filesystem_rpc_path(process, path))
 }
 
-fn decode_guest_filesystem_content(
-    path: &str,
-    content: Option<&str>,
-    encoding: Option<RootFilesystemEntryEncoding>,
-) -> Result<Vec<u8>, SidecarError> {
-    let content = content.ok_or_else(|| {
-        SidecarError::InvalidState(format!(
-            "guest filesystem write_file for {path} requires content",
-        ))
-    })?;
-
-    match encoding.unwrap_or(RootFilesystemEntryEncoding::Utf8) {
-        RootFilesystemEntryEncoding::Utf8 => Ok(content.as_bytes().to_vec()),
-        RootFilesystemEntryEncoding::Base64 => base64::engine::general_purpose::STANDARD
-            .decode(content)
-            .map_err(|error| {
-                SidecarError::InvalidState(format!(
-                    "invalid base64 guest filesystem content for {path}: {error}",
-                ))
-            }),
+fn normalize_process_filesystem_rpc_path(process: &ActiveProcess, path: &str) -> String {
+    let host_path = Path::new(path);
+    if host_path.is_absolute() {
+        let normalized_host_path = normalize_host_path(host_path);
+        if let Some(guest_path) =
+            guest_path_from_runtime_host_mappings(process, &normalized_host_path)
+        {
+            return guest_path;
+        }
+        if let Some(sandbox_root) = process
+            .env
+            .get(EXECUTION_SANDBOX_ROOT_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|path| normalize_host_path(&path))
+        {
+            if let Ok(suffix) = normalized_host_path.strip_prefix(&sandbox_root) {
+                let suffix = suffix.to_string_lossy();
+                return normalize_path(&format!("/{}", suffix.trim_start_matches('/')));
+            }
+        }
     }
+    path.to_owned()
+}
+
+fn guest_path_from_runtime_host_mappings(
+    process: &ActiveProcess,
+    host_path: &Path,
+) -> Option<String> {
+    runtime_guest_host_mappings(process)
+        .into_iter()
+        .filter_map(|(guest_path, host_root)| {
+            host_path.strip_prefix(&host_root).ok().map(|suffix| {
+                let suffix = suffix.to_string_lossy();
+                normalize_path(&format!(
+                    "{}/{}",
+                    guest_path.trim_end_matches('/'),
+                    suffix.trim_start_matches('/')
+                ))
+            })
+        })
+        .max_by_key(String::len)
+}
+
+fn runtime_guest_host_mappings(process: &ActiveProcess) -> Vec<(String, PathBuf)> {
+    let Some(mappings) = process
+        .env
+        .get("AGENTOS_GUEST_PATH_MAPPINGS")
+        .and_then(|value| serde_json::from_str::<Vec<RuntimeGuestPathMappingWire>>(value).ok())
+    else {
+        return Vec::new();
+    };
+    mappings
+        .into_iter()
+        .filter_map(|mapping| {
+            if mapping.guest_path.is_empty() || mapping.host_path.is_empty() {
+                return None;
+            }
+            let host_root = PathBuf::from(mapping.host_path);
+            let normalized_host_root = if host_root.is_absolute() {
+                normalize_host_path(&host_root)
+            } else {
+                normalize_host_path(&std::env::current_dir().ok()?.join(host_root))
+            };
+            Some((normalize_path(&mapping.guest_path), normalized_host_root))
+        })
+        .collect()
+}
+
+fn mirror_kernel_fd_contents_to_process_shadow(
+    kernel: &mut SidecarKernel,
+    process: &ActiveProcess,
+    kernel_pid: u32,
+    fd: u32,
+) -> Result<(), SidecarError> {
+    let path = kernel
+        .fd_path(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+        .map_err(kernel_error)?;
+    let path = normalize_process_filesystem_rpc_path(process, &path);
+    mirror_kernel_path_to_process_shadow(kernel, process, kernel_pid, &path)
+}
+
+fn mirror_kernel_path_to_process_shadow(
+    kernel: &mut SidecarKernel,
+    process: &ActiveProcess,
+    kernel_pid: u32,
+    guest_path: &str,
+) -> Result<(), SidecarError> {
+    let Some(shadow_path) = resolve_process_guest_path_to_host(process, guest_path) else {
+        return Ok(());
+    };
+    let bytes = kernel
+        .read_file_for_process(EXECUTION_DRIVER_NAME, kernel_pid, guest_path)
+        .map_err(kernel_error)?;
+    write_process_shadow_file(&shadow_path, guest_path, &bytes)
+}
+
+fn write_process_shadow_file(
+    shadow_path: &Path,
+    guest_path: &str,
+    bytes: &[u8],
+) -> Result<(), SidecarError> {
+    if let Some(parent) = shadow_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            SidecarError::Io(format!(
+                "failed to create shadow parent for {}: {error}",
+                normalize_path(guest_path)
+            ))
+        })?;
+    }
+    match fs::symlink_metadata(shadow_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(shadow_path).map_err(|error| {
+                SidecarError::Io(format!(
+                    "failed to replace shadow symlink for {}: {error}",
+                    normalize_path(guest_path)
+                ))
+            })?;
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(shadow_path).map_err(|error| {
+                SidecarError::Io(format!(
+                    "failed to replace shadow directory for {}: {error}",
+                    normalize_path(guest_path)
+                ))
+            })?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SidecarError::Io(format!(
+                "failed to inspect shadow path for {}: {error}",
+                normalize_path(guest_path)
+            )));
+        }
+    }
+    fs::write(shadow_path, bytes).map_err(|error| {
+        SidecarError::Io(format!(
+            "failed to mirror kernel file {} into process shadow: {error}",
+            normalize_path(guest_path)
+        ))
+    })
 }
 
 fn javascript_sync_rpc_stat_value(stat: VirtualStat) -> Value {
@@ -2116,6 +2152,10 @@ fn mapped_runtime_host_path(
     guest_path: &str,
     writable: bool,
 ) -> Option<MappedRuntimeHostAccess> {
+    if process_prefers_kernel_fs_sync_rpc(process) {
+        return None;
+    }
+
     let normalized = if guest_path.starts_with('/') {
         normalize_path(guest_path)
     } else {
@@ -2245,6 +2285,10 @@ fn mapped_runtime_host_path_for_read(
 }
 
 fn process_shadow_host_path(process: &ActiveProcess, guest_path: &str) -> Option<PathBuf> {
+    if process_prefers_kernel_fs_sync_rpc(process) {
+        return None;
+    }
+
     let normalized_guest_path = normalized_process_guest_path(process, guest_path);
     let normalized_guest_cwd = normalize_path(&process.guest_cwd);
     let mut host_root = normalize_host_path(&process.host_cwd);
@@ -2272,6 +2316,14 @@ fn normalized_process_guest_path(process: &ActiveProcess, guest_path: &str) -> S
             guest_path
         ))
     }
+}
+
+fn process_prefers_kernel_fs_sync_rpc(process: &ActiveProcess) -> bool {
+    process.runtime == GuestRuntimeKind::WebAssembly
+        && process
+            .env
+            .get(EXECUTION_SANDBOX_ROOT_ENV)
+            .is_some_and(|value| !value.is_empty())
 }
 
 fn runtime_host_access_roots(process: &ActiveProcess, key: &str) -> Option<Vec<PathBuf>> {

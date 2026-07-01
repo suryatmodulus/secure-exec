@@ -13,6 +13,7 @@ use crate::fd_table::{
     O_EXCL, O_NONBLOCK, O_TRUNC,
 };
 use crate::mount_table::{MountEntry, MountOptions, MountTable, MountedFileSystem};
+use crate::network_policy::format_tcp_resource;
 use crate::permissions::{
     check_command_execution, check_network_access, FsOperation, NetworkOperation, PermissionError,
     PermissionedFileSystem, Permissions,
@@ -45,7 +46,7 @@ use crate::vfs::{
     normalize_path, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat,
     VirtualTimeSpec, VirtualUtimeSpec,
 };
-use hickory_resolver::proto::rr::RecordType;
+use hickory_proto::rr::RecordType;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -53,7 +54,8 @@ use std::fmt;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, WaitTimeoutResult};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub type KernelResult<T> = Result<T, KernelError>;
 pub use crate::process_table::{ProcessWaitEvent as WaitPidEvent, WaitPidFlags};
@@ -118,6 +120,7 @@ pub struct KernelVmConfig {
     pub cwd: String,
     pub user: UserConfig,
     pub permissions: Permissions,
+    pub loopback_exempt_ports: BTreeSet<u16>,
     pub dns: DnsConfig,
     pub dns_resolver: SharedDnsResolver,
     pub resources: ResourceLimits,
@@ -132,6 +135,7 @@ impl KernelVmConfig {
             cwd: String::from("/workspace"),
             user: UserConfig::default(),
             permissions: Permissions::default(),
+            loopback_exempt_ports: BTreeSet::new(),
             dns: DnsConfig::default(),
             dns_resolver: Arc::new(HickoryDnsResolver::default()),
             resources: ResourceLimits::default(),
@@ -276,6 +280,7 @@ pub struct KernelVm<F> {
     boot_instant: Instant,
     filesystem: PermissionedFileSystem<DeviceLayer<F>>,
     permissions: Permissions,
+    loopback_exempt_ports: BTreeSet<u16>,
     dns: DnsConfig,
     dns_resolver: SharedDnsResolver,
     env: BTreeMap<String, String>,
@@ -480,6 +485,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 permissions.clone(),
             ),
             permissions,
+            loopback_exempt_ports: config.loopback_exempt_ports,
             dns: config.dns,
             dns_resolver: config.dns_resolver,
             env: config.env,
@@ -527,6 +533,10 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
     pub fn user_manager(&self) -> &UserManager {
         &self.users
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.env
     }
 
     pub fn process_identity(
@@ -593,6 +603,19 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
     pub fn resource_limits(&self) -> &ResourceLimits {
         self.resources.limits()
+    }
+
+    pub fn set_permissions(&mut self, permissions: Permissions) {
+        self.filesystem.set_permissions(permissions.clone());
+        self.permissions = permissions;
+    }
+
+    pub fn set_loopback_exempt_ports(&mut self, ports: BTreeSet<u16>) {
+        self.loopback_exempt_ports = ports;
+    }
+
+    pub fn extend_loopback_exempt_ports(&mut self, ports: impl IntoIterator<Item = u16>) {
+        self.loopback_exempt_ports.extend(ports);
     }
 
     pub fn resolve_dns(
@@ -723,6 +746,29 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         let content = content.into();
         self.check_write_file_limits(path, content.len() as u64)?;
         Ok(self.filesystem.write_file(path, content)?)
+    }
+
+    /// Writes `content` at `offset` within an existing file, growing (and
+    /// zero-filling) it as needed. This is the positional counterpart to
+    /// [`Self::pread_file`]: it lets a descriptor-based caller (the shared WASI
+    /// runner over the browser wire, which has no kernel fd offsets) write a
+    /// region without the lossy, non-atomic read-modify-write it would
+    /// otherwise have to do client-side. Enforcement matches `write_file`:
+    /// read-only paths are rejected and the resulting file size is charged
+    /// against the resource limits before the write.
+    pub fn pwrite_file(
+        &mut self,
+        path: &str,
+        offset: u64,
+        content: impl Into<Vec<u8>>,
+    ) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        self.reject_read_only_resolved_write_path(path)?;
+        let content = content.into();
+        let existing_size = self.storage_stat(path)?.map(|stat| stat.size).unwrap_or(0);
+        let end = offset.saturating_add(content.len() as u64);
+        self.check_write_file_limits(path, existing_size.max(end))?;
+        Ok(self.filesystem.pwrite(path, content, offset)?)
     }
 
     pub fn write_file_for_process(
@@ -912,6 +958,29 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_driver_owns(requester_driver, pid)?;
         let entries = self.read_dir_with_types_internal(Some(pid), path)?;
         self.resources.check_readdir_entries(entries.len())?;
+        Ok(entries)
+    }
+
+    /// Lists a directory with each child's file type in one call. This is the
+    /// typed counterpart to [`Self::read_dir`]: it lets a descriptor-based caller
+    /// recover Dirent kinds (`readdir({ withFileTypes })`) without an extra
+    /// `lstat` round-trip per entry. Reuses `read_dir_internal` so proc, the
+    /// readdir-entry limit, and read-permission checks behave identically; the
+    /// per-entry `lstat` is in-process (no wire hops).
+    pub fn read_dir_with_types(&mut self, path: &str) -> KernelResult<Vec<VirtualDirEntry>> {
+        self.assert_not_terminated()?;
+        let names = self.read_dir_internal(None, path)?;
+        self.resources.check_readdir_entries(names.len())?;
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let child = normalize_path(&format!("{path}/{name}"));
+            let stat = self.lstat_internal(None, &child)?;
+            entries.push(VirtualDirEntry {
+                name,
+                is_directory: stat.is_directory,
+                is_symbolic_link: stat.is_symbolic_link,
+            });
+        }
         Ok(entries)
     }
 
@@ -1324,6 +1393,10 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.sockets.get(socket_id)
     }
 
+    pub fn socket_records_for_pid(&self, pid: u32) -> Vec<SocketRecord> {
+        self.sockets.records_for_owner(pid)
+    }
+
     pub fn socket_bind_inet(
         &mut self,
         requester_driver: &str,
@@ -1342,6 +1415,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 "process {pid} does not own socket {socket_id}"
             )));
         }
+        check_network_access(
+            &self.vm_id,
+            &self.permissions,
+            NetworkOperation::Listen,
+            &format_tcp_resource(address.host(), address.port()),
+        )?;
 
         self.sockets.bind_inet(socket_id, address)?;
         self.poll_notifier.notify();
@@ -1390,6 +1469,14 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             return Err(KernelError::permission_denied(format!(
                 "process {pid} does not own socket {socket_id}"
             )));
+        }
+        if let Some(address) = existing.local_address() {
+            check_network_access(
+                &self.vm_id,
+                &self.permissions,
+                NetworkOperation::Listen,
+                &format_tcp_resource(address.host(), address.port()),
+            )?;
         }
 
         self.sockets.listen(socket_id, backlog)?;
@@ -1558,6 +1645,17 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 "process {pid} does not own socket {socket_id}"
             )));
         }
+        check_network_access(
+            &self.vm_id,
+            &self.permissions,
+            NetworkOperation::Http,
+            &format_tcp_resource(target_address.host(), target_address.port()),
+        )?;
+        self.check_loopback_port_allowed(
+            SocketSpec::tcp(),
+            &target_address,
+            "TCP loopback connect",
+        )?;
 
         self.sockets
             .find_bound_inet_socket(SocketSpec::tcp(), &target_address)
@@ -1610,6 +1708,20 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 "process {pid} does not own socket {socket_id}"
             )));
         }
+        if existing.spec() != SocketSpec::udp()
+            || existing.state() != SocketState::Bound
+            || existing.local_address().is_none()
+        {
+            self.sockets
+                .check_send_to_bound_udp_socket(socket_id, target_address.clone())?;
+        }
+        check_network_access(
+            &self.vm_id,
+            &self.permissions,
+            NetworkOperation::Http,
+            &format_tcp_resource(target_address.host(), target_address.port()),
+        )?;
+        self.check_loopback_port_allowed(SocketSpec::udp(), &target_address, "UDP loopback send")?;
 
         self.sockets
             .check_send_to_bound_udp_socket(socket_id, target_address.clone())?;
@@ -1622,6 +1734,28 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             self.poll_notifier.notify();
         }
         Ok(written)
+    }
+
+    fn check_loopback_port_allowed(
+        &self,
+        spec: SocketSpec,
+        target_address: &InetSocketAddress,
+        operation: &str,
+    ) -> KernelResult<()> {
+        if self
+            .sockets
+            .find_bound_inet_socket(spec, target_address)
+            .is_some()
+            || self.loopback_exempt_ports.contains(&target_address.port())
+        {
+            return Ok(());
+        }
+
+        Err(KernelError::permission_denied(format!(
+            "{operation} to {}:{} is not owned by this VM and is not loopback-exempt",
+            target_address.host(),
+            target_address.port()
+        )))
     }
 
     pub fn socket_recv_datagram(

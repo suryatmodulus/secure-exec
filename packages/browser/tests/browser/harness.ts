@@ -1,5 +1,10 @@
 import { expect, type Page } from "@playwright/test";
-import type { ExecOptions, TimingMitigation } from "../../src/runtime.js";
+import type {
+	ExecOptions,
+	OSConfig,
+	ProcessConfig,
+	TimingMitigation,
+} from "../../src/runtime.js";
 
 export type HarnessStdioEvent = {
 	channel: "stdout" | "stderr";
@@ -9,11 +14,18 @@ export type HarnessStdioEvent = {
 export type HarnessCreateRuntimeOptions = {
 	filesystem?: "memory" | "opfs";
 	timingMitigation?: TimingMitigation;
+	commandExecutor?: "echo";
+	denyFsRead?: boolean;
+	denyChildProcess?: boolean;
+	denyNetwork?: boolean;
+	denyNetworkPort?: number;
 	payloadLimits?: {
 		base64TransferBytes?: number;
 		jsonPayloadBytes?: number;
 	};
 	useDefaultNetwork?: boolean;
+	processConfig?: ProcessConfig;
+	osConfig?: OSConfig;
 };
 
 export type HarnessCreateRuntimeResponse = {
@@ -29,20 +41,36 @@ export type HarnessExecResponse = {
 		errorMessage?: string;
 	};
 	stdio: HarnessStdioEvent[];
+	permissionDecisions: {
+		deniedFsReads: number;
+	};
 };
 
 export type HarnessTerminatePendingResponse = {
 	outcome: "resolved" | "rejected";
 	resultCode: number | null;
 	errorMessage: string | null;
+	signaled?: boolean;
 	debug: {
 		disposed: boolean;
 		pendingCount: number;
 		signalState: number[];
+		signalHandlers: Array<{
+			executionId: string;
+			handlers: Array<{
+				signal: number;
+				action: string;
+				mask: number[];
+				flags: number;
+			}>;
+		}>;
 		workerOnmessage: "null" | "set";
 		workerOnerror: "null" | "set";
 	};
 };
+
+export type HarnessRuntimeDebugResponse =
+	HarnessTerminatePendingResponse["debug"];
 
 export type HarnessSmokeResponse = HarnessExecResponse & {
 	workerUrl: string;
@@ -64,6 +92,18 @@ type SecureExecBrowserHarness = {
 		code: string,
 		delayMs?: number,
 	): Promise<HarnessTerminatePendingResponse>;
+	signalPendingExec(
+		runtimeId: string,
+		code: string,
+		signal?: number,
+		delayMs?: number,
+	): Promise<HarnessTerminatePendingResponse>;
+	debugPendingExec(
+		runtimeId: string,
+		code: string,
+		delayMs?: number,
+	): Promise<HarnessTerminatePendingResponse>;
+	runtimeDebug(runtimeId: string): Promise<HarnessRuntimeDebugResponse>;
 	smoke(): Promise<HarnessSmokeResponse>;
 };
 
@@ -73,8 +113,10 @@ declare global {
 	}
 }
 
+// The converged harness (wasm kernel) is the sole conformance runtime; the
+// legacy in-process TS-kernel harness has been removed.
 export async function openHarnessPage(page: Page): Promise<void> {
-	await page.goto("/frontend/runtime-harness.html");
+	await page.goto("/frontend/converged-conformance-harness.html");
 	await expect(page.locator("#harness-status")).toHaveText("ready");
 }
 
@@ -148,6 +190,66 @@ export async function terminatePendingExec(
 		},
 		{ runtimeId, code, delayMs },
 	);
+}
+
+export async function signalPendingExec(
+	page: Page,
+	runtimeId: string,
+	code: string,
+	signal?: number,
+	delayMs?: number,
+): Promise<HarnessTerminatePendingResponse> {
+	return page.evaluate(
+		async ({
+			runtimeId: runtimeIdArg,
+			code: codeArg,
+			signal: signalArg,
+			delayMs: delayMsArg,
+		}) => {
+			const harness = window.__secureExecBrowserHarness;
+			if (!harness) {
+				throw new Error("Browser harness is unavailable on window");
+			}
+			return harness.signalPendingExec(
+				runtimeIdArg,
+				codeArg,
+				signalArg,
+				delayMsArg,
+			);
+		},
+		{ runtimeId, code, signal, delayMs },
+	);
+}
+
+export async function debugPendingExec(
+	page: Page,
+	runtimeId: string,
+	code: string,
+	delayMs?: number,
+): Promise<HarnessTerminatePendingResponse> {
+	return page.evaluate(
+		async ({ runtimeId: runtimeIdArg, code: codeArg, delayMs: delayMsArg }) => {
+			const harness = window.__secureExecBrowserHarness;
+			if (!harness) {
+				throw new Error("Browser harness is unavailable on window");
+			}
+			return harness.debugPendingExec(runtimeIdArg, codeArg, delayMsArg);
+		},
+		{ runtimeId, code, delayMs },
+	);
+}
+
+export async function runtimeDebug(
+	page: Page,
+	runtimeId: string,
+): Promise<HarnessRuntimeDebugResponse> {
+	return page.evaluate(async (runtimeIdArg) => {
+		const harness = window.__secureExecBrowserHarness;
+		if (!harness) {
+			throw new Error("Browser harness is unavailable on window");
+		}
+		return harness.runtimeDebug(runtimeIdArg);
+	}, runtimeId);
 }
 
 export async function smokeHarness(page: Page): Promise<HarnessSmokeResponse> {

@@ -634,6 +634,17 @@ impl SocketTable {
             .cloned()
     }
 
+    pub fn records_for_owner(&self, owner_pid: u32) -> Vec<SocketRecord> {
+        let table = lock_or_recover(&self.inner.state);
+        let Some(socket_ids) = table.by_owner.get(&owner_pid) else {
+            return Vec::new();
+        };
+        socket_ids
+            .iter()
+            .filter_map(|socket_id| table.sockets.get(socket_id).cloned())
+            .collect()
+    }
+
     pub fn update_state(
         &self,
         socket_id: SocketId,
@@ -664,7 +675,7 @@ impl SocketTable {
         socket_id: SocketId,
         address: InetSocketAddress,
     ) -> SocketResult<SocketRecord> {
-        let address = normalize_inet_address(address);
+        let mut address = normalize_inet_address(address);
         let mut table = lock_or_recover(&self.inner.state);
         let existing = table
             .sockets
@@ -675,6 +686,12 @@ impl SocketTable {
             return Err(SocketTableError::invalid_argument(format!(
                 "socket {socket_id} is not an INET socket"
             )));
+        }
+        // POSIX bind(port=0) assigns a free ephemeral port (kernel-owned, so the
+        // converged browser path does not need a host port allocator).
+        if address.port() == 0 {
+            let port = assign_ephemeral_inet_port(&table, existing.spec, address.host())?;
+            address = normalize_inet_address(InetSocketAddress::new(address.host(), port));
         }
         let conflicting_ids =
             lookup_conflicting_bound_inet_socket_ids(&table, existing.spec, &address);
@@ -1809,6 +1826,26 @@ fn supports_inet_stream_lifecycle(spec: SocketSpec) -> bool {
 fn supports_inet_datagram_lifecycle(spec: SocketSpec) -> bool {
     matches!(spec.socket_type, SocketType::Datagram)
         && matches!(spec.domain, SocketDomain::Inet | SocketDomain::Inet6)
+}
+
+/// Pick a free ephemeral port for `bind(port=0)`, scanning the IANA dynamic
+/// range and skipping any already in conflict for `spec`/`host`.
+fn assign_ephemeral_inet_port(
+    table: &SocketTableState,
+    spec: SocketSpec,
+    host: &str,
+) -> SocketResult<u16> {
+    const EPHEMERAL_START: u16 = 49152;
+    const EPHEMERAL_END: u16 = 65535;
+    for port in EPHEMERAL_START..=EPHEMERAL_END {
+        let candidate = normalize_inet_address(InetSocketAddress::new(host, port));
+        if lookup_conflicting_bound_inet_socket_ids(table, spec, &candidate).is_empty() {
+            return Ok(port);
+        }
+    }
+    Err(SocketTableError::address_in_use(
+        "no free ephemeral port available",
+    ))
 }
 
 fn lookup_conflicting_bound_inet_socket_ids(
