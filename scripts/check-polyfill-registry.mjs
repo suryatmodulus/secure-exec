@@ -13,27 +13,28 @@ const registryPath = path.join(
 	"assets",
 	"polyfill-registry.json",
 );
-const bridgeSourcePath = path.join(
+const builtinModulesPath = path.join(
 	repoRoot,
-	"crates",
-	"execution",
-	"assets",
-	"v8-bridge.source.js",
+	"packages",
+	"build-tools",
+	"bridge-src",
+	"builtins",
+	"builtin-modules.ts",
 );
 
 const registry = JSON.parse(readFileSync(registryPath, "utf8"));
-const bridgeSource = readFileSync(bridgeSourcePath, "utf8");
+const builtinModulesSource = readFileSync(builtinModulesPath, "utf8");
 const registryNames = new Set(
 	(registry.groups ?? []).flatMap((group) => group.names ?? []),
 );
 
 const builtinModules = extractStringList(
-	bridgeSource,
+	builtinModulesSource,
 	/static builtinModules = \[([\s\S]*?)\];/,
 	"Module.builtinModules",
 );
 const loadBuiltinCases = new Set(
-	[...bridgeSource.matchAll(/case "([^"]+)":/g)]
+	[...builtinModulesSource.matchAll(/case "([^"]+)":/g)]
 		.map((match) => match[1])
 		.filter((name) => builtinModules.has(name)),
 );
@@ -63,7 +64,9 @@ if (errors.length > 0) {
 function extractStringList(source, pattern, label) {
 	const match = source.match(pattern);
 	if (!match) {
-		console.error(`Unable to find ${label} in v8-bridge.source.js`);
+		console.error(
+			`Unable to find ${label} in packages/build-tools/bridge-src/builtins/builtin-modules.ts`,
+		);
 		process.exit(1);
 	}
 	return new Set([...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]));
