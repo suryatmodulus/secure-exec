@@ -62,6 +62,7 @@ use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, Uri};
 use md5::Md5;
 use nix::libc;
+use nix::poll::{poll, PollFd as NixPollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{kill as send_signal, Signal};
 use nix::sys::wait::WaitStatus;
 #[cfg(not(target_os = "macos"))]
@@ -152,6 +153,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
     UdpSocket,
 };
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -261,6 +263,36 @@ fn http_loopback_request_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(HTTP_LOOPBACK_REQUEST_TIMEOUT)
+}
+
+/// Block until `fd` is readable or `deadline` passes. Returns whether it became readable.
+///
+/// BLOCKING: parks the calling OS thread in `poll(2)`. The unix/tcp accept and
+/// udp recv callers run on the sidecar's single-thread tokio runtime, so a
+/// non-zero wait stalls the whole event loop for up to `deadline` — the same
+/// stall as the fixed sleeps this replaced, and only acceptable because the
+/// guest net path always polls with wait == 0. Keep deadlines bounded and do
+/// not add wait > 0 callers on paths that service concurrent VM traffic.
+fn wait_fd_readable_until(fd: BorrowedFd<'_>, deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+
+    let timeout_ms = remaining.as_millis().saturating_add(u128::from(
+        !remaining.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    let timeout =
+        PollTimeout::try_from(timeout_ms.min(i32::MAX as u128)).unwrap_or(PollTimeout::MAX);
+    let mut fds = [NixPollFd::new(fd, PollFlags::POLLIN)];
+    match poll(&mut fds, timeout) {
+        Ok(0) => false,
+        Ok(_) => fds[0]
+            .revents()
+            .unwrap_or_else(PollFlags::empty)
+            .intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR),
+        Err(_) => true,
+    }
 }
 
 const DEFAULT_ALLOWED_NODE_BUILTINS: &[&str] = &[
@@ -2234,7 +2266,9 @@ impl ActiveUnixListener {
                     if wait.is_zero() || Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    if !wait_fd_readable_until(self.listener.as_fd(), deadline) {
+                        return Ok(None);
+                    }
                 }
                 Err(error) => {
                     return Ok(Some(JavascriptUnixListenerEvent::Error {
@@ -2456,7 +2490,15 @@ impl ActiveTcpListener {
                     if wait.is_zero() || Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    if !wait_fd_readable_until(
+                        self.listener
+                            .as_ref()
+                            .expect("TCP listener checked before accept")
+                            .as_fd(),
+                        deadline,
+                    ) {
+                        return Ok(None);
+                    }
                 }
                 Err(error) => {
                     return Ok(Some(JavascriptTcpListenerEvent::Error {
@@ -2709,7 +2751,9 @@ impl ActiveUdpSocket {
                     if wait.is_zero() || Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    if !wait_fd_readable_until(socket.as_fd(), deadline) {
+                        return Ok(None);
+                    }
                 }
                 Err(error) => {
                     return Ok(Some(JavascriptUdpSocketEvent::Error {
@@ -20544,7 +20588,10 @@ fn spawn_http2_server_accept_loop(
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(HTTP2_POLL_DELAY);
+                    wait_fd_readable_until(
+                        listener.as_fd(),
+                        Instant::now() + Duration::from_millis(100),
+                    );
                 }
                 Err(error) => {
                     push_http2_server_event(
@@ -20557,6 +20604,8 @@ fn spawn_http2_server_accept_loop(
                             ..Http2BridgeEvent::default()
                         },
                     );
+                    // Persistent accept errors (e.g. EMFILE) leave the fd readable, so a
+                    // readiness wait would return immediately and spin; keep the throttle.
                     thread::sleep(HTTP2_POLL_DELAY);
                 }
             }

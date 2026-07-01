@@ -38,7 +38,7 @@ hickory-resolver = "0.26.0-beta.3"
 jsonwebtoken = "8.3.0"
 log = "0.4"
 md-5 = "0.10"
-nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.29", features = ["fs", "poll", "process", "signal", "user"] }
 # `vendored` builds OpenSSL from source → self-contained binary with no
 # system-openssl discovery on any runner (ubuntu/macOS). openssl backs the
 # guest crypto runtime (RSA/EC/DH/AES), so it cannot be a TLS-only stack.
