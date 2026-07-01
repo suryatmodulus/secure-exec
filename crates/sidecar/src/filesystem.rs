@@ -1084,9 +1084,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 position.is_none() && kernel_fd_surfaces_stdio_event(kernel, kernel_pid, fd)?;
             if surfaces_stdio {
                 let event = if fd == 1 {
-                    ActiveExecutionEvent::Stdout(contents.clone())
+                    ActiveExecutionEvent::Stdout(contents)
                 } else {
-                    ActiveExecutionEvent::Stderr(contents.clone())
+                    ActiveExecutionEvent::Stderr(contents)
                 };
                 process.queue_pending_execution_event(event)?;
             } else {
