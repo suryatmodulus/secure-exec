@@ -706,6 +706,10 @@ impl PythonExecution {
             (None, Some(configured)) => Some(configured),
             (None, None) => None,
         };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("python wait runtime");
 
         loop {
             let poll_timeout = timeout
@@ -719,11 +723,7 @@ impl PythonExecution {
                 })
                 .unwrap_or_else(|| Duration::from_millis(50));
 
-            let event = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("python wait runtime")
-                .block_on(self.poll_event(poll_timeout))?;
+            let event = runtime.block_on(self.poll_event(poll_timeout))?;
 
             match event {
                 Some(PythonExecutionEvent::Stdout(chunk)) => stdout.extend(&chunk),
