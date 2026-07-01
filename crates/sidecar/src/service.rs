@@ -75,7 +75,7 @@ use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -92,6 +92,16 @@ pub(crate) const MAX_PROCESS_EVENT_QUEUE: usize = 10_000;
 pub(crate) const MAX_PENDING_SIDECAR_RESPONSES: usize = 10_000;
 pub(crate) const MAX_OUTBOUND_SIDECAR_REQUESTS: usize = 10_000;
 pub(crate) const MAX_COMPLETED_SIDECAR_RESPONSES: usize = 10_000;
+static BLOCKING_DISPATCH_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn blocking_dispatch_runtime() -> &'static tokio::runtime::Runtime {
+    BLOCKING_DISPATCH_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("sidecar blocking dispatch runtime")
+    })
+}
 
 pub(crate) fn process_event_queue_overflow_error() -> SidecarError {
     SidecarError::InvalidState(format!(
@@ -1072,11 +1082,7 @@ where
     ) -> Result<DispatchResult, SidecarError> {
         let inside_runtime = tokio::runtime::Handle::try_current().is_ok();
         if request_dispatch_mode(&request) == RequestDispatchMode::Async && !inside_runtime {
-            return tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("sidecar dispatch runtime")
-                .block_on(self.dispatch(request));
+            return blocking_dispatch_runtime().block_on(self.dispatch(request));
         }
 
         let mut future = std::pin::pin!(self.dispatch(request));
@@ -1085,11 +1091,7 @@ where
             None if inside_runtime => Err(SidecarError::InvalidState(String::from(
                 "dispatch_blocking cannot wait for an async sidecar request inside a Tokio runtime; use dispatch().await",
             ))),
-            None => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("sidecar dispatch runtime")
-                .block_on(future),
+            None => blocking_dispatch_runtime().block_on(future),
         }
     }
 
@@ -1107,11 +1109,7 @@ where
         ownership: &OwnershipScope,
         timeout: Duration,
     ) -> Result<Option<EventFrame>, SidecarError> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sidecar poll runtime")
-            .block_on(self.poll_event(ownership, timeout))
+        blocking_dispatch_runtime().block_on(self.poll_event(ownership, timeout))
     }
 
     pub fn poll_event_wire_blocking(
@@ -1131,22 +1129,14 @@ where
         connection_id: &str,
         session_id: &str,
     ) -> Result<Vec<EventFrame>, SidecarError> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sidecar close-session runtime")
-            .block_on(self.close_session(connection_id, session_id))
+        blocking_dispatch_runtime().block_on(self.close_session(connection_id, session_id))
     }
 
     pub fn remove_connection_blocking(
         &mut self,
         connection_id: &str,
     ) -> Result<Vec<EventFrame>, SidecarError> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sidecar remove-connection runtime")
-            .block_on(self.remove_connection(connection_id))
+        blocking_dispatch_runtime().block_on(self.remove_connection(connection_id))
     }
 
     pub fn dispose_vm_internal_blocking(
@@ -1156,10 +1146,7 @@ where
         vm_id: &str,
         reason: DisposeReason,
     ) -> Result<Vec<EventFrame>, SidecarError> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("sidecar dispose-vm runtime")
+        blocking_dispatch_runtime()
             .block_on(self.dispose_vm_internal(connection_id, session_id, vm_id, reason))
     }
 
