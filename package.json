@@ -24,7 +24,9 @@
 	"pnpm": {
 		"overrides": {
 			"@mariozechner/pi-tui": "0.60.0",
-			"@mariozechner/pi-agent-core": "0.60.0"
+			"@mariozechner/pi-agent-core": "0.60.0",
+			"@rivet-gg/components": "github:rivet-dev/docs-theme#v0.3.1&path:vendor/components",
+			"@rivet-gg/icons": "github:rivet-dev/docs-theme#v0.3.1&path:vendor/icons"
 		}
 	}
 }
