@@ -22,13 +22,21 @@
 //! Usage: native-baseline --op spawn_exit|exec_capture --iters N --warmup W
 
 use std::fs::File;
-use std::io::{Read, Write};
+#[cfg(not(target_family = "wasm"))]
+use std::io::Read;
+use std::io::Write;
+#[cfg(not(target_family = "wasm"))]
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_family = "wasm")))]
 use std::os::unix::net::UnixStream;
+use std::path::Path;
+#[cfg(not(target_family = "wasm"))]
 use std::process::{Command, Stdio};
+#[cfg(not(target_family = "wasm"))]
 use std::thread;
 use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use std::time::SystemTime;
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -64,8 +72,65 @@ enum Op {
     AllocFree,
 }
 
-fn run_once(op: Op, iter: usize) {
+impl Op {
+    #[cfg(target_family = "wasm")]
+    fn supported_on_wasm(self) -> bool {
+        matches!(
+            self,
+            Op::FsStat
+                | Op::FsWrite
+                | Op::FsRead
+                | Op::FsOpenClose
+                | Op::FsMkdirRmdir
+                | Op::FsRename
+                | Op::FsReaddir
+                | Op::FsFsync
+                | Op::CpuLoop
+                | Op::AllocFree
+        )
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+type Timer = Instant;
+
+#[cfg(not(target_family = "wasm"))]
+fn timer_start() -> Timer {
+    Instant::now()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn elapsed_ns(timer: Timer) -> u128 {
+    timer.elapsed().as_nanos()
+}
+
+#[cfg(target_family = "wasm")]
+struct Timer {
+    instant: Option<Instant>,
+    system: SystemTime,
+}
+
+#[cfg(target_family = "wasm")]
+fn timer_start() -> Timer {
+    Timer {
+        instant: std::panic::catch_unwind(Instant::now).ok(),
+        system: SystemTime::now(),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn elapsed_ns(timer: Timer) -> u128 {
+    if let Some(instant) = timer.instant {
+        if let Ok(elapsed) = std::panic::catch_unwind(|| instant.elapsed()) {
+            return elapsed.as_nanos();
+        }
+    }
+    timer.system.elapsed().map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+fn run_once(op: Op, iter: usize, base_dir: &Path) {
     match op {
+        #[cfg(not(target_family = "wasm"))]
         Op::SpawnExit => {
             let status = Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
@@ -73,6 +138,7 @@ fn run_once(op: Op, iter: usize) {
                 .expect("spawn /bin/sh failed");
             assert!(status.success(), "expected exit 0, got {status:?}");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::ExecCapture => {
             let out = Command::new("/bin/sh")
                 .args(["-c", "printf hi"])
@@ -80,6 +146,7 @@ fn run_once(op: Op, iter: usize) {
                 .expect("spawn /bin/sh failed");
             assert_eq!(out.stdout, b"hi", "unexpected stdout");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::NodeStdoutDiscard2b => {
             let status = Command::new("node")
                 .args(["-e", "process.stdout.write('hi')"])
@@ -89,6 +156,7 @@ fn run_once(op: Op, iter: usize) {
                 .expect("spawn node failed");
             assert!(status.success(), "expected exit 0, got {status:?}");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::NodeStdoutCapture2b => {
             let out = Command::new("node")
                 .args(["-e", "process.stdout.write('hi')"])
@@ -101,6 +169,7 @@ fn run_once(op: Op, iter: usize) {
             );
             assert_eq!(out.stdout, b"hi", "unexpected stdout");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::NodeStdoutListenerOnly2b => {
             let mut child = Command::new("node")
                 .args(["-e", "process.stdout.write('hi')"])
@@ -117,6 +186,7 @@ fn run_once(op: Op, iter: usize) {
         }
         // Real host node process that immediately exits. This is the apples-to-apples
         // floor for the guest layer, where the same logical op spins a V8 isolate.
+        #[cfg(not(target_family = "wasm"))]
         Op::NodeExit => {
             let status = Command::new("node")
                 .args(["-e", "process.exit(0)"])
@@ -124,6 +194,7 @@ fn run_once(op: Op, iter: usize) {
                 .expect("spawn node failed");
             assert!(status.success(), "expected exit 0, got {status:?}");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::NodeFanout | Op::NodeReapStorm => {
             let mut children = Vec::new();
             for _ in 0..8 {
@@ -139,6 +210,7 @@ fn run_once(op: Op, iter: usize) {
                 assert!(status.success(), "expected exit 0, got {status:?}");
             }
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::PipeChain => {
             let out = Command::new("/bin/sh")
                 .args(["-c", "printf hello | cat | cat >/dev/null"])
@@ -147,17 +219,17 @@ fn run_once(op: Op, iter: usize) {
             assert!(out.status.success(), "pipe chain failed: {out:?}");
         }
         Op::FsStat => {
-            let path = std::env::temp_dir().join("secure-exec-native-fs-stat.txt");
+            let path = base_dir.join("secure-exec-native-fs-stat.txt");
             std::fs::write(&path, b"hi").expect("write stat fixture");
             let meta = std::fs::metadata(&path).expect("stat fixture");
             assert!(meta.len() >= 2);
         }
         Op::FsWrite => {
-            let path = std::env::temp_dir().join("secure-exec-native-fs-write.txt");
+            let path = base_dir.join("secure-exec-native-fs-write.txt");
             std::fs::write(path, format!("hello-{iter:08}")).expect("write fixture");
         }
         Op::FsRead => {
-            let path = std::env::temp_dir().join("secure-exec-native-fs-read.bin");
+            let path = base_dir.join("secure-exec-native-fs-read.bin");
             if !path.exists() {
                 std::fs::write(&path, vec![7_u8; 64 * 1024]).expect("write read fixture");
             }
@@ -165,26 +237,25 @@ fn run_once(op: Op, iter: usize) {
             assert_eq!(data.len(), 64 * 1024);
         }
         Op::FsOpenClose => {
-            let path = std::env::temp_dir().join("secure-exec-native-fs-open-close.txt");
+            let path = base_dir.join("secure-exec-native-fs-open-close.txt");
             std::fs::write(&path, b"hi").expect("write open fixture");
             let file = File::open(path).expect("open fixture");
             drop(file);
         }
         Op::FsMkdirRmdir => {
-            let path = std::env::temp_dir().join(format!("secure-exec-native-dir-{iter}"));
+            let path = base_dir.join(format!("secure-exec-native-dir-{iter}"));
             std::fs::create_dir(&path).expect("create dir");
             std::fs::remove_dir(&path).expect("remove dir");
         }
         Op::FsRename => {
-            let base = std::env::temp_dir();
-            let from = base.join(format!("secure-exec-native-rename-{iter}.a"));
-            let to = base.join(format!("secure-exec-native-rename-{iter}.b"));
+            let from = base_dir.join(format!("secure-exec-native-rename-{iter}.a"));
+            let to = base_dir.join(format!("secure-exec-native-rename-{iter}.b"));
             std::fs::write(&from, b"hi").expect("write rename fixture");
             std::fs::rename(&from, &to).expect("rename fixture");
             std::fs::remove_file(&to).expect("remove rename fixture");
         }
         Op::FsReaddir => {
-            let dir = std::env::temp_dir().join("secure-exec-native-readdir");
+            let dir = base_dir.join("secure-exec-native-readdir");
             std::fs::create_dir_all(&dir).expect("create readdir dir");
             for i in 0..32 {
                 let path = dir.join(format!("{i}.txt"));
@@ -196,11 +267,12 @@ fn run_once(op: Op, iter: usize) {
             assert!(count >= 32);
         }
         Op::FsFsync => {
-            let path = std::env::temp_dir().join("secure-exec-native-fsync.txt");
+            let path = base_dir.join("secure-exec-native-fsync.txt");
             let mut file = File::create(path).expect("create fsync fixture");
             file.write_all(b"hello").expect("write fsync fixture");
             file.sync_all().expect("fsync fixture");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::DnsLookup => {
             let addrs: Vec<_> = ("localhost", 80)
                 .to_socket_addrs()
@@ -208,6 +280,7 @@ fn run_once(op: Op, iter: usize) {
                 .collect();
             assert!(!addrs.is_empty());
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::DnsConcurrent => {
             let threads: Vec<_> = (0..4)
                 .map(|_| {
@@ -224,6 +297,7 @@ fn run_once(op: Op, iter: usize) {
                 handle.join().expect("join resolver");
             }
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::TcpConnect => {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
             let addr = listener.local_addr().expect("listener addr");
@@ -233,6 +307,7 @@ fn run_once(op: Op, iter: usize) {
             let _stream = TcpStream::connect(addr).expect("connect tcp listener");
             server.join().expect("join tcp server");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::TcpEcho => {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
             let addr = listener.local_addr().expect("listener addr");
@@ -249,6 +324,7 @@ fn run_once(op: Op, iter: usize) {
             assert_eq!(&buf, b"hello");
             server.join().expect("join tcp server");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::TcpConcurrent => {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
             let addr = listener.local_addr().expect("listener addr");
@@ -268,6 +344,7 @@ fn run_once(op: Op, iter: usize) {
             }
             server.join().expect("join tcp server");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::TcpThroughput => {
             let payload = vec![7_u8; 64 * 1024];
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
@@ -285,6 +362,7 @@ fn run_once(op: Op, iter: usize) {
             assert_eq!(out.len(), payload.len());
             server.join().expect("join tcp server");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::TcpTinyWrites => {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
             let addr = listener.local_addr().expect("listener addr");
@@ -302,6 +380,7 @@ fn run_once(op: Op, iter: usize) {
             stream.read_exact(&mut out).expect("read tiny echo");
             server.join().expect("join tcp server");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::UdpEcho => {
             let server = UdpSocket::bind("127.0.0.1:0").expect("bind udp server");
             let addr = server.local_addr().expect("udp addr");
@@ -317,6 +396,7 @@ fn run_once(op: Op, iter: usize) {
             assert_eq!(n, 5);
             handle.join().expect("join udp server");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::PipeEcho => {
             let out = Command::new("/bin/sh")
                 .args(["-c", "printf hello | cat >/dev/null"])
@@ -324,6 +404,7 @@ fn run_once(op: Op, iter: usize) {
                 .expect("run pipe echo");
             assert!(out.status.success(), "pipe command failed: {out:?}");
         }
+        #[cfg(not(target_family = "wasm"))]
         Op::PipeThroughput | Op::PipeBackpressure => {
             #[cfg(unix)]
             {
@@ -362,6 +443,8 @@ fn run_once(op: Op, iter: usize) {
             }
             std::hint::black_box(data);
         }
+        #[cfg(target_family = "wasm")]
+        _ => unreachable!("unsupported wasm op checked before execution"),
     }
 }
 
@@ -371,61 +454,69 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn run_node_exit_phases() -> Vec<(&'static str, u128)> {
-    let total_start = Instant::now();
-    let spawn_start = Instant::now();
+    let total_start = timer_start();
+    let spawn_start = timer_start();
     let mut child = Command::new("node")
         .args(["-e", "process.exit(0)"])
         .spawn()
         .expect("spawn node failed");
-    let spawn_ns = spawn_start.elapsed().as_nanos();
+    let spawn_ns = elapsed_ns(spawn_start);
 
-    let wait_start = Instant::now();
+    let wait_start = timer_start();
     let status = child.wait().expect("wait node child");
-    let wait_ns = wait_start.elapsed().as_nanos();
+    let wait_ns = elapsed_ns(wait_start);
     assert!(status.success(), "expected exit 0, got {status:?}");
 
     vec![
-        ("total", total_start.elapsed().as_nanos()),
+        ("total", elapsed_ns(total_start)),
         ("spawn", spawn_ns),
         ("wait_reap", wait_ns),
     ]
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn run_node_fanout_phases() -> Vec<(&'static str, u128)> {
-    let total_start = Instant::now();
-    let spawn_start = Instant::now();
+    let total_start = timer_start();
+    let spawn_start = timer_start();
     let mut children = Vec::new();
     for _ in 0..8 {
         children.push(
             Command::new("node")
                 .args(["-e", "process.exit(0)"])
                 .spawn()
-                .expect("spawn node failed"),
+            .expect("spawn node failed"),
         );
     }
-    let spawn_ns = spawn_start.elapsed().as_nanos();
+    let spawn_ns = elapsed_ns(spawn_start);
 
-    let wait_start = Instant::now();
+    let wait_start = timer_start();
     for mut child in children {
         let status = child.wait().expect("wait node child");
         assert!(status.success(), "expected exit 0, got {status:?}");
     }
-    let wait_ns = wait_start.elapsed().as_nanos();
+    let wait_ns = elapsed_ns(wait_start);
 
     vec![
-        ("total", total_start.elapsed().as_nanos()),
+        ("total", elapsed_ns(total_start)),
         ("spawn_batch", spawn_ns),
         ("wait_reap_batch", wait_ns),
     ]
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn run_phases_once(op: Op) -> Option<Vec<(&'static str, u128)>> {
     match op {
         Op::NodeExit => Some(run_node_exit_phases()),
         Op::NodeFanout | Op::NodeReapStorm => Some(run_node_fanout_phases()),
         _ => None,
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn run_phases_once(_op: Op) -> Option<Vec<(&'static str, u128)>> {
+    None
 }
 
 fn write_phase_json(op_name: &str, samples: &[(String, Vec<u128>)]) {
@@ -523,12 +614,26 @@ fn main() {
         Op::CpuLoop => "cpu_loop",
         Op::AllocFree => "alloc_free",
     };
+    #[cfg(target_family = "wasm")]
+    if !op.supported_on_wasm() {
+        println!("{{\"unsupported\":true,\"op\":\"{op_name}\"}}");
+        return;
+    }
     let iters: usize = arg_value(&args, "--iters")
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
     let warmup: usize = arg_value(&args, "--warmup")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    let base_dir = if let Some(path) = arg_value(&args, "--base-dir") {
+        let path = std::path::PathBuf::from(path);
+        if !path.exists() {
+            std::fs::create_dir_all(&path).expect("create base dir");
+        }
+        path
+    } else {
+        std::env::temp_dir()
+    };
     let phases = args.iter().any(|arg| arg == "--phases");
 
     let total = warmup + iters;
@@ -560,9 +665,9 @@ fn main() {
 
     let mut samples: Vec<u128> = Vec::with_capacity(iters);
     for i in 0..total {
-        let t = Instant::now();
-        run_once(op, i);
-        let ns = t.elapsed().as_nanos();
+        let t = timer_start();
+        run_once(op, i, &base_dir);
+        let ns = elapsed_ns(t);
         if i >= warmup {
             samples.push(ns);
         }
