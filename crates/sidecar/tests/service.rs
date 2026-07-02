@@ -11138,6 +11138,145 @@ await new Promise(() => {});
             };
             cleanup_fake_runtime_process(process);
         }
+
+        fn javascript_fs_promises_hot_metadata_ops_use_sync_semantics() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-promises-hot-metadata",
+                r#"
+(async () => {
+  const fs = require("node:fs");
+  const fsp = fs.promises;
+  const root = "/tmp/promises-hot-metadata";
+  const file = `${root}/file.txt`;
+  const link = `${root}/link.txt`;
+
+  const errorCode = async (fn) => {
+    try {
+      await fn();
+      return "OK";
+    } catch (error) {
+      return error.code;
+    }
+  };
+
+  await fsp.mkdir(root, { recursive: true });
+  await fsp.writeFile(file, "hello");
+  fs.symlinkSync("file.txt", link);
+
+  const fileStat = await fsp.stat(file);
+  const dirStat = await fsp.stat(root);
+  const fileLstat = await fsp.lstat(file);
+  const dirLstat = await fsp.lstat(root);
+  const statMissing = await errorCode(() => fsp.stat(`${root}/missing.txt`));
+  const lstatMissing = await errorCode(() => fsp.lstat(`${root}/missing.txt`));
+
+  await fsp.writeFile(`${root}/rename-from.txt`, "move");
+  await fsp.rename(`${root}/rename-from.txt`, `${root}/rename-to.txt`);
+  const renamedText = await fsp.readFile(`${root}/rename-to.txt`, "utf8");
+  await fsp.unlink(`${root}/rename-to.txt`);
+  const unlinkedMissing = await errorCode(() => fsp.stat(`${root}/rename-to.txt`));
+
+  await fsp.mkdir(`${root}/nested/leaf`, { recursive: true });
+  const mkdirExisting = await errorCode(() => fsp.mkdir(`${root}/nested/leaf`));
+  await fsp.rmdir(`${root}/nested/leaf`);
+  const rmdirMissing = await errorCode(() => fsp.rmdir(`${root}/nested/leaf`));
+  const accessMissing = await errorCode(() => fsp.access(`${root}/missing.txt`));
+
+  await fsp.chmod(file, 0o600);
+  const chmodStat = await fsp.stat(file);
+  const stamp = new Date("2024-01-02T03:04:05.000Z");
+  await fsp.utimes(file, stamp, stamp);
+  const utimesStat = await fsp.stat(file);
+
+  const linkTarget = await fsp.readlink(link);
+  const realpath = await fsp.realpath(link);
+
+  process.stdout.write(`${JSON.stringify({
+    fileIsFile: fileStat.isFile(),
+    dirIsDirectory: dirStat.isDirectory(),
+    fileLstatIsFile: fileLstat.isFile(),
+    dirLstatIsDirectory: dirLstat.isDirectory(),
+    statMissing,
+    lstatMissing,
+    renamedText,
+    unlinkedMissing,
+    mkdirExisting,
+    rmdirMissing,
+    accessMissing,
+    chmodMode: chmodStat.mode & 0o777,
+    utimesMtimeMs: Math.round(utimesStat.mtimeMs),
+    linkTarget,
+    realpath,
+  })}\n`);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : String(error));
+  process.exitCode = 1;
+});
+"#,
+            );
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(payload["fileIsFile"], json!(true), "stdout: {stdout}");
+            assert_eq!(payload["dirIsDirectory"], json!(true), "stdout: {stdout}");
+            assert_eq!(payload["fileLstatIsFile"], json!(true), "stdout: {stdout}");
+            assert_eq!(
+                payload["dirLstatIsDirectory"],
+                json!(true),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["statMissing"], json!("ENOENT"), "stdout: {stdout}");
+            assert_eq!(payload["lstatMissing"], json!("ENOENT"), "stdout: {stdout}");
+            assert_eq!(payload["renamedText"], json!("move"), "stdout: {stdout}");
+            assert_eq!(
+                payload["unlinkedMissing"],
+                json!("ENOENT"),
+                "stdout: {stdout}"
+            );
+            assert_eq!(
+                payload["mkdirExisting"],
+                json!("EEXIST"),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["rmdirMissing"], json!("ENOENT"), "stdout: {stdout}");
+            assert_eq!(
+                payload["accessMissing"],
+                json!("ENOENT"),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["chmodMode"], json!(0o600), "stdout: {stdout}");
+            assert_eq!(
+                payload["utimesMtimeMs"],
+                json!(1704164645000i64),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["linkTarget"], json!("file.txt"), "stdout: {stdout}");
+            assert_eq!(
+                payload["realpath"],
+                json!("/tmp/promises-hot-metadata/file.txt"),
+                "stdout: {stdout}"
+            );
+        }
+
         fn python_vfs_rpc_paths_resolve_textually_and_defer_to_kernel_confinement() {
             // Root is `/`: any absolute guest path is addressable and textual
             // `.`/`..` segments are resolved here; confinement is enforced at the
@@ -20050,6 +20189,7 @@ console.log(JSON.stringify({
             command_resolution_rejects_unknown_command();
             python_vfs_rpc_requests_proxy_into_the_vm_kernel_filesystem();
             javascript_sync_rpc_requests_proxy_into_the_vm_kernel_filesystem();
+            javascript_fs_promises_hot_metadata_ops_use_sync_semantics();
             python_vfs_rpc_paths_resolve_textually_and_defer_to_kernel_confinement();
             javascript_fs_sync_rpc_resolves_proc_self_against_the_kernel_process();
             javascript_fd_and_stream_rpc_requests_proxy_into_the_vm_kernel_filesystem();
@@ -20176,6 +20316,11 @@ console.log(JSON.stringify({
         #[test]
         fn aac_javascript_imports_guest_written_modules_after_miss() {
             run_isolated_service_test("javascript-import-fresh");
+        }
+
+        #[test]
+        fn javascript_fs_promises_hot_metadata_ops_use_sync_semantics_regression() {
+            run_isolated_service_test("javascript-fs-promises-hot-metadata");
         }
 
         #[test]
@@ -20312,6 +20457,9 @@ console.log(JSON.stringify({
                 }
                 "javascript-import-fresh" => {
                     javascript_imports_guest_written_modules_after_miss_work();
+                }
+                "javascript-fs-promises-hot-metadata" => {
+                    javascript_fs_promises_hot_metadata_ops_use_sync_semantics();
                 }
                 "mapped-shadow-readdir-wasm-directory" => {
                     javascript_mapped_shadow_readdir_sees_wasm_created_directory();
