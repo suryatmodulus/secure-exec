@@ -216,6 +216,8 @@ async function validateBridgeContractGlobals(sourceText) {
 		"_httpServerConnectDispatch",
 		"_http2Dispatch",
 		"_timerDispatch",
+		"_drainImmediates",
+		"_getPendingImmediateCount",
 		"_upgradeSocketData",
 		"_upgradeSocketEnd",
 		"ProcessExitError",

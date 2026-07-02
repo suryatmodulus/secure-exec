@@ -166,6 +166,16 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host-to-sandbox timer callback dispatch entrypoint."
   },
   {
+    name: "_drainImmediates",
+    classification: "hardened",
+    rationale: "Runtime-owned setImmediate queue drain entrypoint."
+  },
+  {
+    name: "_getPendingImmediateCount",
+    classification: "hardened",
+    rationale: "Runtime-owned setImmediate pending-work counter."
+  },
+  {
     name: "_upgradeSocketData",
     classification: "hardened",
     rationale: "Host-to-sandbox HTTP upgrade socket data dispatch entrypoint."

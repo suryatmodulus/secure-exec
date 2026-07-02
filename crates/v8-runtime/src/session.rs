@@ -1618,6 +1618,7 @@ pub fn run_event_loop(
         || execution::pending_module_evaluation_needs_wait(scope)
         || execution::pending_script_evaluation_needs_wait(scope)
         || pending_guest_timer_count(scope) > 0
+        || pending_guest_immediate_count(scope) > 0
         || deferred
             .map(|dq| !dq.lock().unwrap().is_empty())
             .unwrap_or(false)
@@ -1637,6 +1638,7 @@ pub fn run_event_loop(
                 && !execution::pending_module_evaluation_needs_wait(scope)
                 && !execution::pending_script_evaluation_needs_wait(scope)
                 && pending_guest_timer_count(scope) == 0
+                && pending_guest_immediate_count(scope) == 0
             {
                 break;
             }
@@ -1656,12 +1658,33 @@ pub fn run_event_loop(
             }
         }
 
+        if pending_guest_immediate_count(scope) > 0 {
+            match try_recv_session_command(scope, rx, abort_rx) {
+                Ok(Some(cmd)) => {
+                    let status = dispatch_session_command(scope, cmd, pending);
+                    if !matches!(status, EventLoopStatus::Completed) {
+                        return status;
+                    }
+                }
+                Ok(None) => {
+                    let status = drain_guest_immediates(scope);
+                    if !matches!(status, EventLoopStatus::Completed) {
+                        return status;
+                    }
+                }
+                Err(status) => return status,
+            }
+            scope.perform_microtask_checkpoint();
+            pump_v8_message_loop(scope);
+        }
+
         // Re-check exit conditions after microtask flush — the microtask may
         // have resolved all pending promises or registered new handles.
         if pending.is_empty()
             && !execution::pending_module_evaluation_needs_wait(scope)
             && !execution::pending_script_evaluation_needs_wait(scope)
             && pending_guest_timer_count(scope) == 0
+            && pending_guest_immediate_count(scope) == 0
             && deferred
                 .map(|dq| dq.lock().unwrap().is_empty())
                 .unwrap_or(true)
@@ -1673,6 +1696,21 @@ pub fn run_event_loop(
         // Instead of blocking indefinitely, use a short timeout so we can
         // periodically flush microtasks (like Node.js's libuv + DrainTasks pattern).
         let cmd = loop {
+            if pending_guest_immediate_count(scope) > 0 {
+                match try_recv_session_command(scope, rx, abort_rx) {
+                    Ok(Some(cmd)) => break cmd,
+                    Ok(None) => {
+                        let status = drain_guest_immediates(scope);
+                        if !matches!(status, EventLoopStatus::Completed) {
+                            return status;
+                        }
+                        scope.perform_microtask_checkpoint();
+                        pump_v8_message_loop(scope);
+                        continue;
+                    }
+                    Err(status) => return status,
+                }
+            }
             let recv_result = if let Some(abort) = abort_rx {
                 crossbeam_channel::select! {
                     recv(rx) -> result => result.ok(),
@@ -1708,6 +1746,7 @@ pub fn run_event_loop(
                 && !execution::pending_module_evaluation_needs_wait(scope)
                 && !execution::pending_script_evaluation_needs_wait(scope)
                 && pending_guest_timer_count(scope) == 0
+                && pending_guest_immediate_count(scope) == 0
                 && deferred
                     .map(|dq| dq.lock().unwrap().is_empty())
                     .unwrap_or(true)
@@ -1716,20 +1755,50 @@ pub fn run_event_loop(
             }
         };
 
-        match cmd {
-            SessionCommand::Message(frame) => {
-                let status = dispatch_event_loop_frame(scope, frame, pending);
-                if !matches!(status, EventLoopStatus::Completed) {
-                    return status;
-                }
-            }
-            SessionCommand::SetModuleReader(reader) => {
-                execution::install_session_guest_reader(Some(reader));
-            }
-            SessionCommand::Shutdown => return EventLoopStatus::Terminated,
+        let status = dispatch_session_command(scope, cmd, pending);
+        if !matches!(status, EventLoopStatus::Completed) {
+            return status;
         }
     }
     EventLoopStatus::Completed
+}
+
+fn try_recv_session_command(
+    scope: &mut v8::HandleScope,
+    rx: &Receiver<SessionCommand>,
+    abort_rx: Option<&crossbeam_channel::Receiver<()>>,
+) -> Result<Option<SessionCommand>, EventLoopStatus> {
+    if let Some(abort) = abort_rx {
+        crossbeam_channel::select! {
+            recv(abort) -> _ => {
+                scope.terminate_execution();
+                Err(EventLoopStatus::Terminated)
+            },
+            recv(rx) -> result => Ok(result.ok()),
+            default => Ok(None),
+        }
+    } else {
+        match rx.try_recv() {
+            Ok(cmd) => Ok(Some(cmd)),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+}
+
+fn dispatch_session_command(
+    scope: &mut v8::HandleScope,
+    cmd: SessionCommand,
+    pending: &crate::bridge::PendingPromises,
+) -> EventLoopStatus {
+    match cmd {
+        SessionCommand::Message(frame) => dispatch_event_loop_frame(scope, frame, pending),
+        SessionCommand::SetModuleReader(reader) => {
+            execution::install_session_guest_reader(Some(reader));
+            EventLoopStatus::Completed
+        }
+        SessionCommand::Shutdown => EventLoopStatus::Terminated,
+    }
 }
 
 fn pending_guest_timer_count(scope: &mut v8::HandleScope) -> usize {
@@ -1754,6 +1823,56 @@ fn pending_guest_timer_count(scope: &mut v8::HandleScope) -> usize {
         .integer_value(tc)
         .and_then(|count| usize::try_from(count).ok())
         .unwrap_or(0)
+}
+
+fn pending_guest_immediate_count(scope: &mut v8::HandleScope) -> usize {
+    let tc = &mut v8::TryCatch::new(scope);
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let key = match v8::String::new(tc, "_getPendingImmediateCount") {
+        Some(key) => key,
+        None => return 0,
+    };
+    let Some(func_value) = global.get(tc, key.into()) else {
+        return 0;
+    };
+    let Ok(func) = v8::Local::<v8::Function>::try_from(func_value) else {
+        return 0;
+    };
+    let Some(result) = func.call(tc, global.into(), &[]) else {
+        return 0;
+    };
+
+    result
+        .integer_value(tc)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0)
+}
+
+fn drain_guest_immediates(scope: &mut v8::HandleScope) -> EventLoopStatus {
+    let tc = &mut v8::TryCatch::new(scope);
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let key = match v8::String::new(tc, "_drainImmediates") {
+        Some(key) => key,
+        None => return EventLoopStatus::Completed,
+    };
+    let Some(func_value) = global.get(tc, key.into()) else {
+        return EventLoopStatus::Completed;
+    };
+    let Ok(func) = v8::Local::<v8::Function>::try_from(func_value) else {
+        return EventLoopStatus::Completed;
+    };
+    let _ = func.call(tc, global.into(), &[]);
+    tc.perform_microtask_checkpoint();
+    if let Some(exception) = tc.exception() {
+        let (code, err) = execution::exception_to_result(tc, exception);
+        return EventLoopStatus::Failed(code, err);
+    }
+    if let Some(err) = execution::take_unhandled_promise_rejection(tc) {
+        return EventLoopStatus::Failed(1, err);
+    }
+    EventLoopStatus::Completed
 }
 
 fn pump_v8_message_loop(scope: &mut v8::HandleScope) {

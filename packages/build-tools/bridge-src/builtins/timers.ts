@@ -337,6 +337,10 @@ var TimerHandle = class {
 
 var _timerEntries = /* @__PURE__ */ new Map();
 
+var _immediateEntries = /* @__PURE__ */ new Map();
+
+var _nextImmediateId = -1;
+
 var _timerDrainResolvers = [];
 
 function getRefedTimerCount() {
@@ -352,8 +356,19 @@ function getRefedTimerCount() {
   return count;
 }
 
+function getPendingImmediateCount() {
+  if (typeof _exited !== "undefined" && _exited) {
+    return 0;
+  }
+  return _immediateEntries.size;
+}
+
+function getPendingTimerDrainCount() {
+  return getRefedTimerCount() + getPendingImmediateCount();
+}
+
 function checkTimerDrain() {
-  if (getRefedTimerCount() === 0 && _timerDrainResolvers.length > 0) {
+  if (getPendingTimerDrainCount() === 0 && _timerDrainResolvers.length > 0) {
     const resolvers = _timerDrainResolvers;
     _timerDrainResolvers = [];
     resolvers.forEach((r) => r());
@@ -361,11 +376,15 @@ function checkTimerDrain() {
 }
 
 function _getPendingTimerCount() {
-  return getRefedTimerCount();
+  return getPendingTimerDrainCount();
+}
+
+function _getPendingImmediateCount() {
+  return getPendingImmediateCount();
 }
 
 function _waitForTimerDrain() {
-  if (getRefedTimerCount() === 0) return Promise.resolve();
+  if (getPendingTimerDrainCount() === 0) return Promise.resolve();
   return new Promise((resolve) => {
     _timerDrainResolvers.push(resolve);
     checkTimerDrain();
@@ -488,25 +507,63 @@ function clearInterval(timer) {
 
 exposeCustomGlobal("_timerDispatch", timerDispatch);
 
+function _drainImmediates() {
+  const entries = Array.from(_immediateEntries.entries());
+  for (const [immediateId, entry] of entries) {
+    if (_immediateEntries.get(immediateId) !== entry) {
+      continue;
+    }
+    entry.handle._destroyed = true;
+    _immediateEntries.delete(immediateId);
+    try {
+      entry.callback(...entry.args);
+    } catch (error) {
+      const outcome = routeAsyncCallbackError(error);
+      if (!outcome.handled && outcome.rethrow !== null) {
+        throw outcome.rethrow;
+      }
+      return;
+    }
+    if (typeof _exited !== "undefined" && _exited) {
+      checkTimerDrain();
+      return;
+    }
+  }
+  checkTimerDrain();
+}
+
 exposeCustomGlobal("_getPendingTimerCount", _getPendingTimerCount);
+
+exposeCustomGlobal("_drainImmediates", _drainImmediates);
+
+exposeCustomGlobal("_getPendingImmediateCount", _getPendingImmediateCount);
 
 exposeCustomGlobal("_waitForTimerDrain", _waitForTimerDrain);
 
 function setImmediate(callback, ...args) {
-  const id = createKernelTimer(0, false);
+  const id = _nextImmediateId--;
   const handle = new TimerHandle(id);
   const asyncLocalStorageSnapshot = snapshotAsyncLocalStorageStores();
-  _timerEntries.set(id, {
+  _immediateEntries.set(id, {
     handle,
     callback: wrapAsyncLocalStorageCallback(callback, asyncLocalStorageSnapshot),
     args,
     repeat: false
   });
-  armKernelTimer(id);
   return handle;
 }
 
-function clearImmediate(id) {
-  clearTimeout2(id);
+function clearImmediate(timer) {
+  const id = getTimerId(timer);
+  if (id === void 0) return;
+  const entry = _immediateEntries.get(id);
+  if (entry) {
+    entry.handle._destroyed = true;
+    _immediateEntries.delete(id);
+    checkTimerDrain();
+    return;
+  }
+  if (id < 0) return;
+  clearTimeout2(timer);
 }
-export { TIMER_DISPATCH, TimerHandle, _getPendingTimerCount, _nextTickQueue, _nextTickScheduled, _queueMicrotask, _timerDrainResolvers, _timerEntries, _waitForTimerDrain, applyAsyncLocalStorageSnapshot, armKernelTimer, asyncLocalStorageInstances, builtinAsyncHooksModule, builtinTimersPromisesModule, checkTimerDrain, clearImmediate, clearInterval, clearTimeout2, createKernelTimer, flushNextTickQueue, getRefedTimerCount, getTimerId, normalizeTimerDelay, runWithAsyncLocalStorageSnapshot, scheduleNextTickFlush, setImmediate, setInterval, setTimeout2, snapshotAsyncLocalStorageStores, timerDispatch, wrapAsyncLocalStorageCallback };
+export { TIMER_DISPATCH, TimerHandle, _drainImmediates, _getPendingImmediateCount, _getPendingTimerCount, _immediateEntries, _nextImmediateId, _nextTickQueue, _nextTickScheduled, _queueMicrotask, _timerDrainResolvers, _timerEntries, _waitForTimerDrain, applyAsyncLocalStorageSnapshot, armKernelTimer, asyncLocalStorageInstances, builtinAsyncHooksModule, builtinTimersPromisesModule, checkTimerDrain, clearImmediate, clearInterval, clearTimeout2, createKernelTimer, flushNextTickQueue, getPendingImmediateCount, getPendingTimerDrainCount, getRefedTimerCount, getTimerId, normalizeTimerDelay, runWithAsyncLocalStorageSnapshot, scheduleNextTickFlush, setImmediate, setInterval, setTimeout2, snapshotAsyncLocalStorageStores, timerDispatch, wrapAsyncLocalStorageCallback };

@@ -2462,7 +2462,7 @@ fn javascript_execution_v8_timer_callbacks_fire_and_clear_correctly() {
             limits: Default::default(),
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
-            context_id: context.context_id,
+            context_id: context.context_id.clone(),
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
@@ -2494,6 +2494,62 @@ fn javascript_execution_v8_timer_callbacks_fire_and_clear_correctly() {
   if (intervalTicks !== 2) {
     throw new Error(`interval tick count mismatch: ${intervalTicks}`);
   }
+
+  let immediateFired = false;
+  await new Promise((resolve) => {
+    setImmediate(() => {
+      immediateFired = true;
+      resolve();
+    });
+  });
+  if (!immediateFired) {
+    throw new Error("setImmediate callback did not fire");
+  }
+
+  const order = [];
+  setImmediate(() => order.push("immediate"));
+  queueMicrotask(() => order.push("microtask"));
+  await new Promise((resolve) => setImmediate(resolve));
+  if (order.join(",") !== "microtask,immediate") {
+    throw new Error(`unexpected immediate order: ${order.join(",")}`);
+  }
+
+  for (let i = 0; i < 100; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  let clearedImmediateFired = false;
+  const clearedImmediate = setImmediate(() => {
+    clearedImmediateFired = true;
+  });
+  clearImmediate(clearedImmediate);
+  await new Promise((resolve) => setImmediate(resolve));
+  if (clearedImmediateFired) {
+    throw new Error("cleared immediate fired");
+  }
+
+  const { setImmediate: promiseImmediate } = await import("node:timers/promises");
+  const promiseImmediateValue = await promiseImmediate("promise-value");
+  if (promiseImmediateValue !== "promise-value") {
+    throw new Error(`timers/promises setImmediate mismatch: ${promiseImmediateValue}`);
+  }
+
+  const t0 = Date.now();
+  let chainCount = 0;
+  const immediateChainMs = await new Promise((resolve) => {
+    function tick() {
+      if (++chainCount < 1000) {
+        setImmediate(tick);
+      } else {
+        resolve(Date.now() - t0);
+      }
+    }
+    setImmediate(tick);
+  });
+  if (immediateChainMs >= 500) {
+    throw new Error(`setImmediate chain too slow: ${immediateChainMs}ms`);
+  }
+  console.log(`setImmediate-chain-ms=${immediateChainMs}`);
 })().catch((error) => {
   process.exitCode = 1;
   throw error;
@@ -2508,6 +2564,58 @@ fn javascript_execution_v8_timer_callbacks_fire_and_clear_correctly() {
     let stderr = String::from_utf8(result.stderr.clone()).expect("stderr utf8");
     assert_eq!(result.exit_code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+    let chain_ms_line = stdout
+        .lines()
+        .find(|line| line.starts_with("setImmediate-chain-ms="))
+        .expect("setImmediate timing line");
+    let chain_ms: u64 = chain_ms_line
+        .trim_start_matches("setImmediate-chain-ms=")
+        .parse()
+        .expect("parse setImmediate timing");
+    println!("setImmediate 1000-chain elapsed ms: {chain_ms}");
+    assert!(
+        chain_ms < 500,
+        "setImmediate 1000-chain elapsed too high: {chain_ms}ms"
+    );
+
+    let only_immediate_execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            limits: Default::default(),
+            guest_runtime: Default::default(),
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id.clone(),
+            argv: vec![String::from("./entry.js")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+setImmediate(() => {
+  console.log("only-immediate-fired");
+});
+"#,
+            )),
+        })
+        .expect("start only-immediate JavaScript execution");
+
+    let only_immediate_result = only_immediate_execution
+        .wait()
+        .expect("wait for only-immediate JavaScript execution");
+    let only_immediate_stdout =
+        String::from_utf8(only_immediate_result.stdout.clone()).expect("stdout utf8");
+    let only_immediate_stderr =
+        String::from_utf8(only_immediate_result.stderr.clone()).expect("stderr utf8");
+    assert_eq!(
+        only_immediate_result.exit_code, 0,
+        "stdout:\n{only_immediate_stdout}\nstderr:\n{only_immediate_stderr}"
+    );
+    assert!(
+        only_immediate_stdout.contains("only-immediate-fired"),
+        "only pending setImmediate did not fire; stdout:\n{only_immediate_stdout}"
+    );
+    assert!(
+        only_immediate_stderr.is_empty(),
+        "unexpected stderr: {only_immediate_stderr}"
+    );
 }
 
 fn javascript_execution_v8_readline_polyfill_emits_lines() {
