@@ -568,6 +568,7 @@ pub(crate) struct Http2SharedState {
     pub(crate) next_session_id: u64,
     pub(crate) next_stream_id: u64,
     pub(crate) ready: Arc<Condvar>,
+    pub(crate) event_session: Option<V8SessionHandle>,
     pub(crate) servers: BTreeMap<u64, ActiveHttp2Server>,
     pub(crate) sessions: BTreeMap<u64, ActiveHttp2Session>,
     pub(crate) streams: BTreeMap<u64, ActiveHttp2Stream>,

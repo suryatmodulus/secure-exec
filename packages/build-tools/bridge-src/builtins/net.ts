@@ -1419,6 +1419,10 @@ function netSocketDispatch(socketId, event, data) {
       globalThis._dgramSocketDispatch?.(payload);
       return;
     }
+    if (payload.event === "http2") {
+      globalThis._http2RetainDispatch?.(payload);
+      return;
+    }
     const target = getRegisteredNetSocket(payload.socketId);
     if (target) {
       countNetBridgeMetric("readEventWakeups");
@@ -1437,6 +1441,10 @@ function netSocketDispatch(socketId, event, data) {
     }
     if (payload.event === "dgram") {
       globalThis._dgramSocketDispatch?.(payload);
+      return;
+    }
+    if (payload.event === "http2") {
+      globalThis._http2RetainDispatch?.(payload);
       return;
     }
     const target = getRegisteredNetSocket(payload.socketId);

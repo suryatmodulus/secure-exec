@@ -25,6 +25,8 @@ var pendingHttp2CompatRequests = /* @__PURE__ */ new Map();
 
 var scheduledHttp2DispatchDrain = false;
 
+var retainedHttp2Handles = /* @__PURE__ */ new Map();
+
 var nextHttp2ServerId = 1;
 
 var Http2EventEmitter = class {
@@ -1297,6 +1299,8 @@ var Http2Session = class extends Http2EventEmitter {
     }
     this._waitStarted = true;
     pollRetainedHttp2Handle(
+      "session",
+      this._sessionId,
       () => this._waitStarted && http2Sessions.get(this._sessionId) === this,
       () => _networkHttp2SessionPollRaw.applySyncPromise(void 0, [this._sessionId, 0]),
       (error) => this.emit("error", error instanceof Error ? error : new Error(String(error)))
@@ -1304,6 +1308,7 @@ var Http2Session = class extends Http2EventEmitter {
   }
   _release() {
     this._waitStarted = false;
+    retainedHttp2Handles.delete(`session:${this._sessionId}`);
   }
   _beginInitialSettingsAck() {
     this._awaitingInitialSettingsAck = true;
@@ -1475,6 +1480,8 @@ var Http2Server = class extends Http2EventEmitter {
     }
     this._waitStarted = true;
     pollRetainedHttp2Handle(
+      "server",
+      this._serverId,
       () => this._waitStarted && http2Servers.get(this._serverId) === this,
       () => _networkHttp2ServerPollRaw.applySyncPromise(void 0, [this._serverId, 0]),
       (error) => this.emit("error", error instanceof Error ? error : new Error(String(error)))
@@ -1482,6 +1489,7 @@ var Http2Server = class extends Http2EventEmitter {
   }
   _release() {
     this._waitStarted = false;
+    retainedHttp2Handles.delete(`server:${this._serverId}`);
   }
   setTimeout(timeout, callback) {
     this._timeoutMs = normalizeSocketTimeout(timeout);
@@ -1945,34 +1953,116 @@ function dispatchPolledHttp2Event(event) {
   return event.kind === "serverClose" || event.kind === "sessionClose";
 }
 
-function pollRetainedHttp2Handle(isActive, poll, onError) {
+function pollRetainedHttp2Handle(kind, id, isActive, poll, onError) {
+  const handleKey = `${kind}:${id}`;
+  const handle = {
+    active: true,
+    running: false,
+    pendingWake: false,
+    fallbackTimer: null,
+    poll,
+    tick: null
+  };
+  const clearFallbackTimer = () => {
+    if (handle.fallbackTimer !== null) {
+      clearTimeout(handle.fallbackTimer);
+      handle.fallbackTimer = null;
+    }
+  };
   const tick = () => {
+    clearFallbackTimer();
     if (!isActive()) {
+      handle.active = false;
+      retainedHttp2Handles.delete(handleKey);
       return;
     }
+    if (handle.running) {
+      handle.pendingWake = true;
+      return;
+    }
+    handle.running = true;
     try {
       let sawTerminal = false;
-      for (let i = 0; i < 64 && isActive(); i++) {
-        const event = poll();
-        if (!event) {
-          break;
+      let hitDrainLimit = false;
+      do {
+        handle.pendingWake = false;
+        hitDrainLimit = false;
+        let i = 0;
+        for (; i < 64 && isActive(); i++) {
+          const event = poll();
+          if (!event) {
+            break;
+          }
+          sawTerminal = dispatchPolledHttp2Event(event);
+          if (sawTerminal) {
+            break;
+          }
         }
-        sawTerminal = dispatchPolledHttp2Event(event);
-        if (sawTerminal) {
-          break;
-        }
-      }
-      if (!sawTerminal && isActive()) {
-        setTimeout(tick, 1);
+        hitDrainLimit = i === 64;
+      } while (!sawTerminal && handle.pendingWake && isActive());
+      if (!sawTerminal && hitDrainLimit && isActive()) {
+        handle.fallbackTimer = setTimeout(tick, 0);
+      } else if (!sawTerminal && isActive()) {
+        handle.fallbackTimer = setTimeout(tick, 10);
+      } else if (sawTerminal) {
+        handle.active = false;
+        retainedHttp2Handles.delete(handleKey);
       }
     } catch (error) {
       onError(error);
       if (isActive()) {
-        setTimeout(tick, 10);
+        handle.fallbackTimer = setTimeout(tick, 10);
+      } else {
+        handle.active = false;
+        retainedHttp2Handles.delete(handleKey);
+      }
+    } finally {
+      handle.running = false;
+      if (handle.pendingWake && handle.active && isActive()) {
+        clearFallbackTimer();
+        handle.fallbackTimer = setTimeout(tick, 0);
       }
     }
   };
+  handle.tick = tick;
+  retainedHttp2Handles.set(handleKey, handle);
   setTimeout(tick, 0);
+}
+
+function wakeRetainedHttp2Handle(kind, id) {
+  const handle = retainedHttp2Handles.get(`${kind}:${id}`);
+  if (!handle || !handle.active) {
+    return;
+  }
+  handle.pendingWake = true;
+  if (handle.running) {
+    return;
+  }
+  if (typeof queueMicrotask === "function") {
+    queueMicrotask(() => {
+      if (retainedHttp2Handles.get(`${kind}:${id}`) === handle) {
+        handle.tick?.();
+      }
+    });
+    return;
+  }
+  setTimeout(() => {
+    if (retainedHttp2Handles.get(`${kind}:${id}`) === handle) {
+      handle.tick?.();
+    }
+  }, 0);
+}
+
+function onHttp2RetainDispatch(payload) {
+  if (!payload || payload.event !== "http2") {
+    return;
+  }
+  const kind = payload.kind === "server" ? "server" : payload.kind === "session" ? "session" : null;
+  const id = Number(payload.id);
+  if (!kind || !Number.isFinite(id)) {
+    return;
+  }
+  wakeRetainedHttp2Handle(kind, id);
 }
 
 function scheduleQueuedHttp2DispatchDrain() {
@@ -2030,6 +2120,8 @@ function onHttp2Dispatch(_eventType, payload) {
   });
   scheduleQueuedHttp2DispatchDrain();
 }
+
+exposeCustomGlobal("_http2RetainDispatch", onHttp2RetainDispatch);
 
 var http2 = {
   Http2ServerRequest,

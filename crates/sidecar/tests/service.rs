@@ -1791,7 +1791,11 @@ ykAheWCsAteSEWVc0w==\n\
             cwd: &Path,
             process_id: &str,
         ) -> (String, String, Option<i32>) {
-            run_javascript_entry_with_env(sidecar, vm_id, cwd, process_id, BTreeMap::new())
+            let mut env = BTreeMap::new();
+            if let Ok(value) = std::env::var("SECURE_EXEC_HTTP2_RETAIN_TRACE") {
+                env.insert(String::from("SECURE_EXEC_HTTP2_RETAIN_TRACE"), value);
+            }
+            run_javascript_entry_with_env(sidecar, vm_id, cwd, process_id, env)
         }
 
         fn run_javascript_entry_with_env(
@@ -1854,7 +1858,13 @@ ykAheWCsAteSEWVc0w==\n\
                 );
             }
 
-            drain_process_output(sidecar, vm_id, process_id)
+            let output = drain_process_output(sidecar, vm_id, process_id);
+            if std::env::var("SECURE_EXEC_HTTP2_RETAIN_TRACE").as_deref() == Ok("1")
+                && !output.1.is_empty()
+            {
+                eprint!("{}", output.1);
+            }
+            output
         }
 
         struct FixtureDnsServer {
@@ -16293,6 +16303,88 @@ setTimeout(() => {
             );
         }
 
+        fn javascript_http2_request_handler_round_trip_runs_twice_in_one_vm() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-http2-request-handler-twice");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const http2 = require("node:http2");
+const server = http2.createServer();
+const bodies = [];
+
+server.on("request", (req, res) => {
+  res.setHeader("content-type", "text/plain");
+  res.end(`reply:${req.url}`);
+});
+
+function once(session, path) {
+  return new Promise((resolve, reject) => {
+    const req = session.request({ ":path": path });
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+server.listen(0, "127.0.0.1", async () => {
+  const address = server.address();
+  const session = http2.connect(`http://127.0.0.1:${address.port}`);
+  session.on("error", (error) => {
+    console.error(`SESSION_ERROR:${error.message}`);
+    process.exit(1);
+  });
+  try {
+    bodies.push(await once(session, "/first"));
+    bodies.push(await once(session, "/second"));
+    console.log(`BODIES:${bodies.join(",")}`);
+    session.close();
+    server.close(() => process.exit(
+      bodies.join(",") === "reply:/first,reply:/second" ? 0 : 2
+    ));
+  } catch (error) {
+    console.error(`REQ_ERROR:${error.message}`);
+    process.exit(1);
+  }
+});
+
+setTimeout(() => {
+  console.error("TIMEOUT:http2 request handler round trips did not finish");
+  process.exit(3);
+}, 4_000);
+"#,
+            );
+
+            let (stdout, stderr, exit_code) = run_javascript_entry(
+                &mut sidecar,
+                &vm_id,
+                &cwd,
+                "proc-js-http2-request-handler-twice",
+            );
+            assert_eq!(exit_code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+            assert!(
+                stdout.contains("BODIES:reply:/first,reply:/second"),
+                "stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+
         fn javascript_http2_settings_pause_push_and_file_response_surfaces_work() {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
@@ -20416,6 +20508,7 @@ console.log(JSON.stringify({
             request_frame_limit_counts_generated_wire_overhead();
             javascript_http2_listen_connect_request_and_respond_round_trip();
             javascript_http2_guest_h2c_round_trip_does_not_deadlock();
+            javascript_http2_request_handler_round_trip_runs_twice_in_one_vm();
             javascript_http2_settings_pause_push_and_file_response_surfaces_work();
             javascript_http2_secure_listen_connect_request_and_respond_round_trip();
             javascript_http2_server_respond_records_pending_response();
@@ -20531,6 +20624,11 @@ console.log(JSON.stringify({
         #[test]
         fn aac_http2_guest_h2c_round_trip_does_not_deadlock() {
             run_isolated_service_test("http2-guest-h2c");
+        }
+
+        #[test]
+        fn aac_http2_request_handler_round_trip_runs_twice_in_one_vm() {
+            run_isolated_service_test("http2-request-handler-twice");
         }
 
         #[test]
@@ -20674,6 +20772,9 @@ console.log(JSON.stringify({
                 }
                 "http2-guest-h2c" => {
                     javascript_http2_guest_h2c_round_trip_does_not_deadlock();
+                }
+                "http2-request-handler-twice" => {
+                    javascript_http2_request_handler_round_trip_runs_twice_in_one_vm();
                 }
                 "javascript-import-fresh" => {
                     javascript_imports_guest_written_modules_after_miss_work();

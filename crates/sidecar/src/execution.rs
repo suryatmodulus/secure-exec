@@ -14687,6 +14687,7 @@ fn terminate_child_process_tree(
         http2.streams.clear();
         http2.servers.clear();
         http2.sessions.clear();
+        http2.event_session = None;
         drop(http2);
         for session in sessions {
             let (respond_to, _rx) = mpsc::channel();
@@ -20267,18 +20268,23 @@ fn push_http2_server_event(
     server_id: u64,
     event: Http2BridgeEvent,
 ) {
-    let ready = if let Ok(mut state) = shared.lock() {
-        state
-            .server_events
-            .entry(server_id)
-            .or_default()
-            .push_back(event);
-        Some(Arc::clone(&state.ready))
+    let (ready, wake_session, should_wake) = if let Ok(mut state) = shared.lock() {
+        let queue = state.server_events.entry(server_id).or_default();
+        let should_wake = queue.is_empty();
+        queue.push_back(event);
+        (
+            Some(Arc::clone(&state.ready)),
+            state.event_session.clone(),
+            should_wake,
+        )
     } else {
-        None
+        (None, None, false)
     };
     if let Some(ready) = ready {
         ready.notify_all();
+    }
+    if should_wake {
+        push_http2_retain_wake(wake_session, "server", server_id);
     }
 }
 
@@ -20287,19 +20293,37 @@ fn push_http2_session_event(
     session_id: u64,
     event: Http2BridgeEvent,
 ) {
-    let ready = if let Ok(mut state) = shared.lock() {
-        state
-            .session_events
-            .entry(session_id)
-            .or_default()
-            .push_back(event);
-        Some(Arc::clone(&state.ready))
+    let (ready, wake_session, should_wake) = if let Ok(mut state) = shared.lock() {
+        let queue = state.session_events.entry(session_id).or_default();
+        let should_wake = queue.is_empty();
+        queue.push_back(event);
+        (
+            Some(Arc::clone(&state.ready)),
+            state.event_session.clone(),
+            should_wake,
+        )
     } else {
-        None
+        (None, None, false)
     };
     if let Some(ready) = ready {
         ready.notify_all();
     }
+    if should_wake {
+        push_http2_retain_wake(wake_session, "session", session_id);
+    }
+}
+
+fn push_http2_retain_wake(session: Option<V8SessionHandle>, kind: &'static str, id: u64) {
+    let Some(session) = session else {
+        return;
+    };
+    let payload = v8_runtime::json_to_cbor_payload(&json!({
+        "event": "http2",
+        "kind": kind,
+        "id": id,
+    }))
+    .unwrap_or_default();
+    let _ = session.send_stream_event("net_socket", payload);
 }
 
 fn pop_http2_event(
@@ -22062,6 +22086,9 @@ where
                         closed: Arc::clone(&closed),
                     },
                 );
+                if state.event_session.is_none() {
+                    state.event_session = process.execution.javascript_v8_session_handle();
+                }
                 state.server_events.entry(payload.server_id).or_default();
             }
             spawn_http2_server_accept_loop(
@@ -22255,6 +22282,9 @@ where
                 state
                     .sessions
                     .insert(session_id, ActiveHttp2Session { command_tx });
+                if state.event_session.is_none() {
+                    state.event_session = process.execution.javascript_v8_session_handle();
+                }
                 state.session_events.entry(session_id).or_default();
                 session_id
             };

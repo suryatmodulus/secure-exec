@@ -1176,75 +1176,75 @@ impl SocketTable {
                 .ok_or_else(|| SocketTableError::not_found(socket_id))?;
             let mut accept_was_empty = false;
             let result = (|| {
-            // Validate the listener and confirm backlog capacity BEFORE consuming a
-            // socket id. The id counter is monotonic (saturating_add) and never
-            // reclaims, so allocating an id before this check leaks one on every
-            // rejected connect (for example when the backlog is full).
-            {
+                // Validate the listener and confirm backlog capacity BEFORE consuming a
+                // socket id. The id counter is monotonic (saturating_add) and never
+                // reclaims, so allocating an id before this check leaks one on every
+                // rejected connect (for example when the backlog is full).
+                {
+                    let listener = table
+                        .sockets
+                        .get(&listener_socket_id)
+                        .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
+                    validate_connect_to_listener(&client, listener)?;
+
+                    let listener_state = listener.listener_state.as_ref().ok_or_else(|| {
+                        SocketTableError::invalid_argument(format!(
+                            "socket {listener_socket_id} has no listener state"
+                        ))
+                    })?;
+                    if listener_state.pending_accepts.len() >= listener_state.backlog {
+                        return Err(SocketTableError::would_block(format!(
+                            "listener {listener_socket_id} backlog is full"
+                        )));
+                    }
+                }
+
+                // Capacity confirmed: only now is it safe to consume a socket id.
+                let accepted_socket_id = next_socket_id(&mut table);
                 let listener = table
                     .sockets
-                    .get(&listener_socket_id)
+                    .get_mut(&listener_socket_id)
                     .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
-                validate_connect_to_listener(&client, listener)?;
-
-                let listener_state = listener.listener_state.as_ref().ok_or_else(|| {
+                let listener_state = listener.listener_state.as_mut().ok_or_else(|| {
                     SocketTableError::invalid_argument(format!(
                         "socket {listener_socket_id} has no listener state"
                     ))
                 })?;
-                if listener_state.pending_accepts.len() >= listener_state.backlog {
-                    return Err(SocketTableError::would_block(format!(
-                        "listener {listener_socket_id} backlog is full"
-                    )));
-                }
-            }
 
-            // Capacity confirmed: only now is it safe to consume a socket id.
-            let accepted_socket_id = next_socket_id(&mut table);
-            let listener = table
-                .sockets
-                .get_mut(&listener_socket_id)
-                .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
-            let listener_state = listener.listener_state.as_mut().ok_or_else(|| {
-                SocketTableError::invalid_argument(format!(
-                    "socket {listener_socket_id} has no listener state"
-                ))
-            })?;
+                let accepted = SocketRecord {
+                    id: accepted_socket_id,
+                    owner_pid: listener.owner_pid,
+                    spec: listener.spec,
+                    state: SocketState::Connected,
+                    local_address: listener.local_address.clone(),
+                    peer_address: client.local_address.clone(),
+                    local_unix_path: None,
+                    peer_unix_path: None,
+                    listener_state: None,
+                    connection_state: Some(ConnectionState {
+                        peer_socket_id: Some(socket_id),
+                        ..ConnectionState::default()
+                    }),
+                    datagram_state: default_datagram_state(listener.spec),
+                };
 
-            let accepted = SocketRecord {
-                id: accepted_socket_id,
-                owner_pid: listener.owner_pid,
-                spec: listener.spec,
-                state: SocketState::Connected,
-                local_address: listener.local_address.clone(),
-                peer_address: client.local_address.clone(),
-                local_unix_path: None,
-                peer_unix_path: None,
-                listener_state: None,
-                connection_state: Some(ConnectionState {
-                    peer_socket_id: Some(socket_id),
+                accept_was_empty = listener_state.pending_accepts.is_empty();
+                listener_state.pending_accepts.push_back(PendingConnection {
+                    peer_address: client.local_address.clone(),
+                    peer_unix_path: None,
+                    accepted_socket_id: Some(accepted_socket_id),
+                });
+
+                client.state = SocketState::Connected;
+                client.peer_address = listener.local_address.clone();
+                client.peer_unix_path = None;
+                client.listener_state = None;
+                client.connection_state = Some(ConnectionState {
+                    peer_socket_id: Some(accepted_socket_id),
                     ..ConnectionState::default()
-                }),
-                datagram_state: default_datagram_state(listener.spec),
-            };
+                });
 
-            accept_was_empty = listener_state.pending_accepts.is_empty();
-            listener_state.pending_accepts.push_back(PendingConnection {
-                peer_address: client.local_address.clone(),
-                peer_unix_path: None,
-                accepted_socket_id: Some(accepted_socket_id),
-            });
-
-            client.state = SocketState::Connected;
-            client.peer_address = listener.local_address.clone();
-            client.peer_unix_path = None;
-            client.listener_state = None;
-            client.connection_state = Some(ConnectionState {
-                peer_socket_id: Some(accepted_socket_id),
-                ..ConnectionState::default()
-            });
-
-            Ok(accepted)
+                Ok(accepted)
             })();
 
             let result = match result {
