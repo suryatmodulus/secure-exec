@@ -2165,7 +2165,7 @@ if (summary.rinfo.address !== "127.0.0.1" || summary.rinfo.port !== 7) {
 
     let request = expect_next_sync_rpc(&mut execution, "poll dgram.poll request");
     assert_eq!(request.method, "dgram.poll");
-    assert_eq!(request.args, vec![json!("udp-1"), json!(10)]);
+    assert_eq!(request.args, vec![json!("udp-1"), json!(0)]);
     execution
         .respond_sync_rpc_success(request.id, json!(null))
         .expect("respond to initial dgram.poll");

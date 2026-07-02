@@ -11,6 +11,8 @@ var registeredNetSockets = /* @__PURE__ */ new Map();
 
 var registeredNetServersByPort = /* @__PURE__ */ new Map();
 
+var registeredNetServersByPath = /* @__PURE__ */ new Map();
+
 function getRegisteredNetSocket(socketId) {
   return globalThis[`${NET_SOCKET_REGISTRY_PREFIX}${socketId}`];
 }
@@ -25,10 +27,23 @@ function unregisterNetSocket(socketId) {
   registeredNetSockets.delete(socketId);
 }
 
+function netServerUnixPath(server) {
+  const address = server?._address;
+  if (typeof address === "string") {
+    return address;
+  }
+  const path = address?.path;
+  return typeof path === "string" ? path : void 0;
+}
+
 function registerNetServer(server) {
   const port = server?._address?.port;
   if (typeof port === "number") {
     registeredNetServersByPort.set(port, server);
+  }
+  const path = netServerUnixPath(server);
+  if (typeof path === "string") {
+    registeredNetServersByPath.set(path, server);
   }
 }
 
@@ -36,6 +51,10 @@ function unregisterNetServer(server) {
   const port = server?._address?.port;
   if (typeof port === "number" && registeredNetServersByPort.get(port) === server) {
     registeredNetServersByPort.delete(port);
+  }
+  const path = netServerUnixPath(server);
+  if (typeof path === "string" && registeredNetServersByPath.get(path) === server) {
+    registeredNetServersByPath.delete(path);
   }
 }
 
@@ -140,21 +159,49 @@ function wakeSocketBridgeReads(socket) {
 
 function wakePeerBridgeReads(socket) {
   countNetBridgeMetric("peerWakeScans");
-  if (!socket || socket._socketId === 0 || socket.remotePort === void 0 || socket.localPort === void 0) {
+  if (!socket || socket._socketId === 0) {
     countNetBridgeMetric("peerWakeInvalidTargets");
     return;
   }
+  if (typeof socket.remotePort === "number" && typeof socket.localPort === "number") {
+    for (const peer of registeredNetSockets.values()) {
+      if (peer === socket || peer.destroyed) {
+        continue;
+      }
+      if (peer.localPort === socket.remotePort && peer.remotePort === socket.localPort) {
+        countNetBridgeMetric("peerWakeFound");
+        wakeSocketBridgeReads(peer);
+        return;
+      }
+    }
+    countNetBridgeMetric("peerWakeMiss");
+    return;
+  }
+  const localPath = typeof socket.localPath === "string" ? socket.localPath : void 0;
+  const remotePath = typeof socket.remotePath === "string" ? socket.remotePath : void 0;
+  if (localPath === void 0 && remotePath === void 0) {
+    countNetBridgeMetric("peerWakeInvalidTargets");
+    return;
+  }
+  let foundUnixPeer = false;
   for (const peer of registeredNetSockets.values()) {
     if (peer === socket || peer.destroyed) {
       continue;
     }
-    if (peer.localPort === socket.remotePort && peer.remotePort === socket.localPort) {
-      countNetBridgeMetric("peerWakeFound");
+    const peerLocalPath = typeof peer.localPath === "string" ? peer.localPath : void 0;
+    const peerRemotePath = typeof peer.remotePath === "string" ? peer.remotePath : void 0;
+    const fullPathMirror = localPath !== void 0 && remotePath !== void 0 && peerLocalPath !== void 0 && peerRemotePath !== void 0 && peerLocalPath === remotePath && peerRemotePath === localPath;
+    const remoteToPeerLocal = remotePath !== void 0 && peerLocalPath !== void 0 && peerLocalPath === remotePath;
+    const localToPeerRemote = localPath !== void 0 && peerRemotePath !== void 0 && peerRemotePath === localPath;
+    if (fullPathMirror || remoteToPeerLocal || localToPeerRemote) {
+      foundUnixPeer = true;
+      countNetBridgeMetric("peerWakeUnixFound");
       wakeSocketBridgeReads(peer);
-      return;
     }
   }
-  countNetBridgeMetric("peerWakeMiss");
+  if (!foundUnixPeer) {
+    countNetBridgeMetric("peerWakeUnixMiss");
+  }
 }
 
 function wakeNetServerAccept(server) {
@@ -201,15 +248,28 @@ function wakeNetServerAccept(server) {
 function wakeNetServerAcceptForSocket(socket) {
   countNetBridgeMetric("acceptWakeSocketScans");
   const port = socket?.remotePort;
-  if (typeof port !== "number") {
+  if (typeof port === "number") {
+    const server = registeredNetServersByPort.get(port);
+    if (server) {
+      countNetBridgeMetric("acceptWakeSocketFound");
+    } else {
+      countNetBridgeMetric("acceptWakeSocketMiss");
+    }
+    wakeNetServerAccept(server);
+    return;
+  }
+  const path = socket?.remotePath;
+  if (typeof path !== "string") {
     countNetBridgeMetric("acceptWakeSocketInvalidTargets");
     return;
   }
-  const server = registeredNetServersByPort.get(port);
+  const server = registeredNetServersByPath.get(path);
   if (server) {
     countNetBridgeMetric("acceptWakeSocketFound");
+    countNetBridgeMetric("acceptWakeSocketUnixFound");
   } else {
     countNetBridgeMetric("acceptWakeSocketMiss");
+    countNetBridgeMetric("acceptWakeSocketUnixMiss");
   }
   wakeNetServerAccept(server);
 }
@@ -1117,6 +1177,8 @@ function createNetBridgeMetrics() {
     peerWakeInvalidTargets: 0,
     peerWakeFound: 0,
     peerWakeMiss: 0,
+    peerWakeUnixFound: 0,
+    peerWakeUnixMiss: 0,
     acceptEventWakeups: 0,
     acceptWakeAttempts: 0,
     acceptWakeInvalidTargets: 0,
@@ -1144,7 +1206,16 @@ function createNetBridgeMetrics() {
     acceptWakeSocketScans: 0,
     acceptWakeSocketInvalidTargets: 0,
     acceptWakeSocketFound: 0,
-    acceptWakeSocketMiss: 0
+    acceptWakeSocketMiss: 0,
+    acceptWakeSocketUnixFound: 0,
+    acceptWakeSocketUnixMiss: 0,
+    dgramWakeAttempts: 0,
+    dgramWakeInvalidTargets: 0,
+    dgramWakeAlreadyRunning: 0,
+    dgramWakeNoTimer: 0,
+    dgramEventWakeups: 0,
+    dgramWakeLoopbackHits: 0,
+    dgramWakeLoopbackMisses: 0
   };
 }
 

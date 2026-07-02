@@ -1,9 +1,68 @@
 import { exposeCustomGlobal } from "../global-exposure.js";
 import { createErrorWithCode, createInvalidArgTypeError2, createTypeErrorWithCode, formatReceivedType } from "./http.js";
-import { NET_BRIDGE_POLL_DELAY_MS, NET_BRIDGE_TIMEOUT_SENTINEL, createFunctionArgTypeError, createSocketBadPortError, isIPv4String, isIPv6String, isValidTcpPort } from "./net.js";
+import { NET_BRIDGE_POLL_DELAY_MS, NET_BRIDGE_TIMEOUT_SENTINEL, countNetBridgeMetric, createFunctionArgTypeError, createSocketBadPortError, isIPv4String, isIPv6String, isValidTcpPort } from "./net.js";
 import { tlsModule } from "./tls.js";
 
 var DGRAM_HANDLE_PREFIX = "dgram-socket:";
+
+var registeredDgramSocketsByPort = /* @__PURE__ */ new Map();
+
+function registerDgramSocket(socket) {
+  const port = socket?._localPort;
+  if (typeof port !== "number") {
+    return;
+  }
+  let sockets = registeredDgramSocketsByPort.get(port);
+  if (!sockets) {
+    sockets = /* @__PURE__ */ new Set();
+    registeredDgramSocketsByPort.set(port, sockets);
+  }
+  sockets.add(socket);
+}
+
+function unregisterDgramSocket(socket) {
+  const port = socket?._localPort;
+  if (typeof port !== "number") {
+    return;
+  }
+  const sockets = registeredDgramSocketsByPort.get(port);
+  if (!sockets) {
+    return;
+  }
+  sockets.delete(socket);
+  if (sockets.size === 0) {
+    registeredDgramSocketsByPort.delete(port);
+  }
+}
+
+function isDgramLoopbackAddress(address) {
+  return address === "127.0.0.1" || address === "::1" || address === "localhost";
+}
+
+function wakeDgramSocketReads(socket) {
+  countNetBridgeMetric("dgramWakeAttempts");
+  if (!socket || socket._closed || !socket._bound) {
+    countNetBridgeMetric("dgramWakeInvalidTargets");
+    return;
+  }
+  if (socket._receiveLoopRunning) {
+    countNetBridgeMetric("dgramWakeAlreadyRunning");
+    return;
+  }
+  if (!socket._receivePollTimer) {
+    countNetBridgeMetric("dgramWakeNoTimer");
+    return;
+  }
+  clearTimeout(socket._receivePollTimer);
+  socket._receivePollTimer = null;
+  countNetBridgeMetric("dgramEventWakeups");
+  queueMicrotask(() => {
+    if (!socket._closed && socket._bound) {
+      socket._nextReceivePumpOrigin = "eventWake";
+      void socket._pumpMessages();
+    }
+  });
+}
 
 function createBadDgramSocketTypeError() {
   return createTypeErrorWithCode(
@@ -374,10 +433,14 @@ var DgramSocket = class {
   _bindPromise = null;
   _receiveLoopRunning = false;
   _receivePollTimer = null;
+  _nextReceivePumpOrigin = null;
   _refed = true;
   _closed = false;
   _bound = false;
   _handleRefId = null;
+  _localAddress;
+  _localPort;
+  _localFamily;
   _recvBufferSize;
   _sendBufferSize;
   _memberships = /* @__PURE__ */ new Set();
@@ -441,6 +504,7 @@ var DgramSocket = class {
       return this;
     }
     this._closed = true;
+    unregisterDgramSocket(this);
     this._bound = false;
     this._clearReceivePollTimer();
     this._syncHandleRef();
@@ -672,11 +736,13 @@ var DgramSocket = class {
     }
     this._bindPromise = (async () => {
       try {
-        normalizeDgramBridgeResult(_dgramSocketBindRaw.applySyncPromise(void 0, [
+        const result = normalizeDgramBridgeResult(_dgramSocketBindRaw.applySyncPromise(void 0, [
           this._socketId,
           { port, address }
         ]));
+        this._applyBoundAddress(result);
         this._bound = true;
+        registerDgramSocket(this);
         this._applyInitialBufferSizes();
         this._syncHandleRef();
         queueMicrotask(() => {
@@ -685,6 +751,7 @@ var DgramSocket = class {
           }
           this._emit("listening");
           callback?.call(this);
+          this._nextReceivePumpOrigin = "bind";
           void this._pumpMessages();
         });
       } catch (error) {
@@ -719,6 +786,18 @@ var DgramSocket = class {
         data,
         { port, address }
       ]));
+      this._applyBoundAddress(result);
+      if (isDgramLoopbackAddress(address)) {
+        const sockets = registeredDgramSocketsByPort.get(port);
+        if (sockets) {
+          countNetBridgeMetric("dgramWakeLoopbackHits");
+          for (const socket of sockets) {
+            wakeDgramSocketReads(socket);
+          }
+        } else {
+          countNetBridgeMetric("dgramWakeLoopbackMisses");
+        }
+      }
       if (callback) {
         queueMicrotask(() => {
           callback(null, typeof result?.bytes === "number" ? result.bytes : data.length);
@@ -743,15 +822,19 @@ var DgramSocket = class {
     if (typeof _dgramSocketRecvRaw === "undefined") {
       return;
     }
+    const pumpOrigin = this._nextReceivePumpOrigin;
+    this._nextReceivePumpOrigin = null;
+    const waitMs = pumpOrigin === "timer" ? NET_BRIDGE_POLL_DELAY_MS : 0;
     this._receiveLoopRunning = true;
     try {
       while (!this._closed && this._bound) {
         const payload = normalizeDgramBridgeResult(
-          _dgramSocketRecvRaw.applySync(void 0, [this._socketId, NET_BRIDGE_POLL_DELAY_MS])
+          _dgramSocketRecvRaw.applySync(void 0, [this._socketId, waitMs])
         );
         if (payload === NET_BRIDGE_TIMEOUT_SENTINEL || !payload) {
           this._receivePollTimer = setTimeout(() => {
             this._receivePollTimer = null;
+            this._nextReceivePumpOrigin = "timer";
             void this._pumpMessages();
           }, NET_BRIDGE_POLL_DELAY_MS);
           if (!this._refed && typeof this._receivePollTimer.unref === "function") {
@@ -783,6 +866,23 @@ var DgramSocket = class {
       this._emit("error", error);
     } finally {
       this._receiveLoopRunning = false;
+    }
+  }
+  _applyBoundAddress(info) {
+    if (!info || typeof info !== "object") {
+      return;
+    }
+    const port = typeof info.localPort === "number" ? info.localPort : info.port;
+    if (typeof port === "number") {
+      this._localPort = port;
+    }
+    const address = typeof info.localAddress === "string" ? info.localAddress : info.address;
+    if (typeof address === "string") {
+      this._localAddress = address;
+    }
+    const family = typeof info.localFamily === "string" ? info.localFamily : info.family;
+    if (typeof family === "string") {
+      this._localFamily = family;
     }
   }
   _clearReceivePollTimer() {
