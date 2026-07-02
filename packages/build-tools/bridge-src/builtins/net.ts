@@ -1497,6 +1497,7 @@ var NetSocket = class _NetSocket {
   _remoteEnded = false;
   _writableEnded = false;
   _closeEmitted = false;
+  _bridgeReleased = false;
   _connected = false;
   connecting = false;
   destroyed = false;
@@ -1711,11 +1712,7 @@ var NetSocket = class _NetSocket {
       this._emitSocketClose(Boolean(error));
       return this;
     }
-    if (typeof _netSocketDestroyRaw !== "undefined" && this._socketId) {
-      _netSocketDestroyRaw.applySync(void 0, [this._socketId]);
-      countNetBridgeMetric("peerWakeOnDestroy");
-      wakePeerBridgeReads(this);
-    }
+    this._releaseBridgeSocket();
     if (error) {
       this._emitNet("error", error);
     }
@@ -1832,7 +1829,31 @@ var NetSocket = class _NetSocket {
     if (this._socketId) {
       unregisterNetSocket(this._socketId);
     }
+    if (this.readableLength > 0) {
+      this._deferBridgeReleaseUntilReadDrained = true;
+    } else {
+      this._releaseBridgeSocket();
+    }
     this._emitNet("close", hadError);
+  }
+  _releaseDeferredBridgeSocket() {
+    if (!this._deferBridgeReleaseUntilReadDrained || this.readableLength > 0) {
+      return;
+    }
+    this._deferBridgeReleaseUntilReadDrained = false;
+    this._releaseBridgeSocket();
+  }
+  _releaseBridgeSocket() {
+    if (this._bridgeReleased || !this._socketId || typeof _netSocketDestroyRaw === "undefined") {
+      return;
+    }
+    this._bridgeReleased = true;
+    try {
+      _netSocketDestroyRaw.applySync(void 0, [this._socketId]);
+    } catch {
+    }
+    countNetBridgeMetric("peerWakeOnDestroy");
+    wakePeerBridgeReads(this);
   }
   _handleRemoteReadableEnd() {
     if (this.destroyed || this._remoteEnded) {
@@ -1966,25 +1987,30 @@ var NetSocket = class _NetSocket {
     if (this._readQueue.length === 0) {
       return null;
     }
+    let chunk;
     if (size == null || size <= 0) {
-      const chunk = this._readQueue.shift() ?? null;
+      chunk = this._readQueue.shift() ?? null;
       if (chunk) {
         this.readableLength = Math.max(0, this.readableLength - chunk.length);
       }
-      return chunk;
+    } else {
+      const head = this._readQueue[0];
+      if (!head) {
+        return null;
+      }
+      if (head.length <= size) {
+        this._readQueue.shift();
+        this.readableLength = Math.max(0, this.readableLength - head.length);
+        chunk = head;
+      } else {
+        chunk = head.subarray(0, size);
+        this._readQueue[0] = head.subarray(size);
+        this.readableLength = Math.max(0, this.readableLength - chunk.length);
+      }
     }
-    const head = this._readQueue[0];
-    if (!head) {
-      return null;
+    if (this.readableLength === 0) {
+      this._releaseDeferredBridgeSocket();
     }
-    if (head.length <= size) {
-      this._readQueue.shift();
-      this.readableLength = Math.max(0, this.readableLength - head.length);
-      return head;
-    }
-    const chunk = head.subarray(0, size);
-    this._readQueue[0] = head.subarray(size);
-    this.readableLength = Math.max(0, this.readableLength - chunk.length);
     return chunk;
   }
   unshift(chunk) {

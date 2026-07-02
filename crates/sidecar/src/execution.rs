@@ -1717,6 +1717,7 @@ impl ActiveTcpSocket {
                                 .socket_read_end_events
                                 .fetch_add(1, Ordering::Relaxed);
                         }
+                        self.saw_remote_end.store(true, Ordering::SeqCst);
                         Ok(Some(JavascriptTcpSocketEvent::End))
                     }
                     Err(error) if error.code() == "EAGAIN" => {
@@ -1741,6 +1742,7 @@ impl ActiveTcpSocket {
                 };
             }
             if revents.intersects(POLLHUP) {
+                self.saw_remote_end.store(true, Ordering::SeqCst);
                 return Ok(Some(JavascriptTcpSocketEvent::End));
             }
             if revents.intersects(POLLERR) {
@@ -2182,14 +2184,18 @@ impl ActiveTcpSocket {
             }
         }
         if let Some(socket_id) = self.kernel_socket_id {
-            return kernel
-                .socket_shutdown(
-                    EXECUTION_DRIVER_NAME,
-                    kernel_pid,
-                    socket_id,
-                    KernelSocketShutdown::Write,
-                )
-                .map_err(kernel_error);
+            self.saw_local_shutdown.store(true, Ordering::SeqCst);
+            match kernel.socket_shutdown(
+                EXECUTION_DRIVER_NAME,
+                kernel_pid,
+                socket_id,
+                KernelSocketShutdown::Write,
+            ) {
+                Ok(()) => {}
+                Err(error) if error.code() == "ENOENT" => {}
+                Err(error) => return Err(kernel_error(error)),
+            }
+            return Ok(());
         }
         let stream = self
             .stream
@@ -2241,14 +2247,9 @@ impl ActiveTcpSocket {
                 let _ = stream.send_close_notify();
                 let _ = stream.close();
             }
-            if self.kernel_socket_id.is_some() {
-                return Ok(());
-            }
         }
         if let Some(socket_id) = self.kernel_socket_id {
-            return kernel
-                .socket_close(EXECUTION_DRIVER_NAME, kernel_pid, socket_id)
-                .map_err(kernel_error);
+            return close_kernel_socket_idempotent(kernel, kernel_pid, socket_id);
         }
         let stream = self
             .stream
@@ -2258,6 +2259,45 @@ impl ActiveTcpSocket {
             .map_err(|_| SidecarError::InvalidState(String::from("TCP socket lock poisoned")))?;
         stream.shutdown(Shutdown::Both).map_err(sidecar_net_error)
     }
+}
+
+fn close_kernel_socket_idempotent(
+    kernel: &mut SidecarKernel,
+    kernel_pid: u32,
+    socket_id: SocketId,
+) -> Result<(), SidecarError> {
+    match kernel.socket_close(EXECUTION_DRIVER_NAME, kernel_pid, socket_id) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == "ENOENT" => Ok(()),
+        Err(error) => Err(kernel_error(error)),
+    }
+}
+
+fn release_tcp_socket_handle(
+    process: &mut ActiveProcess,
+    socket_id: &str,
+    socket: ActiveTcpSocket,
+    kernel: &mut SidecarKernel,
+) {
+    if let Some(listener_id) = socket.listener_id.as_deref() {
+        if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
+            listener.release_connection(socket_id);
+        }
+    }
+    let _ = socket.close(kernel, process.kernel_pid);
+}
+
+fn release_unix_socket_handle(
+    process: &mut ActiveProcess,
+    socket_id: &str,
+    socket: ActiveUnixSocket,
+) {
+    if let Some(listener_id) = socket.listener_id.as_deref() {
+        if let Some(listener) = process.unix_listeners.get_mut(listener_id) {
+            listener.release_connection(socket_id);
+        }
+    }
+    let _ = socket.close();
 }
 
 impl ActiveTlsStream {
@@ -2786,9 +2826,7 @@ impl ActiveTcpListener {
 
     fn close(&self, kernel: &mut SidecarKernel, kernel_pid: u32) -> Result<(), SidecarError> {
         if let Some(socket_id) = self.kernel_socket_id {
-            kernel
-                .socket_close(EXECUTION_DRIVER_NAME, kernel_pid, socket_id)
-                .map_err(kernel_error)?;
+            close_kernel_socket_idempotent(kernel, kernel_pid, socket_id)?;
         }
         Ok(())
     }
@@ -3041,7 +3079,7 @@ impl ActiveUdpSocket {
 
     fn close(&mut self, kernel: &mut SidecarKernel, kernel_pid: u32) {
         if let Some(socket_id) = self.kernel_socket_id {
-            let _ = kernel.socket_close(EXECUTION_DRIVER_NAME, kernel_pid, socket_id);
+            let _ = close_kernel_socket_idempotent(kernel, kernel_pid, socket_id);
         }
         self.socket.take();
         self.guest_local_addr = None;
@@ -22659,17 +22697,9 @@ where
                 })),
                 Some(JavascriptTcpSocketEvent::Close { had_error }) => {
                     if let Some(socket) = process.tcp_sockets.remove(socket_id) {
-                        if let Some(listener_id) = socket.listener_id.as_deref() {
-                            if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
-                                listener.release_connection(socket_id);
-                            }
-                        }
+                        release_tcp_socket_handle(process, socket_id, socket, kernel);
                     } else if let Some(socket) = process.unix_sockets.remove(socket_id) {
-                        if let Some(listener_id) = socket.listener_id.as_deref() {
-                            if let Some(listener) = process.unix_listeners.get_mut(listener_id) {
-                                listener.release_connection(socket_id);
-                            }
-                        }
+                        release_unix_socket_handle(process, socket_id, socket);
                     }
                     Ok(json!({
                         "type": "close",
@@ -23129,12 +23159,7 @@ where
             let socket = process.tcp_sockets.remove(socket_id).ok_or_else(|| {
                 SidecarError::InvalidState(format!("unknown TCP socket {socket_id}"))
             })?;
-            if let Some(listener_id) = socket.listener_id.as_deref() {
-                if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
-                    listener.release_connection(socket_id);
-                }
-            }
-            let _ = socket.close(kernel, process.kernel_pid);
+            release_tcp_socket_handle(process, socket_id, socket, kernel);
             Ok(Value::Null)
         }
         "net.write" => {
@@ -23196,23 +23221,12 @@ where
         "net.destroy" => {
             let socket_id = javascript_sync_rpc_arg_str(&request.args, 0, "net.destroy socket id")?;
             if let Some(socket) = process.tcp_sockets.remove(socket_id) {
-                if let Some(listener_id) = socket.listener_id.as_deref() {
-                    if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
-                        listener.release_connection(socket_id);
-                    }
-                }
-                let _ = socket.close(kernel, process.kernel_pid);
+                release_tcp_socket_handle(process, socket_id, socket, kernel);
+                Ok(Value::Null)
+            } else if let Some(socket) = process.unix_sockets.remove(socket_id) {
+                release_unix_socket_handle(process, socket_id, socket);
                 Ok(Value::Null)
             } else {
-                let socket = process.unix_sockets.remove(socket_id).ok_or_else(|| {
-                    SidecarError::InvalidState(format!("unknown net socket {socket_id}"))
-                })?;
-                if let Some(listener_id) = socket.listener_id.as_deref() {
-                    if let Some(listener) = process.unix_listeners.get_mut(listener_id) {
-                        listener.release_connection(socket_id);
-                    }
-                }
-                let _ = socket.close();
                 Ok(Value::Null)
             }
         }

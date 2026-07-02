@@ -1,4 +1,4 @@
-import { getSecureExecUndiciDispatcher, undiciFetch } from "./undici.js";
+import { createSecureExecUndiciDispatcher, undiciFetch } from "./undici.js";
 import { exposeCustomGlobal } from "../global-exposure.js";
 import { undiciHeadersModule, undiciRequestModule, undiciResponseModule } from "../prelude.js";
 import { isFlatHeaderList, onUpgradeSocketEnd } from "./http.js";
@@ -106,7 +106,7 @@ async function fetch(input, options = {}) {
   if (handleId) {
     _registerHandle?.(handleId, `fetch ${requestLabel}`);
   }
-  const fetchDispatcher = normalizedOptions.dispatcher == null && typeof getSecureExecUndiciDispatcher === "function" ? getSecureExecUndiciDispatcher() : null;
+  const fetchDispatcher = normalizedOptions.dispatcher == null && typeof createSecureExecUndiciDispatcher === "function" ? createSecureExecUndiciDispatcher() : null;
   try {
     return await undiciFetch(
       resolvedInput,

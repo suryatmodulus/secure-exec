@@ -13371,6 +13371,115 @@ console.log(JSON.stringify(summary));
             );
             assert!(stdout.contains("\"listenerPort\":"), "stdout: {stdout}");
         }
+        fn javascript_net_loopback_socket_churn_releases_kernel_slots() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(String::from("resource.max_sockets"), String::from("8"))]),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-js-net-churn-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import net from "node:net";
+
+const iterations = 24;
+let accepted = 0;
+let acceptedClosed = 0;
+
+const server = net.createServer((socket) => {
+  accepted += 1;
+  socket.setEncoding("utf8");
+  let payload = "";
+  socket.on("data", (chunk) => {
+    payload += chunk;
+  });
+  socket.on("end", () => {
+    socket.end(payload);
+  });
+  socket.on("close", () => {
+    acceptedClosed += 1;
+  });
+});
+
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", resolve);
+});
+
+const address = server.address();
+if (!address || typeof address === "string") {
+  throw new Error(`unexpected listener address: ${String(address)}`);
+}
+
+const waitForAcceptedClose = async (count) => {
+  const deadline = Date.now() + 5000;
+  while (acceptedClosed < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for accepted close ${count}, got ${acceptedClosed}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+};
+
+for (let index = 0; index < iterations; index += 1) {
+  const message = `x${index}`;
+  const response = await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: address.port });
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.end(message);
+    });
+    socket.on("data", (chunk) => {
+      data += chunk;
+    });
+    socket.on("error", reject);
+    socket.on("close", (hadError) => {
+      if (hadError) {
+        reject(new Error(`client close reported error at ${index}`));
+        return;
+      }
+      resolve(data);
+    });
+  });
+  if (response !== message) {
+    throw new Error(`unexpected response at ${index}: ${response}`);
+  }
+  await waitForAcceptedClose(index + 1);
+}
+
+await new Promise((resolve, reject) => {
+  server.close((error) => {
+    if (error) {
+      reject(error);
+    } else {
+      resolve();
+    }
+  });
+});
+
+console.log(JSON.stringify({ iterations, accepted, acceptedClosed }));
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-net-churn");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse churn JSON");
+            assert_eq!(parsed["iterations"], Value::from(24));
+            assert_eq!(parsed["accepted"], Value::from(24));
+            assert_eq!(parsed["acceptedClosed"], Value::from(24));
+        }
         fn javascript_dgram_rpc_sends_and_receives_vm_loopback_packets() {
             assert_node_available();
 
@@ -19168,6 +19277,11 @@ console.log(JSON.stringify({
         #[test]
         fn aad_javascript_network_dns_javascript_net_poll_suite() {
             run_service_suite();
+        }
+
+        #[test]
+        fn javascript_net_loopback_socket_churn_releases_kernel_slots_regression() {
+            javascript_net_loopback_socket_churn_releases_kernel_slots();
         }
 
         #[test]

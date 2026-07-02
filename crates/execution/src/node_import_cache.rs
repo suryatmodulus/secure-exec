@@ -17,7 +17,7 @@ const NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT_MS_ENV: &str =
     "AGENTOS_NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT_MS";
 const NODE_IMPORT_CACHE_SCHEMA_VERSION: &str = "1";
 const NODE_IMPORT_CACHE_LOADER_VERSION: &str = "8";
-const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "81";
+const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "82";
 const NODE_IMPORT_CACHE_DIR_PREFIX: &str = "agentos-node-import-cache";
 const DEFAULT_NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const PYODIDE_DIST_DIR: &str = "pyodide-dist";
@@ -4758,10 +4758,20 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
   const callDestroy = (socketId) => bridge().call('net.destroy', [socketId]);
   const callServerClose = (serverId) => bridge().call('net.server_close', [serverId]);
 
+  const releaseSocketBridge = (socket) => {
+    if (socket._agentOSBridgeReleased || socket._agentOSSocketId == null) {
+      return Promise.resolve();
+    }
+    const socketId = socket._agentOSSocketId;
+    socket._agentOSBridgeReleased = true;
+    return callDestroy(socketId).catch(() => {});
+  };
+
   const finalizeSocketClose = (socket, hadError = false) => {
     if (socket._agentOSClosed) {
       return;
     }
+    void releaseSocketBridge(socket);
     socket._agentOSClosed = true;
     socket._agentOSCloseHadError = hadError === true;
     socket._agentOSSocketId = null;
@@ -4773,6 +4783,16 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
       socket.push(null);
     }
     queueMicrotask(() => socket.emit('close', hadError));
+  };
+  const finalizeSocketCloseAfterReadableEnd = (socket, hadError = false) => {
+    if (socket._agentOSClosed) {
+      return;
+    }
+    if (socket.readableEnded) {
+      finalizeSocketClose(socket, hadError);
+      return;
+    }
+    socket.once('end', () => finalizeSocketClose(socket, hadError));
   };
 
   const scheduleSocketPoll = (socket, delayMs) => {
@@ -4808,6 +4828,8 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
       }
 
       if (event.type === 'end') {
+        socket._agentOSRemoteEnded = true;
+        finalizeSocketCloseAfterReadableEnd(socket, false);
         socket.push(null);
         if (!socket._agentOSAllowHalfOpen && !socket.writableEnded) {
           socket.end();
@@ -4868,6 +4890,8 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
     socket.connecting = false;
     socket.pending = false;
     socket._agentOSClosed = false;
+    socket._agentOSRemoteEnded = false;
+    socket._agentOSBridgeReleased = false;
     if (emitConnect) {
       queueMicrotask(() => {
         if (socket._agentOSClosed) {
@@ -4887,6 +4911,8 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
       this._agentOSClosed = false;
       this._agentOSCloseHadError = false;
       this._agentOSExplicitDestroy = false;
+      this._agentOSRemoteEnded = false;
+      this._agentOSBridgeReleased = false;
       this._agentOSRefed = true;
       this._agentOSSocketId = null;
       this._pollTimer = null;
@@ -4941,7 +4967,12 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
         return;
       }
       callShutdown(this._agentOSSocketId).then(
-        () => callback(),
+        () => {
+          if (this._agentOSRemoteEnded) {
+            finalizeSocketCloseAfterReadableEnd(this, false);
+          }
+          callback();
+        },
         (error) => callback(error),
       );
     }
@@ -4955,13 +4986,13 @@ function createRpcBackedNetModule(netModule, fromGuestDir = '/') {
       };
       if (
         socketId == null ||
-        this._agentOSClosed ||
-        (error == null && !this._agentOSExplicitDestroy)
+        this._agentOSClosed
       ) {
         finishDestroy();
         return;
       }
-      callDestroy(socketId).then(finishDestroy, () => finishDestroy());
+      this._agentOSSocketId = socketId;
+      releaseSocketBridge(this).then(finishDestroy, () => finishDestroy());
     }
 
     address() {
