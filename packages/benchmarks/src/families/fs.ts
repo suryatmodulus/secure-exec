@@ -51,6 +51,23 @@ export const fsFamily: BenchmarkOp[] = [
 	},
 	{
 		family: "fs",
+		name: "module_import_fresh",
+		nativeUnsupportedReason: "dynamic import of guest-written JavaScript module",
+		wasmUnsupportedReason: "dynamic import of guest-written JavaScript module",
+		fileLine: "crates/execution/src/javascript.rs:3939",
+		reproducer: "write a unique /tmp .mjs file, dynamic-import it, and verify the exported value",
+		program: `async (i) => {
+  const fs = await import("node:fs");
+  const value = "fresh-" + process.pid + "-" + i;
+  const path = "/tmp/fuzz-perf-import-" + process.pid + "-" + i + ".mjs";
+  fs.writeFileSync(path, "export const value = " + JSON.stringify(value) + ";\\n");
+  const mod = await import("file://" + path);
+  if (mod.value !== value) throw new Error("bad fresh import");
+  fs.unlinkSync(path);
+}`,
+	},
+	{
+		family: "fs",
 		name: "big_read",
 		nativeOp: "fs_read",
 		fileLine: "crates/kernel/src/mount_table.rs:814",

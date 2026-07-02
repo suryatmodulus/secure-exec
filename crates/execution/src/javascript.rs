@@ -3503,25 +3503,50 @@ impl LocalBridgeState {
                     _ if method == "_resolveModule" => ModuleResolveMode::Import,
                     _ => ModuleResolveMode::Require,
                 };
+                if self.js_runtime_denies_specifier(specifier) {
+                    return Some(LocalBridgeCallResult::Immediate(Value::Null));
+                }
+                let resolved = self.with_module_resolver(|resolver| {
+                    resolver.resolve_module(specifier, parent, mode)
+                });
+                if resolved.is_none() && self.has_module_reader() {
+                    return None;
+                }
                 Some(LocalBridgeCallResult::Immediate(
-                    self.resolve_module(specifier, parent, mode)
-                        .map(Value::String)
+                    resolved.map(Value::String).unwrap_or(Value::Null),
+                ))
+            }
+            "_moduleFormat" => {
+                let format = self.module_format(args.first().and_then(Value::as_str).unwrap_or(""));
+                if format.is_none() && self.has_module_reader() {
+                    return None;
+                }
+                Some(LocalBridgeCallResult::Immediate(
+                    format
+                        .map(|format| Value::String(String::from(format.as_str())))
                         .unwrap_or(Value::Null),
                 ))
             }
-            "_moduleFormat" => Some(LocalBridgeCallResult::Immediate(
-                self.module_format(args.first().and_then(Value::as_str).unwrap_or(""))
-                    .map(|format| Value::String(String::from(format.as_str())))
-                    .unwrap_or(Value::Null),
-            )),
-            "_loadFile" | "_loadFileSync" => Some(LocalBridgeCallResult::Immediate(
-                self.load_file(args.first().and_then(Value::as_str).unwrap_or(""))
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
-            )),
-            "_batchResolveModules" => Some(LocalBridgeCallResult::Immediate(
-                self.batch_resolve_modules(args),
-            )),
+            "_loadFile" | "_loadFileSync" => {
+                let source = self.load_file(args.first().and_then(Value::as_str).unwrap_or(""));
+                if source.is_none() && self.has_module_reader() {
+                    return None;
+                }
+                Some(LocalBridgeCallResult::Immediate(
+                    source.map(Value::String).unwrap_or(Value::Null),
+                ))
+            }
+            "_batchResolveModules" => {
+                let resolved = self.batch_resolve_modules(args);
+                if self.has_module_reader()
+                    && resolved
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(Value::is_null))
+                {
+                    return None;
+                }
+                Some(LocalBridgeCallResult::Immediate(resolved))
+            }
             "_loadPolyfill" => Some(LocalBridgeCallResult::Immediate(
                 self.handle_polyfill_dispatch(args),
             )),
@@ -3961,9 +3986,11 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
                 .or_else(|| self.resolve_node_modules(specifier, &normalized_from, mode))
         };
 
-        self.cache
-            .resolve_results
-            .insert(cache_key, resolved.clone());
+        if resolved.is_some() || module_resolution_miss_is_stable(&normalized_from) {
+            self.cache
+                .resolve_results
+                .insert(cache_key, resolved.clone());
+        }
         resolved
     }
 
@@ -4222,9 +4249,11 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
             .reader
             .read_to_string(guest_path)
             .and_then(|contents| serde_json::from_str::<LocalPackageJson>(&contents).ok());
-        self.cache
-            .package_json_results
-            .insert(guest_path.to_owned(), parsed.clone());
+        if parsed.is_some() || module_path_miss_is_stable(guest_path) {
+            self.cache
+                .package_json_results
+                .insert(guest_path.to_owned(), parsed.clone());
+        }
         parsed
     }
 
@@ -4233,9 +4262,11 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
             return *cached;
         }
         let exists = self.reader.path_exists(guest_path);
-        self.cache
-            .exists_results
-            .insert(guest_path.to_owned(), exists);
+        if exists || module_path_miss_is_stable(guest_path) {
+            self.cache
+                .exists_results
+                .insert(guest_path.to_owned(), exists);
+        }
         exists
     }
 
@@ -4244,11 +4275,23 @@ impl<'a, R: ModuleFsReader> ModuleResolver<'a, R> {
             return *cached;
         }
         let result = self.reader.path_is_dir(guest_path);
-        self.cache
-            .stat_results
-            .insert(guest_path.to_owned(), result);
+        if result.is_some() || module_path_miss_is_stable(guest_path) {
+            self.cache
+                .stat_results
+                .insert(guest_path.to_owned(), result);
+        }
         result
     }
+}
+
+fn module_resolution_miss_is_stable(from_dir: &str) -> bool {
+    module_path_miss_is_stable(from_dir)
+}
+
+fn module_path_miss_is_stable(guest_path: &str) -> bool {
+    guest_path == "/node_modules"
+        || guest_path.ends_with("/node_modules")
+        || guest_path.contains("/node_modules/")
 }
 
 fn guest_path_from_file_url(specifier: &str) -> Option<String> {

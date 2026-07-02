@@ -6,12 +6,12 @@ pub(crate) use crate::execution::{
     javascript_sync_rpc_arg_u32_optional, javascript_sync_rpc_arg_u64,
     javascript_sync_rpc_arg_u64_optional, javascript_sync_rpc_bytes_arg,
     javascript_sync_rpc_bytes_value, javascript_sync_rpc_encoding, javascript_sync_rpc_error_code,
-    javascript_sync_rpc_option_bool, javascript_sync_rpc_option_u32,
-    mark_execute_exit_event_queued, parse_signal, record_execute_exit_event_queue_wait,
+    javascript_sync_rpc_option_bool, javascript_sync_rpc_option_u32, kernel_poll_response,
+    kernel_stdin_read_response, mark_execute_exit_event_queued, parse_kernel_poll_args,
+    parse_kernel_stdin_read_args, parse_signal, record_execute_exit_event_queue_wait,
     record_execute_phase, sanitize_javascript_child_process_internal_bootstrap_env,
-    kernel_poll_response, kernel_stdin_read_response, parse_kernel_poll_args,
-    parse_kernel_stdin_read_args, service_javascript_sync_rpc, vm_network_resource_counts,
-    JavascriptSyncRpcServiceRequest, LoopbackHttpDispatchRequest,
+    service_javascript_sync_rpc, vm_network_resource_counts, JavascriptSyncRpcServiceRequest,
+    LoopbackHttpDispatchRequest,
 };
 use crate::extension::{
     Extension, ExtensionBufferedProcessOutput, ExtensionContext, ExtensionFuture, ExtensionHost,
@@ -1746,7 +1746,10 @@ where
             return false;
         };
         if request.method == "__kernel_stdin_read"
-            && matches!(process.execution, crate::state::ActiveExecution::Javascript(_))
+            && matches!(
+                process.execution,
+                crate::state::ActiveExecution::Javascript(_)
+            )
             && process.tty_master_fd.is_none()
         {
             return false;
@@ -1776,12 +1779,7 @@ where
         let now = Instant::now();
 
         let Some(vm) = self.vms.get_mut(vm_id) else {
-            log_stale_process_event(
-                &self.bridge,
-                vm_id,
-                process_id,
-                "deferred kernel wait RPC",
-            );
+            log_stale_process_event(&self.bridge, vm_id, process_id, "deferred kernel wait RPC");
             return Ok(None);
         };
         let wait_handle = vm.kernel.poll_wait_handle();
@@ -1790,12 +1788,7 @@ where
         // returns immediately instead of losing the wakeup.
         let generation = wait_handle.snapshot();
         let Some(process) = vm.active_processes.get_mut(process_id) else {
-            log_stale_process_event(
-                &self.bridge,
-                vm_id,
-                process_id,
-                "deferred kernel wait RPC",
-            );
+            log_stale_process_event(&self.bridge, vm_id, process_id, "deferred kernel wait RPC");
             return Ok(None);
         };
         let kernel_pid = process.kernel_pid;
@@ -1825,13 +1818,7 @@ where
         };
         let ready = match request.method.as_str() {
             "__kernel_stdin_read" => !probe.is_null(),
-            _ => {
-                probe
-                    .get("readyCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-            }
+            _ => probe.get("readyCount").and_then(Value::as_u64).unwrap_or(0) > 0,
         };
         if ready || requested_timeout_ms == 0 || now >= deadline {
             process.deferred_kernel_wait_rpc = None;

@@ -7594,13 +7594,7 @@ where
         };
         let ready = match request.method.as_str() {
             "__kernel_stdin_read" => !probe.is_null(),
-            _ => {
-                probe
-                    .get("readyCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-            }
+            _ => probe.get("readyCount").and_then(Value::as_u64).unwrap_or(0) > 0,
         };
         if ready || requested_timeout_ms == 0 || now >= deadline {
             child.deferred_kernel_wait_rpc = None;
@@ -7630,8 +7624,7 @@ where
             let Some(root) = vm.active_processes.get_mut(process_id) else {
                 return Ok(());
             };
-            let Some(parent) = Self::active_process_by_path_mut(root, current_process_path)
-            else {
+            let Some(parent) = Self::active_process_by_path_mut(root, current_process_path) else {
                 return Ok(());
             };
             let Some(child) = parent.child_processes.get_mut(child_process_id) else {
@@ -18323,7 +18316,13 @@ pub(crate) fn kernel_stdin_read_response(
     timeout: Duration,
 ) -> Result<Value, SidecarError> {
     match kernel
-        .fd_read_with_timeout_result(EXECUTION_DRIVER_NAME, kernel_pid, 0, max_bytes, Some(timeout))
+        .fd_read_with_timeout_result(
+            EXECUTION_DRIVER_NAME,
+            kernel_pid,
+            0,
+            max_bytes,
+            Some(timeout),
+        )
         .map_err(kernel_error)
     {
         Ok(Some(chunk)) if !chunk.is_empty() => Ok(json!({

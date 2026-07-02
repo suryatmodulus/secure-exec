@@ -788,17 +788,13 @@ pub(crate) fn normalize_python_vfs_rpc_path(path: &str) -> Result<String, Sideca
     Ok(normalized)
 }
 
-/// Kernel-VFS-backed reader for the module resolver. The resolution algorithm
-/// (in `secure-exec-execution`) is identical to the legacy host-direct path; it
-/// only differs in where it reads from. By going through `vm.kernel` the
-/// resolver sees exactly what `kernel.readFile()` and the guest see — the
-/// Docker-faithful model — including read-only node_modules mounts and their
-/// symlinks. Symlink following is handled natively by the kernel/mount layer
-/// (`openat2(RESOLVE_BENEATH)`); escaping symlinks are refused by the mount.
+/// Kernel-VFS-backed reader for resolver unit tests and kernel-only callers.
+#[cfg(test)]
 struct KernelModuleFsReader<'a> {
     kernel: &'a mut SidecarKernel,
 }
 
+#[cfg(test)]
 impl ModuleFsReader for KernelModuleFsReader<'_> {
     fn canonical_guest_path(&mut self, guest_path: &str) -> Option<String> {
         self.kernel.realpath(guest_path).ok()
@@ -810,9 +806,6 @@ impl ModuleFsReader for KernelModuleFsReader<'_> {
     }
 
     fn path_is_dir(&mut self, guest_path: &str) -> Option<bool> {
-        // `stat` follows symlinks through the mount (O_PATH, no O_NOFOLLOW), so
-        // a symlinked package directory reports as a directory just like real
-        // `fs.statSync` would. `None` means the path does not exist / escapes.
         self.kernel
             .stat(guest_path)
             .ok()
@@ -821,6 +814,101 @@ impl ModuleFsReader for KernelModuleFsReader<'_> {
 
     fn path_exists(&mut self, guest_path: &str) -> bool {
         self.kernel.exists(guest_path).unwrap_or(false)
+    }
+}
+
+/// Module reader for live JavaScript processes. In the NodeRuntime embedding,
+/// guest filesystem calls operate on the process' mapped host shadow first and
+/// reconcile back to the kernel on exit. Module resolution must therefore check
+/// that same process shadow before falling back to the sidecar kernel, otherwise
+/// `fs.writeFileSync(...); await import(...)` observes an older filesystem.
+struct ProcessModuleFsReader<'a> {
+    kernel: &'a mut SidecarKernel,
+    process: &'a ActiveProcess,
+}
+
+impl ProcessModuleFsReader<'_> {
+    fn normalize_guest_path(&self, guest_path: &str) -> String {
+        normalize_process_filesystem_rpc_path(self.process, guest_path)
+    }
+
+    fn mapped_host_path(&self, guest_path: &str) -> Option<MappedRuntimeHostPath> {
+        mapped_runtime_host_path_for_read(self.process, guest_path)
+    }
+
+    fn materialize_mapped_path(
+        &mut self,
+        guest_path: &str,
+        mapped: &MappedRuntimeHostPath,
+    ) -> Result<(), SidecarError> {
+        materialize_mapped_host_path_from_kernel(
+            self.kernel,
+            self.process.kernel_pid,
+            guest_path,
+            mapped,
+        )
+    }
+
+    fn open_mapped_path(
+        &mut self,
+        guest_path: &str,
+        operation: &'static str,
+        flags: OFlag,
+    ) -> Option<MappedRuntimeOpenedPath> {
+        let mapped = self.mapped_host_path(guest_path)?;
+        self.materialize_mapped_path(guest_path, &mapped).ok()?;
+        open_mapped_runtime_beneath(&mapped, operation, flags, Mode::empty()).ok()
+    }
+}
+
+impl ModuleFsReader for ProcessModuleFsReader<'_> {
+    fn canonical_guest_path(&mut self, guest_path: &str) -> Option<String> {
+        let normalized = self.normalize_guest_path(guest_path);
+        if self
+            .open_mapped_path(&normalized, "module.realpath", O_PATH_ANCHOR)
+            .is_some()
+        {
+            return Some(normalized);
+        }
+        self.kernel.realpath(&normalized).ok()
+    }
+
+    fn read_to_string(&mut self, guest_path: &str) -> Option<String> {
+        let normalized = self.normalize_guest_path(guest_path);
+        if let Some(opened) = self.open_mapped_path(&normalized, "module.readFile", OFlag::O_RDONLY)
+        {
+            if let Ok(source) = fs::read_to_string(opened.handle.proc_path()) {
+                return Some(source);
+            }
+        }
+
+        let bytes = self.kernel.read_file(&normalized).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
+    fn path_is_dir(&mut self, guest_path: &str) -> Option<bool> {
+        let normalized = self.normalize_guest_path(guest_path);
+        if let Some(opened) = self.open_mapped_path(&normalized, "module.stat", O_PATH_ANCHOR) {
+            if let Ok(metadata) = fs::metadata(opened.handle.proc_path()) {
+                return Some(metadata.is_dir());
+            }
+        }
+
+        self.kernel
+            .stat(&normalized)
+            .ok()
+            .map(|stat| stat.is_directory)
+    }
+
+    fn path_exists(&mut self, guest_path: &str) -> bool {
+        let normalized = self.normalize_guest_path(guest_path);
+        if self
+            .open_mapped_path(&normalized, "module.exists", O_PATH_ANCHOR)
+            .is_some()
+        {
+            return true;
+        }
+        self.kernel.exists(&normalized).unwrap_or(false)
     }
 }
 
@@ -834,51 +922,59 @@ pub(crate) fn service_javascript_module_sync_rpc(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
-    let cache = &mut process.module_resolution_cache;
-    let mut resolver = ModuleResolver::new(KernelModuleFsReader { kernel }, cache);
+    let mut cache = std::mem::take(&mut process.module_resolution_cache);
+    let value = {
+        let reader = ProcessModuleFsReader {
+            kernel,
+            process: &*process,
+        };
+        let mut resolver = ModuleResolver::new(reader, &mut cache);
 
-    let value = match request.method.as_str() {
-        "__resolve_module" | "_resolveModule" | "_resolveModuleSync" => {
-            let specifier =
-                javascript_sync_rpc_arg_str(&request.args, 0, "module resolve specifier")?;
-            let parent = request.args.get(1).and_then(Value::as_str).unwrap_or("/");
-            let mode = match request.args.get(2).and_then(Value::as_str) {
-                Some("import") => ModuleResolveMode::Import,
-                Some("require") => ModuleResolveMode::Require,
-                // `_resolveModule` defaults to import; `_resolveModuleSync` to require.
-                _ if request.method == "_resolveModuleSync" => ModuleResolveMode::Require,
-                _ => ModuleResolveMode::Import,
-            };
-            resolver
-                .resolve_module(specifier, parent, mode)
-                .map(Value::String)
-                .unwrap_or(Value::Null)
-        }
-        "__load_file" | "_loadFile" | "_loadFileSync" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "module load path")?;
-            resolver
-                .load_file(path)
-                .map(Value::String)
-                .unwrap_or(Value::Null)
-        }
-        "__module_format" | "_moduleFormat" => {
-            let path = javascript_sync_rpc_arg_str(&request.args, 0, "module format path")?;
-            resolver
-                .module_format(path)
-                .map(|format: LocalResolvedModuleFormat| {
-                    Value::String(String::from(format.as_str()))
-                })
-                .unwrap_or(Value::Null)
-        }
-        "__batch_resolve_modules" | "_batchResolveModules" => {
-            resolver.batch_resolve_modules(&request.args)
-        }
-        other => {
-            return Err(SidecarError::InvalidState(format!(
-                "unsupported JavaScript module sync RPC method {other}"
-            )));
+        match request.method.as_str() {
+            "__resolve_module" | "_resolveModule" | "_resolveModuleSync" => {
+                let specifier =
+                    javascript_sync_rpc_arg_str(&request.args, 0, "module resolve specifier")?;
+                let parent = request.args.get(1).and_then(Value::as_str).unwrap_or("/");
+                let mode = match request.args.get(2).and_then(Value::as_str) {
+                    Some("import") => ModuleResolveMode::Import,
+                    Some("require") => ModuleResolveMode::Require,
+                    // `_resolveModule` defaults to import; `_resolveModuleSync` to require.
+                    _ if request.method == "_resolveModuleSync" => ModuleResolveMode::Require,
+                    _ => ModuleResolveMode::Import,
+                };
+                resolver
+                    .resolve_module(specifier, parent, mode)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null)
+            }
+            "__load_file" | "_loadFile" | "_loadFileSync" => {
+                let path = javascript_sync_rpc_arg_str(&request.args, 0, "module load path")?;
+                resolver
+                    .load_file(path)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null)
+            }
+            "__module_format" | "_moduleFormat" => {
+                let path = javascript_sync_rpc_arg_str(&request.args, 0, "module format path")?;
+                resolver
+                    .module_format(path)
+                    .map(|format: LocalResolvedModuleFormat| {
+                        Value::String(String::from(format.as_str()))
+                    })
+                    .unwrap_or(Value::Null)
+            }
+            "__batch_resolve_modules" | "_batchResolveModules" => {
+                resolver.batch_resolve_modules(&request.args)
+            }
+            other => {
+                process.module_resolution_cache = cache;
+                return Err(SidecarError::InvalidState(format!(
+                    "unsupported JavaScript module sync RPC method {other}"
+                )));
+            }
         }
     };
+    process.module_resolution_cache = cache;
 
     Ok(value)
 }

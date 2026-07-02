@@ -11461,6 +11461,108 @@ console.log(
             );
         }
 
+        fn javascript_imports_guest_written_modules_after_miss_work() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+                vm.kernel.mkdir("/app", true).expect("create app dir");
+                vm.kernel
+                    .mkdir("/fixtures", true)
+                    .expect("create fixtures dir");
+                vm.kernel
+                    .write_file(
+                        "/tmp/preexisting.mjs",
+                        b"export const value = 'preexisting';\n".to_vec(),
+                    )
+                    .expect("write preexisting module");
+                vm.kernel
+                    .write_file(
+                        "/app/main.js",
+                        br#"
+import fs from "node:fs";
+
+const seen = [];
+async function expectImport(label, specifier, expected) {
+  const mod = await import(specifier);
+  if (mod.value !== expected) {
+    throw new Error(`${label}: expected ${expected}, got ${mod.value}`);
+  }
+  seen.push(label);
+}
+
+await expectImport("PRE_OK", "/tmp/preexisting.mjs", "preexisting");
+
+fs.writeFileSync("/tmp/fresh-path.mjs", "export const value = 'fresh-path';\n");
+await expectImport("FRESH_PATH_OK", "/tmp/fresh-path.mjs", "fresh-path");
+
+fs.writeFileSync("/tmp/fresh-url.mjs", "export const value = 'fresh-url';\n");
+await expectImport("FRESH_URL_OK", "file:///tmp/fresh-url.mjs", "fresh-url");
+
+let missed = false;
+try {
+  await import("/tmp/retry-after-miss.mjs");
+} catch {
+  missed = true;
+}
+if (!missed) {
+  throw new Error("NEG_RETRY did not miss before write");
+}
+fs.writeFileSync("/tmp/retry-after-miss.mjs", "export const value = 'retry';\n");
+await expectImport("NEG_RETRY_OK", "/tmp/retry-after-miss.mjs", "retry");
+
+console.log(seen.join("\n"));
+"#,
+                    )
+                    .expect("write entrypoint");
+            }
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::Execute(crate::protocol::ExecuteRequest {
+                        process_id: String::from("proc-js-import-fresh"),
+                        command: Some(String::from("node")),
+                        runtime: None,
+                        entrypoint: None,
+                        args: vec![String::from("/app/main.js")],
+                        env: std::collections::HashMap::new(),
+                        cwd: None,
+                        wasm_permission_tier: None,
+                    }),
+                ))
+                .expect("dispatch import fresh execute");
+
+            match response.response.payload {
+                ResponsePayload::ProcessStarted(response) => {
+                    assert_eq!(response.process_id, "proc-js-import-fresh");
+                }
+                other => panic!("unexpected execute response: {other:?}"),
+            }
+
+            let (stdout, stderr, exit_code) =
+                drain_process_output(&mut sidecar, &vm_id, "proc-js-import-fresh");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            for marker in ["PRE_OK", "FRESH_PATH_OK", "FRESH_URL_OK", "NEG_RETRY_OK"] {
+                assert!(
+                    stdout.contains(marker),
+                    "missing {marker} in stdout: {stdout}"
+                );
+            }
+        }
+
         fn javascript_fs_promises_batch_requests_before_waiting_on_sidecar_responses() {
             assert_node_available();
 
@@ -18975,6 +19077,7 @@ console.log(JSON.stringify({
             javascript_fs_sync_rpc_resolves_proc_self_against_the_kernel_process();
             javascript_fd_and_stream_rpc_requests_proxy_into_the_vm_kernel_filesystem();
             javascript_mapped_tmp_open_wx_uses_exclusive_create_once();
+            javascript_imports_guest_written_modules_after_miss_work();
             javascript_fs_promises_batch_requests_before_waiting_on_sidecar_responses();
             javascript_crypto_basic_sync_rpcs_round_trip_through_sidecar();
             javascript_crypto_advanced_sync_rpcs_round_trip_through_sidecar();
@@ -19083,6 +19186,11 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn aac_javascript_imports_guest_written_modules_after_miss() {
+            run_isolated_service_test("javascript-import-fresh");
+        }
+
+        #[test]
         fn aab_wasm_command_timeout_is_enforced_by_sidecar_poll_path() {
             run_isolated_service_test("wasm-command-timeout");
         }
@@ -19178,6 +19286,9 @@ console.log(JSON.stringify({
                 }
                 "http2-guest-h2c" => {
                     javascript_http2_guest_h2c_round_trip_does_not_deadlock();
+                }
+                "javascript-import-fresh" => {
+                    javascript_imports_guest_written_modules_after_miss_work();
                 }
                 "wasm-command-timeout" => {
                     wasm_command_timeout_is_enforced_by_sidecar_poll_path();
