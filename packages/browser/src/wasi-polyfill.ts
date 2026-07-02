@@ -978,6 +978,22 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       }
     }
 
+    _createParentExists(guestPath, hostPath) {
+      const target =
+        this._sidecarManagedProcess() && typeof guestPath === "string"
+          ? guestPath
+          : hostPath;
+      if (typeof target !== "string") {
+        return false;
+      }
+      try {
+        __agentOSFs().statSync(__agentOSPath().dirname(target));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     _currentGuestCwd() {
       const pwd =
         typeof this.env?.PWD === "string" && this.env.PWD.startsWith("/")
@@ -1084,8 +1100,54 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (
           typeof cwdHostTarget === "string" &&
           (
-            (preferCreateParent && !this._rootRelativeTargetMatchesAbsoluteArg(target)) ||
+            (
+              preferCreateParent &&
+              !this._rootRelativeTargetIsWithinAbsoluteArg(target) &&
+              this._createParentExists(cwdGuestTarget, cwdHostTarget)
+            ) ||
             this._rootRelativeTargetPrefersCwd(target) ||
+            (
+              this._hostPathExists(cwdHostTarget) &&
+              !(typeof rootHostPath === "string" && this._hostPathExists(rootHostPath))
+            )
+          )
+        ) {
+          return {
+            guestPath: cwdGuestTarget,
+            hostPath: cwdHostTarget,
+            readOnly: cwdMapping?.readOnly === true,
+          };
+        }
+      }
+      return {
+        guestPath: rootGuestPath,
+        hostPath: rootHostPath,
+        readOnly: rootMapping?.readOnly === true,
+      };
+    }
+
+    _resolveAbsolutePath(target, preferCreateParent = false) {
+      const rootGuestPath = __agentOSPath().posix.normalize(target);
+      const rootMapping = this._resolveHostMappingForGuestPath(rootGuestPath);
+      const rootHostPath = rootMapping?.hostPath ?? null;
+      const cwdGuestPath = this._currentGuestCwd();
+      if (
+        cwdGuestPath !== "/" &&
+        !this._rootRelativeTargetIsWithinAbsoluteArg(target)
+      ) {
+        const cwdGuestTarget = __agentOSPath().posix.resolve(
+          cwdGuestPath,
+          target.replace(/^\\/+/, ""),
+        );
+        const cwdMapping = this._resolveHostMappingForGuestPath(cwdGuestTarget);
+        const cwdHostTarget = cwdMapping?.hostPath ?? null;
+        if (
+          typeof cwdHostTarget === "string" &&
+          (
+            (
+              preferCreateParent &&
+              this._createParentExists(cwdGuestTarget, cwdHostTarget)
+            ) ||
             (
               this._hostPathExists(cwdHostTarget) &&
               !(typeof rootHostPath === "string" && this._hostPathExists(rootHostPath))
@@ -1120,7 +1182,12 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         ? __agentOSPath().posix.normalize(target)
         : __agentOSPath().posix.resolve(base.guestPath, target);
       const mapped =
-        base.guestPath === "/" && !target.startsWith("/")
+        target.startsWith("/")
+          ? this._resolveAbsolutePath(
+              target,
+              options.preferCreateParent === true,
+            )
+        : base.guestPath === "/"
           ? this._resolveRootRelativePath(
               target,
               options.preferCreateParent === true,
@@ -1978,7 +2045,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
 
     _pathCreateDirectory(fd, pathPtr, pathLen) {
       try {
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
+        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen, {
+          preferCreateParent: true,
+        });
         if (resolved.error !== __agentOSWasiErrnoSuccess) {
           return resolved.error;
         }
