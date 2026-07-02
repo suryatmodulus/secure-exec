@@ -38,12 +38,12 @@ export function findingsFromLatency(results: OpResult[]): Finding[] {
 			op: result.op,
 			family: result.family,
 			emulation_ratio: result.tax.emulation,
-			total_ratio: result.tax.total,
+			total_ratio: result.tax.total ?? 0,
 			confirmed: true,
 			suspected_cause: causeFor(result.family, result.op),
 			file_line: result.fileLine,
 			reproducer: result.reproducer,
-			evidence: `p50 native=${result.layers.native.p50}ms node=${result.layers.node.p50}ms guest=${result.layers.guest.p50}ms`,
+			evidence: `p50 native=${result.layers.native ? `${result.layers.native.p50}ms` : `unsupported (${result.unsupported?.native ?? "n/a"})`} node=${result.layers.node.p50}ms guest=${result.layers.guest.p50}ms`,
 		}));
 }
 
@@ -57,7 +57,7 @@ export function refutedFromLatency(results: OpResult[]): RefutedCandidate[] {
 				result.expectedRatio === "control"
 					? "control workload stayed within the methodology guardrail"
 					: "emulation tax stayed below the confirmed-offender threshold",
-			evidence: `guest/node=${result.tax.emulation}; p50 native=${result.layers.native.p50}ms node=${result.layers.node.p50}ms guest=${result.layers.guest.p50}ms`,
+			evidence: `guest/node=${result.tax.emulation}; p50 native=${result.layers.native ? `${result.layers.native.p50}ms` : `unsupported (${result.unsupported?.native ?? "n/a"})`} node=${result.layers.node.p50}ms guest=${result.layers.guest.p50}ms`,
 		}));
 }
 

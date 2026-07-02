@@ -39,14 +39,14 @@ use crate::state::{
     JavascriptSocketPathContext, JavascriptTcpListenerEvent, JavascriptTcpSocketEvent,
     JavascriptTlsBridgeOptions, JavascriptTlsClientHello, JavascriptTlsDataValue,
     JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
-    JavascriptUnixListenerEvent, NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket,
-    ProcNetEntry, ProcessEventEnvelope, PythonHostSocket, ResolvedChildProcessExecution,
-    ResolvedTcpConnectAddr, SharedBridge, SharedSidecarRequestClient, SidecarKernel,
-    SocketQueryKind, ToolExecution, VmDnsConfig, VmListenPolicy, VmState,
-    DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME, EXECUTION_SANDBOX_ROOT_ENV,
-    JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV, MAPPED_HOST_FD_START, PYTHON_COMMAND,
-    TOOL_DRIVER_NAME, VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND,
-    WASM_STDIO_SYNC_RPC_ENV,
+    JavascriptUnixListenerEvent, LoopbackTlsPendingWriteHandle, LoopbackTlsPendingWriteState,
+    NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket, ProcNetEntry, ProcessEventEnvelope,
+    PythonHostSocket, ResolvedChildProcessExecution, ResolvedTcpConnectAddr, SharedBridge,
+    SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution, VmDnsConfig,
+    VmListenPolicy, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
+    EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV,
+    MAPPED_HOST_FD_START, PYTHON_COMMAND, TOOL_DRIVER_NAME,
+    VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
 };
 use crate::tools::{
     format_tool_failure_output, is_tool_command, normalized_tool_command_name,
@@ -177,6 +177,10 @@ const PYTHON_PYODIDE_GUEST_ROOT: &str = "/__agentos_pyodide";
 const PYTHON_PYODIDE_CACHE_GUEST_ROOT: &str = "/__agentos_pyodide_cache";
 const TCP_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOOPBACK_TLS_HANDSHAKE_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+const LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const LOOPBACK_TLS_PENDING_WRITE_WARNING_BYTES: usize =
+    LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES * 4 / 5;
 const HTTP_LOOPBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_EXIT_DRAIN_INITIAL_QUIET: Duration = Duration::from_millis(1);
 const PROCESS_EXIT_DRAIN_TRAILING_QUIET: Duration = Duration::from_millis(25);
@@ -863,11 +867,27 @@ fn loopback_tls_endpoint(
     Ok(crate::state::LoopbackTlsEndpoint {
         pair,
         is_lower_socket: socket_id <= peer_socket_id,
+        poll_timeout: TCP_SOCKET_POLL_TIMEOUT,
         registry_key: Some(key),
     })
 }
 
 impl crate::state::LoopbackTlsEndpoint {
+    fn set_poll_timeout(&mut self, timeout: Duration) {
+        self.poll_timeout = timeout;
+    }
+
+    fn interrupt_reader(pair: &Arc<crate::state::LoopbackTlsTransportPair>, is_lower_socket: bool) {
+        if let Ok(mut state) = pair.state.lock() {
+            if is_lower_socket {
+                state.lower_read_interrupt = true;
+            } else {
+                state.higher_read_interrupt = true;
+            }
+            pair.ready.notify_all();
+        }
+    }
+
     fn shutdown_write(&self) -> Result<(), SidecarError> {
         let mut state = self.pair.state.lock().map_err(|_| {
             SidecarError::InvalidState(String::from("loopback TLS transport lock poisoned"))
@@ -894,6 +914,145 @@ impl crate::state::LoopbackTlsEndpoint {
         }
         self.pair.ready.notify_all();
         Ok(())
+    }
+}
+
+impl LoopbackTlsPendingWriteHandle {
+    pub(crate) fn new(endpoint: &crate::state::LoopbackTlsEndpoint) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LoopbackTlsPendingWriteState {
+                buffer: Vec::new(),
+                warned_near_cap: false,
+                flushing: false,
+                defer_shutdown_write: false,
+                failure_message: None,
+            })),
+            tls_handshake_complete: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            pair: Arc::clone(&endpoint.pair),
+            is_lower_socket: endpoint.is_lower_socket,
+            handshake_started_at: Instant::now(),
+        }
+    }
+
+    fn failure_error(&self) -> SidecarError {
+        let message = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.failure_message.clone())
+            .unwrap_or_else(|| String::from("loopback TLS pending write failed"));
+        SidecarError::Execution(message)
+    }
+
+    fn mark_failed(&self, message: impl Into<String>) {
+        self.failed.store(true, Ordering::SeqCst);
+        if let Ok(mut state) = self.state.lock() {
+            state.buffer.clear();
+            state.flushing = false;
+            state.defer_shutdown_write = false;
+            state.failure_message = Some(message.into());
+        }
+    }
+
+    fn clear_for_close(&self) {
+        self.mark_failed("loopback TLS socket closed before buffered writes flushed");
+    }
+
+    fn fail_if_pending(&self, message: impl Into<String>) {
+        let has_pending = self
+            .state
+            .lock()
+            .map(|state| !state.buffer.is_empty() || state.flushing || state.defer_shutdown_write)
+            .unwrap_or(true);
+        if has_pending {
+            self.mark_failed(message);
+        }
+    }
+
+    fn should_buffer_write(&self) -> Result<bool, SidecarError> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(self.failure_error());
+        }
+        let state = self.state.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("loopback TLS pending write lock poisoned"))
+        })?;
+        Ok(!self.tls_handshake_complete.load(Ordering::SeqCst)
+            || !state.buffer.is_empty()
+            || state.flushing)
+    }
+
+    pub(crate) fn append_write(&self, contents: &[u8]) -> Result<(), SidecarError> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(self.failure_error());
+        }
+        let mut state = self.state.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("loopback TLS pending write lock poisoned"))
+        })?;
+        let observed = state.buffer.len().saturating_add(contents.len());
+        if observed > LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES {
+            return Err(SidecarError::Execution(format!(
+                "loopback TLS pending write buffer exceeded: {observed} bytes > {cap} bytes (limit: loopback TLS pending write buffer)",
+                cap = LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES
+            )));
+        }
+        if !state.warned_near_cap && observed >= LOOPBACK_TLS_PENDING_WRITE_WARNING_BYTES {
+            state.warned_near_cap = true;
+            tracing::warn!(
+                limit = "loopback_tls_pending_write_buffer",
+                observed_bytes = observed,
+                cap_bytes = LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES,
+                fill_percent =
+                    (observed as f64 / LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES as f64) * 100.0,
+                wired = "invariant.loopbackTlsPendingWriteBufferBytes",
+                "loopback TLS pending write buffer is near capacity"
+            );
+        }
+        state.buffer.extend_from_slice(contents);
+        Ok(())
+    }
+
+    fn defer_shutdown_write(&self) -> Result<(), SidecarError> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(self.failure_error());
+        }
+        let mut state = self.state.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("loopback TLS pending write lock poisoned"))
+        })?;
+        state.defer_shutdown_write = true;
+        Ok(())
+    }
+
+    fn take_buffer_for_flush(&self) -> Result<Option<Vec<u8>>, SidecarError> {
+        let mut state = self.state.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("loopback TLS pending write lock poisoned"))
+        })?;
+        if state.buffer.is_empty() {
+            return Ok(None);
+        }
+        state.flushing = true;
+        Ok(Some(std::mem::take(&mut state.buffer)))
+    }
+
+    fn finish_flush(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.flushing = false;
+        }
+    }
+
+    fn take_deferred_shutdown_write(&self) -> Result<bool, SidecarError> {
+        let mut state = self.state.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("loopback TLS pending write lock poisoned"))
+        })?;
+        if state.buffer.is_empty() && !state.flushing && state.defer_shutdown_write {
+            state.defer_shutdown_write = false;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn interrupt_own_reader(&self) {
+        crate::state::LoopbackTlsEndpoint::interrupt_reader(&self.pair, self.is_lower_socket);
     }
 }
 
@@ -1057,10 +1216,22 @@ impl Read for crate::state::LoopbackTlsEndpoint {
                 return Ok(0);
             }
 
+            let read_interrupted = if self.is_lower_socket {
+                std::mem::take(&mut state.lower_read_interrupt)
+            } else {
+                std::mem::take(&mut state.higher_read_interrupt)
+            };
+            if read_interrupted {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "loopback TLS transport read interrupted",
+                ));
+            }
+
             let (next_state, wait_result) = self
                 .pair
                 .ready
-                .wait_timeout(state, TCP_SOCKET_POLL_TIMEOUT)
+                .wait_timeout(state, self.poll_timeout)
                 .map_err(|_| std::io::Error::other("loopback TLS transport lock poisoned"))?;
             state = next_state;
             if wait_result.timed_out() {
@@ -1407,6 +1578,7 @@ impl ActiveTcpSocket {
         let tls_mode = Arc::new(AtomicBool::new(false));
         let tls_stream = Arc::new(Mutex::new(None));
         let tls_state = Arc::new(Mutex::new(None));
+        let loopback_tls_pending_write = Arc::new(Mutex::new(None));
         let saw_local_shutdown = Arc::new(AtomicBool::new(false));
         let saw_remote_end = Arc::new(AtomicBool::new(false));
         let close_notified = Arc::new(AtomicBool::new(false));
@@ -1426,6 +1598,7 @@ impl ActiveTcpSocket {
             tls_mode,
             tls_stream,
             tls_state,
+            loopback_tls_pending_write,
             saw_local_shutdown,
             saw_remote_end,
             close_notified,
@@ -1454,6 +1627,7 @@ impl ActiveTcpSocket {
             tls_mode: Arc::new(AtomicBool::new(false)),
             tls_stream: Arc::new(Mutex::new(None)),
             tls_state: Arc::new(Mutex::new(None)),
+            loopback_tls_pending_write: Arc::new(Mutex::new(None)),
             saw_local_shutdown: Arc::new(AtomicBool::new(false)),
             saw_remote_end: Arc::new(AtomicBool::new(false)),
             close_notified: Arc::new(AtomicBool::new(false)),
@@ -1693,7 +1867,7 @@ impl ActiveTcpSocket {
             None
         };
 
-        let tls_stream = if let Some(socket_id) = self.kernel_socket_id {
+        let (tls_stream, loopback_pending_write) = if let Some(socket_id) = self.kernel_socket_id {
             let peer_socket_id = wait_for_loopback_peer_socket_id(kernel, socket_id)
                 .ok_or_else(|| {
                     SidecarError::Execution(format!(
@@ -1701,7 +1875,8 @@ impl ActiveTcpSocket {
                     ))
                 })?;
             let endpoint = loopback_tls_endpoint(vm_id, socket_id, peer_socket_id)?;
-            if options.is_server {
+            let pending_write = LoopbackTlsPendingWriteHandle::new(&endpoint);
+            let tls_stream = if options.is_server {
                 ActiveTlsStream::LoopbackServer(build_server_loopback_tls_stream(
                     endpoint, &options,
                 )?)
@@ -1709,7 +1884,8 @@ impl ActiveTcpSocket {
                 ActiveTlsStream::LoopbackClient(build_client_loopback_tls_stream(
                     endpoint, &options,
                 )?)
-            }
+            };
+            (tls_stream, Some(pending_write))
         } else {
             self.pending_read_stream
                 .as_ref()
@@ -1735,9 +1911,15 @@ impl ActiveTcpSocket {
             drop(stream);
 
             if options.is_server {
-                ActiveTlsStream::Server(build_server_tls_stream(cloned, &options)?)
+                (
+                    ActiveTlsStream::Server(build_server_tls_stream(cloned, &options)?),
+                    None,
+                )
             } else {
-                ActiveTlsStream::Client(build_client_tls_stream(cloned, &options)?)
+                (
+                    ActiveTlsStream::Client(build_client_tls_stream(cloned, &options)?),
+                    None,
+                )
             }
         };
 
@@ -1761,9 +1943,18 @@ impl ActiveTcpSocket {
             })?;
             *stream = Some(tls_stream);
         }
+        {
+            let mut pending = self.loopback_tls_pending_write.lock().map_err(|_| {
+                SidecarError::InvalidState(String::from(
+                    "loopback TLS pending write handle lock poisoned",
+                ))
+            })?;
+            *pending = loopback_pending_write.clone();
+        }
 
         spawn_tls_socket_reader(
             Arc::clone(&self.tls_stream),
+            loopback_pending_write,
             self.event_sender
                 .as_ref()
                 .ok_or_else(|| {
@@ -1912,6 +2103,22 @@ impl ActiveTcpSocket {
         contents: &[u8],
     ) -> Result<usize, SidecarError> {
         if self.tls_mode.load(Ordering::SeqCst) {
+            let loopback_pending_write = self
+                .loopback_tls_pending_write
+                .lock()
+                .map_err(|_| {
+                    SidecarError::InvalidState(String::from(
+                        "loopback TLS pending write handle lock poisoned",
+                    ))
+                })?
+                .clone();
+            if let Some(pending_write) = loopback_pending_write.as_ref() {
+                if pending_write.should_buffer_write()? {
+                    pending_write.append_write(contents)?;
+                    return Ok(contents.len());
+                }
+                pending_write.interrupt_own_reader();
+            }
             let mut tls_stream = self.tls_stream.lock().map_err(|_| {
                 SidecarError::InvalidState(String::from("TLS stream lock poisoned"))
             })?;
@@ -1943,6 +2150,23 @@ impl ActiveTcpSocket {
         kernel_pid: u32,
     ) -> Result<(), SidecarError> {
         if self.tls_mode.load(Ordering::SeqCst) {
+            let loopback_pending_write = self
+                .loopback_tls_pending_write
+                .lock()
+                .map_err(|_| {
+                    SidecarError::InvalidState(String::from(
+                        "loopback TLS pending write handle lock poisoned",
+                    ))
+                })?
+                .clone();
+            if let Some(pending_write) = loopback_pending_write.as_ref() {
+                if pending_write.should_buffer_write()? {
+                    pending_write.defer_shutdown_write()?;
+                    self.saw_local_shutdown.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                pending_write.interrupt_own_reader();
+            }
             if let Some(stream) = self
                 .tls_stream
                 .lock()
@@ -1995,6 +2219,19 @@ impl ActiveTcpSocket {
 
     fn close(&self, kernel: &mut SidecarKernel, kernel_pid: u32) -> Result<(), SidecarError> {
         if self.tls_mode.load(Ordering::SeqCst) {
+            if let Some(pending_write) = self
+                .loopback_tls_pending_write
+                .lock()
+                .map_err(|_| {
+                    SidecarError::InvalidState(String::from(
+                        "loopback TLS pending write handle lock poisoned",
+                    ))
+                })?
+                .take()
+            {
+                pending_write.clear_for_close();
+                pending_write.interrupt_own_reader();
+            }
             if let Some(stream) = self
                 .tls_stream
                 .lock()
@@ -2024,6 +2261,27 @@ impl ActiveTcpSocket {
 }
 
 impl ActiveTlsStream {
+    fn is_loopback(&self) -> bool {
+        matches!(self, Self::LoopbackClient(_) | Self::LoopbackServer(_))
+    }
+
+    fn is_handshaking(&self) -> bool {
+        match self {
+            Self::Client(stream) => stream.conn.is_handshaking(),
+            Self::Server(stream) => stream.conn.is_handshaking(),
+            Self::LoopbackClient(stream) => stream.conn.is_handshaking(),
+            Self::LoopbackServer(stream) => stream.conn.is_handshaking(),
+        }
+    }
+
+    fn set_loopback_poll_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::LoopbackClient(stream) => stream.sock.set_poll_timeout(timeout),
+            Self::LoopbackServer(stream) => stream.sock.set_poll_timeout(timeout),
+            Self::Client(_) | Self::Server(_) => {}
+        }
+    }
+
     fn write_all(&mut self, contents: &[u8]) -> Result<(), SidecarError> {
         match self {
             Self::Client(stream) => {
@@ -13687,8 +13945,155 @@ fn spawn_tcp_socket_reader(
     });
 }
 
+fn send_tls_socket_error_and_close(
+    sender: &Sender<JavascriptTcpSocketEvent>,
+    close_notified: &Arc<AtomicBool>,
+    code: Option<String>,
+    message: String,
+) {
+    let _ = sender.send(JavascriptTcpSocketEvent::Error { code, message });
+    if !close_notified.swap(true, Ordering::SeqCst) {
+        let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: true });
+    }
+}
+
+fn fail_loopback_tls_pending_reader(
+    pending_write: &LoopbackTlsPendingWriteHandle,
+    sender: &Sender<JavascriptTcpSocketEvent>,
+    close_notified: &Arc<AtomicBool>,
+    code: Option<String>,
+    message: String,
+) {
+    pending_write.mark_failed(message.clone());
+    send_tls_socket_error_and_close(sender, close_notified, code, message);
+}
+
+fn flush_loopback_tls_pending_writes(
+    tls_stream: &Arc<Mutex<Option<ActiveTlsStream>>>,
+    pending_write: &LoopbackTlsPendingWriteHandle,
+    sender: &Sender<JavascriptTcpSocketEvent>,
+    close_notified: &Arc<AtomicBool>,
+) -> bool {
+    loop {
+        let bytes = match pending_write.take_buffer_for_flush() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                fail_loopback_tls_pending_reader(
+                    pending_write,
+                    sender,
+                    close_notified,
+                    Some(String::from("EIO")),
+                    error.to_string(),
+                );
+                return false;
+            }
+        };
+
+        if let Some(bytes) = bytes {
+            let write_result = {
+                let mut guard = match tls_stream.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        pending_write.finish_flush();
+                        fail_loopback_tls_pending_reader(
+                            pending_write,
+                            sender,
+                            close_notified,
+                            Some(String::from("EIO")),
+                            String::from("TLS stream lock poisoned while flushing pending writes"),
+                        );
+                        return false;
+                    }
+                };
+                let Some(stream) = guard.as_mut() else {
+                    pending_write.finish_flush();
+                    fail_loopback_tls_pending_reader(
+                        pending_write,
+                        sender,
+                        close_notified,
+                        Some(String::from("EIO")),
+                        String::from("TLS stream missing while flushing pending writes"),
+                    );
+                    return false;
+                };
+                stream.write_all(&bytes)
+            };
+            pending_write.finish_flush();
+            if let Err(error) = write_result {
+                fail_loopback_tls_pending_reader(
+                    pending_write,
+                    sender,
+                    close_notified,
+                    Some(String::from("EIO")),
+                    format!("loopback TLS pending write flush failed: {error}"),
+                );
+                return false;
+            }
+            continue;
+        }
+
+        let should_shutdown = match pending_write.take_deferred_shutdown_write() {
+            Ok(should_shutdown) => should_shutdown,
+            Err(error) => {
+                fail_loopback_tls_pending_reader(
+                    pending_write,
+                    sender,
+                    close_notified,
+                    Some(String::from("EIO")),
+                    error.to_string(),
+                );
+                return false;
+            }
+        };
+        if should_shutdown {
+            let shutdown_result = {
+                let mut guard = match tls_stream.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        fail_loopback_tls_pending_reader(
+                            pending_write,
+                            sender,
+                            close_notified,
+                            Some(String::from("EIO")),
+                            String::from("TLS stream lock poisoned during deferred shutdown"),
+                        );
+                        return false;
+                    }
+                };
+                let Some(stream) = guard.as_mut() else {
+                    fail_loopback_tls_pending_reader(
+                        pending_write,
+                        sender,
+                        close_notified,
+                        Some(String::from("EIO")),
+                        String::from("TLS stream missing during deferred shutdown"),
+                    );
+                    return false;
+                };
+                stream
+                    .send_close_notify()
+                    .and_then(|_| stream.shutdown_write())
+            };
+            if let Err(error) = shutdown_result {
+                fail_loopback_tls_pending_reader(
+                    pending_write,
+                    sender,
+                    close_notified,
+                    Some(String::from("EIO")),
+                    format!("loopback TLS deferred shutdown failed: {error}"),
+                );
+                return false;
+            }
+            continue;
+        }
+
+        return true;
+    }
+}
+
 fn spawn_tls_socket_reader(
     tls_stream: Arc<Mutex<Option<ActiveTlsStream>>>,
+    loopback_pending_write: Option<LoopbackTlsPendingWriteHandle>,
     sender: Sender<JavascriptTcpSocketEvent>,
     saw_local_shutdown: Arc<AtomicBool>,
     saw_remote_end: Arc<AtomicBool>,
@@ -13697,12 +14102,71 @@ fn spawn_tls_socket_reader(
     thread::spawn(move || {
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
+            if let Some(pending_write) = loopback_pending_write.as_ref() {
+                let is_handshaking = {
+                    let mut guard = match tls_stream.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            pending_write.mark_failed("TLS stream lock poisoned");
+                            return;
+                        }
+                    };
+                    let Some(stream) = guard.as_mut() else {
+                        pending_write.mark_failed("TLS stream missing");
+                        return;
+                    };
+                    if stream.is_loopback() {
+                        let is_handshaking = stream.is_handshaking();
+                        stream.set_loopback_poll_timeout(LOOPBACK_TLS_HANDSHAKE_POLL_TIMEOUT);
+                        is_handshaking
+                    } else {
+                        false
+                    }
+                };
+
+                if is_handshaking {
+                    if pending_write.handshake_started_at.elapsed() >= TLS_HANDSHAKE_TIMEOUT {
+                        fail_loopback_tls_pending_reader(
+                            pending_write,
+                            &sender,
+                            &close_notified,
+                            Some(String::from("ETIMEDOUT")),
+                            format!(
+                                "loopback TLS handshake timed out after {}ms",
+                                TLS_HANDSHAKE_TIMEOUT.as_millis()
+                            ),
+                        );
+                        return;
+                    }
+                } else {
+                    pending_write
+                        .tls_handshake_complete
+                        .store(true, Ordering::SeqCst);
+                    if !flush_loopback_tls_pending_writes(
+                        &tls_stream,
+                        pending_write,
+                        &sender,
+                        &close_notified,
+                    ) {
+                        return;
+                    }
+                }
+            }
+
             let read_result = {
                 let mut guard = match tls_stream.lock() {
                     Ok(guard) => guard,
-                    Err(_) => return,
+                    Err(_) => {
+                        if let Some(pending_write) = loopback_pending_write.as_ref() {
+                            pending_write.mark_failed("TLS stream lock poisoned");
+                        }
+                        return;
+                    }
                 };
                 let Some(stream) = guard.as_mut() else {
+                    if let Some(pending_write) = loopback_pending_write.as_ref() {
+                        pending_write.mark_failed("TLS stream missing");
+                    }
                     return;
                 };
                 stream.read(&mut buffer)
@@ -13710,6 +14174,11 @@ fn spawn_tls_socket_reader(
 
             match read_result {
                 Ok(0) => {
+                    if let Some(pending_write) = loopback_pending_write.as_ref() {
+                        pending_write.fail_if_pending(
+                            "loopback TLS peer closed before buffered writes flushed",
+                        );
+                    }
                     saw_remote_end.store(true, Ordering::SeqCst);
                     let _ = sender.send(JavascriptTcpSocketEvent::End);
                     if saw_local_shutdown.load(Ordering::SeqCst)
@@ -13741,6 +14210,11 @@ fn spawn_tls_socket_reader(
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if let Some(pending_write) = loopback_pending_write.as_ref() {
+                        pending_write.fail_if_pending(
+                            "loopback TLS peer closed before buffered writes flushed",
+                        );
+                    }
                     saw_remote_end.store(true, Ordering::SeqCst);
                     let _ = sender.send(JavascriptTcpSocketEvent::End);
                     if saw_local_shutdown.load(Ordering::SeqCst)
@@ -13751,6 +14225,11 @@ fn spawn_tls_socket_reader(
                     break;
                 }
                 Err(error) => {
+                    if let Some(pending_write) = loopback_pending_write.as_ref() {
+                        pending_write.mark_failed(format!(
+                            "loopback TLS reader failed before buffered writes flushed: {error}"
+                        ));
+                    }
                     let code = io_error_code(&error);
                     let _ = sender.send(JavascriptTcpSocketEvent::Error {
                         code,

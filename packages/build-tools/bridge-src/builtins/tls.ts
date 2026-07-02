@@ -1,5 +1,4 @@
 import { exposeCustomGlobal } from "../global-exposure.js";
-import { Server } from "./http.js";
 import { NetServer, NetSocket, buildSerializedTlsOptions, isTlsSecureContextWrapper, netModule, parseTlsClientHello } from "./net.js";
 
 function createSecureContextWrapper(options) {
@@ -56,10 +55,15 @@ function tlsConnect(...args) {
     options = { ...values[0] };
     if (options.socket) {
       socket = options.socket;
-    } else {
-      socket = new NetSocket();
-      socket.connect({ host: options.host ?? "127.0.0.1", port: options.port });
-    }
+		} else {
+			socket = new NetSocket();
+			socket.connect({
+				host: options.host ?? "127.0.0.1",
+				port: options.port,
+				localAddress: options.localAddress,
+				localPort: options.localPort
+			});
+		}
   } else {
     const positional = {};
     if (values.length > 0) {
@@ -70,12 +74,14 @@ function tlsConnect(...args) {
     }
     const providedOptions = values[0] != null && typeof values[0] === "object" ? { ...values[0] } : {};
     options = { ...providedOptions, ...positional };
-    socket = new NetSocket();
-    socket.connect({
-      host: options.host ?? "127.0.0.1",
-      port: options.port
-    });
-  }
+		socket = new NetSocket();
+		socket.connect({
+			host: options.host ?? "127.0.0.1",
+			port: options.port,
+			localAddress: options.localAddress,
+			localPort: options.localPort
+		});
+	}
   if (cb) socket.once("secureConnect", cb);
   const upgradeOptions = buildSerializedTlsOptions(
     options,

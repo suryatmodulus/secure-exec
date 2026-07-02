@@ -92,48 +92,64 @@ function wakeSocketBridgeReads(socket) {
     if (!socket._bridgeReadPumpStarted && socket._firstReadNoTimerWakeAtUs === 0 && isNetBridgeMetricsEnabled()) {
       socket._firstReadNoTimerWakeAtUs = netBridgeNowUs();
     }
-    if (
-      isNetBridgeMetricsEnabled() &&
-      !socket._bridgeReadPumpStarted &&
-      socket._connected &&
-      socket._refed &&
-      (hasDataListener || hasReadableListener)
-    ) {
-      countNetBridgeMetric("readFirstPumpScheduleCandidates");
+    if (!socket._bridgeReadPumpStarted && socket._connected && socket._refed && (hasDataListener || hasReadableListener)) {
+      if (isNetBridgeMetricsEnabled()) {
+        countNetBridgeMetric("readFirstPumpScheduleCandidates");
+      }
       if (socket._bridgeReadFirstPumpBenchmarkScheduled) {
-        countNetBridgeMetric("readFirstPumpScheduleAlreadyScheduled");
+        if (isNetBridgeMetricsEnabled()) {
+          countNetBridgeMetric("readFirstPumpScheduleAlreadyScheduled");
+        }
       } else {
-        countNetBridgeMetric("readFirstPumpScheduleQueued");
+        if (isNetBridgeMetricsEnabled()) {
+          countNetBridgeMetric("readFirstPumpScheduleQueued");
+        }
         socket._bridgeReadFirstPumpBenchmarkScheduled = true;
         const queuedAtUs = netBridgeNowUs();
         queueMicrotask(() => {
-          countNetBridgeMetric("readFirstPumpScheduleRuns");
+          if (isNetBridgeMetricsEnabled()) {
+            countNetBridgeMetric("readFirstPumpScheduleRuns");
+          }
           const runAtUs = netBridgeNowUs();
           const queuedToRunUs = Math.max(0, runAtUs - queuedAtUs);
-          countNetBridgeMetric("readFirstPumpScheduleQueuedToRunUs", queuedToRunUs);
-          maxNetBridgeMetric("readFirstPumpScheduleQueuedToRunMaxUs", queuedToRunUs);
+          if (isNetBridgeMetricsEnabled()) {
+            countNetBridgeMetric("readFirstPumpScheduleQueuedToRunUs", queuedToRunUs);
+            maxNetBridgeMetric("readFirstPumpScheduleQueuedToRunMaxUs", queuedToRunUs);
+          }
           socket._bridgeReadFirstPumpBenchmarkScheduled = false;
           if (socket.destroyed) {
-            countNetBridgeMetric("readFirstPumpScheduleSkipDestroyed");
+            if (isNetBridgeMetricsEnabled()) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipDestroyed");
+            }
             return;
           }
           if (socket._tlsUpgrading) {
-            countNetBridgeMetric("readFirstPumpScheduleSkipTlsUpgrading");
+            if (isNetBridgeMetricsEnabled()) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipTlsUpgrading");
+            }
             return;
           }
           if (socket._bridgeReadPumpStarted) {
-            countNetBridgeMetric("readFirstPumpScheduleSkipPumpStarted");
+            if (isNetBridgeMetricsEnabled()) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipPumpStarted");
+            }
             return;
           }
           if (socket._bridgeReadLoopRunning) {
-            countNetBridgeMetric("readFirstPumpScheduleSkipLoopRunning");
+            if (isNetBridgeMetricsEnabled()) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipLoopRunning");
+            }
             return;
           }
           if (socket._socketId === 0) {
-            countNetBridgeMetric("readFirstPumpScheduleSkipSocketClosed");
+            if (isNetBridgeMetricsEnabled()) {
+              countNetBridgeMetric("readFirstPumpScheduleSkipSocketClosed");
+            }
             return;
           }
-          countNetBridgeMetric("readFirstPumpSchedulePumpCalls");
+          if (isNetBridgeMetricsEnabled()) {
+            countNetBridgeMetric("readFirstPumpSchedulePumpCalls");
+          }
           socket._nextReadPumpOrigin = "eventWake";
           socket._readFirstPumpScheduleActive = true;
           socket._readFirstPumpScheduleQueuedAtUs = queuedAtUs;
@@ -225,6 +241,14 @@ function wakeNetServerAccept(server) {
       if (!server._acceptPumpStarted && server._firstAcceptNoTimerWakeAtUs === 0 && isNetBridgeMetricsEnabled()) {
         server._firstAcceptNoTimerWakeAtUs = netBridgeNowUs();
       }
+      if (server._acceptLoopActive && !server._acceptLoopRunning) {
+        queueMicrotask(() => {
+          if (server.listening && server._serverId !== 0 && !server._acceptLoopRunning) {
+            server._nextAcceptPumpOrigin = "eventWake";
+            return server._pumpAccepts();
+          }
+        });
+      }
     }
     return;
   }
@@ -240,7 +264,7 @@ function wakeNetServerAccept(server) {
 	    queueMicrotask(() => {
     if (server.listening && server._serverId !== 0) {
       server._nextAcceptPumpOrigin = "eventWake";
-      void server._pumpAccepts();
+      return server._pumpAccepts();
     }
   });
 }
@@ -255,8 +279,11 @@ function wakeNetServerAcceptForSocket(socket) {
     } else {
       countNetBridgeMetric("acceptWakeSocketMiss");
     }
-    wakeNetServerAccept(server);
-    return;
+    if (server?._acceptLoopActive && !server._acceptLoopRunning) {
+      server._nextAcceptPumpOrigin = "eventWake";
+      return server._pumpAccepts();
+    }
+    return wakeNetServerAccept(server);
   }
   const path = socket?.remotePath;
   if (typeof path !== "string") {
@@ -271,7 +298,11 @@ function wakeNetServerAcceptForSocket(socket) {
     countNetBridgeMetric("acceptWakeSocketMiss");
     countNetBridgeMetric("acceptWakeSocketUnixMiss");
   }
-  wakeNetServerAccept(server);
+  if (server?._acceptLoopActive && !server._acceptLoopRunning) {
+    server._nextAcceptPumpOrigin = "eventWake";
+    return server._pumpAccepts();
+  }
+  return wakeNetServerAccept(server);
 }
 
 function isTruthySocketOption(value) {
@@ -436,6 +467,8 @@ function normalizeConnectArgs(portOrOptions, hostOrCallback, callback) {
       host: typeof portOrOptions.host === "string" && portOrOptions.host.length > 0 ? portOrOptions.host : void 0,
       port: normalizedPort,
       path: typeof portOrOptions.path === "string" && portOrOptions.path.length > 0 ? portOrOptions.path : void 0,
+      localAddress: typeof portOrOptions.localAddress === "string" && portOrOptions.localAddress.length > 0 ? portOrOptions.localAddress : void 0,
+      localPort: typeof portOrOptions.localPort === "number" ? portOrOptions.localPort : void 0,
       keepAlive: portOrOptions.keepAlive,
       keepAliveInitialDelay: portOrOptions.keepAliveInitialDelay,
       callback: typeof hostOrCallback === "function" ? hostOrCallback : callback
@@ -927,7 +960,7 @@ function queryTlsSocket(socketId, query, detailed) {
   return deserializeTlsBridgeValue(JSON.parse(payload));
 }
 
-function finalizeTlsUpgrade(socket, eventName = "secureConnect") {
+function finalizeTlsUpgrade(socket, eventName = "secureConnect", startReadPump = true) {
   socket._tlsUpgrading = false;
   socket.encrypted = true;
   socket.authorized = socket.authorizationError == null;
@@ -950,7 +983,7 @@ function finalizeTlsUpgrade(socket, eventName = "secureConnect") {
   if (eventName !== "secure") {
     socket._emitNet("secure");
   }
-  if (!socket.destroyed && !socket._bridgeReadLoopRunning) {
+  if (startReadPump && !socket.destroyed && !socket._bridgeReadLoopRunning) {
     socket._nextReadPumpOrigin = "tls";
     void socket._pumpBridgeReads();
   }
@@ -1512,6 +1545,8 @@ var NetSocket = class _NetSocket {
       host = "127.0.0.1",
       port = 0,
       path,
+      localAddress,
+      localPort,
       keepAlive,
       keepAliveInitialDelay,
       callback: cb
@@ -1526,7 +1561,7 @@ var NetSocket = class _NetSocket {
     try {
       handle = normalizeNetSocketHandle(_netSocketConnectRaw.applySync(
         void 0,
-        [path ? { path } : { host, port }]
+        [path ? { path } : { host, port, localAddress, localPort }]
       ));
     } catch (error) {
       this.connecting = false;
@@ -1555,7 +1590,6 @@ var NetSocket = class _NetSocket {
     this._handle = createConnectedSocketHandle(this._socketId);
     this._applySocketInfo(handle);
     registerNetSocket(this._socketId, this);
-    wakeNetServerAcceptForSocket(this);
     void this._waitForConnect();
     if (keepAlive) {
       this.once("connect", () => {
@@ -2175,6 +2209,7 @@ var NetSocket = class _NetSocket {
         return;
       }
       this._applySocketInfo(parseNetSocketInfo(infoJson));
+      await wakeNetServerAcceptForSocket(this);
       this._connected = true;
       this.connecting = false;
       debugBridgeNetwork("socket connected", this._socketId, this.localAddress, this.localPort, this.remoteAddress, this.remotePort);
@@ -2549,11 +2584,20 @@ var NetSocket = class _NetSocket {
       return;
     }
     _netSocketUpgradeTlsRaw.applySync(void 0, [this._socketId, JSON.stringify(options ?? {})]);
-    queueMicrotask(() => {
+    const finalize = () => {
       if (!this.destroyed) {
         finalizeTlsUpgrade(this);
       }
-    });
+    };
+    if (options?.isServer) {
+      queueMicrotask(finalize);
+    } else {
+      setTimeout(() => {
+        if (!this.destroyed) {
+          finalizeTlsUpgrade(this, "secureConnect", false);
+        }
+      }, 0);
+    }
   }
   _touchTimeout() {
     if (this._timeoutMs === 0 || this.destroyed) {

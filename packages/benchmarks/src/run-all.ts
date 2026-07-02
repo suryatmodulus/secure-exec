@@ -23,6 +23,10 @@ const FAMILY_FILTER = process.env.BENCH_FAMILIES
 	?.split(",")
 	.map((family) => family.trim())
 	.filter(Boolean);
+const OP_FILTER = process.env.BENCH_OP_FILTER
+	?.split(",")
+	.map((op) => op.trim())
+	.filter(Boolean);
 
 export async function runLatencyMatrix(): Promise<LatencyResult[]> {
 	const wasmOptions = wasmLayerOptions();
@@ -42,15 +46,18 @@ export async function runLatencyMatrix(): Promise<LatencyResult[]> {
 		const ops = FAMILY_FILTER
 			? allOps.filter((op) => FAMILY_FILTER.includes(op.family))
 			: allOps;
-		for (const op of ops) {
+		const filteredOps = OP_FILTER
+			? ops.filter((op) => OP_FILTER.includes(op.name) || OP_FILTER.includes(`${op.family}/${op.name}`))
+			: ops;
+		for (const op of filteredOps) {
 			console.error(`latency ${op.family}/${op.name}`);
-			if ("nativeOp" in op && supportsWasmLayer(op.nativeOp)) {
+			if (!("runHostCmd" in op) && op.nativeOp && supportsWasmLayer(op.nativeOp)) {
 				console.error("  wasm lane: guest JS measured first, wasm native-baseline after");
 			}
 			results.push(
-				"nativeOp" in op
-					? await runOp(op, vm, ITERATIONS, WARMUP)
-					: await runCommandOp(op, vm, ITERATIONS, WARMUP),
+				"runHostCmd" in op
+					? await runCommandOp(op, vm, ITERATIONS, WARMUP)
+					: await runOp(op, vm, ITERATIONS, WARMUP),
 			);
 		}
 		return results;
@@ -123,10 +130,16 @@ async function main(): Promise<void> {
 				return [
 					result.family,
 					result.op,
-					`${result.layers.native.p50}ms`,
+					result.layers.native
+						? `${result.layers.native.p50}ms`
+						: `unsupported: ${result.unsupported?.native ?? "n/a"}`,
 					`${result.layers.node.p50}ms`,
 					`${result.layers.guest.p50}ms`,
-					result.layers.wasm ? `${result.layers.wasm.p50}ms` : "-",
+					result.layers.wasm
+						? `${result.layers.wasm.p50}ms`
+						: result.unsupported?.wasm
+							? `unsupported: ${result.unsupported.wasm}`
+							: "-",
 					"-",
 					"-",
 					"-",

@@ -45,7 +45,7 @@ export interface LayerSamples {
 }
 
 export interface LayerStats {
-	native: Stats;
+	native?: Stats;
 	node: Stats;
 	guest: Stats;
 	wasm?: Stats;
@@ -54,7 +54,9 @@ export interface LayerStats {
 export interface BenchmarkOp {
 	family: string;
 	name: string;
-	nativeOp: NativeOp;
+	nativeOp?: NativeOp;
+	nativeUnsupportedReason?: string;
+	wasmUnsupportedReason?: string;
 	fileLine: string;
 	reproducer: string;
 	expectedRatio?: "control";
@@ -89,9 +91,13 @@ export interface OpResult {
 	reproducer: string;
 	expectedRatio?: "control";
 	layers: LayerStats;
+	unsupported?: {
+		native?: string;
+		wasm?: string;
+	};
 	tax: {
 		emulation: number;
-		total: number;
+		total?: number;
 		wasm?: number;
 	};
 }
@@ -311,7 +317,7 @@ export async function runOp(
 	iters: number,
 	warmup: number,
 ): Promise<OpResult> {
-	const native = runNativeLayer(op.nativeOp, iters, warmup);
+	const native = op.nativeOp ? runNativeLayer(op.nativeOp, iters, warmup) : undefined;
 	const node = op.runNode
 		? await op.runNode(iters, warmup)
 		: runNodeProgram(timedProgram(op.program ?? "() => {}", op.setup), iters, warmup);
@@ -324,9 +330,12 @@ export async function runOp(
 				warmup,
 				`${op.family}-${op.name}`,
 			);
-	const wasm = await runWasmLayer(vm, op.nativeOp, iters, warmup);
+	const wasm =
+		op.nativeOp && !op.wasmUnsupportedReason
+			? await runWasmLayer(vm, op.nativeOp, iters, warmup)
+			: undefined;
 	const layers = {
-		native: stats(native),
+		...(native ? { native: stats(native) } : {}),
 		node: stats(node),
 		guest: stats(guest),
 		...(wasm ? { wasm: stats(wasm) } : {}),
@@ -338,10 +347,16 @@ export async function runOp(
 		reproducer: op.reproducer,
 		expectedRatio: op.expectedRatio,
 		layers,
+		unsupported: {
+			...(op.nativeUnsupportedReason ? { native: op.nativeUnsupportedReason } : {}),
+			...(op.wasmUnsupportedReason ? { wasm: op.wasmUnsupportedReason } : {}),
+		},
 		tax: {
 			emulation: round(layers.guest.p50 / layers.node.p50),
-			total: round(layers.guest.p50 / layers.native.p50),
-			...(layers.wasm ? { wasm: round(layers.wasm.p50 / layers.native.p50) } : {}),
+			...(layers.native ? { total: round(layers.guest.p50 / layers.native.p50) } : {}),
+			...(layers.wasm && layers.native
+				? { wasm: round(layers.wasm.p50 / layers.native.p50) }
+				: {}),
 		},
 	};
 }

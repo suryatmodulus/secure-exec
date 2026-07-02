@@ -1,4 +1,92 @@
+import { readFileSync } from "node:fs";
 import type { BenchmarkOp } from "../lib/layers.js";
+import { runGuestProgram, runNodeProgram } from "../lib/layers.js";
+
+const TLS_LOOPBACK_KEY = readFileSync(
+	new URL("../../fixtures/tls-loopback-key.pem", import.meta.url),
+	"utf8",
+);
+const TLS_LOOPBACK_CERT = readFileSync(
+	new URL("../../fixtures/tls-loopback-cert.pem", import.meta.url),
+	"utf8",
+);
+const TLS_LOOPBACK_BODY = "hello-loopback-tls";
+
+function tlsLoopbackGetProgram(): string {
+	return `
+import https from "node:https";
+
+const iters = Number(process.env.BENCH_ITERATIONS || 20);
+const warmup = Number(process.env.BENCH_WARMUP || 5);
+const key = ${JSON.stringify(TLS_LOOPBACK_KEY)};
+const cert = ${JSON.stringify(TLS_LOOPBACK_CERT)};
+	const expectedBody = ${JSON.stringify(TLS_LOOPBACK_BODY)};
+	const port = 18443;
+	const samples = [];
+const now = () => Number(process.hrtime.bigint()) / 1e6;
+const serverSockets = new Set();
+
+const server = https.createServer({ key, cert }, (_req, res) => {
+  res.setHeader("connection", "close");
+  res.end(expectedBody);
+});
+server.on("connection", (socket) => {
+  serverSockets.add(socket);
+  socket.on("close", () => serverSockets.delete(socket));
+});
+
+await new Promise((resolve, reject) => {
+  server.on("error", reject);
+  server.listen(port, "127.0.0.1", resolve);
+});
+
+async function once(iteration) {
+  const body = await new Promise((resolve, reject) => {
+    let response = "";
+    const req = https.get({
+      agent: false,
+      host: "127.0.0.1",
+      localPort: 30000 + iteration,
+      port,
+      path: "/",
+      rejectUnauthorized: false,
+    }, (res) => {
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        response += chunk;
+      });
+      res.on("end", () => {
+        const socket = res.socket;
+        socket?.destroy();
+        req.destroy();
+        resolve(response);
+      });
+    });
+    req.on("error", reject);
+  });
+  if (body !== expectedBody) {
+    throw new Error("bad TLS loopback body: " + JSON.stringify(body));
+  }
+}
+
+try {
+	  for (let i = 0; i < warmup + iters; i++) {
+	    const start = now();
+	    await once(i);
+	    const ms = now() - start;
+	    if (i >= warmup) samples.push(ms);
+	  }
+  for (const socket of serverSockets) socket.destroy();
+  await new Promise((resolve) => server.close(resolve));
+  process.stdout.write(JSON.stringify({ samples }));
+} catch (error) {
+  for (const socket of serverSockets) socket.destroy();
+  await new Promise((resolve) => server.close(resolve));
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+}
+`;
+}
 
 export const netFamily: BenchmarkOp[] = [
 	{
@@ -123,6 +211,17 @@ export const netFamily: BenchmarkOp[] = [
     });
   });
 }`,
+	},
+	{
+		family: "net",
+		name: "tls_loopback_get",
+		nativeUnsupportedReason: "no native TLS-loopback pair yet — Phase 2 backlog",
+		wasmUnsupportedReason: "TLS unsupported in wasm baseline",
+		fileLine: "crates/sidecar/src/execution.rs:13532",
+		reproducer: "persistent node:https loopback server; each iteration opens a fresh https.get connection inside VM",
+		runNode: (iters, warmup) => runNodeProgram(tlsLoopbackGetProgram(), iters, warmup),
+		runGuest: (vm, iters, warmup) =>
+			runGuestProgram(vm, tlsLoopbackGetProgram(), iters, warmup, "net-tls-loopback-get"),
 	},
 	{
 		family: "net",

@@ -746,11 +746,13 @@ pub(crate) struct ActiveTcpSocket {
     pub(crate) tls_mode: Arc<AtomicBool>,
     pub(crate) tls_stream: Arc<Mutex<Option<ActiveTlsStream>>>,
     pub(crate) tls_state: Arc<Mutex<Option<ActiveTlsState>>>,
+    pub(crate) loopback_tls_pending_write: Arc<Mutex<Option<LoopbackTlsPendingWriteHandle>>>,
     pub(crate) saw_local_shutdown: Arc<AtomicBool>,
     pub(crate) saw_remote_end: Arc<AtomicBool>,
     pub(crate) close_notified: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
 pub(crate) struct LoopbackTlsTransportPair {
     pub(crate) state: Mutex<LoopbackTlsTransportPairState>,
     pub(crate) ready: Condvar,
@@ -764,11 +766,14 @@ pub(crate) struct LoopbackTlsTransportPairState {
     pub(crate) higher_write_closed: bool,
     pub(crate) lower_closed: bool,
     pub(crate) higher_closed: bool,
+    pub(crate) lower_read_interrupt: bool,
+    pub(crate) higher_read_interrupt: bool,
 }
 
 pub(crate) struct LoopbackTlsEndpoint {
     pub(crate) pair: Arc<LoopbackTlsTransportPair>,
     pub(crate) is_lower_socket: bool,
+    pub(crate) poll_timeout: Duration,
     /// Registry key (`vm_id:lower:higher`) under which this endpoint's transport
     /// pair is registered in the loopback-TLS transport registry. Stored so the
     /// endpoint's `Drop` can eagerly prune its own registry entry once it is the
@@ -776,6 +781,25 @@ pub(crate) struct LoopbackTlsEndpoint {
     /// next lazy `retain()` in `loopback_tls_endpoint()`. `None` means the
     /// endpoint was not registered (e.g. test-constructed) and Drop skips pruning.
     pub(crate) registry_key: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LoopbackTlsPendingWriteState {
+    pub(crate) buffer: Vec<u8>,
+    pub(crate) warned_near_cap: bool,
+    pub(crate) flushing: bool,
+    pub(crate) defer_shutdown_write: bool,
+    pub(crate) failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoopbackTlsPendingWriteHandle {
+    pub(crate) state: Arc<Mutex<LoopbackTlsPendingWriteState>>,
+    pub(crate) tls_handshake_complete: Arc<AtomicBool>,
+    pub(crate) failed: Arc<AtomicBool>,
+    pub(crate) pair: Arc<LoopbackTlsTransportPair>,
+    pub(crate) is_lower_socket: bool,
+    pub(crate) handshake_started_at: Instant,
 }
 
 impl fmt::Debug for LoopbackTlsEndpoint {

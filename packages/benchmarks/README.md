@@ -50,6 +50,12 @@ BENCH_FAMILIES=fs pnpm --dir packages/benchmarks bench:matrix
 BENCH_FAMILIES=ecosystem pnpm --dir packages/benchmarks bench:matrix
 ```
 
+Run one matrix op:
+
+```bash
+BENCH_FAMILIES=net BENCH_OP_FILTER=tls_loopback_get pnpm --dir packages/benchmarks bench:matrix
+```
+
 ## Focused Lanes
 
 Focused lanes live under `src/focused/` and preserve the legacy CLI flags, env vars, JSON shape, and stderr tables from the Agent OS benchmark scripts. They use `src/lib/vm.ts` over `NodeRuntime`.
@@ -75,6 +81,23 @@ Focused lanes live under `src/focused/` and preserve the legacy CLI flags, env v
 - **`wasi-ls-scaling-counters`**: `ls` scaling with syscall counters.
 
 The shell/coreutils focused lanes use the local `NodeRuntime` command-dir resolution, which prefers `registry/native/target/wasm32-wasip1/release/commands` when `make -C registry/native wasm` has been run.
+
+## Net Family
+
+`BENCH_FAMILIES=net pnpm --dir packages/benchmarks bench:matrix` runs loopback networking rows through the host Node and guest VM lanes, plus native/WASM lanes where a baseline exists.
+
+Rows:
+
+- **`udp_echo_small`**: UDP loopback echo of one small datagram, currently expected to surface unsupported guest behavior.
+- **`unix_echo_small`**: Unix-domain socket echo of one small payload.
+- **`http_loopback_get`**: persistent `node:http` loopback server, fresh GET per iteration.
+- **`fetch_loopback_get`**: persistent HTTP loopback server, fresh global `fetch()` per iteration.
+- **`tls_loopback_get`**: persistent `node:https` loopback server, fresh `https.get` per iteration, verifies `hello-loopback-tls`. Native is unsupported until a native TLS-loopback pair exists, and WASM is unsupported because the native baseline has no TLS lane.
+- **`tcp_connect_close`**: TCP client connects to a loopback server and closes.
+- **`tcp_echo`**: TCP loopback echo of one small payload.
+- **`tcp_concurrent_4`**: four concurrent TCP loopback clients connect to one server.
+- **`tcp_throughput_64k`**: TCP loopback echo of one 64 KiB payload.
+- **`tcp_tiny_writes_16`**: TCP loopback echo using sixteen one-byte writes.
 
 ## Ecosystem Family
 

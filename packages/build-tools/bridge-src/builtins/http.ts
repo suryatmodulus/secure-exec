@@ -6,7 +6,7 @@ import { dns } from "./dns.js";
 import { Headers, MAX_HTTP_BODY_BYTES, MAX_HTTP_REQUEST_HEADERS, MAX_HTTP_REQUEST_HEADER_BYTES, Request, Response } from "./fetch.js";
 import { http2Servers, onHttp2Dispatch, pendingHttp2CompatRequests } from "./http2.js";
 import { NetServer, NetSocket, netConnect } from "./net.js";
-import { tlsConnect } from "./tls.js";
+import { TLSSocket, tlsConnect } from "./tls.js";
 
 function createConnResetError(message = "socket hang up") {
   const error = new Error(message);
@@ -1913,15 +1913,19 @@ function createHttpRequestSocket(options, callback) {
   const protocol = options?.protocol === "https:" ? "https:" : "http:";
   const host = String(options?.hostname || options?.host || "localhost");
   const port = Number(options?.port) || (protocol === "https:" ? 443 : 80);
-  const socket = protocol === "https:" ? tlsConnect({
-    host,
-    port,
-    servername: options?.servername || host,
-    rejectUnauthorized: options?.rejectUnauthorized,
-    socket: options?.socket
-  }) : netConnect({
-    host,
-    port,
+	  const socket = protocol === "https:" ? tlsConnect({
+	    host,
+	    localAddress: options?.localAddress,
+	    localPort: options?.localPort,
+	    port,
+	    servername: options?.servername || host,
+	    rejectUnauthorized: options?.rejectUnauthorized,
+	    socket: options?.socket
+	  }) : netConnect({
+	    host,
+	    localAddress: options?.localAddress,
+	    localPort: options?.localPort,
+	    port,
     path: options?.socketPath,
     keepAlive: options?.keepAlive,
     keepAliveInitialDelay: options?.keepAliveInitialDelay
@@ -3402,11 +3406,13 @@ var Server = class {
   _closePending = false;
   _closeRunning = false;
   _closeCallbacks = [];
+  _tlsOptions = null;
   /** @internal Request listener stored on the instance (replaces serverRequestListeners Map). */
   _requestListener;
-  constructor(requestListener) {
+  constructor(requestListener, tlsOptions = null) {
     this._serverId = nextServerId++;
     this._requestListener = requestListener ?? (() => void 0);
+    this._tlsOptions = tlsOptions;
     serverInstances.set(this._serverId, this);
   }
   /** @internal Bridge-visible server ID for loopback self-dispatch. */
@@ -3464,6 +3470,22 @@ var Server = class {
     const netServer = new NetServer({ allowHalfOpen: true });
     this._netServer = netServer;
     netServer.on("connection", (socket) => {
+      if (this._tlsOptions) {
+        const tlsSocket = new TLSSocket(socket, {
+          ...this._tlsOptions,
+          isServer: true
+        });
+        tlsSocket.server = this;
+        tlsSocket.once("secure", () => {
+          this._emit("secureConnection", tlsSocket);
+          this._emit("connection", tlsSocket);
+          attachHttpServerSocket(this, tlsSocket);
+        });
+        tlsSocket.on("error", (error) => {
+          this._emit("tlsClientError", error, tlsSocket);
+        });
+        return;
+      }
       this._emit("connection", socket);
       attachHttpServerSocket(this, socket);
     });
@@ -4451,7 +4473,8 @@ function createHttpModule(protocol) {
     },
     createServer(_optionsOrListener, maybeListener) {
       const listener = typeof _optionsOrListener === "function" ? _optionsOrListener : maybeListener;
-      return new Server(listener);
+      const serverOptions = typeof _optionsOrListener === "function" ? null : _optionsOrListener;
+      return new Server(listener, protocol === "https" ? serverOptions : null);
     },
     Agent,
     globalAgent: moduleAgent,

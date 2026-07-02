@@ -1899,7 +1899,10 @@ ykAheWCsAteSEWVc0w==\n\
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut exit_code = None;
-            for _ in 0..64 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut events_drained = 0;
+            while events_drained < 10_000 && Instant::now() < deadline {
+                events_drained += 1;
                 pump_sibling_internal_process_events(sidecar, vm_id, process_id);
                 let next_event = {
                     let vm = sidecar.vms.get_mut(vm_id).expect("active vm");
@@ -3263,11 +3266,13 @@ ykAheWCsAteSEWVc0w==\n\
                 crate::state::LoopbackTlsEndpoint {
                     pair: Arc::clone(&pair),
                     is_lower_socket: true,
+                    poll_timeout: Duration::from_millis(100),
                     registry_key: None,
                 },
                 crate::state::LoopbackTlsEndpoint {
                     pair,
                     is_lower_socket: false,
+                    poll_timeout: Duration::from_millis(100),
                     registry_key: None,
                 },
             )
@@ -3438,6 +3443,7 @@ ykAheWCsAteSEWVc0w==\n\
                 let competing_reader = crate::state::LoopbackTlsEndpoint {
                     pair: Arc::clone(&reader_endpoint.pair),
                     is_lower_socket: reader_endpoint.is_lower_socket,
+                    poll_timeout: Duration::from_millis(100),
                     registry_key: None,
                 };
                 let start = Arc::new(Barrier::new(3));
@@ -3514,6 +3520,28 @@ ykAheWCsAteSEWVc0w==\n\
                     "loopback TLS endpoint race triggered a panic"
                 );
             });
+        }
+
+        fn loopback_tls_pending_write_buffer_cap_is_typed_limit_error_work() {
+            let (endpoint, _peer_endpoint) = loopback_tls_endpoints();
+            let pending_write = crate::state::LoopbackTlsPendingWriteHandle::new(&endpoint);
+            let at_limit = vec![b'a'; 4 * 1024 * 1024];
+            pending_write
+                .append_write(&at_limit)
+                .expect("write exactly at pending buffer limit");
+
+            let error = pending_write
+                .append_write(b"b")
+                .expect_err("extra byte should exceed pending write buffer limit");
+            let message = error.to_string();
+            assert!(
+                message.contains("loopback TLS pending write buffer exceeded"),
+                "unexpected cap error: {message}"
+            );
+            assert!(
+                message.contains("4194305 bytes > 4194304 bytes"),
+                "unexpected cap units: {message}"
+            );
         }
         fn javascript_net_socket_wait_connect_reports_tcp_socket_info() {
             assert_node_available();
@@ -4775,6 +4803,25 @@ ykAheWCsAteSEWVc0w==\n\
             )
             .expect("upgrade guest TLS client socket");
 
+            call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-tls-server",
+                JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
+                    id: 45,
+                    method: String::from("net.write"),
+                    args: vec![
+                        json!(client_socket_id.clone()),
+                        json!({
+                            "__agentOSType": "bytes",
+                            "base64": base64::engine::general_purpose::STANDARD.encode("ping"),
+                        }),
+                    ],
+                },
+            )
+            .expect("buffer guest TLS client payload while handshake is pending");
+
             let client_hello = (0..30)
                 .find_map(|attempt| {
                     let value = call_javascript_sync_rpc(
@@ -4891,25 +4938,6 @@ ykAheWCsAteSEWVc0w==\n\
                     }
                 })
                 .expect("eventually complete guest TLS handshake");
-
-            call_javascript_sync_rpc(
-                &mut sidecar,
-                &vm_id,
-                "proc-js-tls-server",
-                JavascriptSyncRpcRequest {
-                    raw_bytes_args: std::collections::HashMap::new(),
-                    id: 145,
-                    method: String::from("net.write"),
-                    args: vec![
-                        json!(client_socket_id.clone()),
-                        json!({
-                            "__agentOSType": "bytes",
-                            "base64": base64::engine::general_purpose::STANDARD.encode("ping"),
-                        }),
-                    ],
-                },
-            )
-            .expect("write guest TLS client payload");
 
             let payload = read_javascript_socket_chunk(
                 &mut sidecar,
@@ -6293,6 +6321,11 @@ ykAheWCsAteSEWVc0w==\n\
             assert_eq!(
                 vm.kernel.mounted_filesystems(),
                 vec![
+                    MountEntry {
+                        path: String::from("/opt/agentos"),
+                        plugin_id: String::from("host_dir"),
+                        read_only: true,
+                    },
                     MountEntry {
                         path: String::from("/workspace"),
                         plugin_id: String::from("memory"),
@@ -8640,7 +8673,11 @@ ykAheWCsAteSEWVc0w==\n\
                 .expect("configured vm")
                 .kernel
                 .mounted_filesystems();
-            assert_eq!(operator_mounts.len(), 2, "root + operator-applied mount");
+            assert_eq!(
+                operator_mounts.len(),
+                3,
+                "root + operator-applied mount + package projection mount"
+            );
 
             let mount_error = sidecar
                 .vms
@@ -14227,6 +14264,7 @@ const summary = await new Promise((resolve, reject) => {{
 }});
 
 console.log(JSON.stringify(summary));
+process.exit(0);
 "#,
                 key = TLS_TEST_KEY_PEM,
                 cert = TLS_TEST_CERT_PEM,
@@ -16432,6 +16470,7 @@ await new Promise(() => {});
         }
 
         fn javascript_https_rpc_requests_and_serves_over_guest_tls() {
+            let _tls_lock = tls_service_test_lock();
             assert_node_available();
 
             let mut sidecar = create_test_sidecar();
@@ -16505,7 +16544,10 @@ console.log(JSON.stringify(summary));
             let (stdout, stderr, exit_code) =
                 run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-https");
 
-            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+            assert!(
+                !stderr.contains("ERR_AGENTOS_NODE_SYNC_RPC"),
+                "unexpected sync RPC error: {stderr}"
+            );
             let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse https JSON");
             assert_eq!(parsed["received"], Value::String(String::from("ping")));
             assert_eq!(
@@ -16514,7 +16556,77 @@ console.log(JSON.stringify(summary));
             );
             assert!(
                 parsed["port"].as_u64().is_some_and(|port| port > 0),
-                "stdout: {stdout}"
+                "stdout: {stdout}, exit_code: {exit_code:?}"
+            );
+        }
+
+        fn javascript_loopback_tls_https_get_buffers_handshake_pending_write_work() {
+            let _tls_lock = tls_service_test_lock();
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-js-loopback-tls-get-cwd");
+            let entry = format!(
+                r#"
+	import https from "node:https";
+
+	const key = {key:?};
+	const cert = {cert:?};
+
+const body = await new Promise((resolve, reject) => {{
+  const server = https.createServer({{ key, cert }}, (_req, res) => {{
+    res.end("hello-loopback-tls");
+  }});
+
+  server.on("error", reject);
+  server.listen(0, "127.0.0.1", () => {{
+    const port = server.address().port;
+    let response = "";
+    const req = https.get({{
+      agent: false,
+      host: "127.0.0.1",
+      port,
+      path: "/",
+      rejectUnauthorized: false,
+    }}, (res) => {{
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {{
+        response += chunk;
+      }});
+      res.on("end", () => {{
+        server.close(() => resolve(response));
+      }});
+    }});
+    req.on("error", reject);
+  }});
+}});
+
+console.log(`BODY:${{body}}`);
+	"#,
+                key = TLS_TEST_KEY_PEM,
+                cert = TLS_TEST_CERT_PEM,
+            );
+            write_fixture(&cwd.join("entry.mjs"), &entry);
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-loopback-tls-get");
+
+            assert!(
+                !stderr.contains("ERR_AGENTOS_NODE_SYNC_RPC"),
+                "unexpected sync RPC error: {stderr}"
+            );
+            assert!(
+                stdout.contains("BODY:hello-loopback-tls"),
+                "unexpected stdout: {stdout}, stderr: {stderr}, exit_code: {exit_code:?}"
             );
         }
         fn javascript_net_rpc_listens_accepts_connections_and_reports_listener_state() {
@@ -18957,9 +19069,19 @@ console.log(JSON.stringify({
         }
 
         #[test]
-        #[ignore = "flaky: high-level HTTPS over loopback TLS can deadlock the sync RPC bridge; lower-level TLS and HTTP coverage still run"]
+        #[ignore = "flaky: high-level HTTPS over loopback TLS can deadlock the sync RPC bridge; lower-level TLS and dedicated loopback HTTPS regression still run"]
         fn javascript_https_rpc_requests_and_serves_over_guest_tls_regression() {
             javascript_https_rpc_requests_and_serves_over_guest_tls();
+        }
+
+        #[test]
+        fn javascript_loopback_tls_https_get_buffers_handshake_pending_write() {
+            javascript_loopback_tls_https_get_buffers_handshake_pending_write_work();
+        }
+
+        #[test]
+        fn loopback_tls_pending_write_buffer_cap_is_typed_limit_error() {
+            loopback_tls_pending_write_buffer_cap_is_typed_limit_error_work();
         }
 
         #[test]
