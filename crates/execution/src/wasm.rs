@@ -4319,6 +4319,9 @@ mod tests {
     fn wasm_runner_bootstrap_reports_dot_preopen_to_wasi() {
         let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
 
+        assert!(bootstrap.contains("const cwdMount = guestCwd || '/workspace';"));
+        assert!(bootstrap.contains("preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);"));
+        assert!(!bootstrap.contains("preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);"));
         assert!(bootstrap.contains("_descriptorPreopenName(entry)"));
         assert!(bootstrap.contains(
             "if (guestPath === \".\") {\n        return this._descriptorGuestPath(entry);"
@@ -4349,6 +4352,11 @@ mod tests {
         assert!(bootstrap.contains("_rootRelativeTargetPrefersCwd(target)"));
         assert!(bootstrap.contains("_rootRelativeTargetMatchesAbsoluteArg(target)"));
         assert!(bootstrap.contains("__agentOSPath().posix.normalize(arg) === rootGuestPath"));
+        assert!(bootstrap.contains("_createParentExists(guestPath, hostPath)"));
+        assert!(bootstrap.contains(
+            "preferCreateParent &&\n              !this._rootRelativeTargetIsWithinAbsoluteArg(target)"
+        ));
+        assert!(bootstrap.contains("this._createParentExists(cwdGuestTarget, cwdHostTarget)"));
     }
 
     #[test]

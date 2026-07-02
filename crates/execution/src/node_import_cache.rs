@@ -17,7 +17,7 @@ const NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT_MS_ENV: &str =
     "AGENTOS_NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT_MS";
 const NODE_IMPORT_CACHE_SCHEMA_VERSION: &str = "1";
 const NODE_IMPORT_CACHE_LOADER_VERSION: &str = "8";
-const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "80";
+const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "81";
 const NODE_IMPORT_CACHE_DIR_PREFIX: &str = "agentos-node-import-cache";
 const DEFAULT_NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const PYODIDE_DIST_DIR: &str = "pyodide-dist";
@@ -11344,15 +11344,15 @@ for (let index = 0; index < 520; index += 1) {
     }
 
     #[test]
-    fn wasm_runner_preopens_dot_before_root() {
-        let dot_index = NODE_WASM_RUNNER_SOURCE
-            .find("preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);")
-            .expect("runner should preopen the current directory");
+    fn wasm_runner_preopens_guest_cwd_before_root() {
+        let cwd_index = NODE_WASM_RUNNER_SOURCE
+            .find("preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);")
+            .expect("runner should preopen the guest cwd");
         let root_index = NODE_WASM_RUNNER_SOURCE
             .find("preopens['/'] = createPreopen(rootMapping.hostPath, rootMapping.readOnly);")
             .expect("runner should preopen the guest root");
 
-        assert!(dot_index < root_index);
+        assert!(cwd_index < root_index);
     }
 
     #[test]
@@ -11366,7 +11366,7 @@ for (let index = 0; index < 520; index += 1) {
             .contains("preopens[guestPath] = createPreopen(mapping.hostPath, mapping.readOnly);"));
         assert!(NODE_WASM_RUNNER_SOURCE.contains("const cwdReadOnly = readOnlyForCwd(guestCwd);"));
         assert!(NODE_WASM_RUNNER_SOURCE
-            .contains("preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);"));
+            .contains("preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);"));
         assert!(
             NODE_WASM_RUNNER_SOURCE.contains("if (mapping.readOnly) {\n        return 1;\n      }")
         );

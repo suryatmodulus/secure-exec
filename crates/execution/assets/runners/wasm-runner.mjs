@@ -484,12 +484,13 @@ function buildPreopens() {
       const preopens = {};
       const seen = new Set();
       const cwdReadOnly = readOnlyForCwd(guestCwd);
-      preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);
-      seen.add('.');
+      const cwdMount = guestCwd || '/workspace';
+      preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);
+      seen.add(cwdMount);
       const rootMapping = GUEST_PATH_MAPPINGS.find(
         (mapping) => mapping && mapping.guestPath === '/',
       );
-      if (rootMapping) {
+      if (rootMapping && !seen.has('/')) {
         preopens['/'] = createPreopen(rootMapping.hostPath, rootMapping.readOnly);
         seen.add('/');
       }
@@ -507,11 +508,6 @@ function buildPreopens() {
         }
         preopens[guestPath] = createPreopen(mapping.hostPath, mapping.readOnly);
         seen.add(guestPath);
-      }
-      const cwdMount = guestCwd || '/workspace';
-      if (!seen.has(cwdMount)) {
-        preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);
-        seen.add(cwdMount);
       }
       if (cwdMount !== '/workspace' && !seen.has('/workspace')) {
         preopens['/workspace'] = createPreopen(HOST_CWD, cwdReadOnly);

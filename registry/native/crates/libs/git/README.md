@@ -8,6 +8,7 @@ small git subset for WasmVM guests.
 - `git init`
 - `git add`
 - `git commit -m ...`
+- `git rev-parse <ref>`
 - `git branch`
 - `git checkout`
 - `git clone <local-path>`

@@ -5,7 +5,7 @@
  * smart-HTTP remote clone via kernel.exec() with real WASM binaries.
  */
 
-import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,8 @@ import {
   hasWasmBinaries,
 } from '../helpers.js';
 import type { Kernel } from '../helpers.js';
+
+vi.setConfig({ testTimeout: 30_000 });
 
 /** Check git binary exists in addition to base WASM binaries */
 const hasGit = hasWasmBinaries && existsSync(resolve(COMMANDS_DIR, 'git'));

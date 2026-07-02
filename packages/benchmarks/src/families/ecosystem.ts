@@ -8,18 +8,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolveNodeRuntimeCommandsDir } from "@secure-exec/core";
 import type { CommandBenchmarkOp } from "../lib/layers.js";
 import { nowMs } from "../lib/perf-utils.js";
 
-const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
-const GIT_WASM_DIR = join(REPO_ROOT, "registry/software/git/wasm");
 const VM_LS_DIR = "/tmp/ecosystem-ls-100";
 const VM_GREP_FILE = "/tmp/ecosystem-grep-1m.txt";
 const VM_GIT_DIR = "/tmp/ecosystem-git-init-commit";
 
 export function ecosystemWasmCommandDirs(): string[] {
-	return gitWasmAvailable() ? [GIT_WASM_DIR] : [];
+	const commandsDir = resolveNodeRuntimeCommandsDir();
+	return existsSync(join(commandsDir, "git")) ? [commandsDir] : [];
 }
 
 export const ecosystemFamily: CommandBenchmarkOp[] = [
@@ -90,7 +89,7 @@ export const ecosystemFamily: CommandBenchmarkOp[] = [
 		reproducer: "git init, add ten files, commit, and rev-parse HEAD",
 		skipReason: gitWasmAvailable()
 			? undefined
-			: "registry/software/git/wasm is not available in this checkout",
+			: `git wasm command is not available in ${resolveNodeRuntimeCommandsDir()}`,
 		runHostCmd: (iters, warmup) =>
 			sampleSyncCommand(iters, warmup, () => {
 				const dir = createHostDirWithFiles("secure-exec-ecosystem-git-", 10);
@@ -151,7 +150,7 @@ export const ecosystemFamily: CommandBenchmarkOp[] = [
 ];
 
 function gitWasmAvailable(): boolean {
-	return existsSync(GIT_WASM_DIR);
+	return existsSync(join(resolveNodeRuntimeCommandsDir(), "git"));
 }
 
 function gitEnv(): Record<string, string> {

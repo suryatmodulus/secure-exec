@@ -1578,7 +1578,7 @@ fn commit_tree(git_dir: &Path, commit_hash: &[u8; 20]) -> io::Result<[u8; 20]> {
 
 // ─── Commands ───────────────────────────────────────────────────────────────
 
-fn cmd_init(path: &Path) -> io::Result<()> {
+fn cmd_init(path: &Path, quiet: bool) -> io::Result<()> {
     let git_dir = path.join(".git");
     // Create directories one at a time to avoid create_dir_all issues on WASI
     for dir in &[
@@ -1602,10 +1602,57 @@ fn cmd_init(path: &Path) -> io::Result<()> {
         "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n",
     )
     .map_err(|e| err(&format!("write config: {}", e)))?;
-    print_stdout_line(format_args!(
-        "Initialized empty Git repository in {}/.git/",
-        path.display()
-    ))?;
+    if !quiet {
+        print_stdout_line(format_args!(
+            "Initialized empty Git repository in {}/.git/",
+            path.display()
+        ))?;
+    }
+    Ok(())
+}
+
+fn collect_add_paths(workdir: &Path, rel_path: &str, out: &mut Vec<String>) -> io::Result<()> {
+    if rel_path == ".git" || rel_path.starts_with(".git/") || rel_path.ends_with("/.git") {
+        return Ok(());
+    }
+
+    if rel_path == "." {
+        for entry in fs::read_dir(workdir)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| err("repository path must be utf-8"))?
+                .to_owned();
+            if name == ".git" {
+                continue;
+            }
+            collect_add_paths(workdir, &name, out)?;
+        }
+        return Ok(());
+    }
+
+    let repo_path = normalize_repo_path(rel_path)?;
+    let file_path = workdir.join(&repo_path);
+    if file_path.is_dir() {
+        for entry in fs::read_dir(&file_path)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| err("repository path must be utf-8"))?
+                .to_owned();
+            if name == ".git" {
+                continue;
+            }
+            collect_add_paths(workdir, &format!("{repo_path}/{name}"), out)?;
+        }
+        return Ok(());
+    }
+
+    if file_path.exists() {
+        out.push(repo_path);
+    }
     Ok(())
 }
 
@@ -1620,24 +1667,33 @@ fn cmd_add(workdir: &Path, paths: &[String]) -> io::Result<()> {
     })?;
 
     for rel_path in paths {
-        let repo_path = normalize_repo_path(rel_path)?;
-        let file_path = workdir.join(&repo_path);
-        if !file_path.exists() {
+        let mut repo_paths = Vec::new();
+        collect_add_paths(workdir, rel_path, &mut repo_paths)?;
+        if repo_paths.is_empty() {
             return Err(err(&format!(
-                "pathspec '{}' did not match any files (looked at {})",
-                rel_path,
-                file_path.display()
+                "pathspec '{}' did not match any files",
+                rel_path
             )));
         }
-        let content = read_file_limited(&file_path, MAX_GIT_OBJECT_BYTES, "file")?;
-        let hash = hash_object(&git_dir, "blob", &content)?;
+        for repo_path in repo_paths {
+            let file_path = workdir.join(&repo_path);
+            if !file_path.exists() {
+                return Err(err(&format!(
+                    "pathspec '{}' did not match any files (looked at {})",
+                    rel_path,
+                    file_path.display()
+                )));
+            }
+            let content = read_file_limited(&file_path, MAX_GIT_OBJECT_BYTES, "file")?;
+            let hash = hash_object(&git_dir, "blob", &content)?;
 
-        entries.retain(|e| e.name != repo_path);
-        entries.push(IndexEntry {
-            mode: 0o100644,
-            sha1: hash,
-            name: repo_path,
-        });
+            entries.retain(|e| e.name != repo_path);
+            entries.push(IndexEntry {
+                mode: 0o100644,
+                sha1: hash,
+                name: repo_path,
+            });
+        }
     }
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1692,6 +1748,21 @@ fn cmd_commit(workdir: &Path, message: &str) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_rev_parse(workdir: &Path, args: &[String]) -> io::Result<()> {
+    let git_dir = workdir.join(".git");
+    if args.len() != 1 {
+        return Err(err("usage: git rev-parse <ref>"));
+    }
+
+    let hash = resolve_ref(&git_dir, &args[0])?.ok_or_else(|| {
+        err(&format!(
+            "unknown revision or path not in the working tree: {}",
+            args[0]
+        ))
+    })?;
+    print_stdout_line(format_args!("{}", hex(&hash)))
 }
 
 fn cmd_branch(workdir: &Path) -> io::Result<()> {
@@ -1921,6 +1992,12 @@ fn run(args: &[String]) -> io::Result<()> {
             let p = PathBuf::from(&args[i]);
             workdir = if p.is_absolute() { p } else { workdir.join(p) };
             i += 1;
+        } else if args[i] == "-c" {
+            i += 1;
+            if i >= args.len() {
+                return Err(err("-c requires a config assignment"));
+            }
+            i += 1;
         } else {
             break;
         }
@@ -1936,17 +2013,31 @@ fn run(args: &[String]) -> io::Result<()> {
 
     match subcmd.as_str() {
         "init" => {
-            let path = if sub_args.is_empty() {
-                workdir
-            } else {
-                let p = PathBuf::from(&sub_args[0]);
+            let mut path_arg = None;
+            let mut quiet = false;
+            for arg in sub_args {
+                if arg == "-q" || arg == "--quiet" {
+                    quiet = true;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    return Err(unsupported("init", &format!("does not support `{}`.", arg)));
+                }
+                if path_arg.replace(arg).is_some() {
+                    return Err(err("usage: git init [<path>]"));
+                }
+            }
+            let path = if let Some(path_arg) = path_arg {
+                let p = PathBuf::from(path_arg);
                 if p.is_absolute() {
                     p
                 } else {
                     workdir.join(p)
                 }
+            } else {
+                workdir
             };
-            cmd_init(&path)
+            cmd_init(&path, quiet)
         }
         "add" => {
             if sub_args.is_empty() {
@@ -1970,6 +2061,7 @@ fn run(args: &[String]) -> io::Result<()> {
             cmd_commit(&workdir, &msg)
         }
         "branch" => cmd_branch(&workdir),
+        "rev-parse" => cmd_rev_parse(&workdir, sub_args),
         "checkout" => {
             let mut create = false;
             let mut target = None;
