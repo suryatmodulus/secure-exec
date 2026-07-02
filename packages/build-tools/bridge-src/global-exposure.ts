@@ -6,6 +6,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Bridge bootstrap configuration must not be replaced by sandbox code."
   },
   {
+    name: "__secureExecHrNowUs",
+    classification: "hardened",
+    rationale: "High-resolution monotonic clock, only installed when high_resolution_time opt-in is set."
+  },
+  {
     name: "process.cpuUsage",
     classification: "hardened",
     rationale: "Host process CPU usage bridge reference."

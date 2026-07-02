@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroI32;
+use std::ffi::c_void;
 use std::time::Instant;
 
 // ── Module-load read/compile split (opt-in via AGENTOS_MODULE_TRACE=1) ──
@@ -103,6 +104,45 @@ pub fn inject_globals(
     // bridge code (applyTimingMitigationFreeze), which runs AFTER the bridge bundle
     // loads. The bridge bundle depends on SharedArrayBuffer being available during
     // its initialization (whatwg-url/webidl-conversions uses it).
+}
+
+pub fn install_high_resolution_time_global(
+    scope: &mut v8::HandleScope,
+    origin: *const Instant,
+) {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let external = v8::External::new(scope, origin as *mut c_void);
+    let template = v8::FunctionTemplate::builder(high_resolution_time_callback)
+        .data(external.into())
+        .build(scope);
+    let Some(func) = template.get_function(scope) else {
+        return;
+    };
+    let key = v8::String::new(scope, "__secureExecHrNowUs").unwrap();
+    let attr = v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE;
+    global.define_own_property(scope, key.into(), func.into(), attr);
+}
+
+fn high_resolution_time_callback(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let external = match v8::Local::<v8::External>::try_from(args.data()) {
+        Ok(ext) => ext,
+        Err(_) => {
+            let msg = v8::String::new(scope, "internal error: missing hrtime origin").unwrap();
+            let exc = v8::Exception::error(scope, msg);
+            scope.throw_exception(exc);
+            return;
+        }
+    };
+    // SAFETY: the pointer targets the session thread's per-isolate Instant,
+    // which is kept alive for the lifetime of the V8 session thread.
+    let origin = unsafe { &*(external.value() as *const Instant) };
+    let micros = origin.elapsed().as_secs_f64() * 1_000_000.0;
+    rv.set(v8::Number::new(scope, micros).into());
 }
 
 /// Inject globals from a V8-serialized payload containing { processConfig, osConfig }.
@@ -696,7 +736,7 @@ pub(crate) fn extract_error_info(
     }
 }
 
-/// Build the _processConfig JS object: { cwd, env, timing_mitigation, frozen_time_ms }
+/// Build the _processConfig JS object: { cwd, env, timing_mitigation, frozen_time_ms, high_resolution_time }
 #[cfg(test)]
 fn build_process_config<'s>(
     scope: &mut v8::HandleScope<'s>,
@@ -732,6 +772,11 @@ fn build_process_config<'s>(
         None => v8::null(scope).into(),
     };
     obj.set(scope, key.into(), val);
+
+    // high_resolution_time
+    let key = v8::String::new(scope, "high_resolution_time").unwrap();
+    let val = v8::Boolean::new(scope, config.high_resolution_time);
+    obj.set(scope, key.into(), val.into());
 
     obj
 }
@@ -3536,6 +3581,7 @@ export const file = new File([], "empty.txt");
                 env,
                 timing_mitigation: "none".into(),
                 frozen_time_ms: Some(1700000000000.0),
+                high_resolution_time: true,
             };
             let os_config = OsConfig {
                 homedir: "/home/agentos".into(),
@@ -3561,6 +3607,10 @@ export const file = new File([], "empty.txt");
             assert_eq!(
                 eval(&mut isolate, &context, "_processConfig.frozen_time_ms"),
                 "1700000000000"
+            );
+            assert_eq!(
+                eval(&mut isolate, &context, "_processConfig.high_resolution_time"),
+                "true"
             );
             assert_eq!(
                 eval(&mut isolate, &context, "_processConfig.env.HOME"),
@@ -3842,6 +3892,7 @@ export const file = new File([], "empty.txt");
                 env: HashMap::new(),
                 timing_mitigation: "none".into(),
                 frozen_time_ms: None,
+                high_resolution_time: false,
             };
             let os_config = OsConfig {
                 homedir: "/root".into(),
@@ -3877,6 +3928,7 @@ export const file = new File([], "empty.txt");
                 env: HashMap::new(),
                 timing_mitigation: "none".into(),
                 frozen_time_ms: None,
+                high_resolution_time: false,
             };
             let os_config = OsConfig {
                 homedir: "/home".into(),
@@ -3953,6 +4005,7 @@ export const file = new File([], "empty.txt");
                 env: HashMap::new(),
                 timing_mitigation: "freeze".into(),
                 frozen_time_ms: None,
+                high_resolution_time: false,
             };
             let os_config = OsConfig {
                 homedir: "/root".into(),
@@ -3991,6 +4044,7 @@ export const file = new File([], "empty.txt");
                 env: HashMap::new(),
                 timing_mitigation: "none".into(),
                 frozen_time_ms: None,
+                high_resolution_time: false,
             };
             let os_config = OsConfig {
                 homedir: "/root".into(),

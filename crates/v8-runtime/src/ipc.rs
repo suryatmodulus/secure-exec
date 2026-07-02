@@ -12,6 +12,7 @@ pub struct ProcessConfig {
     pub env: HashMap<String, String>,
     pub timing_mitigation: String,
     pub frozen_time_ms: Option<f64>,
+    pub high_resolution_time: bool,
 }
 
 /// OS configuration injected into the V8 global as _osConfig

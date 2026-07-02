@@ -178,6 +178,7 @@ impl V8SessionHandle {
         bridge_code: String,
         post_restore_script: String,
         userland_code: String,
+        high_resolution_time: bool,
         user_code: String,
     ) -> io::Result<()> {
         self.inner.execute(
@@ -186,6 +187,7 @@ impl V8SessionHandle {
             bridge_code,
             post_restore_script,
             userland_code,
+            high_resolution_time,
             user_code,
         )
     }

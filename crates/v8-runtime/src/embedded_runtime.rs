@@ -277,6 +277,7 @@ impl EmbeddedV8SessionHandle {
         bridge_code: String,
         post_restore_script: String,
         userland_code: String,
+        high_resolution_time: bool,
         user_code: String,
     ) -> io::Result<()> {
         validate_execute_mode(mode)?;
@@ -288,6 +289,7 @@ impl EmbeddedV8SessionHandle {
                 bridge_code,
                 post_restore_script,
                 userland_code,
+                high_resolution_time,
                 user_code,
             },
         })

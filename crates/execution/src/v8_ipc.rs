@@ -63,6 +63,7 @@ pub enum BinaryFrame {
         // alongside the bridge (empty = bridge-only snapshot). Must stay
         // wire-compatible with v8-runtime's ipc_binary BinaryFrame::Execute.
         userland_code: String,
+        high_resolution_time: bool,
         user_code: String,
     },
     BridgeResponse {
@@ -184,6 +185,7 @@ pub fn decode_frame(buf: &[u8]) -> io::Result<BinaryFrame> {
             let post_restore_script = read_utf8(buf, &mut pos, prs_len)?;
             let ul_len = read_u32(buf, &mut pos)? as usize;
             let userland_code = read_utf8(buf, &mut pos, ul_len)?;
+            let high_resolution_time = read_u8(buf, &mut pos)? != 0;
             let remaining = buf.len() - pos;
             let user_code = read_utf8(buf, &mut pos, remaining)?;
             Ok(BinaryFrame::Execute {
@@ -193,6 +195,7 @@ pub fn decode_frame(buf: &[u8]) -> io::Result<BinaryFrame> {
                 bridge_code,
                 post_restore_script,
                 userland_code,
+                high_resolution_time,
                 user_code,
             })
         }
@@ -328,6 +331,7 @@ fn encode_body(buf: &mut Vec<u8>, frame: &BinaryFrame) -> io::Result<()> {
             bridge_code,
             post_restore_script,
             userland_code,
+            high_resolution_time,
             user_code,
         } => {
             buf.push(MSG_EXECUTE);
@@ -343,6 +347,7 @@ fn encode_body(buf: &mut Vec<u8>, frame: &BinaryFrame) -> io::Result<()> {
             let ul_bytes = userland_code.as_bytes();
             buf.extend_from_slice(&(ul_bytes.len() as u32).to_be_bytes());
             buf.extend_from_slice(ul_bytes);
+            buf.push(u8::from(*high_resolution_time));
             buf.extend_from_slice(user_code.as_bytes());
         }
         BinaryFrame::BridgeResponse {

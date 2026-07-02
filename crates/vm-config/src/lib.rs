@@ -106,6 +106,15 @@ pub struct JsRuntimeConfig {
     )]
     #[ts(optional)]
     pub allowed_builtins: Option<Vec<String>>,
+    /// Opt in to a high-resolution monotonic guest clock. Default false keeps
+    /// the security-oriented 1ms timer resolution.
+    #[serde(
+        default,
+        rename = "highResolutionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub high_resolution_time: Option<bool>,
     /// Optional userland JS (an esbuild IIFE, e.g. a bundled agent SDK) to
     /// evaluate into the per-sidecar V8 startup snapshot alongside the bridge, so
     /// it is loaded once per sidecar and reused across sessions instead of
@@ -120,6 +129,10 @@ pub struct JsRuntimeConfig {
     )]
     #[ts(optional)]
     pub snapshot_userland_code: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl JsRuntimeConfig {
@@ -812,6 +825,26 @@ mod tests {
         assert_eq!(js.platform, JsRuntimePlatform::Node);
         assert_eq!(js.module_resolution, JsModuleResolution::Node);
         assert!(js.allowed_builtins.is_none());
+        assert!(js.high_resolution_time.is_none());
+    }
+
+    #[test]
+    fn js_runtime_high_resolution_time_defaults_off_and_round_trips() {
+        let defaulted = js_runtime_config(serde_json::json!({})).unwrap();
+        assert!(defaulted.js_runtime.unwrap().high_resolution_time.is_none());
+
+        let enabled = js_runtime_config(serde_json::json!({
+            "highResolutionTime": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            enabled.js_runtime.as_ref().unwrap().high_resolution_time,
+            Some(true)
+        );
+        let json = serde_json::to_string(&enabled).expect("serialize");
+        assert!(json.contains("highResolutionTime"));
+        let decoded: CreateVmConfig = serde_json::from_str(&json).expect("re-decode");
+        assert_eq!(decoded, enabled);
     }
 
     #[test]

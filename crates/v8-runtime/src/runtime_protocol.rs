@@ -72,6 +72,7 @@ pub enum SessionMessage {
         bridge_code: String,
         post_restore_script: String,
         userland_code: String,
+        high_resolution_time: bool,
         user_code: String,
     },
     BridgeResponse(BridgeResponse),
@@ -162,6 +163,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                 bridge_code,
                 post_restore_script,
                 userland_code,
+                high_resolution_time,
                 user_code,
             } => {
                 if mode > 1 {
@@ -178,6 +180,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                         bridge_code,
                         post_restore_script,
                         userland_code,
+                        high_resolution_time,
                         user_code,
                     },
                 })
@@ -310,6 +313,7 @@ mod tests {
             bridge_code: String::new(),
             post_restore_script: String::new(),
             userland_code: String::new(),
+            high_resolution_time: false,
             user_code: String::new(),
         })
         .expect_err("unknown execute mode should be rejected");

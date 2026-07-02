@@ -60,6 +60,7 @@ fn dispatch_execute(
             bridge_code: bridge_code.to_owned(),
             post_restore_script: String::new(),
             userland_code: String::new(),
+            high_resolution_time: false,
             user_code: user_code.to_owned(),
         },
     })

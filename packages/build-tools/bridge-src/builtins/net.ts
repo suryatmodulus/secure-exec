@@ -1230,6 +1230,9 @@ function isNetBridgeMetricsEnabled() {
 }
 
 function netBridgeNowUs() {
+  if (typeof __secureExecHrNowUs === "function") {
+    return Math.round(__secureExecHrNowUs());
+  }
   if (typeof performance !== "undefined" && typeof performance.now === "function") {
     return Math.round(performance.now() * 1000);
   }

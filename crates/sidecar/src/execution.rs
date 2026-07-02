@@ -10052,6 +10052,11 @@ fn guest_runtime_identity(
         os_machine: Some(identity.os_machine),
         os_shell: Some(identity.os_shell),
         os_user: Some(identity.os_user),
+        high_resolution_time: vm
+            .configuration
+            .js_runtime
+            .as_ref()
+            .is_some_and(|cfg| cfg.high_resolution_time.unwrap_or(false)),
         // Userland bundle to bake into the per-sidecar snapshot, supplied by the
         // (trusted) client via jsRuntime.snapshotUserlandCode. The agent-os layer
         // sets this to the agent SDK bundle for snapshot-enabled agents; `None`

@@ -243,7 +243,8 @@ fn inject_snapshot_defaults(scope: &mut v8::HandleScope) {
         cwd: "/",
         env: {},
         timing_mitigation: "off",
-        frozen_time_ms: null
+        frozen_time_ms: null,
+        high_resolution_time: false
     })"#;
     let pc_source = v8::String::new(scope, pc_code).unwrap();
     let pc_script = v8::Script::compile(scope, pc_source, None).unwrap();

@@ -36,13 +36,21 @@ function readProcessConfig() {
     gid: typeof _processConfig !== "undefined" && _processConfig.gid || 0,
     stdin: typeof _processConfig !== "undefined" ? _processConfig.stdin : void 0,
     timingMitigation: typeof _processConfig !== "undefined" && _processConfig.timingMitigation || "off",
-    frozenTimeMs: typeof _processConfig !== "undefined" ? _processConfig.frozenTimeMs : void 0
+    frozenTimeMs: typeof _processConfig !== "undefined" ? _processConfig.frozenTimeMs : void 0,
+    highResolutionTime: typeof _processConfig !== "undefined" && _processConfig.high_resolution_time === true
   };
 }
 
 var config2 = readProcessConfig();
 
-var processClockNow = typeof performance !== "undefined" && performance && typeof performance.now === "function" ? performance.now.bind(performance) : Date.now;
+var processClockFallbackNow = typeof performance !== "undefined" && performance && typeof performance.now === "function" ? performance.now.bind(performance) : Date.now;
+
+var processClockNow = () => {
+  if (typeof __secureExecHrNowUs === "function") {
+    return __secureExecHrNowUs() / 1000;
+  }
+  return processClockFallbackNow();
+};
 
 function getNowMs() {
   if (config2.timingMitigation === "freeze" && typeof config2.frozenTimeMs === "number") {

@@ -26,6 +26,11 @@ moduleResolution: JsModuleResolution,
  */
 allowedBuiltins?: Array<string>, 
 /**
+ * Opt in to a high-resolution monotonic guest clock. Default false keeps
+ * the security-oriented 1ms timer resolution.
+ */
+highResolutionTime?: boolean, 
+/**
  * Optional userland JS (an esbuild IIFE, e.g. a bundled agent SDK) to
  * evaluate into the per-sidecar V8 startup snapshot alongside the bridge, so
  * it is loaded once per sidecar and reused across sessions instead of

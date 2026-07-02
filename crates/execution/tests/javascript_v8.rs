@@ -1,7 +1,7 @@
 use base64::Engine;
 use secure_exec_execution::{
     v8_runtime::map_bridge_method, CreateJavascriptContextRequest, JavascriptExecution,
-    JavascriptExecutionEngine, JavascriptExecutionEvent, JavascriptExecutionLimits,
+    GuestRuntimeConfig, JavascriptExecutionEngine, JavascriptExecutionEvent, JavascriptExecutionLimits,
     JavascriptExecutionResult, JavascriptSyncRpcRequest, StartJavascriptExecutionRequest,
 };
 use serde::Deserialize;
@@ -1630,6 +1630,96 @@ if (typeof process.hrtime.bigint() !== "bigint") {
         "unexpected stderr: {:?}",
         result.stderr
     );
+}
+
+fn javascript_execution_high_resolution_time_opt_in_enables_sub_ms_hrtime() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js-high-res-on"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            limits: Default::default(),
+            guest_runtime: GuestRuntimeConfig {
+                high_resolution_time: true,
+                ..Default::default()
+            },
+            vm_id: String::from("vm-js-high-res-on"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+if (typeof __secureExecHrNowUs !== "function") {
+  throw new Error("high-resolution host clock was not installed");
+}
+let sawSubMs = false;
+for (let attempt = 0; attempt < 80 && !sawSubMs; attempt++) {
+  const start = process.hrtime.bigint();
+  const until = __secureExecHrNowUs() + 200;
+  while (__secureExecHrNowUs() < until) {}
+  const delta = process.hrtime.bigint() - start;
+  if (delta > 0n && delta < 1000000n) {
+    sawSubMs = true;
+  }
+}
+if (!sawSubMs) {
+  throw new Error("process.hrtime.bigint did not observe a sub-ms delta");
+}
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.exit_code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+}
+
+fn javascript_execution_high_resolution_time_default_off_keeps_coarse_clock() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js-high-res-off"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            limits: Default::default(),
+            guest_runtime: Default::default(),
+            vm_id: String::from("vm-js-high-res-off"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+if (typeof __secureExecHrNowUs !== "undefined") {
+  throw new Error("high-resolution host clock exists without opt-in");
+}
+for (let attempt = 0; attempt < 20; attempt++) {
+  const now = process.hrtime.bigint();
+  if (now % 1000000n !== 0n) {
+    throw new Error("process.hrtime.bigint was not millisecond aligned: " + now);
+  }
+}
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.exit_code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 }
 
 fn javascript_execution_exposes_compatibility_shims_and_denies_escape_builtins() {
@@ -5754,6 +5844,8 @@ fn javascript_v8_suite() {
     javascript_execution_imports_node_process_without_hanging();
     javascript_execution_imports_node_fs_promises_without_hanging();
     javascript_execution_imports_node_perf_hooks_without_hanging();
+    javascript_execution_high_resolution_time_opt_in_enables_sub_ms_hrtime();
+    javascript_execution_high_resolution_time_default_off_keeps_coarse_clock();
     javascript_execution_exposes_compatibility_shims_and_denies_escape_builtins();
     javascript_execution_denies_dns_and_subpaths_on_every_resolution_path();
     javascript_execution_v8_util_format_with_options_matches_node();

@@ -4,6 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
+#[cfg(not(test))]
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 #[cfg(not(test))]
@@ -809,6 +811,8 @@ fn session_thread(
     // must rebuild the isolate for the same reason as a bridge-code change.
     #[cfg(not(test))]
     let mut isolate_userland_code: Option<String> = None;
+    #[cfg(not(test))]
+    let mut high_resolution_time_origin = Instant::now();
 
     // Process commands until shutdown or channel close
     loop {
@@ -841,12 +845,15 @@ fn session_thread(
                     bridge_code,
                     post_restore_script,
                     userland_code,
+                    high_resolution_time,
                     user_code,
                 } => {
                     // `userland_code` is consumed only by the non-test snapshot
                     // path below; keep it bound (without a warning) under `test`.
                     #[cfg(test)]
                     let _ = &userland_code;
+                    #[cfg(test)]
+                    let _ = high_resolution_time;
                     #[cfg(not(test))]
                     {
                         let session_id = session_id.clone();
@@ -955,6 +962,7 @@ fn session_thread(
                             iso.set_host_initialize_import_meta_object_callback(
                                 execution::import_meta_object_callback,
                             );
+                            high_resolution_time_origin = Instant::now();
                             *isolate_handle
                                 .lock()
                                 .expect("session isolate handle lock poisoned") =
@@ -974,6 +982,16 @@ fn session_thread(
                         // (bridge IIFE already executed, all infrastructure set up).
                         // On a non-snapshot isolate, this gives a blank context.
                         let exec_context = isolate::create_context(iso);
+
+                        if high_resolution_time {
+                            let scope = &mut v8::HandleScope::new(iso);
+                            let ctx = v8::Local::new(scope, &exec_context);
+                            let scope = &mut v8::ContextScope::new(scope, ctx);
+                            execution::install_high_resolution_time_global(
+                                scope,
+                                &high_resolution_time_origin as *const Instant,
+                            );
+                        }
 
                         // Inject globals from last InjectGlobals payload
                         if let Some(ref payload) = last_globals_payload {

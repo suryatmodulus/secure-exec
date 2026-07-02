@@ -501,6 +501,9 @@ pub struct GuestRuntimeConfig {
     pub os_shell: Option<String>,
     /// `os.userInfo().username`.
     pub os_user: Option<String>,
+    /// Opt-in high-resolution monotonic guest clock. Default false preserves
+    /// the security-oriented coarse clock.
+    pub high_resolution_time: bool,
     /// Optional agent-SDK bundle (esbuild IIFE) to evaluate into the per-sidecar
     /// V8 snapshot alongside the bridge, so the SDK is loaded once per sidecar and
     /// reused across sessions instead of re-imported on every execution. `None`
@@ -2337,6 +2340,7 @@ impl JavascriptExecutionEngine {
                     .snapshot_userland_code
                     .clone()
                     .unwrap_or_default(),
+                request.guest_runtime.high_resolution_time,
                 user_code,
             )
             .map_err(JavascriptExecutionError::Spawn)?;
@@ -2925,6 +2929,7 @@ fn prepend_v8_runtime_shim(
         "user": guest_runtime.os_user,
     })
     .to_string();
+    let high_resolution_time = guest_runtime.high_resolution_time;
 
     format!(
         r#"(function () {{
@@ -2939,6 +2944,25 @@ fn prepend_v8_runtime_shim(
   const entryFile = {entry_json};
   const nextCwd = {cwd_json};
   const nextEnv = {env_json};
+  const nextHighResolutionTime = {high_resolution_time};
+  try {{
+    const previousProcessConfig =
+      typeof globalThis._processConfig === "object" && globalThis._processConfig !== null
+        ? globalThis._processConfig
+        : {{}};
+    Object.defineProperty(globalThis, "_processConfig", {{
+      configurable: true,
+      enumerable: false,
+      value: Object.freeze({{
+        ...previousProcessConfig,
+        cwd: nextCwd,
+        env: nextEnv,
+        argv: nextArgv,
+        high_resolution_time: nextHighResolutionTime,
+      }}),
+      writable: false,
+    }});
+  }} catch (_e) {{}}
   Object.defineProperty(globalThis, "__agentOSProcessConfigEnv", {{
     configurable: true,
     enumerable: false,
