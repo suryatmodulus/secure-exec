@@ -308,6 +308,7 @@ interface TrackedProcessEntry {
 	waitWithFallbackPromise: Promise<number> | null;
 	hostExitObservedAt: number | null;
 	outputGeneration: number;
+	exitViaEvent: boolean;
 }
 
 interface NativeSidecarKernelProxyOptions {
@@ -649,6 +650,7 @@ export class NativeSidecarKernelProxy {
 			waitWithFallbackPromise: null,
 			hostExitObservedAt: null,
 			outputGeneration: 0,
+			exitViaEvent: false,
 		};
 		this.trackedProcesses.set(pid, entry);
 		this.trackedProcessesById.set(processId, entry);
@@ -1463,6 +1465,16 @@ export class NativeSidecarKernelProxy {
 			return;
 		}
 
+		if (entry.exitViaEvent) {
+			// The sidecar drains process output before it emits `process_exited`,
+			// the stdio frame stream is FIFO, and this pump dispatches events in
+			// order. Once the exit event reaches this entry, no trailing output can
+			// follow it; one zero-delay turn is cheap insurance for same-tick
+			// listener scheduling.
+			await drainTrailingProcessOutputTurn(0);
+			return;
+		}
+
 		let observedGeneration = entry.outputGeneration;
 		let quietTurns = 0;
 		let delayMs = 0;
@@ -1499,7 +1511,10 @@ export class NativeSidecarKernelProxy {
 		entry.started = true;
 		this.updateTrackedProcessSnapshot(entry);
 		void this.refreshProcessSnapshot().catch(() => {});
-		await this.refreshSignalState(entry);
+		this.signalRefreshes.set(
+			entry.pid,
+			this.refreshSignalState(entry).catch(() => {}),
+		);
 
 		void this.flushPendingStdin(entry).catch((error) => {
 			this.handleBackgroundProcessError(entry, error);
@@ -1533,8 +1548,10 @@ export class NativeSidecarKernelProxy {
 					entry.outputGeneration += 1;
 					void this.refreshProcessSnapshot().catch(() => {});
 					if (!this.signalRefreshes.has(entry.pid)) {
-						this.signalRefreshes.set(entry.pid, this.refreshSignalState(entry));
-						await this.signalRefreshes.get(entry.pid);
+						this.signalRefreshes.set(
+							entry.pid,
+							this.refreshSignalState(entry).catch(() => {}),
+						);
 					}
 					const chunk = event.payload.chunk;
 					const listeners =
@@ -1553,7 +1570,7 @@ export class NativeSidecarKernelProxy {
 						continue;
 					}
 					void this.refreshProcessSnapshot().catch(() => {});
-					this.signalRefreshes.delete(entry.pid);
+					entry.exitViaEvent = true;
 					this.finishProcess(entry, event.payload.exit_code);
 				}
 			} catch (error) {
@@ -1583,6 +1600,10 @@ export class NativeSidecarKernelProxy {
 		if (entry.exitCode !== null) {
 			return;
 		}
+		// Every started process now parks a signal-state refresh here, so clean
+		// up on the shared exit path — the snapshot-poll fallback exits never
+		// pass through the event pump's `process_exited` branch.
+		this.signalRefreshes.delete(entry.pid);
 		entry.exitCode = exitCode;
 		entry.exitTime = Date.now();
 		this.updateTrackedProcessSnapshot(entry);
@@ -1658,6 +1679,7 @@ export class NativeSidecarKernelProxy {
 		entry: TrackedProcessEntry,
 		signal: number,
 	): Promise<void> {
+		await this.signalRefreshes.get(entry.pid);
 		try {
 			await this.client.killProcess(
 				this.session,
