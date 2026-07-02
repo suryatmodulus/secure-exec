@@ -294,6 +294,7 @@ pub struct KernelVm<F> {
     poll_notifier: PollNotifier,
     users: UserManager,
     resources: ResourceAccountant,
+    filesystem_usage_cache: Option<FileSystemUsage>,
     file_locks: FileLockManager,
     driver_pids: Arc<Mutex<BTreeMap<String, BTreeSet<u32>>>>,
     terminated: bool,
@@ -475,15 +476,21 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             );
         })));
 
+        let filesystem = PermissionedFileSystem::new(
+            create_device_layer(filesystem),
+            vm_id.clone(),
+            permissions.clone(),
+        );
+        // Usage accounting is kernel-internal: the cache is populated lazily by
+        // `filesystem_usage()` through the RAW filesystem so no guest-attributable
+        // permission check fires at construction (or ever) for quota bookkeeping.
+        let filesystem_usage_cache = None;
+
         Self {
             vm_id: vm_id.clone(),
             boot_time_ms,
             boot_instant,
-            filesystem: PermissionedFileSystem::new(
-                create_device_layer(filesystem),
-                vm_id,
-                permissions.clone(),
-            ),
+            filesystem,
             permissions,
             loopback_exempt_ports: config.loopback_exempt_ports,
             dns: config.dns,
@@ -499,6 +506,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             poll_notifier,
             users,
             resources: ResourceAccountant::new(config.resources),
+            filesystem_usage_cache,
             file_locks,
             driver_pids,
             terminated: false,
@@ -744,8 +752,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_not_terminated()?;
         self.reject_read_only_resolved_write_path(path)?;
         let content = content.into();
-        self.check_write_file_limits(path, content.len() as u64)?;
-        Ok(self.filesystem.write_file(path, content)?)
+        let new_size = content.len() as u64;
+        let existing = self.storage_stat(path)?;
+        self.check_write_file_limits_with_existing(path, existing.as_ref(), new_size)?;
+        self.filesystem.write_file(path, content)?;
+        self.update_filesystem_usage_cache_for_write(existing.as_ref(), new_size);
+        Ok(())
     }
 
     /// Writes `content` at `offset` within an existing file, growing (and
@@ -765,10 +777,17 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_not_terminated()?;
         self.reject_read_only_resolved_write_path(path)?;
         let content = content.into();
-        let existing_size = self.storage_stat(path)?.map(|stat| stat.size).unwrap_or(0);
+        let existing = self.storage_stat(path)?;
+        let existing_size = existing.as_ref().map(|stat| stat.size).unwrap_or(0);
         let end = offset.saturating_add(content.len() as u64);
-        self.check_write_file_limits(path, existing_size.max(end))?;
-        Ok(self.filesystem.pwrite(path, content, offset)?)
+        self.check_write_file_limits_with_existing(
+            path,
+            existing.as_ref(),
+            existing_size.max(end),
+        )?;
+        self.filesystem.pwrite(path, content, offset)?;
+        self.update_filesystem_usage_cache_for_write(existing.as_ref(), existing_size.max(end));
+        Ok(())
     }
 
     pub fn write_file_for_process(
@@ -783,9 +802,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_driver_owns(requester_driver, pid)?;
         let existed = self.exists_internal(Some(pid), path)?;
         let content = content.into();
+        let new_size = content.len() as u64;
         self.reject_read_only_resolved_write_path(path)?;
-        self.check_write_file_limits(path, content.len() as u64)?;
+        let existing = self.storage_stat(path)?;
+        self.check_write_file_limits_with_existing(path, existing.as_ref(), new_size)?;
         VirtualFileSystem::write_file_with_mode(&mut self.filesystem, path, content, mode)?;
+        self.update_filesystem_usage_cache_for_write(existing.as_ref(), new_size);
         if !existed {
             let umask = self.processes.get_umask(pid)?;
             self.apply_creation_mode(path, mode.unwrap_or(0o666), umask)?;
@@ -797,7 +819,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.assert_not_terminated()?;
         self.reject_read_only_entry_write_path(path)?;
         self.check_create_dir_limits(path)?;
-        Ok(self.filesystem.create_dir(path)?)
+        self.filesystem.create_dir(path)?;
+        self.update_filesystem_usage_cache_for_inode_create(0);
+        Ok(())
     }
 
     pub fn create_dir_for_process(
@@ -813,6 +837,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.reject_read_only_entry_write_path(path)?;
         self.check_create_dir_limits(path)?;
         VirtualFileSystem::create_dir_with_mode(&mut self.filesystem, path, mode)?;
+        self.update_filesystem_usage_cache_for_inode_create(0);
         if !existed {
             let umask = self.processes.get_umask(pid)?;
             self.apply_creation_mode(path, mode.unwrap_or(0o777), umask)?;
@@ -823,8 +848,11 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     pub fn mkdir(&mut self, path: &str, recursive: bool) -> KernelResult<()> {
         self.assert_not_terminated()?;
         self.reject_read_only_entry_write_path(path)?;
+        let created_paths = self.missing_directory_paths(path, recursive)?;
         self.check_mkdir_limits(path, recursive)?;
-        Ok(self.filesystem.mkdir(path, recursive)?)
+        self.filesystem.mkdir(path, recursive)?;
+        self.update_filesystem_usage_cache_for_inode_creates(created_paths.len());
+        Ok(())
     }
 
     pub fn mkdir_for_process(
@@ -844,10 +872,11 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         if !created_paths.is_empty() {
             let umask = self.processes.get_umask(pid)?;
             let mode = mode.unwrap_or(0o777);
-            for created_path in created_paths {
+            for created_path in &created_paths {
                 self.apply_creation_mode(&created_path, mode, umask)?;
             }
         }
+        self.update_filesystem_usage_cache_for_inode_creates(created_paths.len());
         Ok(())
     }
 
@@ -987,13 +1016,21 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     pub fn remove_file(&mut self, path: &str) -> KernelResult<()> {
         self.assert_not_terminated()?;
         self.reject_read_only_entry_write_path(path)?;
-        Ok(self.filesystem.remove_file(path)?)
+        let removed = self.storage_lstat(path)?;
+        self.filesystem.remove_file(path)?;
+        self.update_filesystem_usage_cache_for_remove(removed.as_ref());
+        Ok(())
     }
 
     pub fn remove_dir(&mut self, path: &str) -> KernelResult<()> {
         self.assert_not_terminated()?;
         self.reject_read_only_entry_write_path(path)?;
-        Ok(self.filesystem.remove_dir(path)?)
+        let removed = self.storage_lstat(path)?;
+        self.filesystem.remove_dir(path)?;
+        if removed.as_ref().is_some_and(|stat| stat.is_directory) {
+            self.update_filesystem_usage_cache_for_inode_delete(0);
+        }
+        Ok(())
     }
 
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> KernelResult<()> {
@@ -1001,7 +1038,12 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.reject_read_only_entry_write_path(old_path)?;
         self.reject_read_only_entry_write_path(new_path)?;
         self.check_rename_copy_up_limits(old_path, new_path)?;
-        Ok(self.filesystem.rename(old_path, new_path)?)
+        self.filesystem.rename(old_path, new_path)?;
+        // Rename can be a pure metadata move, a destination replacement, or an
+        // overlay copy-up/removal with hard-link aliasing. Drop the cached root
+        // usage because the local byte/inode delta is not knowable here.
+        self.invalidate_filesystem_usage_cache();
+        Ok(())
     }
 
     pub fn realpath(&self, path: &str) -> KernelResult<String> {
@@ -1030,7 +1072,9 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         }
         self.reject_read_only_entry_write_path(link_path)?;
         self.check_symlink_limits(target, link_path)?;
-        Ok(self.filesystem.symlink(target, link_path)?)
+        self.filesystem.symlink(target, link_path)?;
+        self.update_filesystem_usage_cache_for_inode_create(target.len() as u64);
+        Ok(())
     }
 
     pub fn chmod(&mut self, path: &str, mode: u32) -> KernelResult<()> {
@@ -1049,7 +1093,10 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         }
         self.reject_read_only_resolved_write_path(old_path)?;
         self.reject_read_only_entry_write_path(new_path)?;
-        Ok(self.filesystem.link(old_path, new_path)?)
+        self.filesystem.link(old_path, new_path)?;
+        // Hard-link creation makes another directory entry for an already
+        // reachable inode, so measured root usage is unchanged.
+        Ok(())
     }
 
     pub fn chown(&mut self, path: &str, uid: u32, gid: u32) -> KernelResult<()> {
@@ -1108,8 +1155,11 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     pub fn truncate(&mut self, path: &str, length: u64) -> KernelResult<()> {
         self.assert_not_terminated()?;
         self.reject_read_only_resolved_write_path(path)?;
-        self.check_truncate_limits(path, length)?;
-        Ok(self.filesystem.truncate(path, length)?)
+        let existing = self.storage_stat(path)?;
+        self.check_truncate_limits_with_existing(path, existing.as_ref(), length)?;
+        self.filesystem.truncate(path, length)?;
+        self.update_filesystem_usage_cache_for_write(existing.as_ref(), length);
+        Ok(())
     }
 
     pub fn list_processes(&self) -> BTreeMap<u32, ProcessInfo> {
@@ -2226,6 +2276,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             let required_size = current_size.max(checked_write_end(current_size, data.len())?);
             self.check_path_resize_limits(&path, required_size)?;
             let new_len = VirtualFileSystem::append_file(&mut self.filesystem, &path, data)?;
+            self.update_filesystem_usage_cache_for_resize(current_size, new_len);
             entry.description.set_cursor(new_len);
             return Ok(data.len());
         }
@@ -2233,6 +2284,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         let required_size = current_size.max(checked_write_end(cursor, data.len())?);
         self.check_path_resize_limits(&path, required_size)?;
         VirtualFileSystem::pwrite(&mut self.filesystem, &path, data, cursor)?;
+        self.update_filesystem_usage_cache_for_resize(current_size, required_size);
         entry
             .description
             .set_cursor(cursor.saturating_add(data.len() as u64));
@@ -2446,9 +2498,8 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
 
         self.reject_read_only_resolved_write_path(entry.description.path())?;
 
-        let required_size = self
-            .current_storage_file_size(entry.description.path())?
-            .max(checked_write_end(offset, data.len())?);
+        let current_size = self.current_storage_file_size(entry.description.path())?;
+        let required_size = current_size.max(checked_write_end(offset, data.len())?);
         self.check_path_resize_limits(entry.description.path(), required_size)?;
         VirtualFileSystem::pwrite(
             &mut self.filesystem,
@@ -2456,6 +2507,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             data.to_vec(),
             offset,
         )?;
+        self.update_filesystem_usage_cache_for_resize(current_size, required_size);
         Ok(data.len())
     }
 
@@ -2906,6 +2958,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 Vec::new(),
                 mode,
             )?;
+            self.update_filesystem_usage_cache_for_inode_create(0);
             let stat = VirtualFileSystem::stat(&mut self.filesystem, path)?;
             return Ok((
                 filetype_for_path(path, &stat),
@@ -2916,12 +2969,15 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         let exists = self.filesystem.exists(path)?;
         if exists {
             if flags & O_TRUNC != 0 {
-                self.check_truncate_limits(path, 0)?;
+                let existing_size = self.current_storage_file_size(path)?;
+                self.check_path_resize_limits_with_existing(existing_size, 0)?;
                 VirtualFileSystem::truncate(&mut self.filesystem, path, 0)?;
+                self.update_filesystem_usage_cache_for_resize(existing_size, 0);
             }
         } else if flags & O_CREAT != 0 {
             self.check_write_file_limits(path, 0)?;
             VirtualFileSystem::write_file_with_mode(&mut self.filesystem, path, Vec::new(), mode)?;
+            self.update_filesystem_usage_cache_for_inode_create(0);
         } else {
             let _ = VirtualFileSystem::stat(&mut self.filesystem, path)?;
             unreachable!("stat should return an error when opening a missing path");
@@ -4006,12 +4062,80 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     }
 
     fn filesystem_usage(&mut self) -> KernelResult<FileSystemUsage> {
+        if let Some(usage) = self.filesystem_usage_cache.clone() {
+            return Ok(usage);
+        }
         let filesystem = self.raw_filesystem_mut();
         let filesystem_any = filesystem as &mut dyn Any;
-        if let Some(mount_table) = filesystem_any.downcast_mut::<MountTable>() {
-            return Ok(mount_table.root_usage()?);
+        let usage = if let Some(mount_table) = filesystem_any.downcast_mut::<MountTable>() {
+            mount_table.root_usage()?
+        } else {
+            measure_filesystem_usage(filesystem)?
+        };
+        self.filesystem_usage_cache = Some(usage.clone());
+        Ok(usage)
+    }
+
+    fn invalidate_filesystem_usage_cache(&mut self) {
+        self.filesystem_usage_cache = None;
+    }
+
+    fn update_filesystem_usage_cache_for_resize(&mut self, old_size: u64, new_size: u64) {
+        if let Some(usage) = self.filesystem_usage_cache.as_mut() {
+            usage.total_bytes = usage
+                .total_bytes
+                .saturating_sub(old_size)
+                .saturating_add(new_size);
         }
-        Ok(measure_filesystem_usage(filesystem)?)
+    }
+
+    fn update_filesystem_usage_cache_for_write(
+        &mut self,
+        existing: Option<&VirtualStat>,
+        new_size: u64,
+    ) {
+        if is_storage_directory(existing) {
+            return;
+        }
+
+        if let Some(stat) = existing {
+            self.update_filesystem_usage_cache_for_resize(stat.size, new_size);
+        } else {
+            self.update_filesystem_usage_cache_for_inode_create(new_size);
+        }
+    }
+
+    fn update_filesystem_usage_cache_for_inode_create(&mut self, size: u64) {
+        if let Some(usage) = self.filesystem_usage_cache.as_mut() {
+            usage.total_bytes = usage.total_bytes.saturating_add(size);
+            usage.inode_count = usage.inode_count.saturating_add(1);
+        }
+    }
+
+    fn update_filesystem_usage_cache_for_inode_creates(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(usage) = self.filesystem_usage_cache.as_mut() {
+            usage.inode_count = usage.inode_count.saturating_add(count);
+        }
+    }
+
+    fn update_filesystem_usage_cache_for_inode_delete(&mut self, size: u64) {
+        if let Some(usage) = self.filesystem_usage_cache.as_mut() {
+            usage.total_bytes = usage.total_bytes.saturating_sub(size);
+            usage.inode_count = usage.inode_count.saturating_sub(1);
+        }
+    }
+
+    fn update_filesystem_usage_cache_for_remove(&mut self, removed: Option<&VirtualStat>) {
+        let Some(stat) = removed else {
+            return;
+        };
+        if stat.is_directory || stat.nlink > 1 {
+            return;
+        }
+        self.update_filesystem_usage_cache_for_inode_delete(stat.size);
     }
 
     fn storage_stat(&mut self, path: &str) -> KernelResult<Option<VirtualStat>> {
@@ -4088,16 +4212,29 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
     }
 
     fn check_write_file_limits(&mut self, path: &str, new_size: u64) -> KernelResult<()> {
+        let existing = self.storage_stat(path)?;
+        self.check_write_file_limits_with_existing(path, existing.as_ref(), new_size)
+    }
+
+    fn check_write_file_limits_with_existing(
+        &mut self,
+        path: &str,
+        existing: Option<&VirtualStat>,
+        new_size: u64,
+    ) -> KernelResult<()> {
         if is_virtual_device_storage_path(path) {
             return Ok(());
         }
 
-        let usage = self.filesystem_usage()?;
-        if let Some(existing) = self.storage_stat(path)? {
-            if existing.is_directory {
+        if let Some(existing) = existing {
+            if is_storage_directory(Some(existing)) {
+                return Ok(());
+            }
+            if new_size <= existing.size {
                 return Ok(());
             }
 
+            let usage = self.filesystem_usage()?;
             self.resources.check_filesystem_usage(
                 &usage,
                 usage
@@ -4109,13 +4246,11 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             return Ok(());
         }
 
-        let new_inodes =
-            count_missing_directory_components(self.raw_filesystem_mut(), path, false)?
-                .saturating_add(1);
+        let usage = self.filesystem_usage()?;
         self.resources.check_filesystem_usage(
             &usage,
             usage.total_bytes.saturating_add(new_size),
-            usage.inode_count.saturating_add(new_inodes),
+            usage.inode_count.saturating_add(1),
         )?;
         Ok(())
     }
@@ -4183,8 +4318,23 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         Ok(())
     }
 
-    fn check_truncate_limits(&mut self, path: &str, length: u64) -> KernelResult<()> {
-        self.check_path_resize_limits(path, length)
+    fn check_truncate_limits_with_existing(
+        &mut self,
+        path: &str,
+        existing: Option<&VirtualStat>,
+        length: u64,
+    ) -> KernelResult<()> {
+        if is_virtual_device_storage_path(path) {
+            return Ok(());
+        }
+
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        if is_storage_directory(Some(existing)) {
+            return Ok(());
+        }
+        self.check_path_resize_limits_with_existing(existing.size, length)
     }
 
     fn check_rename_copy_up_limits(&mut self, old_path: &str, new_path: &str) -> KernelResult<()> {
@@ -4215,13 +4365,24 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         if existing.is_directory {
             return Ok(());
         }
+        self.check_path_resize_limits_with_existing(existing.size, new_size)
+    }
+
+    fn check_path_resize_limits_with_existing(
+        &mut self,
+        existing_size: u64,
+        new_size: u64,
+    ) -> KernelResult<()> {
+        if new_size <= existing_size {
+            return Ok(());
+        }
 
         let usage = self.filesystem_usage()?;
         self.resources.check_filesystem_usage(
             &usage,
             usage
                 .total_bytes
-                .saturating_sub(existing.size)
+                .saturating_sub(existing_size)
                 .saturating_add(new_size),
             usage.inode_count,
         )?;
@@ -4585,6 +4746,10 @@ fn is_virtual_device_storage_path(path: &str) -> bool {
         || path == "/dev/pts"
         || path.starts_with("/dev/fd/")
         || path.starts_with("/dev/pts/")
+}
+
+fn is_storage_directory(stat: Option<&VirtualStat>) -> bool {
+    stat.is_some_and(|stat| stat.is_directory && !stat.is_symbolic_link)
 }
 
 fn is_proc_path(path: &str) -> bool {

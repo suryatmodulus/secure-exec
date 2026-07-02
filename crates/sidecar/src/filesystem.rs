@@ -1007,6 +1007,13 @@ impl Drop for FsSyncPhaseTimer<'_> {
     }
 }
 
+fn record_fs_sync_subphase(method: &str, stage: &str, start: Instant) {
+    if !fs_sync_phases_enabled() {
+        return;
+    }
+    record_fs_sync_phase(&format!("{method}:{stage}"), start.elapsed().as_nanos());
+}
+
 fn fs_sync_phases_enabled() -> bool {
     matches!(env::var("AGENTOS_FS_SYNC_PHASES").as_deref(), Ok("1"))
 }
@@ -1124,49 +1131,83 @@ pub(crate) fn service_javascript_fs_sync_rpc(
     }
     match request.method.as_str() {
         "fs.open" | "fs.openSync" => {
+            let phase_start = Instant::now();
             let path =
                 javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem open path")?;
             let path = path.as_str();
             let flags = javascript_sync_rpc_arg_u32(&request.args, 1, "filesystem open flags")?;
             let mode =
                 javascript_sync_rpc_arg_u32_optional(&request.args, 2, "filesystem open mode")?;
+            record_fs_sync_subphase(request.method.as_str(), "parse", phase_start);
+            let phase_start = Instant::now();
             match mapped_runtime_host_path(process, path, mapped_host_open_is_writable(flags)) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
+                    record_fs_sync_subphase(
+                        request.method.as_str(),
+                        "mapped_host_match",
+                        phase_start,
+                    );
+                    let phase_start = Instant::now();
                     materialize_mapped_host_path_from_kernel(
                         kernel,
                         kernel_pid,
                         path,
                         &mapped_host,
                     )?;
+                    record_fs_sync_subphase(
+                        request.method.as_str(),
+                        "materialize_mapped_host",
+                        phase_start,
+                    );
+                    let phase_start = Instant::now();
                     let opened = open_mapped_runtime_beneath(
                         &mapped_host,
                         "fs.open",
                         OFlag::from_bits_truncate(flags as i32),
                         Mode::from_bits_truncate(mode.unwrap_or(0o666) as _),
                     )?;
+                    record_fs_sync_subphase(
+                        request.method.as_str(),
+                        "open_mapped_beneath",
+                        phase_start,
+                    );
                     let host_path = opened.host_path.clone();
+                    let phase_start = Instant::now();
                     return open_mapped_host_fd(
                         process,
                         host_path,
                         opened.handle.proc_path(),
                         flags,
-                    );
+                    )
+                    .inspect(|_| {
+                        record_fs_sync_subphase(
+                            request.method.as_str(),
+                            "open_mapped_fd",
+                            phase_start,
+                        );
+                    });
                 }
                 Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
                     return Err(read_only_mapped_runtime_host_path_error(path));
                 }
                 None => {}
             }
+            record_fs_sync_subphase(request.method.as_str(), "mapped_host_none", phase_start);
+            let phase_start = Instant::now();
             kernel
                 .fd_open(EXECUTION_DRIVER_NAME, kernel_pid, path, flags, mode)
                 .map(|fd| json!(fd))
                 .map_err(|error| kernel_path_error("fs.open", path, error))
+                .inspect(|_| {
+                    record_fs_sync_subphase(request.method.as_str(), "kernel_fd_open", phase_start);
+                })
         }
         "fs.read" | "fs.readSync" => {
             service_javascript_fs_read_sync_rpc(kernel, process, kernel_pid, request)
                 .map(|bytes| javascript_sync_rpc_bytes_value(&bytes))
         }
         "fs.write" | "fs.writeSync" => {
+            let phase_start = Instant::now();
             let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem write fd")?;
             let contents = if let Some(bytes) = request.raw_bytes_args.get(&1) {
                 bytes.clone()
@@ -1178,9 +1219,14 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 2,
                 "filesystem write position",
             )?;
+            record_fs_sync_subphase(request.method.as_str(), "parse", phase_start);
+            let phase_start = Instant::now();
             if let Some(mapped) = process.mapped_host_fd_mut(fd) {
+                record_fs_sync_subphase(request.method.as_str(), "mapped_fd_match", phase_start);
                 return write_mapped_host_fd(mapped, fd, &contents, position);
             }
+            record_fs_sync_subphase(request.method.as_str(), "mapped_fd_none", phase_start);
+            let phase_start = Instant::now();
             let written = match position {
                 Some(offset) => kernel
                     .fd_pwrite(EXECUTION_DRIVER_NAME, kernel_pid, fd, &contents, offset)
@@ -1189,17 +1235,24 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     .fd_write(EXECUTION_DRIVER_NAME, kernel_pid, fd, &contents)
                     .map_err(kernel_error)?,
             };
+            record_fs_sync_subphase(request.method.as_str(), "kernel_fd_write", phase_start);
+            let phase_start = Instant::now();
             let surfaces_stdio =
                 position.is_none() && kernel_fd_surfaces_stdio_event(kernel, kernel_pid, fd)?;
+            record_fs_sync_subphase(request.method.as_str(), "stdio_check", phase_start);
             if surfaces_stdio {
+                let phase_start = Instant::now();
                 let event = if fd == 1 {
                     ActiveExecutionEvent::Stdout(contents)
                 } else {
                     ActiveExecutionEvent::Stderr(contents)
                 };
                 process.queue_pending_execution_event(event)?;
+                record_fs_sync_subphase(request.method.as_str(), "queue_stdio_event", phase_start);
             } else {
+                let phase_start = Instant::now();
                 mirror_kernel_fd_contents_to_process_shadow(kernel, process, kernel_pid, fd)?;
+                record_fs_sync_subphase(request.method.as_str(), "mirror_shadow", phase_start);
             }
             Ok(json!(written))
         }

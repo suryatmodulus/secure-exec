@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "kind": "local",
-  "generatedAt": "2026-07-02T07:19:33.575-07:00",
+  "generatedAt": "2026-07-02T08:41:33.847-07:00",
   "hardware": {
     "cpu": "12th Gen Intel(R) Core(TM) i7-12700KF",
     "cores": 20,
@@ -11,11 +11,11 @@
     "arch": "x64"
   },
   "sidecar": {
-    "path": "/home/nathan/.herdr/workspaces/agent-os/secure-exec-perf-rules/target/release/secure-exec-sidecar",
+    "path": "/home/nathan/.herdr/workspaces/agent-os/secure-exec-perf-rules/packages/benchmarks/../../target/release/secure-exec-sidecar",
     "profile": "release",
-    "mtimeMs": 1782991959165.789,
-    "mtimeIso": "2026-07-02T04:32:39.166-07:00",
-    "sizeBytes": 114963696
+    "mtimeMs": 1783005507539.7039,
+    "mtimeIso": "2026-07-02T08:18:27.540-07:00",
+    "sizeBytes": 114967736
   },
   "engine": {
     "iterations": 20,
@@ -31,23 +31,23 @@
       "op": "node_exit",
       "lanes": {
         "native": {
-          "p50Ms": 14.49,
-          "memBytes": 1204224,
+          "p50Ms": 14.68,
+          "memBytes": 1228800,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 16.61
+          "p50Ms": 16.37
         },
         "guest": {
-          "p50Ms": 15.12,
-          "memBytes": 33177600,
+          "p50Ms": 15.63,
+          "memBytes": 32698368,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.91,
-        "total": 1.04,
-        "mem": 27.55
+        "emulation": 0.95,
+        "total": 1.06,
+        "mem": 26.61
       }
     },
     {
@@ -56,23 +56,23 @@
       "op": "node_stdout_discard_2b",
       "lanes": {
         "native": {
-          "p50Ms": 15.79,
-          "memBytes": 1085440,
+          "p50Ms": 15.95,
+          "memBytes": 1179648,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 16.95
+          "p50Ms": 17.23
         },
         "guest": {
-          "p50Ms": 14.49,
-          "memBytes": 33005568,
+          "p50Ms": 14.1,
+          "memBytes": 32964608,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.85,
-        "total": 0.92,
-        "mem": 30.41
+        "emulation": 0.82,
+        "total": 0.88,
+        "mem": 27.94
       }
     },
     {
@@ -81,23 +81,23 @@
       "op": "exec_capture",
       "lanes": {
         "native": {
-          "p50Ms": 16.12,
-          "memBytes": 1204224,
+          "p50Ms": 16.99,
+          "memBytes": 1167360,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 18.32
+          "p50Ms": 19.22
         },
         "guest": {
-          "p50Ms": 27.84,
-          "memBytes": 32997376,
+          "p50Ms": 29.01,
+          "memBytes": 32849920,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.52,
-        "total": 1.73,
-        "mem": 27.4
+        "emulation": 1.51,
+        "total": 1.71,
+        "mem": 28.14
       }
     },
     {
@@ -106,23 +106,23 @@
       "op": "node_stdout_listener_only_2b",
       "lanes": {
         "native": {
-          "p50Ms": 16.91,
-          "memBytes": 1228800,
+          "p50Ms": 17.25,
+          "memBytes": 1105920,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 17.78
+          "p50Ms": 18.89
         },
         "guest": {
-          "p50Ms": 27.63,
-          "memBytes": 32923648,
+          "p50Ms": 26.86,
+          "memBytes": 32792576,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.55,
-        "total": 1.63,
-        "mem": 26.79
+        "emulation": 1.42,
+        "total": 1.56,
+        "mem": 29.65
       }
     },
     {
@@ -131,23 +131,23 @@
       "op": "fanout_spawn_8",
       "lanes": {
         "native": {
-          "p50Ms": 21.7,
-          "memBytes": 1187840,
+          "p50Ms": 22.69,
+          "memBytes": 1093632,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 28.44
+          "p50Ms": 31.83
         },
         "guest": {
-          "p50Ms": 45.75,
-          "memBytes": 321912832,
+          "p50Ms": 45.88,
+          "memBytes": 311668736,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.61,
-        "total": 2.11,
-        "mem": 271.01
+        "emulation": 1.44,
+        "total": 2.02,
+        "mem": 284.99
       }
     },
     {
@@ -156,23 +156,23 @@
       "op": "wait_reap_storm_8",
       "lanes": {
         "native": {
-          "p50Ms": 21.66,
-          "memBytes": 1187840,
+          "p50Ms": 22.97,
+          "memBytes": 1110016,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 28.93
+          "p50Ms": 31.77
         },
         "guest": {
-          "p50Ms": 45.21,
-          "memBytes": 321814528,
+          "p50Ms": 46.51,
+          "memBytes": 322703360,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.56,
-        "total": 2.09,
-        "mem": 270.92
+        "emulation": 1.46,
+        "total": 2.02,
+        "mem": 290.72
       }
     },
     {
@@ -181,25 +181,25 @@
       "op": "pipe_chain_3",
       "lanes": {
         "native": {
-          "p50Ms": 0.79,
-          "memBytes": 1126400,
+          "p50Ms": 0.69,
+          "memBytes": 1110016,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.17,
-          "memBytes": 8519680,
+          "memBytes": 8495104,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.03,
-          "memBytes": 17039360,
+          "memBytes": 24428544,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
         "emulation": 0.18,
         "total": 0.04,
-        "mem": 15.13
+        "mem": 22.01
       }
     },
     {
@@ -208,25 +208,25 @@
       "op": "spawn_stdout_capture_small",
       "lanes": {
         "native": {
-          "p50Ms": 16.65,
-          "memBytes": 1175552,
+          "p50Ms": 16.81,
+          "memBytes": 1163264,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 16.98,
-          "memBytes": 7802880,
+          "p50Ms": 17.89,
+          "memBytes": 7393280,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 36.22,
-          "memBytes": 75292672,
+          "p50Ms": 36,
+          "memBytes": 67235840,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.13,
-        "total": 2.18,
-        "mem": 64.05
+        "emulation": 2.01,
+        "total": 2.14,
+        "mem": 57.8
       }
     },
     {
@@ -235,25 +235,25 @@
       "op": "spawn_stdout_capture_big",
       "lanes": {
         "native": {
-          "p50Ms": 17.31,
-          "memBytes": 1437696,
+          "p50Ms": 16.98,
+          "memBytes": 1454080,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 17.86,
-          "memBytes": 16535552,
+          "p50Ms": 17.73,
+          "memBytes": 16302080,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 48.98,
-          "memBytes": 89223168,
+          "p50Ms": 47.48,
+          "memBytes": 85962752,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.74,
-        "total": 2.83,
-        "mem": 62.06
+        "emulation": 2.68,
+        "total": 2.8,
+        "mem": 59.12
       }
     },
     {
@@ -262,25 +262,25 @@
       "op": "spawn_stdin_roundtrip",
       "lanes": {
         "native": {
-          "p50Ms": 16.56,
-          "memBytes": 1155072,
+          "p50Ms": 17.62,
+          "memBytes": 1196032,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 17.77,
-          "memBytes": 8441856,
+          "p50Ms": 18.3,
+          "memBytes": 8462336,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 43.03,
-          "memBytes": 75075584,
+          "p50Ms": 44.1,
+          "memBytes": 68075520,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.42,
-        "total": 2.6,
-        "mem": 65
+        "emulation": 2.41,
+        "total": 2.5,
+        "mem": 56.92
       }
     },
     {
@@ -289,25 +289,25 @@
       "op": "udp_echo_small",
       "lanes": {
         "native": {
-          "p50Ms": 0.03,
-          "memBytes": 45056,
+          "p50Ms": 0.02,
+          "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.06,
-          "memBytes": 4317184,
+          "p50Ms": 0.04,
+          "memBytes": 4304896,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.21,
-          "memBytes": 16334848,
+          "memBytes": 23801856,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 3.5,
-        "total": 7,
-        "mem": 362.55
+        "emulation": 5.25,
+        "total": 10.5,
+        "mem": 5811
       }
     },
     {
@@ -316,25 +316,25 @@
       "op": "udp_echo_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.05,
-          "memBytes": 258048,
+          "p50Ms": 0.06,
+          "memBytes": 352256,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.08,
-          "memBytes": 6995968,
+          "memBytes": 9072640,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.59,
-          "memBytes": 32120832,
+          "p50Ms": 0.63,
+          "memBytes": 38883328,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 7.37,
-        "total": 11.8,
-        "mem": 124.48
+        "emulation": 7.88,
+        "total": 10.5,
+        "mem": 110.38
       }
     },
     {
@@ -343,25 +343,25 @@
       "op": "unix_echo_small",
       "lanes": {
         "native": {
-          "p50Ms": 0.05,
-          "memBytes": 94208,
+          "p50Ms": 0.03,
+          "memBytes": 126976,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.21,
-          "memBytes": 9715712,
+          "p50Ms": 0.23,
+          "memBytes": 9076736,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 7.65,
-          "memBytes": 18636800,
+          "p50Ms": 5.26,
+          "memBytes": 25780224,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 36.43,
-        "total": 153,
-        "mem": 197.83
+        "emulation": 22.87,
+        "total": 175.33,
+        "mem": 203.03
       }
     },
     {
@@ -371,24 +371,24 @@
       "lanes": {
         "native": {
           "p50Ms": 0.04,
-          "memBytes": 1568768,
+          "memBytes": 1605632,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.33,
-          "memBytes": 15179776,
+          "p50Ms": 0.31,
+          "memBytes": 15859712,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 8.3,
-          "memBytes": 38248448,
+          "p50Ms": 4.03,
+          "memBytes": 38326272,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 25.15,
-        "total": 207.5,
-        "mem": 24.38
+        "emulation": 13,
+        "total": 100.75,
+        "mem": 23.87
       }
     },
     {
@@ -397,25 +397,25 @@
       "op": "http_loopback_get",
       "lanes": {
         "native": {
-          "p50Ms": 0.05,
-          "memBytes": 40960,
+          "p50Ms": 0.1,
+          "memBytes": 270336,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.44,
-          "memBytes": 21696512,
+          "p50Ms": 0.45,
+          "memBytes": 21512192,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.95,
-          "memBytes": 30793728,
+          "memBytes": 29892608,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.16,
-        "total": 19,
-        "mem": 751.8
+        "emulation": 2.11,
+        "total": 9.5,
+        "mem": 110.58
       }
     },
     {
@@ -424,16 +424,16 @@
       "op": "http_external_get",
       "lanes": {
         "node": {
-          "p50Ms": 0.29
+          "p50Ms": 0.3
         },
         "guest": {
-          "p50Ms": 0.54,
-          "memBytes": 26390528,
+          "p50Ms": 0.48,
+          "memBytes": 25944064,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.86
+        "emulation": 1.6
       }
     },
     {
@@ -443,17 +443,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.52,
-          "memBytes": 19460096,
+          "memBytes": 19324928,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 95.08,
-          "memBytes": 31277056,
+          "p50Ms": 56.99,
+          "memBytes": 33148928,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 182.85
+        "emulation": 109.6
       }
     },
     {
@@ -462,18 +462,18 @@
       "op": "fetch_loopback_get",
       "lanes": {
         "node": {
-          "p50Ms": 0.7,
-          "memBytes": 47624192,
+          "p50Ms": 0.75,
+          "memBytes": 47173632,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 1.69,
-          "memBytes": 56762368,
+          "p50Ms": 1.8,
+          "memBytes": 56193024,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.41
+        "emulation": 2.4
       }
     },
     {
@@ -482,16 +482,16 @@
       "op": "tls_loopback_get",
       "lanes": {
         "node": {
-          "p50Ms": 1.72
+          "p50Ms": 1.75
         },
         "guest": {
-          "p50Ms": 14.7,
-          "memBytes": 33648640,
+          "p50Ms": 15.75,
+          "memBytes": 34246656,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 8.55
+        "emulation": 9
       }
     },
     {
@@ -501,24 +501,24 @@
       "lanes": {
         "native": {
           "p50Ms": 0.05,
-          "memBytes": 270336,
+          "memBytes": 53248,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.16,
-          "memBytes": 5705728,
+          "p50Ms": 0.15,
+          "memBytes": 5275648,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.39,
-          "memBytes": 18374656,
+          "p50Ms": 0.46,
+          "memBytes": 25329664,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.44,
-        "total": 7.8,
-        "mem": 67.97
+        "emulation": 3.07,
+        "total": 9.2,
+        "mem": 475.69
       }
     },
     {
@@ -528,24 +528,24 @@
       "lanes": {
         "native": {
           "p50Ms": 0.04,
-          "memBytes": 94208,
+          "memBytes": 196608,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.22,
-          "memBytes": 9465856,
+          "memBytes": 8695808,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 2.8,
-          "memBytes": 25694208,
+          "p50Ms": 2.88,
+          "memBytes": 25497600,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 12.73,
-        "total": 70,
-        "mem": 272.74
+        "emulation": 13.09,
+        "total": 72,
+        "mem": 129.69
       }
     },
     {
@@ -554,23 +554,23 @@
       "op": "tcp_external_echo",
       "lanes": {
         "native": {
-          "p50Ms": 0.05,
-          "memBytes": 114688,
+          "p50Ms": 0.06,
+          "memBytes": 192512,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.17
+          "p50Ms": 0.19
         },
         "guest": {
-          "p50Ms": 0.28,
-          "memBytes": 24428544,
+          "p50Ms": 0.27,
+          "memBytes": 23973888,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.65,
-        "total": 5.6,
-        "mem": 213
+        "emulation": 1.42,
+        "total": 4.5,
+        "mem": 124.53
       }
     },
     {
@@ -579,25 +579,25 @@
       "op": "tcp_concurrent_4",
       "lanes": {
         "native": {
-          "p50Ms": 0.13,
-          "memBytes": 155648,
+          "p50Ms": 0.11,
+          "memBytes": 172032,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.34,
-          "memBytes": 9506816,
+          "p50Ms": 0.37,
+          "memBytes": 9703424,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 4.24,
-          "memBytes": 24625152,
+          "p50Ms": 6.25,
+          "memBytes": 31567872,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 12.47,
-        "total": 32.62,
-        "mem": 158.21
+        "emulation": 16.89,
+        "total": 56.82,
+        "mem": 183.5
       }
     },
     {
@@ -606,25 +606,25 @@
       "op": "tcp_echo_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.05,
-          "memBytes": 1552384,
+          "p50Ms": 0.07,
+          "memBytes": 1527808,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.33,
-          "memBytes": 16224256,
+          "p50Ms": 0.35,
+          "memBytes": 15949824,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 6.31,
-          "memBytes": 38633472,
+          "p50Ms": 5.57,
+          "memBytes": 38273024,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 19.12,
-        "total": 126.2,
-        "mem": 24.89
+        "emulation": 15.91,
+        "total": 79.57,
+        "mem": 25.05
       }
     },
     {
@@ -633,25 +633,25 @@
       "op": "tcp_tiny_writes_16",
       "lanes": {
         "native": {
-          "p50Ms": 0.16,
-          "memBytes": 184320,
+          "p50Ms": 0.11,
+          "memBytes": 196608,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.24,
-          "memBytes": 9400320,
+          "memBytes": 8863744,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 3.86,
-          "memBytes": 25968640,
+          "p50Ms": 3.03,
+          "memBytes": 17842176,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 16.08,
-        "total": 24.13,
-        "mem": 140.89
+        "emulation": 12.63,
+        "total": 27.55,
+        "mem": 90.75
       }
     },
     {
@@ -660,31 +660,31 @@
       "op": "open_close_churn",
       "lanes": {
         "native": {
-          "p50Ms": 0.03,
+          "p50Ms": 0.05,
           "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.01,
-          "memBytes": 2977792,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.08,
-          "memBytes": 11223040,
+          "p50Ms": 0.1,
+          "memBytes": 18755584,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 18,
-          "memBytes": 15118336,
+          "p50Ms": 8,
+          "memBytes": 15339520,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 8,
-        "total": 2.67,
-        "wasm": 600,
-        "mem": 2740
+        "emulation": 10,
+        "total": 2,
+        "wasm": 160,
+        "mem": 4579
       }
     },
     {
@@ -694,30 +694,30 @@
       "lanes": {
         "native": {
           "p50Ms": 0.03,
-          "memBytes": 4096,
+          "memBytes": 28672,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.01,
-          "memBytes": 2981888,
+          "memBytes": 2949120,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.08,
-          "memBytes": 9166848,
+          "memBytes": 9392128,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 12,
-          "memBytes": 12443648,
+          "p50Ms": 5,
+          "memBytes": 12369920,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
         "emulation": 8,
         "total": 2.67,
-        "wasm": 400,
-        "mem": 2238
+        "wasm": 166.67,
+        "mem": 327.57
       }
     },
     {
@@ -732,25 +732,25 @@
         },
         "node": {
           "p50Ms": 0.03,
-          "memBytes": 3059712,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.11,
-          "memBytes": 9113600,
+          "p50Ms": 0.06,
+          "memBytes": 9166848,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 10,
-          "memBytes": 16678912,
+          "p50Ms": 4,
+          "memBytes": 13168640,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 3.67,
-        "total": 3.67,
-        "wasm": 333.33,
-        "mem": 2225
+        "emulation": 2,
+        "total": 2,
+        "wasm": 133.33,
+        "mem": 2238
       }
     },
     {
@@ -759,31 +759,31 @@
       "op": "fs_write_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.81,
-          "memBytes": 1916928,
+          "p50Ms": 0.95,
+          "memBytes": 1921024,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.79,
-          "memBytes": 29118464,
+          "memBytes": 29093888,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 3.89,
-          "memBytes": 39170048,
+          "p50Ms": 5.07,
+          "memBytes": 38666240,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 15,
-          "memBytes": 56094720,
+          "p50Ms": 16,
+          "memBytes": 55279616,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 4.92,
-        "total": 4.8,
-        "wasm": 18.52,
-        "mem": 20.43
+        "emulation": 6.42,
+        "total": 5.34,
+        "wasm": 16.84,
+        "mem": 20.13
       }
     },
     {
@@ -798,25 +798,25 @@
         },
         "node": {
           "p50Ms": 0.02,
-          "memBytes": 2973696,
+          "memBytes": 2949120,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.07,
-          "memBytes": 9228288,
+          "p50Ms": 0.08,
+          "memBytes": 9105408,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 9,
-          "memBytes": 12525568,
+          "p50Ms": 7,
+          "memBytes": 13623296,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 3.5,
+        "emulation": 4,
         "total": null,
         "wasm": null,
-        "mem": 2253
+        "mem": 2223
       }
     },
     {
@@ -825,31 +825,31 @@
       "op": "fs_read_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.05,
-          "memBytes": 2019328,
+          "p50Ms": 0.08,
+          "memBytes": 2121728,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.43,
-          "memBytes": 29798400,
+          "p50Ms": 0.27,
+          "memBytes": 29679616,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 2.22,
-          "memBytes": 57884672,
+          "p50Ms": 2.29,
+          "memBytes": 51396608,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 11,
-          "memBytes": 50286592,
+          "p50Ms": 8,
+          "memBytes": 51761152,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 5.16,
-        "total": 44.4,
-        "wasm": 220,
-        "mem": 28.67
+        "emulation": 8.48,
+        "total": 28.63,
+        "wasm": 100,
+        "mem": 24.22
       }
     },
     {
@@ -859,30 +859,30 @@
       "lanes": {
         "native": {
           "p50Ms": 0.01,
-          "memBytes": 4096,
+          "memBytes": 20480,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.03,
-          "memBytes": 3039232,
+          "memBytes": 3018752,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.17,
-          "memBytes": 9576448,
+          "p50Ms": 0.15,
+          "memBytes": 9113600,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 4,
-          "memBytes": 12197888,
+          "p50Ms": 3,
+          "memBytes": 13553664,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 5.67,
-        "total": 17,
-        "wasm": 400,
-        "mem": 2338
+        "emulation": 5,
+        "total": 15,
+        "wasm": 300,
+        "mem": 445
       }
     },
     {
@@ -897,25 +897,25 @@
         },
         "node": {
           "p50Ms": 0.03,
-          "memBytes": 2969600,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.15,
-          "memBytes": 9232384,
+          "p50Ms": 0.32,
+          "memBytes": 9175040,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 14,
-          "memBytes": 13856768,
+          "p50Ms": 10,
+          "memBytes": 12939264,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 5,
-        "total": 7.5,
-        "wasm": 700,
-        "mem": 2254
+        "emulation": 10.67,
+        "total": 16,
+        "wasm": 500,
+        "mem": 2240
       }
     },
     {
@@ -924,31 +924,31 @@
       "op": "readdir_small",
       "lanes": {
         "native": {
-          "p50Ms": 0.24,
+          "p50Ms": 0.16,
           "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.02,
-          "memBytes": 2977792,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.29,
-          "memBytes": 9449472,
+          "p50Ms": 0.23,
+          "memBytes": 11751424,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 45,
-          "memBytes": 20262912,
+          "p50Ms": 6,
+          "memBytes": 18210816,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 14.5,
-        "total": 1.21,
-        "wasm": 187.5,
-        "mem": 2307
+        "emulation": 11.5,
+        "total": 1.44,
+        "wasm": 37.5,
+        "mem": 2869
       }
     },
     {
@@ -957,31 +957,31 @@
       "op": "readdir_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.61,
-          "memBytes": 20480,
+          "p50Ms": 0.27,
+          "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.3,
-          "memBytes": 6156288,
+          "memBytes": 5427200,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 6.03,
-          "memBytes": 11788288,
+          "p50Ms": 6,
+          "memBytes": 11395072,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 1185,
-          "memBytes": 31932416,
+          "p50Ms": 14,
+          "memBytes": 22536192,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 20.1,
-        "total": 9.89,
-        "wasm": 1942.62,
-        "mem": 575.6
+        "emulation": 20,
+        "total": 22.22,
+        "wasm": 51.85,
+        "mem": 2782
       }
     },
     {
@@ -990,31 +990,31 @@
       "op": "fsync_small",
       "lanes": {
         "native": {
-          "p50Ms": 0.61,
-          "memBytes": 12288,
+          "p50Ms": 1.54,
+          "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.58,
-          "memBytes": 2969600,
+          "p50Ms": 0.63,
+          "memBytes": 3555328,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.12,
-          "memBytes": 9560064,
+          "p50Ms": 0.07,
+          "memBytes": 9437184,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 10,
-          "memBytes": 11886592,
+          "p50Ms": 4,
+          "memBytes": 12349440,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.21,
-        "total": 0.2,
-        "wasm": 16.39,
-        "mem": 778
+        "emulation": 0.11,
+        "total": 0.05,
+        "wasm": 2.6,
+        "mem": 2304
       }
     },
     {
@@ -1024,30 +1024,30 @@
       "lanes": {
         "native": {
           "p50Ms": 0.01,
-          "memBytes": 20480,
+          "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.23,
-          "memBytes": 6987776,
+          "memBytes": 7032832,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 2.04,
-          "memBytes": 11309056,
+          "p50Ms": 1.51,
+          "memBytes": 11542528,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 38,
-          "memBytes": 15724544,
+          "p50Ms": 0,
+          "memBytes": 17268736,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 8.87,
-        "total": 204,
-        "wasm": 3800,
-        "mem": 552.2
+        "emulation": 6.57,
+        "total": 151,
+        "wasm": 0,
+        "mem": 2818
       }
     },
     {
@@ -1061,26 +1061,26 @@
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.25,
-          "memBytes": 8175616,
+          "p50Ms": 0.23,
+          "memBytes": 8044544,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.6,
-          "memBytes": 14032896,
+          "p50Ms": 1,
+          "memBytes": 25378816,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 41,
-          "memBytes": 16289792,
+          "p50Ms": 23,
+          "memBytes": 19582976,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.4,
-        "total": 20,
-        "wasm": 1366.67,
-        "mem": 3426
+        "emulation": 4.35,
+        "total": 33.33,
+        "wasm": 766.67,
+        "mem": 6196
       }
     },
     {
@@ -1089,31 +1089,31 @@
       "op": "stream_copy_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.41,
+          "p50Ms": 0.4,
           "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.9,
-          "memBytes": 15855616,
+          "p50Ms": 1.02,
+          "memBytes": 15896576,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 5.33,
-          "memBytes": 53104640,
+          "p50Ms": 16.08,
+          "memBytes": 58056704,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
-          "p50Ms": 356,
-          "memBytes": 59502592,
+          "p50Ms": 261,
+          "memBytes": 59047936,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 5.92,
-        "total": 13,
-        "wasm": 868.29,
-        "mem": 12965
+        "emulation": 15.76,
+        "total": 40.2,
+        "wasm": 652.5,
+        "mem": 14174
       }
     },
     {
@@ -1122,18 +1122,18 @@
       "op": "require_100_small",
       "lanes": {
         "node": {
-          "p50Ms": 2.36,
-          "memBytes": 18501632,
+          "p50Ms": 2.25,
+          "memBytes": 19079168,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 13.21,
-          "memBytes": 27828224,
+          "p50Ms": 12.21,
+          "memBytes": 27848704,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 5.6
+        "emulation": 5.43
       }
     },
     {
@@ -1142,18 +1142,18 @@
       "op": "import_100_small_esm",
       "lanes": {
         "node": {
-          "p50Ms": 5.57,
-          "memBytes": 27082752,
+          "p50Ms": 5.59,
+          "memBytes": 26521600,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 13.99,
-          "memBytes": 34856960,
+          "p50Ms": 14.81,
+          "memBytes": 35450880,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.51
+        "emulation": 2.65
       }
     },
     {
@@ -1162,16 +1162,16 @@
       "op": "import_npm_package",
       "lanes": {
         "node": {
-          "p50Ms": 38.52
+          "p50Ms": 41.85
         },
         "guest": {
-          "p50Ms": 60.63,
-          "memBytes": 39391232,
+          "p50Ms": 55,
+          "memBytes": 38526976,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.57
+        "emulation": 1.31
       }
     },
     {
@@ -1181,12 +1181,12 @@
       "lanes": {
         "node": {
           "p50Ms": 0.2,
-          "memBytes": 5107712,
+          "memBytes": 5087232,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.19,
-          "memBytes": 20955136,
+          "memBytes": 20774912,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
@@ -1205,20 +1205,20 @@
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.05,
-          "memBytes": 2793472,
+          "p50Ms": 0.07,
+          "memBytes": 2768896,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.03,
-          "memBytes": 22540288,
+          "memBytes": 22089728,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.6,
+        "emulation": 0.43,
         "total": 1.5,
-        "mem": 5503
+        "mem": 5393
       }
     },
     {
@@ -1227,25 +1227,25 @@
       "op": "resolve_cached_localhost",
       "lanes": {
         "native": {
-          "p50Ms": 0.06,
+          "p50Ms": 0.17,
           "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.08,
-          "memBytes": 2789376,
+          "p50Ms": 0.09,
+          "memBytes": 2764800,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.08,
-          "memBytes": 15073280,
+          "p50Ms": 0.06,
+          "memBytes": 22024192,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1,
-        "total": 1.33,
-        "mem": 3680
+        "emulation": 0.67,
+        "total": 0.35,
+        "mem": 5377
       }
     },
     {
@@ -1254,25 +1254,25 @@
       "op": "resolve_concurrent_4",
       "lanes": {
         "native": {
-          "p50Ms": 0.44,
+          "p50Ms": 0.36,
           "memBytes": 397312,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.12,
-          "memBytes": 3321856,
+          "p50Ms": 0.13,
+          "memBytes": 3190784,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.09,
-          "memBytes": 22937600,
+          "p50Ms": 0.07,
+          "memBytes": 14942208,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.75,
-        "total": 0.2,
-        "mem": 57.73
+        "emulation": 0.54,
+        "total": 0.19,
+        "mem": 37.61
       }
     },
     {
@@ -1281,16 +1281,16 @@
       "op": "ls_100",
       "lanes": {
         "hostCmd": {
-          "p50Ms": 6.61
+          "p50Ms": 6.66
         },
         "vmCmd": {
-          "p50Ms": 369.43,
-          "memBytes": 99741696,
+          "p50Ms": 491.5,
+          "memBytes": 54095872,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "command": 55.89
+        "command": 73.8
       }
     },
     {
@@ -1299,16 +1299,16 @@
       "op": "grep_1m",
       "lanes": {
         "hostCmd": {
-          "p50Ms": 4.84
+          "p50Ms": 7.87
         },
         "vmCmd": {
-          "p50Ms": 126.37,
-          "memBytes": 104460288,
+          "p50Ms": 124.6,
+          "memBytes": 139874304,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "command": 26.11
+        "command": 15.83
       }
     },
     {
@@ -1317,16 +1317,16 @@
       "op": "git_init_commit",
       "lanes": {
         "hostCmd": {
-          "p50Ms": 14.85
+          "p50Ms": 11.34
         },
         "vmCmd": {
-          "p50Ms": 2143.67,
-          "memBytes": 127102976,
+          "p50Ms": 1451.04,
+          "memBytes": 109875200,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "command": 144.35
+        "command": 127.96
       }
     },
     {
@@ -1335,16 +1335,16 @@
       "op": "sh_pipeline",
       "lanes": {
         "hostCmd": {
-          "p50Ms": 5.83
+          "p50Ms": 12.08
         },
         "vmCmd": {
-          "p50Ms": 814.01,
-          "memBytes": 225320960,
+          "p50Ms": 1135.71,
+          "memBytes": 233422848,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "command": 139.62
+        "command": 94.02
       }
     },
     {
@@ -1354,17 +1354,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.03,
-          "memBytes": 2977792,
+          "memBytes": 2957312,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.06,
-          "memBytes": 23416832,
+          "p50Ms": 0.05,
+          "memBytes": 21291008,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2
+        "emulation": 1.67
       }
     },
     {
@@ -1374,17 +1374,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.03,
-          "memBytes": 2977792,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.06,
-          "memBytes": 14123008,
+          "p50Ms": 0.05,
+          "memBytes": 21225472,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2
+        "emulation": 1.67
       }
     },
     {
@@ -1394,12 +1394,12 @@
       "lanes": {
         "node": {
           "p50Ms": 0.01,
-          "memBytes": 2981888,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.07,
-          "memBytes": 14135296,
+          "memBytes": 13602816,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
@@ -1414,17 +1414,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.01,
-          "memBytes": 2977792,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.08,
-          "memBytes": 14131200,
+          "p50Ms": 0.07,
+          "memBytes": 21327872,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 8
+        "emulation": 7
       }
     },
     {
@@ -1434,17 +1434,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.02,
-          "memBytes": 3006464,
+          "memBytes": 2953216,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.5,
-          "memBytes": 21626880,
+          "p50Ms": 0.24,
+          "memBytes": 21819392,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 25
+        "emulation": 12
       }
     },
     {
@@ -1454,17 +1454,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.02,
-          "memBytes": 3043328,
+          "memBytes": 2981888,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.24,
-          "memBytes": 21557248,
+          "p50Ms": 0.23,
+          "memBytes": 14372864,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 12
+        "emulation": 11.5
       }
     },
     {
@@ -1473,18 +1473,18 @@
       "op": "tcp_echo_small_allow",
       "lanes": {
         "node": {
-          "p50Ms": 0.24,
-          "memBytes": 7413760,
+          "p50Ms": 0.27,
+          "memBytes": 9314304,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 3.3,
-          "memBytes": 25948160,
+          "p50Ms": 2.84,
+          "memBytes": 25624576,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 13.75
+        "emulation": 10.52
       }
     },
     {
@@ -1494,17 +1494,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.22,
-          "memBytes": 9244672,
+          "memBytes": 9994240,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 2.92,
-          "memBytes": 25948160,
+          "p50Ms": 3.4,
+          "memBytes": 25677824,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 13.27
+        "emulation": 15.45
       }
     },
     {
@@ -1513,18 +1513,18 @@
       "op": "http_loopback_get_allow",
       "lanes": {
         "node": {
-          "p50Ms": 0.43,
-          "memBytes": 21286912,
+          "p50Ms": 0.45,
+          "memBytes": 21688320,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 1.02,
-          "memBytes": 29388800,
+          "p50Ms": 0.99,
+          "memBytes": 28659712,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.37
+        "emulation": 2.2
       }
     },
     {
@@ -1534,17 +1534,17 @@
       "lanes": {
         "node": {
           "p50Ms": 0.45,
-          "memBytes": 21811200,
+          "memBytes": 21499904,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 1.09,
-          "memBytes": 24297472,
+          "p50Ms": 1.03,
+          "memBytes": 29024256,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.42
+        "emulation": 2.29
       }
     },
     {
@@ -1553,25 +1553,25 @@
       "op": "pass_through_small",
       "lanes": {
         "native": {
-          "p50Ms": 0.73,
-          "memBytes": 1175552,
+          "p50Ms": 2.1,
+          "memBytes": 1273856,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.04,
-          "memBytes": 3690496,
+          "p50Ms": 0.03,
+          "memBytes": 1933312,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
           "p50Ms": 0.01,
-          "memBytes": 21590016,
+          "memBytes": 21135360,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.25,
-        "total": 0.01,
-        "mem": 18.37
+        "emulation": 0.33,
+        "total": 0,
+        "mem": 16.59
       }
     },
     {
@@ -1580,25 +1580,25 @@
       "op": "pass_through_big",
       "lanes": {
         "native": {
-          "p50Ms": 0.04,
-          "memBytes": 249856,
+          "p50Ms": 0.06,
+          "memBytes": 233472,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.07,
-          "memBytes": 4931584,
+          "p50Ms": 0.08,
+          "memBytes": 5550080,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.2,
-          "memBytes": 34267136,
+          "p50Ms": 0.16,
+          "memBytes": 27922432,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.86,
-        "total": 5,
-        "mem": 137.15
+        "emulation": 2,
+        "total": 2.67,
+        "mem": 119.6
       }
     },
     {
@@ -1607,25 +1607,25 @@
       "op": "backpressure_chunks",
       "lanes": {
         "native": {
-          "p50Ms": 0.03,
-          "memBytes": 176128,
+          "p50Ms": 0.09,
+          "memBytes": 184320,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.07,
-          "memBytes": 6832128,
+          "memBytes": 7282688,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 0.06,
-          "memBytes": 27287552,
+          "p50Ms": 0.07,
+          "memBytes": 26255360,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.86,
-        "total": 2,
-        "mem": 154.93
+        "emulation": 1,
+        "total": 0.78,
+        "mem": 142.44
       }
     },
     {
@@ -1639,26 +1639,26 @@
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 106.97,
-          "memBytes": 7524352,
+          "p50Ms": 107.18,
+          "memBytes": 5726208,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 118.13,
-          "memBytes": 14176256,
+          "p50Ms": 118.93,
+          "memBytes": 20996096,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
           "p50Ms": 0,
-          "memBytes": 22585344,
+          "memBytes": 11743232,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 1.1,
+        "emulation": 1.11,
         "total": null,
         "wasm": null,
-        "mem": 3461
+        "mem": 5126
       }
     },
     {
@@ -1667,31 +1667,31 @@
       "op": "settimeout_1ms_x50",
       "lanes": {
         "native": {
-          "p50Ms": 52.92,
-          "memBytes": 4096,
+          "p50Ms": 52.99,
+          "memBytes": 1081344,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 53.54,
-          "memBytes": 6627328,
+          "p50Ms": 53.5,
+          "memBytes": 5664768,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 59.63,
-          "memBytes": 13451264,
+          "p50Ms": 59.3,
+          "memBytes": 11063296,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
           "p50Ms": 54,
-          "memBytes": 14839808,
+          "memBytes": 14860288,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
         "emulation": 1.11,
-        "total": 1.13,
+        "total": 1.12,
         "wasm": 1.02,
-        "mem": 3284
+        "mem": 10.23
       }
     },
     {
@@ -1701,30 +1701,30 @@
       "lanes": {
         "native": {
           "p50Ms": 0.13,
-          "memBytes": 4096,
+          "memBytes": 32768,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.74,
-          "memBytes": 12345344,
+          "p50Ms": 0.72,
+          "memBytes": 13496320,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 1.84,
-          "memBytes": 14696448,
+          "p50Ms": 1.86,
+          "memBytes": 18632704,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
           "p50Ms": 0,
-          "memBytes": 11829248,
+          "memBytes": 12046336,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 2.49,
-        "total": 14.15,
+        "emulation": 2.58,
+        "total": 14.31,
         "wasm": 0,
-        "mem": 3588
+        "mem": 568.63
       }
     },
     {
@@ -1738,26 +1738,26 @@
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 7.92,
-          "memBytes": 7356416,
+          "p50Ms": 7.76,
+          "memBytes": 7241728,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 7.79,
-          "memBytes": 10309632,
+          "p50Ms": 7.85,
+          "memBytes": 12025856,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
           "p50Ms": 3,
-          "memBytes": 18313216,
+          "memBytes": 20934656,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.98,
-        "total": 6.09,
+        "emulation": 1.01,
+        "total": 6.13,
         "wasm": 2.34,
-        "mem": 2517
+        "mem": 2936
       }
     },
     {
@@ -1766,31 +1766,31 @@
       "op": "alloc_free",
       "lanes": {
         "native": {
-          "p50Ms": 2.14,
-          "memBytes": 5214208,
+          "p50Ms": 2.15,
+          "memBytes": 5140480,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 4.4,
-          "memBytes": 70893568,
+          "p50Ms": 4.38,
+          "memBytes": 70877184,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 3.52,
-          "memBytes": 56737792,
+          "p50Ms": 4.23,
+          "memBytes": 41381888,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         },
         "wasm": {
           "p50Ms": 5,
-          "memBytes": 14745600,
+          "memBytes": 15732736,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 0.8,
-        "total": 1.64,
-        "wasm": 2.34,
-        "mem": 10.88
+        "emulation": 0.97,
+        "total": 1.97,
+        "wasm": 2.33,
+        "mem": 8.05
       }
     },
     {
@@ -1799,25 +1799,25 @@
       "op": "stdio_writeSync_8x64k",
       "lanes": {
         "native": {
-          "p50Ms": 0,
+          "p50Ms": 0.01,
           "memBytes": 4096,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
           "p50Ms": 0.14,
-          "memBytes": 4784128,
+          "memBytes": 4759552,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 1.05,
-          "memBytes": 29716480,
+          "p50Ms": 1.74,
+          "memBytes": 25673728,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 7.5,
-        "total": null,
-        "mem": 7255
+        "emulation": 12.43,
+        "total": 174,
+        "mem": 6268
       }
     },
     {
@@ -1826,25 +1826,25 @@
       "op": "unix_accept_latency",
       "lanes": {
         "native": {
-          "p50Ms": 0.08,
-          "memBytes": 163840,
+          "p50Ms": 0.04,
+          "memBytes": 225280,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus native-baseline cpu_loop --iters 1 startup baseline, floored to one page"
         },
         "node": {
-          "p50Ms": 0.14,
-          "memBytes": 7442432,
+          "p50Ms": 0.13,
+          "memBytes": 6787072,
           "memProvenance": "direct child spawn with /proc/<pid>/status VmHWM sampling minus node -e \"\" startup baseline, floored to one page"
         },
         "guest": {
-          "p50Ms": 2.84,
-          "memBytes": 25616384,
+          "p50Ms": 0.52,
+          "memBytes": 25284608,
           "memProvenance": "/proc/<sidecarPid>/clear_refs=5, baseline VmRSS, post-op VmHWM, max(VmHWM - baseline, 0)"
         }
       },
       "tax": {
-        "emulation": 20.29,
-        "total": 35.5,
-        "mem": 156.35
+        "emulation": 4,
+        "total": 13,
+        "mem": 112.24
       }
     }
   ]

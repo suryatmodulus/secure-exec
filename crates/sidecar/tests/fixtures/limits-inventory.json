@@ -116,12 +116,6 @@
 		"wired": "VmLimits.js_runtime.v8_ipc_max_frame_bytes"
 	},
 	{
-		"name": "DEFAULT_WASM_EXECUTION_TIMEOUT_MS",
-		"path": "crates/execution/src/wasm.rs",
-		"class": "policy-deferred",
-		"rationale": "WASM wall-clock backstop applied when no fuel budget is set; safety default to stop infinite-loop core-pinning, fold into a wasm execution-timeout field later."
-	},
-	{
 		"name": "DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB",
 		"path": "crates/execution/src/wasm.rs",
 		"class": "policy-deferred",

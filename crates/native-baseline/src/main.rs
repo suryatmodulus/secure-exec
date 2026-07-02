@@ -420,9 +420,16 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             if !path.exists() {
                 std::fs::write(&path, b"hi").expect("write stat fixture");
             }
-            for _ in 0..32 {
-                let meta = std::fs::metadata(&path).expect("stat fixture");
-                assert!(meta.len() >= 2);
+            // Every lane must measure the SAME work (32 stats): under wasm the
+            // post-quota-fix batch runs faster than the guest clock granularity,
+            // so samples may read 0-1ms quantized — that is the truthful value;
+            // never batch one lane harder than the others.
+            let batches = config.chunk_count.unwrap_or(1);
+            for _ in 0..batches {
+                for _ in 0..32 {
+                    let meta = std::fs::metadata(&path).expect("stat fixture");
+                    assert!(meta.len() >= 2);
+                }
             }
         }
         Op::FsWrite => {
@@ -501,14 +508,18 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             let entry_count = config.entry_count.unwrap_or(32);
             let dir = base_dir.join("secure-exec-native-readdir");
             std::fs::create_dir_all(&dir).expect("create readdir dir");
-            for i in 0..entry_count {
-                let path = dir.join(format!("{i}.txt"));
-                if !path.exists() {
-                    std::fs::write(&path, b"hi").expect("write readdir fixture");
+            let marker = dir.join(format!(".fixture-ready-{entry_count}"));
+            if !marker.exists() {
+                for i in 0..entry_count {
+                    let path = dir.join(format!("{i}.txt"));
+                    if !path.exists() {
+                        std::fs::write(&path, b"hi").expect("write readdir fixture");
+                    }
                 }
+                std::fs::write(&marker, b"ready").expect("write readdir fixture marker");
             }
             let count = std::fs::read_dir(dir).expect("read dir").count();
-            assert!(count >= entry_count);
+            assert!(count > entry_count);
         }
         Op::FsFsync => {
             let path = base_dir.join("secure-exec-native-fsync.txt");

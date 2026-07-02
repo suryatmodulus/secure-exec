@@ -104,6 +104,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         [1, { kind: "stdout", fdFlags: 0 }],
         [2, { kind: "stderr", fdFlags: 0 }],
       ]);
+      this.statCache = new Map();
       this.syscallCountersEnabled = __agentOSWasiSyscallCountersEnabled();
       for (const [guestPath, spec] of Object.entries(this.preopens)) {
         const normalized = this._normalizePreopenSpec(spec);
@@ -177,6 +178,19 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       }
     }
 
+    _measureWasiPhase(name, fn) {
+      if (!this.syscallCountersEnabled || !this._activeWasiMetric) {
+        return fn();
+      }
+      const startedAt = __agentOSWasiNow();
+      try {
+        return fn();
+      } finally {
+        const phases = (this._activeWasiMetric.phases ??= {});
+        phases[name] = (phases[name] ?? 0) + (__agentOSWasiNow() - startedAt);
+      }
+    }
+
     _installSyscallCounterWrappers() {
       if (!this.syscallCountersEnabled) {
         return;
@@ -193,11 +207,20 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         }
         this.wasiImport[name] = (...args) => {
           const startedAt = __agentOSWasiNow();
-          const result = original(...args);
+          const previousMetric = this._activeWasiMetric;
+          const activeMetric = { name, phases: {} };
+          this._activeWasiMetric = activeMetric;
+          let result;
+          try {
+            result = original(...args);
+          } finally {
+            this._activeWasiMetric = previousMetric;
+          }
           const details = {
             result,
             fd: Number(args[0]) >>> 0,
             iovsLen: name === "fd_write" ? Number(args[2]) >>> 0 : undefined,
+            phases: activeMetric.phases,
           };
           if (name === "path_filestat_get") {
             try {
@@ -667,6 +690,17 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       return __agentOSWasiFiletypeUnknown;
     }
 
+    _clearStatCache() {
+      this.statCache?.clear?.();
+    }
+
+    _statCacheKey(resolved, follow) {
+      const path = typeof resolved?.guestPath === "string"
+        ? resolved.guestPath
+        : this._resolvedFsPath(resolved);
+      return typeof path === "string" ? `${follow ? "stat" : "lstat"}:${path}` : null;
+    }
+
     _fdFiletype(entry) {
       if (!entry) {
         return __agentOSWasiFiletypeUnknown;
@@ -862,12 +896,14 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
     }
 
     _hostPathExists(hostPath) {
-      try {
-        __agentOSFs().statSync(hostPath);
-        return true;
-      } catch {
-        return false;
-      }
+      return this._measureWasiPhase("hostPathExists", () => {
+        try {
+          __agentOSFs().statSync(hostPath);
+          return true;
+        } catch {
+          return false;
+        }
+      });
     }
 
     _createParentExists(guestPath, hostPath) {
@@ -878,12 +914,14 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       if (typeof target !== "string") {
         return false;
       }
-      try {
-        __agentOSFs().statSync(__agentOSPath().dirname(target));
-        return true;
-      } catch {
-        return false;
-      }
+      return this._measureWasiPhase("createParentExists", () => {
+        try {
+          __agentOSFs().statSync(__agentOSPath().dirname(target));
+          return true;
+        } catch {
+          return false;
+        }
+      });
     }
 
     _currentGuestCwd() {
@@ -897,47 +935,49 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
     }
 
     _resolveHostMappingForGuestPath(guestPath) {
-      const normalized = __agentOSPath().posix.normalize(guestPath);
-      const mappings = [];
-      for (const entry of this.fdTable.values()) {
-        if (entry?.kind !== "preopen" || typeof entry.hostPath !== "string") {
-          continue;
+      return this._measureWasiPhase("resolveHostMapping", () => {
+        const normalized = __agentOSPath().posix.normalize(guestPath);
+        const mappings = [];
+        for (const entry of this.fdTable.values()) {
+          if (entry?.kind !== "preopen" || typeof entry.hostPath !== "string") {
+            continue;
+          }
+          const guestRoot = this._descriptorGuestPath(entry);
+          if (typeof guestRoot !== "string") {
+            continue;
+          }
+          mappings.push({
+            guestRoot,
+            hostPath: entry.hostPath,
+            readOnly: entry.readOnly === true,
+          });
         }
-        const guestRoot = this._descriptorGuestPath(entry);
-        if (typeof guestRoot !== "string") {
-          continue;
-        }
-        mappings.push({
-          guestRoot,
-          hostPath: entry.hostPath,
-          readOnly: entry.readOnly === true,
-        });
-      }
-      mappings.sort((left, right) => right.guestRoot.length - left.guestRoot.length);
+        mappings.sort((left, right) => right.guestRoot.length - left.guestRoot.length);
 
-      for (const mapping of mappings) {
-        const matchesRoot = mapping.guestRoot === "/" && normalized.startsWith("/");
-        const matchesNested =
-          normalized === mapping.guestRoot ||
-          normalized.startsWith(`${mapping.guestRoot}/`);
-        if (!matchesRoot && !matchesNested) {
-          continue;
+        for (const mapping of mappings) {
+          const matchesRoot = mapping.guestRoot === "/" && normalized.startsWith("/");
+          const matchesNested =
+            normalized === mapping.guestRoot ||
+            normalized.startsWith(`${mapping.guestRoot}/`);
+          if (!matchesRoot && !matchesNested) {
+            continue;
+          }
+          const suffix =
+            normalized === mapping.guestRoot
+              ? ""
+              : mapping.guestRoot === "/"
+                ? normalized.slice(1)
+                : normalized.slice(mapping.guestRoot.length + 1);
+          return {
+            hostPath: suffix
+              ? __agentOSPath().join(mapping.hostPath, ...suffix.split("/"))
+              : mapping.hostPath,
+            readOnly: mapping.readOnly,
+          };
         }
-        const suffix =
-          normalized === mapping.guestRoot
-            ? ""
-            : mapping.guestRoot === "/"
-              ? normalized.slice(1)
-              : normalized.slice(mapping.guestRoot.length + 1);
-        return {
-          hostPath: suffix
-            ? __agentOSPath().join(mapping.hostPath, ...suffix.split("/"))
-            : mapping.hostPath,
-          readOnly: mapping.readOnly,
-        };
-      }
 
-      return null;
+        return null;
+      });
     }
 
     _resolveHostPathForGuestPath(guestPath) {
@@ -1061,36 +1101,39 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
     }
 
     _resolveDescriptorPath(fd, pathPtr, pathLen, options = {}) {
-      const entry = this._descriptorEntry(fd);
+      const entry = this._measureWasiPhase("descriptorEntry", () => this._descriptorEntry(fd));
       if (!entry) {
         return { error: __agentOSWasiErrnoBadf };
       }
-      const target = this._readString(pathPtr, pathLen);
-      const base = this._descriptorPathBase(entry, target);
+      const target = this._measureWasiPhase("readString", () => this._readString(pathPtr, pathLen));
+      const base = this._measureWasiPhase("descriptorPathBase", () => this._descriptorPathBase(entry, target));
       if (!base || typeof base.guestPath !== "string") {
         return { error: __agentOSWasiErrnoBadf };
       }
-      const guestPath = target.startsWith("/")
-        ? __agentOSPath().posix.normalize(target)
-        : __agentOSPath().posix.resolve(base.guestPath, target);
-      const mapped =
+      const guestPath = this._measureWasiPhase("guestPathResolve", () =>
+        target.startsWith("/")
+          ? __agentOSPath().posix.normalize(target)
+          : __agentOSPath().posix.resolve(base.guestPath, target)
+      );
+      const mapped = this._measureWasiPhase("descriptorPathMap", () =>
         target.startsWith("/")
           ? this._resolveAbsolutePath(
               target,
               options.preferCreateParent === true,
             )
-        : base.guestPath === "/"
-          ? this._resolveRootRelativePath(
-              target,
-              options.preferCreateParent === true,
-            )
-          : {
-              guestPath,
-              ...(
-                this._resolveHostMappingForGuestPath(guestPath) ??
-                { hostPath: null, readOnly: false }
-              ),
-            };
+          : base.guestPath === "/"
+            ? this._resolveRootRelativePath(
+                target,
+                options.preferCreateParent === true,
+              )
+            : {
+                guestPath,
+                ...(
+                  this._resolveHostMappingForGuestPath(guestPath) ??
+                  { hostPath: null, readOnly: false }
+                ),
+              }
+      );
       const hostPath = mapped.hostPath;
       if (typeof hostPath !== "string") {
         return { error: __agentOSWasiErrnoNoent };
@@ -1213,9 +1256,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
 
     _fdWrite(fd, iovs, iovsLen, nwrittenPtr) {
       try {
-        const bytes = this._collectIovs(iovs, iovsLen);
+        const bytes = this._measureWasiPhase("collectIovs", () => this._collectIovs(iovs, iovsLen));
         const descriptor = Number(fd) >>> 0;
-        const handle = this._externalFdHandle(descriptor);
+        const handle = this._measureWasiPhase("externalFdHandle", () => this._externalFdHandle(descriptor));
         if (handle?.kind === "pipe-write" && handle.pipe) {
           if (bytes.length > 0 && !this._pipeHasReaders(handle.pipe)) {
             return __agentOSWasiErrnoPipe;
@@ -1238,36 +1281,44 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
             const useKernelStdioSyncRpc =
               sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
             if (useKernelStdioSyncRpc) {
-              const written = Number(
-                __agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [descriptor, bytes]),
-              ) >>> 0;
-              return this._writeUint32(nwrittenPtr, written);
+              const written = this._measureWasiPhase("kernelStdioWrite", () =>
+                Number(
+                  __agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [descriptor, bytes]),
+                ) >>> 0
+              );
+              return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
             }
           }
-          const written = __agentOSFs().writeSync(
-            handle.targetFd,
-            bytes,
-            0,
-            bytes.length,
-            null,
+          const written = this._measureWasiPhase("writeSync", () =>
+            __agentOSFs().writeSync(
+              handle.targetFd,
+              bytes,
+              0,
+              bytes.length,
+              null,
+            )
           );
-          return this._writeUint32(nwrittenPtr, written);
+          return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
         }
         if (handle?.kind === "guest-file" && typeof handle.targetFd === "number") {
           const position = handle.append ? null : (handle.position ?? 0);
-          const written = __agentOSFs().writeSync(
-            handle.targetFd,
-            bytes,
-            0,
-            bytes.length,
-            position,
+          const written = this._measureWasiPhase("writeSync", () =>
+            __agentOSFs().writeSync(
+              handle.targetFd,
+              bytes,
+              0,
+              bytes.length,
+              position,
+            )
           );
           if (handle.append) {
-            handle.position = Number(__agentOSFs().fstatSync(handle.targetFd).size ?? 0);
+            handle.position = this._measureWasiPhase("appendFstat", () =>
+              Number(__agentOSFs().fstatSync(handle.targetFd).size ?? 0)
+            );
           } else {
             handle.position = (handle.position ?? 0) + written;
           }
-          return this._writeUint32(nwrittenPtr, written);
+          return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
         }
         if (handle?.kind === "stdio" && typeof handle.targetFd === "number") {
           const targetFd = Number(handle.targetFd) >>> 0;
@@ -1278,9 +1329,13 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
             const useKernelStdioSyncRpc =
               sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
             const written = useKernelStdioSyncRpc
-              ? Number(__agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [targetFd, bytes])) >>> 0
-              : (targetFd === 2 ? process.stderr.write(bytes) : process.stdout.write(bytes), bytes.length);
-            return this._writeUint32(nwrittenPtr, written);
+              ? this._measureWasiPhase("kernelStdioWrite", () =>
+                  Number(__agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [targetFd, bytes])) >>> 0
+                )
+              : this._measureWasiPhase("processStreamWrite", () =>
+                  (targetFd === 2 ? process.stderr.write(bytes) : process.stdout.write(bytes), bytes.length)
+                );
+            return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
           }
           return __agentOSWasiErrnoBadf;
         }
@@ -1295,9 +1350,13 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
           const useKernelStdioSyncRpc =
             sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
           const written = useKernelStdioSyncRpc
-            ? Number(__agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [1, bytes])) >>> 0
-            : (process.stdout.write(bytes), bytes.length);
-          return this._writeUint32(nwrittenPtr, written);
+            ? this._measureWasiPhase("kernelStdioWrite", () =>
+                Number(__agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [1, bytes])) >>> 0
+              )
+            : this._measureWasiPhase("processStreamWrite", () =>
+                (process.stdout.write(bytes), bytes.length)
+              );
+          return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
         }
         if (entry.kind === "stderr") {
           const sidecarManagedProcess =
@@ -1306,26 +1365,33 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
           const useKernelStdioSyncRpc =
             sidecarManagedProcess || __agentOSKernelStdioSyncRpcEnabled();
           const written = useKernelStdioSyncRpc
-            ? Number(__agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [2, bytes])) >>> 0
-            : (process.stderr.write(bytes), bytes.length);
-          return this._writeUint32(nwrittenPtr, written);
+            ? this._measureWasiPhase("kernelStdioWrite", () =>
+                Number(__agentOSWasiSyncRpc().callSync("__kernel_stdio_write", [2, bytes])) >>> 0
+              )
+            : this._measureWasiPhase("processStreamWrite", () =>
+                (process.stderr.write(bytes), bytes.length)
+              );
+          return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
         }
         if (entry.readOnly === true) {
           return __agentOSWasiErrnoRofs;
         }
         if (entry.kind === "file") {
+          this._clearStatCache();
           const position = typeof entry.offset === "number" ? entry.offset : null;
-          const written = __agentOSFs().writeSync(
-            entry.realFd,
-            bytes,
-            0,
-            bytes.length,
-            position,
+          const written = this._measureWasiPhase("writeSync", () =>
+            __agentOSFs().writeSync(
+              entry.realFd,
+              bytes,
+              0,
+              bytes.length,
+              position,
+            )
           );
           if (typeof entry.offset === "number") {
             entry.offset += written;
           }
-          return this._writeUint32(nwrittenPtr, written);
+          return this._measureWasiPhase("writeResultPtr", () => this._writeUint32(nwrittenPtr, written));
         }
         return __agentOSWasiErrnoBadf;
       } catch (error) {
@@ -1853,8 +1919,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
             : null;
         if (!dirents) {
           dirents = __agentOSFs()
-            .readdirSync(fsPath, { withFileTypes: true })
-            .sort((left, right) => left.name.localeCompare(right.name));
+            .readdirSync(fsPath)
+            .map((entry) => String(entry))
+            .sort((left, right) => left.localeCompare(right));
           entry.readdirCache = dirents;
         }
         const view = this._memoryView();
@@ -1866,7 +1933,8 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         let stoppedRecordTooLarge = false;
         for (let index = requestedCookie; index < dirents.length; index += 1) {
           const dirent = dirents[index];
-          const nameBytes = Buffer.from(dirent.name, "utf8");
+          const name = typeof dirent === "string" ? dirent : String(dirent?.name ?? "");
+          const nameBytes = Buffer.from(name, "utf8");
           const recordLen = 24 + nameBytes.length;
           if (offset + recordLen > limit) {
             const remaining = Math.max(0, limit - offset);
@@ -1882,11 +1950,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
               recordView.setUint32(16, nameBytes.length, true);
               recordView.setUint8(
                 20,
-                dirent.isDirectory()
-                  ? __agentOSWasiFiletypeDirectory
-                  : dirent.isSymbolicLink()
-                    ? __agentOSWasiFiletypeSymbolicLink
-                    : __agentOSWasiFiletypeRegularFile,
+                __agentOSWasiFiletypeUnknown,
               );
               record.set(nameBytes, 24);
               memory.set(record.subarray(0, remaining), offset);
@@ -1901,11 +1965,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
           view.setUint32(offset + 16, nameBytes.length, true);
           view.setUint8(
             offset + 20,
-            dirent.isDirectory()
-              ? __agentOSWasiFiletypeDirectory
-              : dirent.isSymbolicLink()
-                ? __agentOSWasiFiletypeSymbolicLink
-                : __agentOSWasiFiletypeRegularFile,
+            __agentOSWasiFiletypeUnknown,
           );
           memory.set(nameBytes, offset + 24);
           offset += recordLen;
@@ -1946,6 +2006,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (resolved.readOnly) {
           return __agentOSWasiErrnoRofs;
         }
+        this._clearStatCache();
         __agentOSFs().mkdirSync(this._resolvedFsPath(resolved));
         return __agentOSWasiErrnoSuccess;
       } catch (error) {
@@ -1966,6 +2027,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (source.readOnly || destination.readOnly) {
           return __agentOSWasiErrnoRofs;
         }
+        this._clearStatCache();
         __agentOSFs().linkSync(this._resolvedFsPath(source), this._resolvedFsPath(destination));
         return __agentOSWasiErrnoSuccess;
       } catch (error) {
@@ -1975,7 +2037,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
 
     _pathOpen(fd, _dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, _fdflags, openedFdPtr) {
       try {
-        const entry = this._descriptorEntry(fd);
+        const entry = this._measureWasiPhase("descriptorEntry", () => this._descriptorEntry(fd));
         if (
           !entry ||
           (entry.kind !== "preopen" && entry.kind !== "directory") ||
@@ -1987,9 +2049,11 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         const createOrTruncate =
           (requestedFlags & __agentOSWasiOpenCreate) !== 0 ||
           (requestedFlags & __agentOSWasiOpenTruncate) !== 0;
-        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen, {
-          preferCreateParent: createOrTruncate,
-        });
+        const resolved = this._measureWasiPhase("resolveDescriptorPath", () =>
+          this._resolveDescriptorPath(fd, pathPtr, pathLen, {
+            preferCreateParent: createOrTruncate,
+          })
+        );
         if (resolved.error !== __agentOSWasiErrnoSuccess) {
           return resolved.error;
         }
@@ -2021,6 +2085,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (requestedWriteAccess && resolved.readOnly) {
           return __agentOSWasiErrnoRofs;
         }
+        if (createOrTruncate) {
+          this._clearStatCache();
+        }
         const fsConstants = __agentOSFs().constants ?? {};
         let openFlags = requestedWriteAccess
           ? fsConstants.O_RDWR ?? 2
@@ -2037,29 +2104,27 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (openDirectory) {
           openFlags |= fsConstants.O_DIRECTORY ?? 0;
         }
-        if (createOrTruncate && !openDirectory) {
-          __agentOSFs().statSync(__agentOSPath().dirname(fsPath));
-        } else {
-          __agentOSFs().statSync(fsPath);
-        }
-        const realFd = __agentOSFs().openSync(fsPath, openFlags);
-        const stats =
-          createOrTruncate && !openDirectory
-            ? __agentOSFs().fstatSync(realFd)
-            : __agentOSFs().statSync(fsPath);
+        const realFd = this._measureWasiPhase("openSync", () => __agentOSFs().openSync(fsPath, openFlags));
+        const openedKind = openDirectory || createOrTruncate
+          ? (openDirectory ? "directory" : "file")
+          : this._measureWasiPhase("postOpenStat", () =>
+              __agentOSFs().statSync(fsPath).isDirectory() ? "directory" : "file"
+            );
         const openedFd = this.nextFd++;
-        this.fdTable.set(openedFd, {
-          kind: stats.isDirectory() ? "directory" : "file",
-          guestPath,
-          hostPath: fsPath,
-          readOnly: resolved.readOnly === true,
-          realFd,
-          offset: 0,
-          rightsBase: requestedRightsBase & allowedRightsInheriting,
-          rightsInheriting: requestedRightsInheriting & allowedRightsInheriting,
-          fdFlags: (Number(_fdflags) >>> 0) & 0xffff,
+        this._measureWasiPhase("fdTableSet", () => {
+          this.fdTable.set(openedFd, {
+            kind: openedKind,
+            guestPath,
+            hostPath: fsPath,
+            readOnly: resolved.readOnly === true,
+            realFd,
+            offset: 0,
+            rightsBase: requestedRightsBase & allowedRightsInheriting,
+            rightsInheriting: requestedRightsInheriting & allowedRightsInheriting,
+            fdFlags: (Number(_fdflags) >>> 0) & 0xffff,
+          });
         });
-        return this._writeUint32(openedFdPtr, openedFd);
+        return this._measureWasiPhase("writeOpenedFd", () => this._writeUint32(openedFdPtr, openedFd));
       } catch (error) {
         return this._mapFsError(error);
       }
@@ -2075,6 +2140,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
           return __agentOSWasiErrnoRofs;
         }
         const target = this._readString(targetPtr, targetLen);
+        this._clearStatCache();
         __agentOSFs().symlinkSync(target, this._resolvedFsPath(resolved));
         return __agentOSWasiErrnoSuccess;
       } catch (error) {
@@ -2091,6 +2157,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (resolved.readOnly) {
           return __agentOSWasiErrnoRofs;
         }
+        this._clearStatCache();
         __agentOSFs().rmdirSync(this._resolvedFsPath(resolved));
         return __agentOSWasiErrnoSuccess;
       } catch (error) {
@@ -2111,6 +2178,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (source.readOnly || destination.readOnly) {
           return __agentOSWasiErrnoRofs;
         }
+        this._clearStatCache();
         __agentOSFs().renameSync(this._resolvedFsPath(source), this._resolvedFsPath(destination));
         return __agentOSWasiErrnoSuccess;
       } catch (error) {
@@ -2127,6 +2195,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         if (resolved.readOnly) {
           return __agentOSWasiErrnoRofs;
         }
+        this._clearStatCache();
         __agentOSFs().unlinkSync(this._resolvedFsPath(resolved));
         return __agentOSWasiErrnoSuccess;
       } catch (error) {
@@ -2136,18 +2205,29 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
 
     _pathFilestatGet(fd, flags, pathPtr, pathLen, statPtr) {
       try {
-        const target = this._readString(pathPtr, pathLen);
+        const target = this._measureWasiPhase("readString", () => this._readString(pathPtr, pathLen));
         const resolved =
-          this._resolveDescriptorDirectStatPath(fd, target) ??
-          this._resolveDescriptorPath(fd, pathPtr, pathLen);
+          this._measureWasiPhase("resolveDirectStatPath", () => this._resolveDescriptorDirectStatPath(fd, target)) ??
+          this._measureWasiPhase("resolveDescriptorPath", () => this._resolveDescriptorPath(fd, pathPtr, pathLen));
         if (resolved.error !== __agentOSWasiErrnoSuccess) {
           return resolved.error;
         }
         const follow = (Number(flags) & __agentOSWasiLookupSymlinkFollow) !== 0;
-        const stats = follow
-          ? __agentOSFs().statSync(this._resolvedFsPath(resolved))
-          : __agentOSFs().lstatSync(this._resolvedFsPath(resolved));
-        return this._writeFilestat(statPtr, stats, this._filetypeForStats(stats));
+        const cacheKey = this._statCacheKey(resolved, follow);
+        let stats = cacheKey ? this.statCache.get(cacheKey) : undefined;
+        if (stats) {
+          this._measureWasiPhase("statCacheHit", () => undefined);
+        } else {
+          stats = this._measureWasiPhase(follow ? "statSync" : "lstatSync", () =>
+            follow
+              ? __agentOSFs().statSync(this._resolvedFsPath(resolved))
+              : __agentOSFs().lstatSync(this._resolvedFsPath(resolved))
+          );
+          if (cacheKey) {
+            this.statCache.set(cacheKey, stats);
+          }
+        }
+        return this._measureWasiPhase("writeFilestat", () => this._writeFilestat(statPtr, stats, this._filetypeForStats(stats)));
       } catch (error) {
         return this._mapFsError(error);
       }
