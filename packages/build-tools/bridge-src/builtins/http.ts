@@ -2342,6 +2342,42 @@ function parseChunkedBody(bodyBuffer, maxBodyBytes = MAX_HTTP_BODY_BYTES) {
       return null;
     }
     const chunkStart = lineEnd + 2;
+    if (chunkSize === 0) {
+      const trailersStart = chunkStart;
+      if (trailersStart === bodyBuffer.length) {
+        return { complete: false };
+      }
+      if (bodyBuffer[trailersStart] === 13 && bodyBuffer[trailersStart + 1] === 10) {
+        return {
+          complete: true,
+          bytesConsumed: trailersStart + 2,
+          body: chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0)
+        };
+      }
+      const trailersEnd = bodyBuffer.indexOf("\r\n\r\n", trailersStart);
+      if (trailersEnd === -1) {
+        return { complete: false };
+      }
+      const trailerBlock = bodyBuffer.subarray(trailersStart, trailersEnd).toString("latin1");
+      if (trailerBlock.length > 0) {
+        for (const trailerLine of trailerBlock.split("\r\n")) {
+          if (trailerLine.length === 0) {
+            continue;
+          }
+          if (trailerLine.startsWith(" ") || trailerLine.startsWith("	")) {
+            return null;
+          }
+          if (trailerLine.indexOf(":") === -1) {
+            return null;
+          }
+        }
+      }
+      return {
+        complete: true,
+        bytesConsumed: trailersEnd + 4,
+        body: chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0)
+      };
+    }
     const chunkEnd = chunkStart + chunkSize;
     const chunkTerminatorEnd = chunkEnd + 2;
     if (chunkTerminatorEnd > bodyBuffer.length) {
@@ -2350,35 +2386,9 @@ function parseChunkedBody(bodyBuffer, maxBodyBytes = MAX_HTTP_BODY_BYTES) {
     if (bodyBuffer[chunkEnd] !== 13 || bodyBuffer[chunkEnd + 1] !== 10) {
       return null;
     }
-    if (chunkSize > 0) {
-      totalBodyBytes += chunkSize;
-      chunks.push(bodyBuffer.subarray(chunkStart, chunkEnd));
-      offset = chunkTerminatorEnd;
-      continue;
-    }
-    const trailersEnd = bodyBuffer.indexOf("\r\n\r\n", chunkStart);
-    if (trailersEnd === -1) {
-      return { complete: false };
-    }
-    const trailerBlock = bodyBuffer.subarray(chunkStart, trailersEnd).toString("latin1");
-    if (trailerBlock.length > 0) {
-      for (const trailerLine of trailerBlock.split("\r\n")) {
-        if (trailerLine.length === 0) {
-          continue;
-        }
-        if (trailerLine.startsWith(" ") || trailerLine.startsWith("	")) {
-          return null;
-        }
-        if (trailerLine.indexOf(":") === -1) {
-          return null;
-        }
-      }
-    }
-    return {
-      complete: true,
-      bytesConsumed: trailersEnd + 4,
-      body: chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0)
-    };
+    totalBodyBytes += chunkSize;
+    chunks.push(bodyBuffer.subarray(chunkStart, chunkEnd));
+    offset = chunkTerminatorEnd;
   }
 }
 

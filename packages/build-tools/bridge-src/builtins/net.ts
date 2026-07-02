@@ -1378,6 +1378,24 @@ function yieldBridgeMacrotask() {
 }
 
 function netSocketDispatch(socketId, event, data) {
+  if (socketId === "net_socket" && event && typeof event === "object") {
+    const payload = event;
+    const target = getRegisteredNetSocket(payload.socketId);
+    if (target) {
+      countNetBridgeMetric("readEventWakeups");
+      wakeSocketBridgeReads(target);
+    }
+    return;
+  }
+  if (socketId && typeof socketId === "object") {
+    const payload = socketId;
+    const target = getRegisteredNetSocket(payload.socketId);
+    if (target) {
+      countNetBridgeMetric("readEventWakeups");
+      wakeSocketBridgeReads(target);
+    }
+    return;
+  }
   if (socketId === 0 && event.startsWith("http2:")) {
     debugBridgeNetwork("http2 dispatch via netSocket", event);
     try {

@@ -1,6 +1,9 @@
+import http from "node:http";
+import net from "node:net";
 import { readFileSync } from "node:fs";
 import type { BenchmarkOp } from "../lib/layers.js";
 import { runGuestProgram, runNodeProgram } from "../lib/layers.js";
+import { createBenchVm } from "../lib/vm.js";
 
 const TLS_LOOPBACK_KEY = readFileSync(
 	new URL("../../fixtures/tls-loopback-key.pem", import.meta.url),
@@ -11,6 +14,218 @@ const TLS_LOOPBACK_CERT = readFileSync(
 	"utf8",
 );
 const TLS_LOOPBACK_BODY = "hello-loopback-tls";
+const EXTERNAL_HTTP_BODY = "external-host-http-ok";
+const EXTERNAL_TCP_PAYLOAD = "external-tcp-echo";
+
+async function closeServer(server: http.Server | net.Server): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		server.close((error?: Error) => {
+			if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+				reject(error);
+				return;
+			}
+			resolve();
+		});
+	});
+}
+
+async function listenHttpExternalServer(): Promise<{ port: number; server: http.Server }> {
+	const server = http.createServer((_req, res) => {
+		res.setHeader("connection", "close");
+		res.end(EXTERNAL_HTTP_BODY);
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.on("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		await closeServer(server);
+		throw new Error("http external server did not bind to a TCP port");
+	}
+	return { port: address.port, server };
+}
+
+async function listenTcpExternalServer(): Promise<{ port: number; server: net.Server }> {
+	const server = net.createServer((socket) => {
+		socket.on("data", (data) => socket.end(data));
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.on("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		await closeServer(server);
+		throw new Error("tcp external server did not bind to a TCP port");
+	}
+	return { port: address.port, server };
+}
+
+async function runExternalGuestProgram(
+	port: number,
+	source: string,
+	iters: number,
+	warmup: number,
+	name: string,
+): Promise<number[]> {
+	const vm = await createBenchVm({ loopbackExemptPorts: [port] });
+	try {
+		return await runGuestProgram(vm, source, iters, warmup, name);
+	} finally {
+		await vm.dispose();
+	}
+}
+
+async function withHttpExternalServer<T>(
+	callback: (port: number) => Promise<T> | T,
+): Promise<T> {
+	const { port, server } = await listenHttpExternalServer();
+	try {
+		return await callback(port);
+	} finally {
+		await closeServer(server);
+	}
+}
+
+async function withTcpExternalServer<T>(
+	callback: (port: number) => Promise<T> | T,
+): Promise<T> {
+	const { port, server } = await listenTcpExternalServer();
+	try {
+		return await callback(port);
+	} finally {
+		await closeServer(server);
+	}
+}
+
+async function runHttpExternalClient(port: number, iters: number, warmup: number): Promise<number[]> {
+	const samples: number[] = [];
+	for (let i = 0; i < warmup + iters; i++) {
+		const start = Number(process.hrtime.bigint()) / 1e6;
+		const body = await new Promise<string>((resolve, reject) => {
+			const req = http.get(
+				{
+					agent: false,
+					host: "127.0.0.1",
+					port,
+					path: "/",
+					headers: { connection: "close" },
+				},
+				(res) => {
+					const chunks: Buffer[] = [];
+					res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+					res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+				},
+			);
+			req.on("error", reject);
+		});
+		if (body !== EXTERNAL_HTTP_BODY) {
+			throw new Error(`bad external HTTP body: ${JSON.stringify(body)}`);
+		}
+		const ms = Number(process.hrtime.bigint()) / 1e6 - start;
+		if (i >= warmup) samples.push(ms);
+	}
+	return samples;
+}
+
+async function runTcpExternalClient(port: number, iters: number, warmup: number): Promise<number[]> {
+	const samples: number[] = [];
+	const expected = Buffer.from(EXTERNAL_TCP_PAYLOAD);
+	for (let i = 0; i < warmup + iters; i++) {
+		const start = Number(process.hrtime.bigint()) / 1e6;
+		const body = await new Promise<Buffer>((resolve, reject) => {
+			const socket = net.connect(port, "127.0.0.1");
+			const chunks: Buffer[] = [];
+			socket.on("connect", () => socket.write(expected));
+			socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+			socket.on("error", reject);
+			socket.on("close", () => resolve(Buffer.concat(chunks)));
+		});
+		if (!body.equals(expected)) {
+			throw new Error(`bad external TCP echo: ${body.toString("hex")}`);
+		}
+		const ms = Number(process.hrtime.bigint()) / 1e6 - start;
+		if (i >= warmup) samples.push(ms);
+	}
+	return samples;
+}
+
+function httpExternalGetProgram(port: number): string {
+	return `
+import http from "node:http";
+
+const iters = Number(process.env.BENCH_ITERATIONS || 20);
+const warmup = Number(process.env.BENCH_WARMUP || 5);
+const expectedBody = ${JSON.stringify(EXTERNAL_HTTP_BODY)};
+const port = ${port};
+const samples = [];
+const now = () => Number(process.hrtime.bigint()) / 1e6;
+
+async function once() {
+  const body = await new Promise((resolve, reject) => {
+    const req = http.get({
+      agent: false,
+      host: "127.0.0.1",
+      port,
+      path: "/",
+      headers: { connection: "close" },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    req.on("error", reject);
+  });
+  if (body !== expectedBody) {
+    throw new Error("bad external HTTP body: " + JSON.stringify(body));
+  }
+}
+
+for (let i = 0; i < warmup + iters; i++) {
+  const start = now();
+  await once();
+  const ms = now() - start;
+  if (i >= warmup) samples.push(ms);
+}
+process.stdout.write(JSON.stringify({ samples }));
+`;
+}
+
+function tcpExternalEchoProgram(port: number): string {
+	return `
+import net from "node:net";
+
+const iters = Number(process.env.BENCH_ITERATIONS || 20);
+const warmup = Number(process.env.BENCH_WARMUP || 5);
+const expected = Buffer.from(${JSON.stringify(EXTERNAL_TCP_PAYLOAD)});
+const port = ${port};
+const samples = [];
+const now = () => Number(process.hrtime.bigint()) / 1e6;
+
+async function once() {
+  const body = await new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const chunks = [];
+    socket.on("connect", () => socket.write(expected));
+    socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    socket.on("error", reject);
+    socket.on("close", () => resolve(Buffer.concat(chunks)));
+  });
+  if (!Buffer.from(body).equals(expected)) {
+    throw new Error("bad external TCP echo: " + Buffer.from(body).toString("hex"));
+  }
+}
+
+for (let i = 0; i < warmup + iters; i++) {
+  const start = now();
+  await once();
+  const ms = now() - start;
+  if (i >= warmup) samples.push(ms);
+}
+process.stdout.write(JSON.stringify({ samples }));
+`;
+}
 
 function tlsLoopbackGetProgram(): string {
 	return `
@@ -187,6 +402,26 @@ export const netFamily: BenchmarkOp[] = [
 	},
 	{
 		family: "net",
+		name: "http_external_get",
+		nativeOp: "tcp_echo",
+		wasmUnsupportedReason: "host-side benchmark listener requires Node harness networking",
+		fileLine: "crates/sidecar/src/execution.rs:13919",
+		reproducer: "node:http GET from guest to a host-side loopback-exempt HTTP server",
+		runNode: (iters, warmup) =>
+			withHttpExternalServer((port) => runHttpExternalClient(port, iters, warmup)),
+		runGuest: (_vm, iters, warmup) =>
+			withHttpExternalServer((port) =>
+				runExternalGuestProgram(
+					port,
+					httpExternalGetProgram(port),
+					iters,
+					warmup,
+					"net-http-external-get",
+				),
+			),
+	},
+	{
+		family: "net",
 		name: "http2_loopback_get",
 		nativeUnsupportedReason: "no native HTTP/2-loopback pair yet — Phase 2 backlog",
 		wasmUnsupportedReason: "HTTP/2 unsupported in wasm baseline",
@@ -310,8 +545,28 @@ export const netFamily: BenchmarkOp[] = [
       });
       socket.write("hello");
     });
-  });
+	  });
 }`,
+	},
+	{
+		family: "net",
+		name: "tcp_external_echo",
+		nativeOp: "tcp_echo",
+		wasmUnsupportedReason: "host-side benchmark listener requires Node harness networking",
+		fileLine: "crates/sidecar/src/execution.rs:13919",
+		reproducer: "guest net.connect to a host-side loopback-exempt TCP echo server, one 16-byte echo",
+		runNode: (iters, warmup) =>
+			withTcpExternalServer((port) => runTcpExternalClient(port, iters, warmup)),
+		runGuest: (_vm, iters, warmup) =>
+			withTcpExternalServer((port) =>
+				runExternalGuestProgram(
+					port,
+					tcpExternalEchoProgram(port),
+					iters,
+					warmup,
+					"net-tcp-external-echo",
+				),
+			),
 	},
 	{
 		family: "net",

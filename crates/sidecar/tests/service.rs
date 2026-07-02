@@ -173,7 +173,7 @@ mod service {
         use std::process::Command;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Barrier, Mutex, OnceLock,
+            mpsc, Arc, Barrier, Mutex, OnceLock,
         };
         use std::thread;
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15889,6 +15889,120 @@ console.log(JSON.stringify(summary));
                 "stdout: {stdout}"
             );
         }
+
+        fn javascript_http_external_get_reaches_host_listener() {
+            assert_node_available();
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind host HTTP listener");
+            let port = listener
+                .local_addr()
+                .expect("host HTTP listener address")
+                .port();
+            let (server_done_tx, server_done_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept host HTTP request");
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).expect("read host HTTP request");
+                let request_text = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request_text.starts_with("GET /external HTTP/1.1\r\n"),
+                    "unexpected request: {request_text:?}"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Transfer-Encoding: chunked\r\n\
+                          Connection: keep-alive\r\n\
+                          \r\n\
+                          12\r\nexternal-host-body\r\n\
+                          0\r\n\
+                          \r\n",
+                    )
+                    .expect("write host HTTP response");
+                stream.flush().expect("flush host HTTP response");
+                let _ = server_done_rx.recv_timeout(Duration::from_secs(5));
+            });
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: Vec::new(),
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: std::collections::HashMap::new(),
+                        loopback_exempt_ports: vec![port],
+                        packages: Vec::new(),
+                        packages_mount_at: String::new(),
+                    }),
+                ))
+                .expect("configure loopback-exempt host listener port");
+
+            let cwd = temp_dir("secure-exec-sidecar-js-http-external-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                &format!(
+                    r#"
+import http from "node:http";
+
+const result = await Promise.race([
+  new Promise((resolve, reject) => {{
+    const req = http.get(
+      {{
+        host: "127.0.0.1",
+        port: {port},
+        path: "/external",
+      }},
+      (res) => {{
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {{
+          body += chunk;
+        }});
+        res.on("end", () => {{
+          resolve({{ status: res.statusCode, body }});
+        }});
+      }},
+    );
+    req.on("error", reject);
+  }}),
+  new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
+]);
+
+console.log(JSON.stringify(result));
+"#
+                ),
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-http-external");
+            let _ = server_done_tx.send(());
+            server.join().expect("join host HTTP listener");
+
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+            let parsed: Value =
+                serde_json::from_str(stdout.trim()).expect("parse external http JSON");
+            assert_eq!(parsed["status"], json!(200));
+            assert_eq!(
+                parsed["body"],
+                Value::String(String::from("external-host-body"))
+            );
+        }
+
         fn javascript_fetch_posts_to_guest_loopback_http_server() {
             assert_node_available();
 
@@ -19213,6 +19327,7 @@ console.log(JSON.stringify({
             javascript_http2_secure_listen_connect_request_and_respond_round_trip();
             javascript_http2_server_respond_records_pending_response();
             javascript_http_rpc_requests_gets_and_serves_over_guest_net();
+            javascript_http_external_get_reaches_host_listener();
             javascript_fetch_posts_to_guest_loopback_http_server();
             javascript_fetch_reaches_http_server_in_parallel_guest_process();
             javascript_net_rpc_listens_accepts_connections_and_reports_listener_state();
@@ -19283,6 +19398,11 @@ console.log(JSON.stringify({
         #[test]
         fn javascript_net_loopback_socket_churn_releases_kernel_slots_regression() {
             javascript_net_loopback_socket_churn_releases_kernel_slots();
+        }
+
+        #[test]
+        fn javascript_http_external_get_reaches_host_listener_regression() {
+            javascript_http_external_get_reaches_host_listener();
         }
 
         #[test]

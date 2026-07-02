@@ -35,10 +35,10 @@ use crate::state::{
     ActiveSqliteStatement, ActiveTcpListener, ActiveTcpSocket, ActiveTlsState, ActiveTlsStream,
     ActiveUdpSocket, ActiveUnixListener, ActiveUnixSocket, BridgeError, ExitedProcessSnapshot,
     Http2BridgeEvent, Http2RuntimeSnapshot, Http2SessionCommand, Http2SessionSnapshot,
-    Http2SocketSnapshot, JavascriptHttpLoopbackTarget, JavascriptSocketFamily,
-    JavascriptSocketPathContext, JavascriptTcpListenerEvent, JavascriptTcpSocketEvent,
-    JavascriptTlsBridgeOptions, JavascriptTlsClientHello, JavascriptTlsDataValue,
-    JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
+    Http2SocketSnapshot, JavascriptHttpLoopbackTarget, JavascriptSocketEventPusher,
+    JavascriptSocketFamily, JavascriptSocketPathContext, JavascriptTcpListenerEvent,
+    JavascriptTcpSocketEvent, JavascriptTlsBridgeOptions, JavascriptTlsClientHello,
+    JavascriptTlsDataValue, JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
     JavascriptUnixListenerEvent, LoopbackTlsPendingWriteHandle, LoopbackTlsPendingWriteState,
     NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket, ProcNetEntry, ProcessEventEnvelope,
     PythonHostSocket, ResolvedChildProcessExecution, ResolvedTcpConnectAddr, SharedBridge,
@@ -194,6 +194,10 @@ struct NetTcpTraceCounters {
     socket_read_end_events: AtomicU64,
     socket_read_eagain: AtomicU64,
     socket_read_errors: AtomicU64,
+    socket_read_push_attempts: AtomicU64,
+    socket_read_push_sent: AtomicU64,
+    socket_read_push_missing: AtomicU64,
+    socket_read_push_errors: AtomicU64,
     socket_write_calls: AtomicU64,
     socket_write_bytes: AtomicU64,
     socket_write_kernel_us: AtomicU64,
@@ -226,6 +230,10 @@ impl NetTcpTraceCounters {
             socket_read_end_events: AtomicU64::new(0),
             socket_read_eagain: AtomicU64::new(0),
             socket_read_errors: AtomicU64::new(0),
+            socket_read_push_attempts: AtomicU64::new(0),
+            socket_read_push_sent: AtomicU64::new(0),
+            socket_read_push_missing: AtomicU64::new(0),
+            socket_read_push_errors: AtomicU64::new(0),
             socket_write_calls: AtomicU64::new(0),
             socket_write_bytes: AtomicU64::new(0),
             socket_write_kernel_us: AtomicU64::new(0),
@@ -1588,6 +1596,7 @@ impl ActiveTcpSocket {
             pending_read_stream: Some(pending_read_stream),
             events: Some(events),
             event_sender: Some(sender),
+            event_pusher: Arc::new(Mutex::new(None)),
             kernel_socket_id: None,
             no_delay: false,
             keep_alive: false,
@@ -1617,6 +1626,7 @@ impl ActiveTcpSocket {
             pending_read_stream: None,
             events: Some(events),
             event_sender: Some(sender),
+            event_pusher: Arc::new(Mutex::new(None)),
             kernel_socket_id: Some(socket_id),
             no_delay: false,
             keep_alive: false,
@@ -1631,6 +1641,15 @@ impl ActiveTcpSocket {
             saw_local_shutdown: Arc::new(AtomicBool::new(false)),
             saw_remote_end: Arc::new(AtomicBool::new(false)),
             close_notified: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn set_event_pusher(&self, session: Option<V8SessionHandle>, socket_id: String) {
+        let Some(session) = session else {
+            return;
+        };
+        if let Ok(mut pusher) = self.event_pusher.lock() {
+            *pusher = Some(JavascriptSocketEventPusher { session, socket_id });
         }
     }
 
@@ -1796,6 +1815,7 @@ impl ActiveTcpSocket {
                         SidecarError::InvalidState(String::from("TCP socket event sender missing"))
                     })?
                     .clone(),
+                Arc::clone(&self.event_pusher),
                 Arc::clone(&self.tls_mode),
                 Arc::clone(&self.saw_local_shutdown),
                 Arc::clone(&self.saw_remote_end),
@@ -1963,6 +1983,7 @@ impl ActiveTcpSocket {
                     SidecarError::InvalidState(String::from("TCP socket event sender missing"))
                 })?
                 .clone(),
+            Arc::clone(&self.event_pusher),
             Arc::clone(&self.saw_local_shutdown),
             Arc::clone(&self.saw_remote_end),
             Arc::clone(&self.close_notified),
@@ -13919,6 +13940,7 @@ fn tls_bridge_undefined_value() -> Value {
 fn spawn_tcp_socket_reader(
     stream: TcpStream,
     sender: Sender<JavascriptTcpSocketEvent>,
+    event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     tls_mode: Arc<AtomicBool>,
     saw_local_shutdown: Arc<AtomicBool>,
     saw_remote_end: Arc<AtomicBool>,
@@ -13935,10 +13957,12 @@ fn spawn_tcp_socket_reader(
                 Ok(0) => {
                     saw_remote_end.store(true, Ordering::SeqCst);
                     let _ = sender.send(JavascriptTcpSocketEvent::End);
+                    push_socket_event(&event_pusher, "end");
                     if saw_local_shutdown.load(Ordering::SeqCst)
                         && !close_notified.swap(true, Ordering::SeqCst)
                     {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: false });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -13951,6 +13975,7 @@ fn spawn_tcp_socket_reader(
                     {
                         break;
                     }
+                    push_socket_event(&event_pusher, "data");
                 }
                 Err(error)
                     if matches!(
@@ -13966,8 +13991,10 @@ fn spawn_tcp_socket_reader(
                         code,
                         message: error.to_string(),
                     });
+                    push_socket_event(&event_pusher, "error");
                     if !close_notified.swap(true, Ordering::SeqCst) {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: true });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -13976,33 +14003,71 @@ fn spawn_tcp_socket_reader(
     });
 }
 
+fn push_socket_event(
+    event_pusher: &Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
+    event: &'static str,
+) {
+    NET_TCP_TRACE_COUNTERS
+        .socket_read_push_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    let target = event_pusher.lock().ok().and_then(|guard| guard.clone());
+    let Some(target) = target else {
+        NET_TCP_TRACE_COUNTERS
+            .socket_read_push_missing
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let payload = v8_runtime::json_to_cbor_payload(&json!({
+        "socketId": target.socket_id,
+        "event": event,
+    }))
+    .unwrap_or_default();
+    match target.session.send_stream_event("net_socket", payload) {
+        Ok(()) => {
+            NET_TCP_TRACE_COUNTERS
+                .socket_read_push_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            NET_TCP_TRACE_COUNTERS
+                .socket_read_push_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn send_tls_socket_error_and_close(
     sender: &Sender<JavascriptTcpSocketEvent>,
+    event_pusher: &Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     close_notified: &Arc<AtomicBool>,
     code: Option<String>,
     message: String,
 ) {
     let _ = sender.send(JavascriptTcpSocketEvent::Error { code, message });
+    push_socket_event(event_pusher, "error");
     if !close_notified.swap(true, Ordering::SeqCst) {
         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: true });
+        push_socket_event(event_pusher, "close");
     }
 }
 
 fn fail_loopback_tls_pending_reader(
     pending_write: &LoopbackTlsPendingWriteHandle,
     sender: &Sender<JavascriptTcpSocketEvent>,
+    event_pusher: &Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     close_notified: &Arc<AtomicBool>,
     code: Option<String>,
     message: String,
 ) {
     pending_write.mark_failed(message.clone());
-    send_tls_socket_error_and_close(sender, close_notified, code, message);
+    send_tls_socket_error_and_close(sender, event_pusher, close_notified, code, message);
 }
 
 fn flush_loopback_tls_pending_writes(
     tls_stream: &Arc<Mutex<Option<ActiveTlsStream>>>,
     pending_write: &LoopbackTlsPendingWriteHandle,
     sender: &Sender<JavascriptTcpSocketEvent>,
+    event_pusher: &Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     close_notified: &Arc<AtomicBool>,
 ) -> bool {
     loop {
@@ -14012,6 +14077,7 @@ fn flush_loopback_tls_pending_writes(
                 fail_loopback_tls_pending_reader(
                     pending_write,
                     sender,
+                    event_pusher,
                     close_notified,
                     Some(String::from("EIO")),
                     error.to_string(),
@@ -14029,6 +14095,7 @@ fn flush_loopback_tls_pending_writes(
                         fail_loopback_tls_pending_reader(
                             pending_write,
                             sender,
+                            event_pusher,
                             close_notified,
                             Some(String::from("EIO")),
                             String::from("TLS stream lock poisoned while flushing pending writes"),
@@ -14041,6 +14108,7 @@ fn flush_loopback_tls_pending_writes(
                     fail_loopback_tls_pending_reader(
                         pending_write,
                         sender,
+                        event_pusher,
                         close_notified,
                         Some(String::from("EIO")),
                         String::from("TLS stream missing while flushing pending writes"),
@@ -14054,6 +14122,7 @@ fn flush_loopback_tls_pending_writes(
                 fail_loopback_tls_pending_reader(
                     pending_write,
                     sender,
+                    event_pusher,
                     close_notified,
                     Some(String::from("EIO")),
                     format!("loopback TLS pending write flush failed: {error}"),
@@ -14069,6 +14138,7 @@ fn flush_loopback_tls_pending_writes(
                 fail_loopback_tls_pending_reader(
                     pending_write,
                     sender,
+                    event_pusher,
                     close_notified,
                     Some(String::from("EIO")),
                     error.to_string(),
@@ -14084,6 +14154,7 @@ fn flush_loopback_tls_pending_writes(
                         fail_loopback_tls_pending_reader(
                             pending_write,
                             sender,
+                            event_pusher,
                             close_notified,
                             Some(String::from("EIO")),
                             String::from("TLS stream lock poisoned during deferred shutdown"),
@@ -14095,6 +14166,7 @@ fn flush_loopback_tls_pending_writes(
                     fail_loopback_tls_pending_reader(
                         pending_write,
                         sender,
+                        event_pusher,
                         close_notified,
                         Some(String::from("EIO")),
                         String::from("TLS stream missing during deferred shutdown"),
@@ -14109,6 +14181,7 @@ fn flush_loopback_tls_pending_writes(
                 fail_loopback_tls_pending_reader(
                     pending_write,
                     sender,
+                    event_pusher,
                     close_notified,
                     Some(String::from("EIO")),
                     format!("loopback TLS deferred shutdown failed: {error}"),
@@ -14126,6 +14199,7 @@ fn spawn_tls_socket_reader(
     tls_stream: Arc<Mutex<Option<ActiveTlsStream>>>,
     loopback_pending_write: Option<LoopbackTlsPendingWriteHandle>,
     sender: Sender<JavascriptTcpSocketEvent>,
+    event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     saw_local_shutdown: Arc<AtomicBool>,
     saw_remote_end: Arc<AtomicBool>,
     close_notified: Arc<AtomicBool>,
@@ -14160,6 +14234,7 @@ fn spawn_tls_socket_reader(
                         fail_loopback_tls_pending_reader(
                             pending_write,
                             &sender,
+                            &event_pusher,
                             &close_notified,
                             Some(String::from("ETIMEDOUT")),
                             format!(
@@ -14177,6 +14252,7 @@ fn spawn_tls_socket_reader(
                         &tls_stream,
                         pending_write,
                         &sender,
+                        &event_pusher,
                         &close_notified,
                     ) {
                         return;
@@ -14212,10 +14288,12 @@ fn spawn_tls_socket_reader(
                     }
                     saw_remote_end.store(true, Ordering::SeqCst);
                     let _ = sender.send(JavascriptTcpSocketEvent::End);
+                    push_socket_event(&event_pusher, "end");
                     if saw_local_shutdown.load(Ordering::SeqCst)
                         && !close_notified.swap(true, Ordering::SeqCst)
                     {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: false });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -14228,6 +14306,7 @@ fn spawn_tls_socket_reader(
                     {
                         break;
                     }
+                    push_socket_event(&event_pusher, "data");
                 }
                 Err(error)
                     if matches!(
@@ -14248,10 +14327,12 @@ fn spawn_tls_socket_reader(
                     }
                     saw_remote_end.store(true, Ordering::SeqCst);
                     let _ = sender.send(JavascriptTcpSocketEvent::End);
+                    push_socket_event(&event_pusher, "end");
                     if saw_local_shutdown.load(Ordering::SeqCst)
                         && !close_notified.swap(true, Ordering::SeqCst)
                     {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: false });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -14266,8 +14347,10 @@ fn spawn_tls_socket_reader(
                         code,
                         message: error.to_string(),
                     });
+                    push_socket_event(&event_pusher, "error");
                     if !close_notified.swap(true, Ordering::SeqCst) {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: true });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -15633,6 +15716,10 @@ fn net_tcp_trace_reset() {
         &NET_TCP_TRACE_COUNTERS.socket_read_end_events,
         &NET_TCP_TRACE_COUNTERS.socket_read_eagain,
         &NET_TCP_TRACE_COUNTERS.socket_read_errors,
+        &NET_TCP_TRACE_COUNTERS.socket_read_push_attempts,
+        &NET_TCP_TRACE_COUNTERS.socket_read_push_sent,
+        &NET_TCP_TRACE_COUNTERS.socket_read_push_missing,
+        &NET_TCP_TRACE_COUNTERS.socket_read_push_errors,
         &NET_TCP_TRACE_COUNTERS.socket_write_calls,
         &NET_TCP_TRACE_COUNTERS.socket_write_bytes,
         &NET_TCP_TRACE_COUNTERS.socket_write_kernel_us,
@@ -15675,6 +15762,10 @@ fn net_tcp_trace_snapshot() -> Value {
         "socketReadEndEvents": load(&NET_TCP_TRACE_COUNTERS.socket_read_end_events),
         "socketReadEagain": load(&NET_TCP_TRACE_COUNTERS.socket_read_eagain),
         "socketReadErrors": load(&NET_TCP_TRACE_COUNTERS.socket_read_errors),
+        "socketReadPushAttempts": load(&NET_TCP_TRACE_COUNTERS.socket_read_push_attempts),
+        "socketReadPushSent": load(&NET_TCP_TRACE_COUNTERS.socket_read_push_sent),
+        "socketReadPushMissing": load(&NET_TCP_TRACE_COUNTERS.socket_read_push_missing),
+        "socketReadPushErrors": load(&NET_TCP_TRACE_COUNTERS.socket_read_push_errors),
         "socketWriteCalls": load(&NET_TCP_TRACE_COUNTERS.socket_write_calls),
         "socketWriteBytes": load(&NET_TCP_TRACE_COUNTERS.socket_write_bytes),
         "socketWriteKernelUs": load(&NET_TCP_TRACE_COUNTERS.socket_write_kernel_us),
@@ -22541,6 +22632,10 @@ where
                 let socket_id = process.allocate_tcp_socket_id();
                 let local_addr = socket.guest_local_addr;
                 let remote_addr = socket.guest_remote_addr;
+                socket.set_event_pusher(
+                    process.execution.javascript_v8_session_handle(),
+                    socket_id.clone(),
+                );
                 process.tcp_sockets.insert(socket_id.clone(), socket);
                 Ok(json!({
                     "socketId": socket_id,
@@ -22904,6 +22999,10 @@ where
                             )
                         };
                         let socket_id = process.allocate_tcp_socket_id();
+                        socket.set_event_pusher(
+                            process.execution.javascript_v8_session_handle(),
+                            socket_id.clone(),
+                        );
                         if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
                             listener.register_connection(&socket_id);
                         }
@@ -23044,6 +23143,10 @@ where
                             )
                         };
                         let socket_id = process.allocate_tcp_socket_id();
+                        socket.set_event_pusher(
+                            process.execution.javascript_v8_session_handle(),
+                            socket_id.clone(),
+                        );
                         if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
                             listener.register_connection(&socket_id);
                         }

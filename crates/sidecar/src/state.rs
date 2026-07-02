@@ -13,8 +13,8 @@ use rusqlite::Connection;
 use rustls::{ClientConnection, ServerConnection, StreamOwned};
 use secure_exec_bridge::{BridgeTypes, FilesystemSnapshot};
 use secure_exec_execution::{
-    JavascriptExecution, JavascriptSyncRpcRequest, PythonExecution, PythonVfsRpcRequest,
-    WasmExecution,
+    v8_host::V8SessionHandle, JavascriptExecution, JavascriptSyncRpcRequest, PythonExecution,
+    PythonVfsRpcRequest, WasmExecution,
 };
 use secure_exec_kernel::kernel::{KernelProcessHandle, KernelVm};
 use secure_exec_kernel::mount_table::MountTable;
@@ -730,12 +730,19 @@ pub(crate) enum JavascriptTcpSocketEvent {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct JavascriptSocketEventPusher {
+    pub(crate) session: V8SessionHandle,
+    pub(crate) socket_id: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct ActiveTcpSocket {
     pub(crate) stream: Option<Arc<Mutex<TcpStream>>>,
     pub(crate) pending_read_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
     pub(crate) events: Option<Receiver<JavascriptTcpSocketEvent>>,
     pub(crate) event_sender: Option<Sender<JavascriptTcpSocketEvent>>,
+    pub(crate) event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     pub(crate) kernel_socket_id: Option<SocketId>,
     pub(crate) no_delay: bool,
     pub(crate) keep_alive: bool,

@@ -11,6 +11,7 @@ import {
 
 export interface BenchVmOptions {
 	commandsDir?: string;
+	loopbackExemptPorts?: number[];
 	mounts?: HostDirectoryMount[];
 	wasmCommandDirs?: string[];
 	sidecar?: SidecarProcess;
@@ -96,6 +97,7 @@ export async function createBenchVm(options: BenchVmOptions = {}): Promise<Bench
 		},
 		mounts: options.mounts,
 		commandsDir: options.commandsDir,
+		loopbackExemptPorts: options.loopbackExemptPorts,
 		wasmCommandDirs: options.wasmCommandDirs,
 		sidecar: options.sidecar,
 		// Benchmark VM: opt in to the us-resolution guest clock so sub-ms guest
