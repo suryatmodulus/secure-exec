@@ -1179,6 +1179,8 @@ function createNetBridgeMetrics() {
     peerWakeMiss: 0,
     peerWakeUnixFound: 0,
     peerWakeUnixMiss: 0,
+    peerWakeOnShutdown: 0,
+    peerWakeOnDestroy: 0,
     acceptEventWakeups: 0,
     acceptWakeAttempts: 0,
     acceptWakeInvalidTargets: 0,
@@ -1641,6 +1643,8 @@ var NetSocket = class _NetSocket {
       this._flushBridgeWrites();
       debugBridgeNetwork("socket end", this._socketId);
       _netSocketEndRaw.applySync(void 0, [this._socketId]);
+      countNetBridgeMetric("peerWakeOnShutdown");
+      wakePeerBridgeReads(this);
       this._touchTimeout();
     }
     return this;
@@ -1672,6 +1676,8 @@ var NetSocket = class _NetSocket {
     }
     if (typeof _netSocketDestroyRaw !== "undefined" && this._socketId) {
       _netSocketDestroyRaw.applySync(void 0, [this._socketId]);
+      countNetBridgeMetric("peerWakeOnDestroy");
+      wakePeerBridgeReads(this);
     }
     if (error) {
       this._emitNet("error", error);
@@ -2627,6 +2633,14 @@ var NetServer = class {
             remoteFamily: clientHandle.info.remoteFamily
           });
           _netSocketDestroyRaw?.applySync(void 0, [clientHandle.socketId]);
+          countNetBridgeMetric("peerWakeOnDestroy");
+          wakePeerBridgeReads({
+            _socketId: clientHandle.socketId,
+            localPort: clientHandle.info.localPort,
+            remotePort: clientHandle.info.remotePort,
+            localPath: clientHandle.info.localPath,
+            remotePath: clientHandle.info.remotePath
+          });
           return;
         }
         if (this.keepAlive) {
