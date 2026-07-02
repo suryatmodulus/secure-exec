@@ -1,9 +1,12 @@
 import { allOps } from "./families/index.js";
+import { ecosystemWasmCommandDirs } from "./families/ecosystem.js";
 import {
+	isLayerOpResult,
 	runOp,
+	runCommandOp,
 	supportsWasmLayer,
 	wasmLayerOptions,
-	type OpResult,
+	type LatencyResult,
 } from "./lib/layers.js";
 import { createBenchVm } from "./lib/vm.js";
 import { findingsFromLatency, refutedFromLatency, writeJson } from "./lib/report.js";
@@ -21,23 +24,34 @@ const FAMILY_FILTER = process.env.BENCH_FAMILIES
 	.map((family) => family.trim())
 	.filter(Boolean);
 
-export async function runLatencyMatrix(): Promise<OpResult[]> {
+export async function runLatencyMatrix(): Promise<LatencyResult[]> {
 	const wasmOptions = wasmLayerOptions();
 	if (!wasmOptions) {
 		console.error("vm-wasm lane disabled: native-baseline wasm artifact was not found");
 	}
-	const vm = await createBenchVm(wasmOptions ?? {});
+	const commandDirs = ecosystemWasmCommandDirs();
+	const vm = await createBenchVm({
+		...(wasmOptions ?? {}),
+		wasmCommandDirs: [
+			...(wasmOptions?.wasmCommandDirs ?? []),
+			...commandDirs,
+		],
+	});
 	try {
-		const results: OpResult[] = [];
+		const results: LatencyResult[] = [];
 		const ops = FAMILY_FILTER
 			? allOps.filter((op) => FAMILY_FILTER.includes(op.family))
 			: allOps;
 		for (const op of ops) {
 			console.error(`latency ${op.family}/${op.name}`);
-			if (supportsWasmLayer(op.nativeOp)) {
+			if ("nativeOp" in op && supportsWasmLayer(op.nativeOp)) {
 				console.error("  wasm lane: guest JS measured first, wasm native-baseline after");
 			}
-			results.push(await runOp(op, vm, ITERATIONS, WARMUP));
+			results.push(
+				"nativeOp" in op
+					? await runOp(op, vm, ITERATIONS, WARMUP)
+					: await runCommandOp(op, vm, ITERATIONS, WARMUP),
+			);
 		}
 		return results;
 	} finally {
@@ -47,8 +61,9 @@ export async function runLatencyMatrix(): Promise<OpResult[]> {
 
 async function main(): Promise<void> {
 	const latency = await runLatencyMatrix();
-	const findings = findingsFromLatency(latency);
-	const refuted = refutedFromLatency(latency);
+	const layerLatency = latency.filter(isLayerOpResult);
+	const findings = findingsFromLatency(layerLatency);
+	const refuted = refutedFromLatency(layerLatency);
 	const resourceSnapshotStubbed = false;
 	const fuzz = FAMILY_FILTER
 		? { programs: [], findings: [], refuted: [] }
@@ -92,15 +107,43 @@ async function main(): Promise<void> {
 	writeJson(`${RESULTS_DIR}/regression-diff.json`, diff);
 
 	printTable(
-		["family", "op", "native p50", "node p50", "guest p50", "wasm p50"],
-		latency.map((result) => [
-			result.family,
-			result.op,
-			`${result.layers.native.p50}ms`,
-			`${result.layers.node.p50}ms`,
-			`${result.layers.guest.p50}ms`,
-			result.layers.wasm ? `${result.layers.wasm.p50}ms` : "-",
-		]),
+		[
+			"family",
+			"op",
+			"native p50",
+			"node p50",
+			"guest p50",
+			"wasm p50",
+			"hostCmd p50",
+			"vmCmd p50",
+			"vm/host",
+		],
+		latency.map((result) => {
+			if (isLayerOpResult(result)) {
+				return [
+					result.family,
+					result.op,
+					`${result.layers.native.p50}ms`,
+					`${result.layers.node.p50}ms`,
+					`${result.layers.guest.p50}ms`,
+					result.layers.wasm ? `${result.layers.wasm.p50}ms` : "-",
+					"-",
+					"-",
+					"-",
+				];
+			}
+			return [
+				result.family,
+				result.op,
+				"-",
+				"-",
+				"-",
+				"-",
+				result.layers.hostCmd ? `${result.layers.hostCmd.p50}ms` : "-",
+				result.layers.vmCmd ? `${result.layers.vmCmd.p50}ms` : "-",
+				result.tax.command ?? result.skipReason ?? "-",
+			];
+		}),
 	);
 
 	printTable(
@@ -117,13 +160,15 @@ async function main(): Promise<void> {
 }
 
 function criticGaps(
-	latency: OpResult[],
+	latency: LatencyResult[],
 	fuzz: Awaited<ReturnType<typeof runFuzz>>,
 	leak: { streams: Array<{ idleMs: number }> },
 	footprint: { components?: unknown[] },
 ): string[] {
 	const gaps: string[] = [];
-	const covered = new Set(latency.map((result) => `${result.family}/${result.op}`));
+	const covered = new Set(
+		latency.filter(isLayerOpResult).map((result) => `${result.family}/${result.op}`),
+	);
 	for (const required of [
 		"process/fanout_spawn_8",
 		"process/wait_reap_storm_8",

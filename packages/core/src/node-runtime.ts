@@ -27,6 +27,7 @@ import type {
 	Kernel,
 	KernelBootTiming,
 	Permissions,
+	VirtualDirEntry,
 } from "./test-runtime.js";
 import type { JsRuntimeConfig } from "./generated/JsRuntimeConfig.js";
 import type { SidecarProcess } from "./sidecar-process.js";
@@ -39,7 +40,11 @@ import {
 } from "./test-runtime.js";
 import { parseNodeRuntimeCreateOptions } from "./node-runtime-options-schema.js";
 
-export type { BindingDefinition, HostToolExample } from "./test-runtime.js";
+export type {
+	BindingDefinition,
+	HostToolExample,
+	VirtualDirEntry,
+} from "./test-runtime.js";
 
 export type NodeRuntimeBootTimingPhase =
 	| KernelBootTiming["phase"]
@@ -90,7 +95,7 @@ const BUNDLED_COMMANDS_DIR = fileURLToPath(
  * freshly built commands without re-vendoring. A fresh `npm install` has no
  * in-repo path, so it falls through to the bundled copy.
  */
-function resolveCommandsDir(explicit?: string): string {
+export function resolveNodeRuntimeCommandsDir(explicit?: string): string {
 	if (explicit !== undefined) {
 		return explicit;
 	}
@@ -577,7 +582,7 @@ export class NodeRuntime {
 		options: NodeRuntimeCreateOptions = {},
 	): Promise<NodeRuntime> {
 		options = parseNodeRuntimeCreateOptions(options);
-		const commandsDir = resolveCommandsDir(options.commandsDir);
+		const commandsDir = resolveNodeRuntimeCommandsDir(options.commandsDir);
 
 		// Seed caller-provided files into the VM's in-memory filesystem before
 		// boot so they are part of the root filesystem snapshot the guest sees
@@ -1128,6 +1133,16 @@ export class NodeRuntime {
 	/** Read a file from the VM's virtual filesystem as raw bytes. */
 	async readFile(filePath: string): Promise<Uint8Array> {
 		return this.kernel.readFile(filePath);
+	}
+
+	/** Read directory entry names from the VM's virtual filesystem. */
+	async readDir(dirPath: string): Promise<string[]> {
+		return this.kernel.readdir(dirPath);
+	}
+
+	/** Read typed directory entries from the VM's virtual filesystem. */
+	async readDirWithTypes(dirPath: string): Promise<VirtualDirEntry[]> {
+		return this.kernel.vfs.readDirWithTypes(dirPath);
 	}
 
 	async getResourceSnapshot(): Promise<NodeRuntimeResourceSnapshot> {

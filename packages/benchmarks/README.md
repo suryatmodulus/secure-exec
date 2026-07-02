@@ -35,6 +35,61 @@ memory-YYYYMMDD-HHMMSS.json
 memory-YYYYMMDD-HHMMSS.log
 ```
 
+Run one focused lane by name:
+
+```bash
+BENCH_ONLY=sync-bridge-floor pnpm --dir packages/benchmarks bench
+BENCH_ONLY=ls-serial pnpm --dir packages/benchmarks bench
+BENCH_ONLY=process-spawn pnpm --dir packages/benchmarks bench
+```
+
+Run one matrix family:
+
+```bash
+BENCH_FAMILIES=fs pnpm --dir packages/benchmarks bench:matrix
+BENCH_FAMILIES=ecosystem pnpm --dir packages/benchmarks bench:matrix
+```
+
+## Focused Lanes
+
+Focused lanes live under `src/focused/` and preserve the legacy CLI flags, env vars, JSON shape, and stderr tables from the Agent OS benchmark scripts. They use `src/lib/vm.ts` over `NodeRuntime`.
+
+- **`sync-bridge-floor`**: no-op sync bridge RPC floor. Knobs: `BENCH_SYNC_BRIDGE_ITERATIONS`, `BENCH_SYNC_BRIDGE_WARMUP`, `BENCH_SYNC_BRIDGE_CALL_COUNTS`, `BENCH_SYNC_BRIDGE_PAYLOAD_BYTES`, `BENCH_SYNC_BRIDGE_RPC_LATENCY`, `BENCH_SYNC_BRIDGE_PHASES`.
+- **`sync-bridge-floor-phases`**: bridge floor with latency and phase diagnostics enabled.
+- **`sync-bridge-floor-bigargs`**: bridge floor with a larger payload, default 64 KiB.
+- **`fs-sync-ops`**: focused sync filesystem operation bundles. Knobs: `BENCH_FS_SYNC_ITERATIONS`, `BENCH_FS_SYNC_WARMUP`, `BENCH_FS_SYNC_OPS`, `BENCH_FS_SYNC_CALL_COUNTS`, `BENCH_FS_SYNC_FIXTURES`, `BENCH_FS_SYNC_PAYLOAD_BYTES`, `BENCH_FS_SYNC_RPC_LATENCY`, `BENCH_FS_SYNC_PHASES`.
+- **`fs-sync-ops-phases`**: sync filesystem floor with phase diagnostics enabled.
+- **`dns-lookup-floor`**: warm, repeated, concurrent, and fresh-process DNS lookup rows. Knobs: `BENCH_DNS_LOOKUP_ITERATIONS`, `BENCH_DNS_LOOKUP_WARMUP`, `BENCH_DNS_LOOKUP_ROWS`.
+- **`net-tcp-event-floor`**: TCP loopback event-floor rows. Knobs: `BENCH_NET_TCP_ITERATIONS`, `BENCH_NET_TCP_WARMUP`, `BENCH_NET_TCP_ROWS`, `BENCH_NET_TCP_POLL_DELAY_MS`, `BENCH_NET_TCP_TRACE`.
+- **`net-tcp-cadence-trace`**: TCP trace attribution rows with bridge tracing enabled.
+- **`readdir-scaling`**: pure readdir scaling with setup outside the timed loop. Knobs: `BENCH_READDIR_ITERATIONS`, `BENCH_READDIR_WARMUP`, `BENCH_READDIR_ENTRY_COUNTS`, `BENCH_READDIR_MODES`, `BENCH_READDIR_FIXTURES`, `BENCH_READDIR_WORKLOADS`.
+- **`readdir-probe`**: guarded/probe readdir shapes.
+- **`mount-readdir`**: host mount-table readdir scaling. Knobs: `BENCH_MOUNT_READDIR_ITERATIONS`, `BENCH_MOUNT_READDIR_WARMUP`, `BENCH_MOUNT_READDIR_COUNTS`, `BENCH_MOUNT_READDIR_ENTRY_COUNT`.
+- **`overlay-readdir`**: explicitly skipped in secure-exec because Agent OS TypeScript overlay layer-store APIs are not exposed here.
+- **`process-spawn`**: native baseline, host Node, and guest VM process-spawn floor. Knobs: `BENCH_ITERATIONS`, `BENCH_WARMUP`, `BENCH_PROCESS_LIFECYCLE_TRACE`.
+- **`wasm-command-floor`**: direct WASM command startup/capture floor. Knobs: `BENCH_WASM_COMMAND_FLOOR_ITERATIONS`, `BENCH_WASM_COMMAND_FLOOR_WARMUP`, `BENCH_WASM_COMMAND_FLOOR_SERIAL_RUNS`, `BENCH_WASM_COMMAND_FLOOR_STDOUT_SIZES`, `BENCH_WASM_COMMAND_FLOOR_WARMUP_DEBUG`.
+- **`wasm-command-floor-debug`**: command floor with WASM warmup diagnostics.
+- **`echo-cold-warm`**: cold/warm WASM shell `echo hello`.
+- **`ls-serial`**: VM startup plus serial `ls`. Knobs: `BENCH_LS_ITERATIONS`, `BENCH_LS_WARMUP`, `BENCH_LS_SERIAL_RUNS`, `BENCH_LS_FILE_COUNTS`, `BENCH_LS_WASM_WARMUP_DEBUG`.
+- **`wasi-ls-scaling`**: focused `ls` command scaling. Knobs: `BENCH_WASI_LS_ITERATIONS`, `BENCH_WASI_LS_WARMUP`, `BENCH_WASI_LS_SERIAL_RUNS`, `BENCH_WASI_LS_FILE_COUNTS`, `BENCH_WASI_LS_VARIANTS`, `BENCH_WASI_LS_WASM_WARMUP_DEBUG`, `BENCH_WASI_LS_SYSCALL_COUNTERS`.
+- **`wasi-ls-scaling-counters`**: `ls` scaling with syscall counters.
+
+The shell/coreutils focused lanes use the local `NodeRuntime` command-dir resolution, which prefers `registry/native/target/wasm32-wasip1/release/commands` when `make -C registry/native wasm` has been run.
+
+## Ecosystem Family
+
+`BENCH_FAMILIES=ecosystem pnpm --dir packages/benchmarks bench:matrix` runs end-to-end command workloads through two lanes:
+
+- **`hostCmd`**: real host binaries via `child_process`.
+- **`vmCmd`**: the same command in the VM through the WASM command tier.
+
+Rows:
+
+- **`ls_100`**: `ls -1` over a 100-file directory.
+- **`grep_1m`**: `grep -c needle` over a ~1 MiB fixture with a known count.
+- **`git_init_commit`**: `git init && git add . && git commit`, skipped unless `registry/software/git/wasm` exists locally.
+- **`sh_pipeline`**: `sh -c "ls -1 | grep -c ."` over the 100-file directory.
+
 Run only the cold-start matrix:
 
 ```bash

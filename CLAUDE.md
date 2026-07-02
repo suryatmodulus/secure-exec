@@ -54,12 +54,14 @@ Every bound that protects a shared resource — memory/heap, CPU/wall-clock, fd/
 ## Benchmarks
 
 - **Purpose:** `packages/benchmarks` owns the differential matrix for the runtime surface. It compares four lanes: native (host Rust `crates/native-baseline`), node (host Node.js), vm-js (guest V8 Node emulation), and vm-wasm (`native-baseline` compiled to `wasm32-wasip1` and run in the VM). `guest/node` is JS-emulation tax, `wasm/native` is WASM-runtime tax, and `node/native` is Node's own cost.
+- **Ecosystem family:** `BENCH_FAMILIES=ecosystem` is command-pair only: `hostCmd` (host binary) vs `vmCmd` (VM WASM command), with `tax.command = vmCmd/hostCmd`.
 - **Layout:** matrix families and the lane engine live in `packages/benchmarks/src`; Rust op implementations live in `crates/native-baseline` and build for both host and wasm. Run one family with `BENCH_FAMILIES=fs pnpm --dir packages/benchmarks bench:matrix` or through `bash packages/benchmarks/run-benchmarks.sh`; results land in `packages/benchmarks/results/`.
 - **Verify work:** every op must verify its payload or side effect, so a fast-but-broken path fails instead of passing.
 - **Clock discipline:** guest clocks are 1ms-quantized by default for security. Bench VMs opt in to `jsRuntime.highResolutionTime`, or the op must amplify by call count.
 - **Unsupported cells:** unsupported lane/op cells are explicit and never silently dropped.
 - **Baselines:** regenerate baselines only on a canonical environment, with hardware and dependency metadata recorded.
 - **Merge rule:** a perf fix whose row does not move gets reverted, matching the Performance section.
+- **Keep them current:** the benches are a maintained surface, not a one-off audit. New runtime surface (a syscall, a polyfill module, an executor capability, a registry command tier) needs a matrix op or focused lane in the same change or a filed follow-up; perf-relevant changes to existing surface must re-run the affected rows and update coverage when the shape changes (new lanes, renamed ops). If a bench stops compiling or a lane can no longer run, fix or explicitly skip it with a reason — never delete coverage silently.
 - **Agent OS boundary:** agent-os keeps product-surface benches only (session tax, ACP) and consumes this framework.
 
 ## Project Boundaries

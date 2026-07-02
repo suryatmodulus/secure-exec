@@ -1,5 +1,6 @@
 import { controlFamily } from "./control.js";
 import { dnsFamily } from "./dns.js";
+import { ecosystemFamily } from "./ecosystem.js";
 import { fsFamily } from "./fs.js";
 import { netFamily } from "./net.js";
 import { perfFindingsFamily } from "./perf-findings.js";
@@ -12,6 +13,7 @@ export const allFamilies = [
 	netFamily,
 	fsFamily,
 	dnsFamily,
+	ecosystemFamily,
 	pipesFamily,
 	timersFamily,
 	controlFamily,

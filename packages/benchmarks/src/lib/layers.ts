@@ -68,6 +68,20 @@ export interface BenchmarkOp {
 	program?: string;
 }
 
+export interface CommandBenchmarkOp {
+	family: string;
+	name: string;
+	fileLine: string;
+	reproducer: string;
+	skipReason?: string;
+	runHostCmd: (iters: number, warmup: number) => Promise<number[]> | number[];
+	runVmCmd: (
+		vm: BenchVm,
+		iters: number,
+		warmup: number,
+	) => Promise<number[]> | number[];
+}
+
 export interface OpResult {
 	family: string;
 	op: string;
@@ -80,6 +94,32 @@ export interface OpResult {
 		total: number;
 		wasm?: number;
 	};
+}
+
+export interface CommandOpResult {
+	family: string;
+	op: string;
+	fileLine: string;
+	reproducer: string;
+	skipped?: true;
+	skipReason?: string;
+	layers: {
+		hostCmd?: Stats;
+		vmCmd?: Stats;
+	};
+	tax: {
+		command?: number;
+	};
+}
+
+export type LatencyResult = OpResult | CommandOpResult;
+
+export function isCommandOpResult(result: LatencyResult): result is CommandOpResult {
+	return "hostCmd" in result.layers || "skipped" in result;
+}
+
+export function isLayerOpResult(result: LatencyResult): result is OpResult {
+	return !isCommandOpResult(result);
 }
 
 export function supportsWasmLayer(op: NativeOp): boolean {
@@ -302,6 +342,38 @@ export async function runOp(
 			emulation: round(layers.guest.p50 / layers.node.p50),
 			total: round(layers.guest.p50 / layers.native.p50),
 			...(layers.wasm ? { wasm: round(layers.wasm.p50 / layers.native.p50) } : {}),
+		},
+	};
+}
+
+export async function runCommandOp(
+	op: CommandBenchmarkOp,
+	vm: BenchVm,
+	iters: number,
+	warmup: number,
+): Promise<CommandOpResult> {
+	if (op.skipReason) {
+		return {
+			family: op.family,
+			op: op.name,
+			fileLine: op.fileLine,
+			reproducer: op.reproducer,
+			skipped: true,
+			skipReason: op.skipReason,
+			layers: {},
+			tax: {},
+		};
+	}
+	const hostCmd = stats(await op.runHostCmd(iters, warmup));
+	const vmCmd = stats(await op.runVmCmd(vm, iters, warmup));
+	return {
+		family: op.family,
+		op: op.name,
+		fileLine: op.fileLine,
+		reproducer: op.reproducer,
+		layers: { hostCmd, vmCmd },
+		tax: {
+			command: round(vmCmd.p50 / hostCmd.p50),
 		},
 	};
 }

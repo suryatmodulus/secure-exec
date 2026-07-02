@@ -60,3 +60,39 @@ export function runNativeLayer(
 	}
 	return parsed.samples.map((ns) => ns / 1e6);
 }
+
+export type NativePhaseSamples = Record<string, number[]>;
+
+export function runNativePhaseLayer(
+	op: Extract<NativeOp, "node_exit" | "node_fanout">,
+	iters: number,
+	warmup: number,
+): NativePhaseSamples {
+	const bin = process.env.NATIVE_BASELINE_BIN ?? DEFAULT_NATIVE_BIN;
+	const stdout = execFileSync(
+		bin,
+		[
+			"--op",
+			op,
+			"--iters",
+			String(iters),
+			"--warmup",
+			String(warmup),
+			"--phases",
+		],
+		{ encoding: "utf8", maxBuffer: 128 * 1024 * 1024 },
+	);
+	const parsed = JSON.parse(stdout) as {
+		unit: string;
+		phases: Record<string, number[]>;
+	};
+	if (parsed.unit !== "ns") {
+		throw new Error(`native-baseline emitted unexpected unit: ${parsed.unit}`);
+	}
+	return Object.fromEntries(
+		Object.entries(parsed.phases).map(([phase, samples]) => [
+			phase,
+			samples.map((ns) => ns / 1e6),
+		]),
+	);
+}
