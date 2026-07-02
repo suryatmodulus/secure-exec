@@ -97,6 +97,9 @@ Focused lanes live under `src/focused/` and preserve the legacy CLI flags, env v
 - **`dns-lookup-floor`**: warm, repeated, concurrent, and fresh-process DNS lookup rows. Knobs: `BENCH_DNS_LOOKUP_ITERATIONS`, `BENCH_DNS_LOOKUP_WARMUP`, `BENCH_DNS_LOOKUP_ROWS`.
 - **`net-tcp-event-floor`**: TCP loopback event-floor rows. Knobs: `BENCH_NET_TCP_ITERATIONS`, `BENCH_NET_TCP_WARMUP`, `BENCH_NET_TCP_ROWS`, `BENCH_NET_TCP_POLL_DELAY_MS`, `BENCH_NET_TCP_TRACE`.
 - **`net-tcp-cadence-trace`**: TCP trace attribution rows with bridge tracing enabled.
+- **`concurrency-vms`**: N owned sidecars/VMs concurrently run sustained `tcp_echo_small` loops for a fixed wall window. Knobs: `BENCH_CONCURRENCY_COUNTS` (default `1,4,8`), `BENCH_CONCURRENCY_DURATION_MS` (default `5000`).
+- **`interference`**: one busy VM alternates CPU spin and filesystem write churn while a second VM samples `fs_write_small`. Knobs: `BENCH_INTERFERENCE_DURATION_MS` (default `5000`), `BENCH_INTERFERENCE_BUSY_DURATION_MS` (default probe duration plus `1000`).
+- **`concurrent-processes`**: one VM runs N concurrent guest Node processes doing sustained `fs_write_small` loops, exposing the per-VM service ceiling. Knobs: `BENCH_PROCESS_COUNTS` (default `1,4,8`), `BENCH_PROCESS_DURATION_MS` (default `5000`).
 - **`readdir-scaling`**: pure readdir scaling with setup outside the timed loop. Knobs: `BENCH_READDIR_ITERATIONS`, `BENCH_READDIR_WARMUP`, `BENCH_READDIR_ENTRY_COUNTS`, `BENCH_READDIR_MODES`, `BENCH_READDIR_FIXTURES`, `BENCH_READDIR_WORKLOADS`.
 - **`readdir-probe`**: guarded/probe readdir shapes.
 - **`mount-readdir`**: host mount-table readdir scaling. Knobs: `BENCH_MOUNT_READDIR_ITERATIONS`, `BENCH_MOUNT_READDIR_WARMUP`, `BENCH_MOUNT_READDIR_COUNTS`, `BENCH_MOUNT_READDIR_ENTRY_COUNT`.

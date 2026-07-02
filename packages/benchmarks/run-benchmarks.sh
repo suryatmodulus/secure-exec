@@ -223,6 +223,12 @@ run_tsx "net-tcp-cadence-trace" \
 	--net-bridge-trace \
 	${BENCH_NET_TCP_TRACE_POLL_DELAY_MS:+--net-poll-delay-ms="${BENCH_NET_TCP_TRACE_POLL_DELAY_MS}"}
 
+run_tsx "concurrency-vms" "$HERE/src/focused/concurrency-vms.bench.ts"
+
+run_tsx "interference" "$HERE/src/focused/interference.bench.ts"
+
+run_tsx "concurrent-processes" "$HERE/src/focused/concurrent-processes.bench.ts"
+
 run_tsx "wasm-command-floor" \
 	"$HERE/src/focused/wasm-command-floor.bench.ts" \
 	--iterations="${BENCH_WASM_COMMAND_FLOOR_ITERATIONS:-3}" \
