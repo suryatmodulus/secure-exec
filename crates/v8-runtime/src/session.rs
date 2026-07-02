@@ -1,6 +1,8 @@
 // Session management: create/destroy sessions with V8 isolates on dedicated threads
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(not(test))]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -19,8 +21,10 @@ use crate::host_call::{CallIdRouter, SharedCallIdCounter};
 use crate::ipc::ExecutionError;
 #[cfg(not(test))]
 use crate::ipc_binary::ExecutionErrorBin;
-use crate::runtime_protocol::{BridgeResponse, RuntimeEvent, SessionMessage, StreamEvent};
-use crate::snapshot::SnapshotCache;
+use crate::runtime_protocol::{
+    BridgeResponse, RuntimeEvent, SessionMessage, StreamEvent, WarmSessionHint,
+};
+use crate::snapshot::{snapshot_cache_key, SnapshotCache, SnapshotCacheKey};
 #[cfg(not(test))]
 use crate::{bridge, isolate, snapshot};
 
@@ -58,6 +62,56 @@ const DEFERRED_COMMAND_LIMIT_ERROR_CODE: &str = "ERR_SESSION_DEFERRED_COMMAND_LI
 const SESSION_COMMAND_CHANNEL_CAPACITY: usize = 256;
 const MAX_DEFERRED_SESSION_COMMANDS: usize = SESSION_COMMAND_CHANNEL_CAPACITY;
 const MAX_DEFERRED_SYNC_MESSAGES: usize = SESSION_COMMAND_CHANNEL_CAPACITY;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WarmPoolKey {
+    snapshot_key_digest: SnapshotCacheKey,
+    heap_limit_mb: u32,
+}
+
+struct ParkedWorker {
+    assignment_tx: Sender<SessionAssignment>,
+    join_handle: thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct WarmWorkerPoolState {
+    workers: HashMap<WarmPoolKey, Vec<ParkedWorker>>,
+    refilling: HashSet<WarmPoolKey>,
+}
+
+#[derive(Default)]
+struct WarmWorkerPool {
+    state: Mutex<WarmWorkerPoolState>,
+}
+
+struct SessionAssignment {
+    heap_limit_mb: Option<u32>,
+    cpu_time_limit_ms: Option<u32>,
+    wall_clock_limit_ms: Option<u32>,
+    rx: Receiver<SessionCommand>,
+    slot_control: SlotControl,
+    max_concurrency: usize,
+    event_tx: RuntimeEventSender,
+    call_id_router: CallIdRouter,
+    shared_call_id: SharedCallIdCounter,
+    snapshot_cache: Arc<SnapshotCache>,
+    isolate_handle: SharedIsolateHandle,
+    execution_abort: SharedExecutionAbort,
+    session_id: String,
+    output_generation: Option<u64>,
+}
+
+#[cfg(not(test))]
+struct PrecreatedIsolate {
+    isolate: v8::OwnedIsolate,
+    context: v8::Global<v8::Context>,
+    bridge_code: String,
+    userland_code: String,
+}
+
+#[cfg(test)]
+struct PrecreatedIsolate;
 
 #[cfg(not(test))]
 #[derive(Default)]
@@ -108,6 +162,299 @@ fn record_v8_session_phase(stage: &str, elapsed: Duration) {
         ));
     }
     let _ = std::fs::write(path, output);
+}
+
+#[cfg(not(test))]
+fn record_warm_worker_hit() {
+    record_v8_session_phase("warm_worker_hit", Duration::ZERO);
+}
+
+#[cfg(test)]
+fn record_warm_worker_hit() {}
+
+#[cfg(not(test))]
+fn record_warm_worker_miss() {
+    record_v8_session_phase("warm_worker_miss", Duration::ZERO);
+}
+
+#[cfg(test)]
+fn record_warm_worker_miss() {}
+
+fn warm_worker_capacity_per_key() -> usize {
+    std::env::var("AGENTOS_V8_WARM_ISOLATES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+}
+
+fn effective_heap_limit_mb(heap_limit_mb: Option<u32>) -> u32 {
+    heap_limit_mb.unwrap_or(crate::isolate::DEFAULT_HEAP_LIMIT_MB)
+}
+
+fn warm_pool_key(
+    bridge_code: &str,
+    userland_code: &str,
+    heap_limit_mb: Option<u32>,
+) -> WarmPoolKey {
+    WarmPoolKey {
+        snapshot_key_digest: snapshot_cache_key(
+            bridge_code,
+            (!userland_code.is_empty()).then_some(userland_code),
+        ),
+        heap_limit_mb: effective_heap_limit_mb(heap_limit_mb),
+    }
+}
+
+fn warm_key_prefix(key: &WarmPoolKey) -> String {
+    key.snapshot_key_digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+impl WarmWorkerPool {
+    fn claim(&self, key: &WarmPoolKey) -> Option<ParkedWorker> {
+        let mut state = self.state.lock().expect("warm worker pool lock poisoned");
+        state.workers.get_mut(key).and_then(Vec::pop)
+    }
+
+    fn shutdown_handles(&self) -> Vec<thread::JoinHandle<()>> {
+        let mut state = self.state.lock().expect("warm worker pool lock poisoned");
+        state.refilling.clear();
+        state
+            .workers
+            .drain()
+            .flat_map(|(_, workers)| workers)
+            .map(|worker| {
+                drop(worker.assignment_tx);
+                worker.join_handle
+            })
+            .collect()
+    }
+
+    fn ensure_count(
+        self: &Arc<Self>,
+        snapshot_cache: Arc<SnapshotCache>,
+        slot_control: SlotControl,
+        bridge_code: String,
+        userland_code: String,
+        heap_limit_mb: Option<u32>,
+        requested_count: usize,
+    ) {
+        let capacity = warm_worker_capacity_per_key();
+        if capacity == 0 || requested_count == 0 {
+            return;
+        }
+
+        let target_count = requested_count.min(capacity);
+        let key = warm_pool_key(&bridge_code, &userland_code, heap_limit_mb);
+        {
+            let mut state = self.state.lock().expect("warm worker pool lock poisoned");
+            let current = state.workers.get(&key).map_or(0, Vec::len);
+            if current >= target_count || state.refilling.contains(&key) {
+                return;
+            }
+            state.refilling.insert(key.clone());
+        }
+
+        let pool = Arc::clone(self);
+        let spawn_key = key.clone();
+        let _ = thread::Builder::new()
+            .name(String::from("secure-exec-v8-warm-refill"))
+            .spawn(move || {
+                pool.refill_until(
+                    snapshot_cache,
+                    slot_control,
+                    spawn_key,
+                    bridge_code,
+                    userland_code,
+                    heap_limit_mb,
+                    target_count,
+                );
+            })
+            .map_err(|error| {
+                eprintln!("secure-exec-v8-runtime: warm worker refill spawn failed: {error}");
+                self.state
+                    .lock()
+                    .expect("warm worker pool lock poisoned")
+                    .refilling
+                    .remove(&key);
+            });
+    }
+
+    fn refill_until(
+        &self,
+        snapshot_cache: Arc<SnapshotCache>,
+        slot_control: SlotControl,
+        key: WarmPoolKey,
+        bridge_code: String,
+        userland_code: String,
+        heap_limit_mb: Option<u32>,
+        target_count: usize,
+    ) {
+        loop {
+            let capacity = warm_worker_capacity_per_key();
+            if capacity == 0 {
+                break;
+            }
+            let desired = target_count.min(capacity);
+            {
+                let state = self.state.lock().expect("warm worker pool lock poisoned");
+                if state.workers.get(&key).map_or(0, Vec::len) >= desired {
+                    break;
+                }
+            }
+
+            let Some(worker) = spawn_warm_worker(
+                Arc::clone(&snapshot_cache),
+                Arc::clone(&slot_control),
+                key.clone(),
+                bridge_code.clone(),
+                userland_code.clone(),
+                heap_limit_mb,
+            ) else {
+                break;
+            };
+
+            let mut state = self.state.lock().expect("warm worker pool lock poisoned");
+            let workers = state.workers.entry(key.clone()).or_default();
+            if workers.len() >= desired {
+                drop(worker.assignment_tx);
+                let _ = worker.join_handle.join();
+                break;
+            }
+            workers.push(worker);
+            eprintln!(
+                "secure-exec-v8-runtime: warm worker refilled key={} heap={} pool_size={}",
+                warm_key_prefix(&key),
+                key.heap_limit_mb,
+                workers.len()
+            );
+        }
+
+        self.state
+            .lock()
+            .expect("warm worker pool lock poisoned")
+            .refilling
+            .remove(&key);
+    }
+}
+
+#[cfg(not(test))]
+fn spawn_warm_worker(
+    snapshot_cache: Arc<SnapshotCache>,
+    slot_control: SlotControl,
+    key: WarmPoolKey,
+    bridge_code: String,
+    userland_code: String,
+    heap_limit_mb: Option<u32>,
+) -> Option<ParkedWorker> {
+    let (assignment_tx, assignment_rx) = crossbeam_channel::bounded::<SessionAssignment>(1);
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
+    let worker_bridge_code = bridge_code.clone();
+    let worker_userland_code = userland_code.clone();
+    let join_handle = match thread::Builder::new()
+        .name(String::from("secure-exec-v8-warm-worker"))
+        .spawn(move || {
+            let precreated = precreate_warm_isolate(
+                snapshot_cache,
+                slot_control,
+                worker_bridge_code,
+                worker_userland_code,
+                heap_limit_mb,
+            );
+            match precreated {
+                Ok(precreated) => {
+                    let _ = ready_tx.send(Ok(()));
+                    if let Ok(assignment) = assignment_rx.recv() {
+                        session_thread(assignment, Some(precreated));
+                    }
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("secure-exec-v8-runtime: warm worker spawn failed: {error}");
+            return None;
+        }
+    };
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Some(ParkedWorker {
+            assignment_tx,
+            join_handle,
+        }),
+        Ok(Err(error)) => {
+            eprintln!(
+                "secure-exec-v8-runtime: warm worker refill failed key={} heap={}: {error}",
+                warm_key_prefix(&key),
+                key.heap_limit_mb
+            );
+            let _ = join_handle.join();
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "secure-exec-v8-runtime: warm worker refill failed key={} heap={}: {error}",
+                warm_key_prefix(&key),
+                key.heap_limit_mb
+            );
+            let _ = join_handle.join();
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn spawn_warm_worker(
+    _snapshot_cache: Arc<SnapshotCache>,
+    _slot_control: SlotControl,
+    _key: WarmPoolKey,
+    _bridge_code: String,
+    _userland_code: String,
+    _heap_limit_mb: Option<u32>,
+) -> Option<ParkedWorker> {
+    None
+}
+
+#[cfg(not(test))]
+fn precreate_warm_isolate(
+    snapshot_cache: Arc<SnapshotCache>,
+    slot_control: SlotControl,
+    bridge_code: String,
+    userland_code: String,
+    heap_limit_mb: Option<u32>,
+) -> Result<PrecreatedIsolate, String> {
+    isolate::init_v8_platform();
+    let snapshot_blob = snapshot_cache.get_or_create_with_userland(
+        &bridge_code,
+        (!userland_code.is_empty()).then_some(userland_code.as_str()),
+    )?;
+    let snapshot_blob = (*snapshot_blob).clone();
+    let _idle_slots = lock_idle_slots(&slot_control);
+    let mut isolate = snapshot::create_isolate_from_snapshot(snapshot_blob, heap_limit_mb);
+    isolate.set_host_import_module_dynamically_callback(execution::dynamic_import_callback);
+    isolate.set_host_initialize_import_meta_object_callback(execution::import_meta_object_callback);
+    let context = isolate::create_context(&mut isolate);
+    Ok(PrecreatedIsolate {
+        isolate,
+        context,
+        bridge_code,
+        userland_code,
+    })
+}
+
+#[cfg(not(test))]
+fn lock_idle_slots(slot_control: &SlotControl) -> std::sync::MutexGuard<'_, usize> {
+    let (lock, cvar) = &**slot_control;
+    let mut count = lock.lock().unwrap();
+    while *count != 0 {
+        count = cvar.wait(count).unwrap();
+    }
+    count
 }
 
 /// Normalize an opt-in CPU-time budget: `Some(0)` means "disabled" and folds to
@@ -268,6 +615,8 @@ pub struct SessionManager {
     shared_call_id: SharedCallIdCounter,
     /// Shared snapshot cache for fast isolate creation from pre-compiled bridge code
     snapshot_cache: Arc<SnapshotCache>,
+    /// Ready-to-claim isolate workers keyed by snapshot digest and heap cap.
+    warm_pool: Arc<WarmWorkerPool>,
 }
 
 impl SessionManager {
@@ -285,6 +634,7 @@ impl SessionManager {
             call_id_router,
             shared_call_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache,
+            warm_pool: Arc::new(WarmWorkerPool::default()),
         }
     }
 
@@ -292,6 +642,23 @@ impl SessionManager {
     #[allow(dead_code)]
     pub fn snapshot_cache(&self) -> &Arc<SnapshotCache> {
         &self.snapshot_cache
+    }
+
+    pub fn pre_warm_workers(
+        &self,
+        bridge_code: String,
+        userland_code: String,
+        heap_limit_mb: Option<u32>,
+        count: usize,
+    ) {
+        self.warm_pool.ensure_count(
+            Arc::clone(&self.snapshot_cache),
+            Arc::clone(&self.slot_control),
+            bridge_code,
+            userland_code,
+            heap_limit_mb,
+            count,
+        );
     }
 
     /// Create a new session.
@@ -310,6 +677,7 @@ impl SessionManager {
             cpu_time_limit_ms,
             wall_clock_limit_ms,
             None,
+            None,
         )
     }
 
@@ -320,6 +688,7 @@ impl SessionManager {
         cpu_time_limit_ms: Option<u32>,
         wall_clock_limit_ms: Option<u32>,
         output_generation: Option<u64>,
+        warm_hint: Option<WarmSessionHint>,
     ) -> Result<(), String> {
         if self.sessions.contains_key(&session_id) {
             return Err(format!("session {} already exists", session_id));
@@ -328,44 +697,43 @@ impl SessionManager {
         let cpu_time_limit_ms = normalize_cpu_time_limit_ms(cpu_time_limit_ms);
         let wall_clock_limit_ms = normalize_wall_clock_limit_ms(wall_clock_limit_ms);
         let (tx, rx) = crossbeam_channel::bounded(SESSION_COMMAND_CHANNEL_CAPACITY);
-        let slot_control = Arc::clone(&self.slot_control);
-        let max = self.max_concurrency;
-        let event_tx = self.event_tx.clone();
-        let router = Arc::clone(&self.call_id_router);
-        let shared_call_id = Arc::clone(&self.shared_call_id);
-        let snap_cache = Arc::clone(&self.snapshot_cache);
         let isolate_handle = Arc::new(Mutex::new(None));
         let execution_abort = new_execution_abort();
-        let isolate_handle_for_thread = Arc::clone(&isolate_handle);
-        let execution_abort_for_thread = execution_abort.clone();
-        let session_id_for_thread = session_id.clone();
-
-        let name_prefix = if session_id.len() > 8 {
-            &session_id[..8]
-        } else {
-            &session_id
+        let assignment = SessionAssignment {
+            heap_limit_mb,
+            cpu_time_limit_ms,
+            wall_clock_limit_ms,
+            rx,
+            slot_control: Arc::clone(&self.slot_control),
+            max_concurrency: self.max_concurrency,
+            event_tx: self.event_tx.clone(),
+            call_id_router: Arc::clone(&self.call_id_router),
+            shared_call_id: Arc::clone(&self.shared_call_id),
+            snapshot_cache: Arc::clone(&self.snapshot_cache),
+            isolate_handle: Arc::clone(&isolate_handle),
+            execution_abort: execution_abort.clone(),
+            session_id: session_id.clone(),
+            output_generation,
         };
-        let join_handle = thread::Builder::new()
-            .name(format!("session-{}", name_prefix))
-            .spawn(move || {
-                session_thread(
-                    heap_limit_mb,
-                    cpu_time_limit_ms,
-                    wall_clock_limit_ms,
-                    rx,
-                    slot_control,
-                    max,
-                    event_tx,
-                    router,
-                    shared_call_id,
-                    snap_cache,
-                    isolate_handle_for_thread,
-                    execution_abort_for_thread,
-                    session_id_for_thread,
-                    output_generation,
-                );
-            })
-            .map_err(|e| format!("failed to spawn session thread: {}", e))?;
+
+        let join_handle = match self.claim_warm_worker(warm_hint.as_ref(), assignment) {
+            Ok((join_handle, true)) => {
+                if let Some(hint) = warm_hint {
+                    self.warm_pool.ensure_count(
+                        Arc::clone(&self.snapshot_cache),
+                        Arc::clone(&self.slot_control),
+                        hint.bridge_code,
+                        hint.userland_code,
+                        hint.heap_limit_mb,
+                        warm_worker_capacity_per_key(),
+                    );
+                }
+                join_handle
+            }
+            Ok((join_handle, false)) => join_handle,
+            Err(assignment) => spawn_session_thread(assignment)
+                .map_err(|e| format!("failed to spawn session thread: {}", e))?,
+        };
 
         self.sessions.insert(
             session_id,
@@ -379,6 +747,48 @@ impl SessionManager {
         );
 
         Ok(())
+    }
+
+    fn claim_warm_worker(
+        &self,
+        warm_hint: Option<&WarmSessionHint>,
+        assignment: SessionAssignment,
+    ) -> Result<(thread::JoinHandle<()>, bool), SessionAssignment> {
+        let Some(hint) = warm_hint else {
+            return Err(assignment);
+        };
+        if warm_worker_capacity_per_key() == 0 {
+            record_warm_worker_miss();
+            return Err(assignment);
+        }
+
+        let key = warm_pool_key(&hint.bridge_code, &hint.userland_code, hint.heap_limit_mb);
+        let Some(worker) = self.warm_pool.claim(&key) else {
+            record_warm_worker_miss();
+            eprintln!(
+                "secure-exec-v8-runtime: warm worker pool-empty key={} heap={}",
+                warm_key_prefix(&key),
+                key.heap_limit_mb
+            );
+            return Err(assignment);
+        };
+
+        match worker.assignment_tx.send(assignment) {
+            Ok(()) => {
+                record_warm_worker_hit();
+                eprintln!(
+                    "secure-exec-v8-runtime: warm worker claimed key={} heap={}",
+                    warm_key_prefix(&key),
+                    key.heap_limit_mb
+                );
+                Ok((worker.join_handle, true))
+            }
+            Err(error) => {
+                record_warm_worker_miss();
+                let _ = worker.join_handle.join();
+                Err(error.0)
+            }
+        }
     }
 
     pub fn destroy_session_if_output_generation(
@@ -504,7 +914,8 @@ impl SessionManager {
             .expect("call_id router lock poisoned")
             .clear();
 
-        self.sessions
+        let mut handles: Vec<_> = self
+            .sessions
             .drain()
             .filter_map(|(_, mut entry)| {
                 #[cfg(not(test))]
@@ -521,7 +932,9 @@ impl SessionManager {
                 drop(entry.tx);
                 entry.join_handle.take()
             })
-            .collect()
+            .collect();
+        handles.extend(self.warm_pool.shutdown_handles());
+        handles
     }
 
     pub(crate) fn clear_call_route(&self, call_id: u64) {
@@ -749,23 +1162,50 @@ fn defer_session_command_before_slot(
 /// Session thread: acquires a concurrency slot, defers V8 isolate creation
 /// to first Execute (when bridge code is known for snapshot lookup), and
 /// processes commands until shutdown.
+fn spawn_session_thread(assignment: SessionAssignment) -> std::io::Result<thread::JoinHandle<()>> {
+    let name_prefix = if assignment.session_id.len() > 8 {
+        assignment.session_id[..8].to_string()
+    } else {
+        assignment.session_id.clone()
+    };
+    thread::Builder::new()
+        .name(format!("session-{}", name_prefix))
+        .spawn(move || session_thread(assignment, None))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn session_thread(
-    #[cfg_attr(test, allow(unused_variables))] heap_limit_mb: Option<u32>,
-    #[cfg_attr(test, allow(unused_variables))] cpu_time_limit_ms: Option<u32>,
-    #[cfg_attr(test, allow(unused_variables))] wall_clock_limit_ms: Option<u32>,
-    rx: Receiver<SessionCommand>,
-    slot_control: SlotControl,
-    max_concurrency: usize,
-    #[cfg_attr(test, allow(unused_variables))] event_tx: RuntimeEventSender,
-    #[cfg_attr(test, allow(unused_variables))] call_id_router: CallIdRouter,
-    #[cfg_attr(test, allow(unused_variables))] shared_call_id: SharedCallIdCounter,
-    #[cfg_attr(test, allow(unused_variables))] snapshot_cache: Arc<SnapshotCache>,
-    #[cfg_attr(test, allow(unused_variables))] isolate_handle: SharedIsolateHandle,
-    #[cfg_attr(test, allow(unused_variables))] execution_abort: SharedExecutionAbort,
-    #[cfg_attr(test, allow(unused_variables))] session_id: String,
-    #[cfg_attr(test, allow(unused_variables))] output_generation: Option<u64>,
+    assignment: SessionAssignment,
+    #[cfg_attr(test, allow(unused_variables))] precreated_isolate: Option<PrecreatedIsolate>,
 ) {
+    let SessionAssignment {
+        heap_limit_mb,
+        cpu_time_limit_ms,
+        wall_clock_limit_ms,
+        rx,
+        slot_control,
+        max_concurrency,
+        event_tx,
+        call_id_router,
+        shared_call_id,
+        snapshot_cache,
+        isolate_handle,
+        execution_abort,
+        session_id,
+        output_generation,
+    } = assignment;
+    #[cfg(test)]
+    let _ = (
+        heap_limit_mb,
+        cpu_time_limit_ms,
+        wall_clock_limit_ms,
+        call_id_router,
+        shared_call_id,
+        snapshot_cache,
+        isolate_handle,
+        execution_abort,
+    );
+
     // Acquire concurrency slot, but keep polling the session channel so a queued
     // session can still shut down cleanly before it ever gets a slot.
     let mut deferred_commands = VecDeque::new();
@@ -818,20 +1258,26 @@ fn session_thread(
     #[cfg(all(not(test), not(unix)))]
     let exec_thread_cpu_clock: Option<crate::timeout::ThreadCpuClock> = None;
 
-    // Isolate creation is deferred to first Execute (when bridge code is known
-    // for snapshot cache lookup). This avoids creating an isolate that may never
-    // be used and enables snapshot-based fast creation.
+    // Isolate creation is normally deferred to first Execute (when bridge code is
+    // known for snapshot cache lookup). A claimed warm worker enters here with
+    // the snapshot isolate already created on this same thread.
     #[cfg(not(test))]
-    let mut v8_isolate: Option<v8::OwnedIsolate> = None;
-    #[cfg(not(test))]
-    let mut _v8_context: Option<v8::Global<v8::Context>> = None;
-
-    // Whether the isolate was created from a context snapshot.
-    // When true, Execute uses the snapshot's default context (bridge IIFE
-    // already executed) and skips re-running the bridge code. Bridge function
-    // stubs in the snapshot are replaced with real session-local functions.
-    #[cfg(not(test))]
-    let mut from_snapshot = false;
+    let (
+        mut v8_isolate,
+        mut _v8_context,
+        mut from_snapshot,
+        mut isolate_bridge_code,
+        mut isolate_userland_code,
+    ) = match precreated_isolate {
+        Some(precreated) => (
+            Some(precreated.isolate),
+            Some(precreated.context),
+            true,
+            Some(precreated.bridge_code),
+            Some(precreated.userland_code),
+        ),
+        None => (None, None, false, None, None),
+    };
 
     #[cfg(not(test))]
     let mut pending = bridge::PendingPromises::new();
@@ -855,15 +1301,16 @@ fn session_thread(
     // bridge code stays the same. Fresh contexts cloned from a snapshot inherit
     // the snapshot's bridge IIFE, so a bridge-code change must rebuild the
     // isolate before the next execution or the session will keep restoring the
-    // old snapshot forever.
-    #[cfg(not(test))]
-    let mut isolate_bridge_code: Option<String> = None;
-    // The userland bundle baked into the current isolate's snapshot — a change
-    // must rebuild the isolate for the same reason as a bridge-code change.
-    #[cfg(not(test))]
-    let mut isolate_userland_code: Option<String> = None;
+    // old snapshot forever. The userland bundle is part of the same guard.
     #[cfg(not(test))]
     let mut high_resolution_time_origin = Instant::now();
+
+    #[cfg(not(test))]
+    if let Some(iso) = v8_isolate.as_mut() {
+        *isolate_handle
+            .lock()
+            .expect("session isolate handle lock poisoned") = Some(iso.thread_safe_handle());
+    }
 
     // Process commands until shutdown or channel close
     loop {
@@ -2319,6 +2766,7 @@ mod tests {
             None,
             None,
             Some(7),
+            None,
         )
         .expect("create session");
         mgr.call_id_router()

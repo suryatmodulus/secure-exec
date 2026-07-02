@@ -5,7 +5,7 @@ use secure_exec_bridge::queue_tracker::{tracked_sync_channel, TrackedLimit, Trac
 use secure_exec_v8_runtime::embedded_runtime::{
     shared_embedded_runtime, EmbeddedV8Runtime, EmbeddedV8SessionHandle,
 };
-use secure_exec_v8_runtime::runtime_protocol::{RuntimeCommand, RuntimeEvent};
+use secure_exec_v8_runtime::runtime_protocol::{RuntimeCommand, RuntimeEvent, WarmSessionHint};
 use std::io::{self, Cursor};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -80,6 +80,27 @@ impl V8RuntimeHost {
         self.shared.runtime.unregister_session(session_id);
     }
 
+    pub fn create_session(
+        &self,
+        session_id: String,
+        heap_limit_mb: u32,
+        cpu_time_limit_ms: u32,
+        wall_clock_limit_ms: u32,
+        warm_hint: Option<WarmSessionHint>,
+    ) -> io::Result<()> {
+        self.shared.runtime.dispatch(RuntimeCommand::CreateSession {
+            session_id,
+            heap_limit_mb: non_zero_option(heap_limit_mb),
+            cpu_time_limit_ms: non_zero_option(cpu_time_limit_ms),
+            wall_clock_limit_ms: non_zero_option(wall_clock_limit_ms),
+            warm_hint,
+        })
+    }
+
+    pub fn create_session_from_command(&self, command: RuntimeCommand) -> io::Result<()> {
+        self.shared.runtime.dispatch(command)
+    }
+
     /// Send a frame to the V8 runtime.
     pub fn send_frame(&self, frame: &BinaryFrame) -> io::Result<()> {
         self.shared.runtime.dispatch(to_runtime_command(frame)?)
@@ -103,6 +124,32 @@ impl V8RuntimeHost {
             bridge_code: Self::bridge_code().to_owned(),
             userland_code: userland_code.to_owned(),
         })
+    }
+
+    pub fn pre_warm_workers(&self, userland_code: &str, heap_limit_mb: u32, count: usize) {
+        self.shared.runtime.pre_warm_workers(
+            Self::bridge_code().to_owned(),
+            userland_code.to_owned(),
+            non_zero_option(heap_limit_mb),
+            count,
+        );
+    }
+
+    pub fn seed_default_warm_workers_async(&self) {
+        static DEFAULT_WARM_STARTED: OnceLock<()> = OnceLock::new();
+        let runtime = Arc::clone(&self.shared.runtime);
+        let _ = DEFAULT_WARM_STARTED.get_or_init(|| {
+            let _ = thread::Builder::new()
+                .name(String::from("secure-exec-v8-default-warm"))
+                .spawn(move || {
+                    runtime.pre_warm_workers(
+                        V8_BRIDGE_CODE.to_owned(),
+                        String::new(),
+                        None,
+                        warm_worker_count(),
+                    );
+                });
+        });
     }
 
     /// True when the process-wide snapshot cache already has this userland
@@ -132,6 +179,7 @@ impl V8RuntimeHost {
                         eprintln!(
                             "secure-exec-v8-runtime: wasm runner snapshot warm failed: {error}"
                         );
+                        return;
                     }
                 });
         });
@@ -154,6 +202,17 @@ impl V8RuntimeHost {
     fn runtime_ptr(&self) -> usize {
         Arc::as_ptr(&self.shared.runtime) as usize
     }
+}
+
+fn non_zero_option(value: u32) -> Option<u32> {
+    (value > 0).then_some(value)
+}
+
+fn warm_worker_count() -> usize {
+    std::env::var("AGENTOS_V8_WARM_ISOLATES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
 }
 
 /// A handle to a single V8 session within the shared runtime.

@@ -117,6 +117,19 @@ impl EmbeddedV8Runtime {
             .is_some()
     }
 
+    pub fn pre_warm_workers(
+        &self,
+        bridge_code: String,
+        userland_code: String,
+        heap_limit_mb: Option<u32>,
+        count: usize,
+    ) {
+        self.session_mgr
+            .lock()
+            .expect("embedded runtime session manager lock poisoned")
+            .pre_warm_workers(bridge_code, userland_code, heap_limit_mb, count);
+    }
+
     pub fn register_session(&self, session_id: &str) -> io::Result<mpsc::Receiver<RuntimeEvent>> {
         self.register_session_with_output_registration(session_id)
             .map(|(receiver, _registration)| receiver)
@@ -215,6 +228,7 @@ impl EmbeddedV8Runtime {
                 heap_limit_mb,
                 cpu_time_limit_ms,
                 wall_clock_limit_ms,
+                warm_hint,
             } => {
                 let output_generation = self
                     .session_outputs
@@ -232,6 +246,7 @@ impl EmbeddedV8Runtime {
                     cpu_time_limit_ms,
                     wall_clock_limit_ms,
                     output_generation,
+                    warm_hint,
                 )
                 .map_err(other_io_error)
             }
@@ -594,13 +609,16 @@ fn dispatch_runtime_command(
             heap_limit_mb,
             cpu_time_limit_ms,
             wall_clock_limit_ms,
+            warm_hint,
         } => {
             let mut mgr = session_mgr.lock().expect("session manager lock poisoned");
-            mgr.create_session(
+            mgr.create_session_with_output_generation(
                 session_id,
                 heap_limit_mb,
                 cpu_time_limit_ms,
                 wall_clock_limit_ms,
+                None,
+                warm_hint,
             )
             .map_err(other_io_error)
         }
@@ -835,6 +853,7 @@ mod tests {
                     heap_limit_mb: None,
                     cpu_time_limit_ms: None,
                     wall_clock_limit_ms: None,
+                    warm_hint: None,
                 })
                 .expect("create session");
             assert_eq!(
@@ -1192,6 +1211,7 @@ mod tests {
                 heap_limit_mb: None,
                 cpu_time_limit_ms: None,
                 wall_clock_limit_ms: None,
+                warm_hint: None,
             })
             .expect("create first session");
         runtime
@@ -1208,6 +1228,7 @@ mod tests {
                 heap_limit_mb: None,
                 cpu_time_limit_ms: None,
                 wall_clock_limit_ms: None,
+                warm_hint: None,
             })
             .expect("create reused session");
 
@@ -1234,12 +1255,26 @@ mod tests {
         let session_mgr = test_session_manager();
         {
             let mut mgr = session_mgr.lock().expect("session manager");
-            mgr.create_session_with_output_generation("reused".into(), None, None, None, Some(1))
-                .expect("create first session");
+            mgr.create_session_with_output_generation(
+                "reused".into(),
+                None,
+                None,
+                None,
+                Some(1),
+                None,
+            )
+            .expect("create first session");
             mgr.destroy_session("reused")
                 .expect("destroy first session");
-            mgr.create_session_with_output_generation("reused".into(), None, None, None, Some(2))
-                .expect("create reused session");
+            mgr.create_session_with_output_generation(
+                "reused".into(),
+                None,
+                None,
+                None,
+                Some(2),
+                None,
+            )
+            .expect("create reused session");
 
             assert!(
                 !mgr.destroy_session_if_output_generation("reused", 1)
@@ -1291,6 +1326,7 @@ mod tests {
                 None,
                 None,
                 Some(output_generation),
+                None,
             )
             .expect("create test session");
         session_mgr

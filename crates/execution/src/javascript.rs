@@ -12,6 +12,7 @@ use crate::v8_ipc::BinaryFrame;
 use crate::v8_runtime;
 use getrandom::getrandom;
 use secure_exec_bridge::queue_tracker::{register_queue, TrackedLimit, TrackedReceiver};
+use secure_exec_v8_runtime::runtime_protocol::{RuntimeCommand, WarmSessionHint};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -2055,21 +2056,23 @@ fn register_v8_session<F>(
     heap_limit_mb: u32,
     cpu_time_limit_ms: u32,
     wall_clock_limit_ms: u32,
-    send_frame: F,
+    warm_hint: Option<WarmSessionHint>,
+    create_session: F,
 ) -> Result<PendingV8SessionRegistration<'_>, JavascriptExecutionError>
 where
-    F: FnOnce(&BinaryFrame) -> std::io::Result<()>,
+    F: FnOnce(RuntimeCommand) -> std::io::Result<()>,
 {
     let frame_receiver = v8_host
         .register_session(&session_id)
         .map_err(JavascriptExecutionError::Spawn)?;
     let registration_guard = V8SessionRegistrationGuard::new(v8_host, session_id.clone());
 
-    send_frame(&BinaryFrame::CreateSession {
+    create_session(RuntimeCommand::CreateSession {
         session_id,
-        heap_limit_mb,
-        cpu_time_limit_ms,
-        wall_clock_limit_ms,
+        heap_limit_mb: (heap_limit_mb > 0).then_some(heap_limit_mb),
+        cpu_time_limit_ms: (cpu_time_limit_ms > 0).then_some(cpu_time_limit_ms),
+        wall_clock_limit_ms: (wall_clock_limit_ms > 0).then_some(wall_clock_limit_ms),
+        warm_hint,
     })
     .map_err(JavascriptExecutionError::Spawn)?;
 
@@ -2173,6 +2176,20 @@ impl JavascriptExecutionEngine {
             .map_err(JavascriptExecutionError::Spawn)
     }
 
+    pub(crate) fn pre_warm_workers(
+        &mut self,
+        userland_code: &str,
+        heap_limit_mb: u32,
+        count: usize,
+    ) -> Result<(), JavascriptExecutionError> {
+        self.ensure_v8_host()?;
+        self.v8_host
+            .as_ref()
+            .expect("V8 host initialized")
+            .pre_warm_workers(userland_code, heap_limit_mb, count);
+        Ok(())
+    }
+
     /// Like [`start_execution`](Self::start_execution) but with an optional
     /// read-only VFS reader over the mounted `node_modules` tree. When supplied,
     /// the bridge thread resolves module-resolution RPCs inline against this
@@ -2229,6 +2246,19 @@ impl JavascriptExecutionEngine {
         let heap_limit_mb = javascript_heap_limit_mb(&request);
         let cpu_time_limit_ms = javascript_cpu_time_limit_ms(&request);
         let wall_clock_limit_ms = javascript_wall_clock_limit_ms(&request);
+        let snapshot_userland_code = request
+            .guest_runtime
+            .snapshot_userland_code
+            .clone()
+            .unwrap_or_default();
+        let warm_hint = Some(WarmSessionHint {
+            bridge_code: V8RuntimeHost::bridge_code().to_owned(),
+            userland_code: snapshot_userland_code.clone(),
+            heap_limit_mb: (heap_limit_mb > 0).then_some(heap_limit_mb),
+        });
+        if snapshot_userland_code.is_empty() && heap_limit_mb == 0 {
+            v8_host.seed_default_warm_workers_async();
+        }
         let PendingV8SessionRegistration {
             frame_receiver,
             mut registration_guard,
@@ -2238,7 +2268,8 @@ impl JavascriptExecutionEngine {
             heap_limit_mb,
             cpu_time_limit_ms,
             wall_clock_limit_ms,
-            |frame| v8_host.send_frame(frame),
+            warm_hint,
+            |command| v8_host.create_session_from_command(command),
         )?;
         record_js_start_phase("js_start_v8_session_register", phase_start.elapsed());
 
@@ -2363,11 +2394,7 @@ impl JavascriptExecutionEngine {
                 guest_entrypoint.clone(),
                 V8RuntimeHost::bridge_code().to_owned(),
                 String::new(),
-                request
-                    .guest_runtime
-                    .snapshot_userland_code
-                    .clone()
-                    .unwrap_or_default(),
+                snapshot_userland_code,
                 request.guest_runtime.high_resolution_time,
                 user_code,
             )
@@ -7499,15 +7526,16 @@ mod tests {
                 .as_nanos()
         );
 
-        let error = match register_v8_session(&host, session_id.clone(), 0, 0, 0, |_frame| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "simulated CreateSession send failure",
-            ))
-        }) {
-            Ok(_) => panic!("register_v8_session should surface create-session send failures"),
-            Err(error) => error,
-        };
+        let error =
+            match register_v8_session(&host, session_id.clone(), 0, 0, 0, None, |_command| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated CreateSession send failure",
+                ))
+            }) {
+                Ok(_) => panic!("register_v8_session should surface create-session send failures"),
+                Err(error) => error,
+            };
 
         match error {
             JavascriptExecutionError::Spawn(inner) => {

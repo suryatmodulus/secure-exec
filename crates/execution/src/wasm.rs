@@ -2228,6 +2228,7 @@ fn start_wasm_javascript_execution(
         }
         WasmSnapshotRunnerMode::Auto | WasmSnapshotRunnerMode::Block => {
             let userland_bundle = build_wasm_runner_userland_bundle(import_cache)?;
+            let runner_heap_limit_mb = wasm_runner_heap_limit_mb(request);
             V8RuntimeHost::warm_snapshot_async(userland_bundle.clone());
             let use_snapshot = match snapshot_mode {
                 WasmSnapshotRunnerMode::Block => {
@@ -2239,6 +2240,16 @@ fn start_wasm_javascript_execution(
                             .pre_warm_snapshot(&userland_bundle)
                             .map_err(map_javascript_error)?;
                     }
+                    javascript_engine
+                        .pre_warm_workers(
+                            &userland_bundle,
+                            runner_heap_limit_mb,
+                            v8_warm_worker_count(),
+                        )
+                        .map_err(map_javascript_error)?;
+                    javascript_engine
+                        .pre_warm_workers("", 0, v8_warm_worker_count())
+                        .map_err(map_javascript_error)?;
                     true
                 }
                 WasmSnapshotRunnerMode::Auto => javascript_engine
@@ -3497,6 +3508,13 @@ fn wasm_runner_heap_limit_mb(request: &StartWasmExecutionRequest) -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB)
+}
+
+fn v8_warm_worker_count() -> usize {
+    std::env::var("AGENTOS_V8_WARM_ISOLATES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
 }
 
 fn wasm_limit_u64(

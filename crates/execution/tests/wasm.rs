@@ -970,6 +970,132 @@ fn wasm_snapshot_runner_block_round_trips_twice() {
     assert_eq!(second_stdout, "hello\n");
 }
 
+fn phase_calls(path: &Path, stage: &str) -> u64 {
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    contents
+        .lines()
+        .find(|line| line.starts_with(&format!("stage={stage} ")))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("calls="))
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn wasm_snapshot_runner_warm_worker_pool_hits() {
+    assert_node_available();
+    let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "block");
+    let _warm = EnvVarGuard::set_value("AGENTOS_V8_WARM_ISOLATES", "2");
+    let _phases = EnvVarGuard::set_value("AGENTOS_V8_SESSION_PHASES", "1");
+    let phases_dir = tempdir().expect("create phases temp dir");
+    let phases_file = phases_dir.path().join("v8-phases.txt");
+    let _phases_file = EnvVarGuard::set("AGENTOS_V8_SESSION_PHASES_FILE", &phases_file);
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("guest.wasm"),
+        &wasm_stdout_chunks_module(&["pool-hit\n"]),
+    );
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    for _ in 0..2 {
+        let (stdout, stderr, exit_code) = run_wasm_execution(
+            &mut engine,
+            context.context_id.clone(),
+            temp.path(),
+            Vec::new(),
+            BTreeMap::new(),
+            WasmPermissionTier::Full,
+        );
+        assert_eq!(exit_code, 0, "stderr={stderr}");
+        assert_eq!(stdout, "pool-hit\n");
+    }
+
+    assert!(
+        phase_calls(&phases_file, "warm_worker_hit") >= 1,
+        "expected at least one warm worker pool hit; phases={}",
+        fs::read_to_string(&phases_file).unwrap_or_default()
+    );
+}
+
+fn wasm_snapshot_runner_warm_worker_pool_disabled_falls_back() {
+    assert_node_available();
+    let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "block");
+    let _warm = EnvVarGuard::set_value("AGENTOS_V8_WARM_ISOLATES", "0");
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("guest.wasm"),
+        &wasm_stdout_chunks_module(&["pool-disabled\n"]),
+    );
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+    let (stdout, stderr, exit_code) = run_wasm_execution(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+
+    assert_eq!(exit_code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "pool-disabled\n");
+}
+
+fn wasm_snapshot_runner_warm_hint_mismatch_falls_back() {
+    assert_node_available();
+    let _warm = EnvVarGuard::set_value("AGENTOS_V8_WARM_ISOLATES", "2");
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("guest.wasm"),
+        &wasm_stdout_chunks_module(&["mismatch\n"]),
+    );
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    {
+        let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "block");
+        let (stdout, stderr, exit_code) = run_wasm_execution(
+            &mut engine,
+            context.context_id.clone(),
+            temp.path(),
+            Vec::new(),
+            BTreeMap::new(),
+            WasmPermissionTier::Full,
+        );
+        assert_eq!(exit_code, 0, "stderr={stderr}");
+        assert_eq!(stdout, "mismatch\n");
+    }
+
+    let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "off");
+    let (stdout, stderr, exit_code) = run_wasm_execution(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+    assert_eq!(exit_code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "mismatch\n");
+}
+
 fn wasm_snapshot_runner_off_fallback_matches_inline() {
     assert_node_available();
     let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "off");
@@ -2612,6 +2738,9 @@ fn wasm_suite() {
     wasm_execution_stays_inside_v8_runtime_without_host_node_launches();
     wasm_execution_runs_guest_module_through_v8();
     wasm_snapshot_runner_block_round_trips_twice();
+    wasm_snapshot_runner_warm_worker_pool_hits();
+    wasm_snapshot_runner_warm_worker_pool_disabled_falls_back();
+    wasm_snapshot_runner_warm_hint_mismatch_falls_back();
     wasm_snapshot_runner_off_fallback_matches_inline();
     wasm_module_base64_cache_invalidates_when_file_changes();
     wasm_execution_supports_fd_fdstat_set_flags();

@@ -1,6 +1,13 @@
 use crate::ipc_binary::{BinaryFrame, ExecutionErrorBin};
 use std::io;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmSessionHint {
+    pub bridge_code: String,
+    pub userland_code: String,
+    pub heap_limit_mb: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeCommand {
     CreateSession {
@@ -8,6 +15,7 @@ pub enum RuntimeCommand {
         heap_limit_mb: Option<u32>,
         cpu_time_limit_ms: Option<u32>,
         wall_clock_limit_ms: Option<u32>,
+        warm_hint: Option<WarmSessionHint>,
     },
     DestroySession {
         session_id: String,
@@ -145,6 +153,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                 heap_limit_mb: non_zero_option(heap_limit_mb),
                 cpu_time_limit_ms: non_zero_option(cpu_time_limit_ms),
                 wall_clock_limit_ms: non_zero_option(wall_clock_limit_ms),
+                warm_hint: None,
             }),
             BinaryFrame::DestroySession { session_id } => {
                 Ok(RuntimeCommand::DestroySession { session_id })

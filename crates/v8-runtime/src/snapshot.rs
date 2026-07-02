@@ -131,18 +131,49 @@ const SNAPSHOT_USERLAND_PREP: &str = r#"
 /// Compile and run a Script in the snapshot-creation context, returning a
 /// descriptive error (with the V8 exception message) on failure. `label`
 /// identifies the phase (e.g. "bridge code" / "userland code") in error text.
-fn run_snapshot_script(scope: &mut v8::HandleScope, code: &str, label: &str) -> Result<(), String> {
+fn run_snapshot_script(
+    scope: &mut v8::HandleScope,
+    code: &str,
+    label: &str,
+    eager: bool,
+) -> Result<(), String> {
     let try_catch = &mut v8::TryCatch::new(scope);
     let source = match v8::String::new(try_catch, code) {
         Some(source) => source,
         None => return Err(format!("failed to create V8 string for {label}")),
     };
-    // NOTE(perf, measured 2026-07-02): do NOT switch this to
-    // script_compiler::compile(EagerCompile) to bake function bytecode into the
-    // blob. It moves cost instead of removing it: user_code_execute dropped
+    // NOTE(perf, measured 2026-07-02): EagerCompile was a wash while isolate
+    // creation stayed on the per-exec critical path: user_code_execute dropped
     // 8.9ms -> 7.9ms on the wasm-runner floor, but the fatter blob made
-    // isolate_new 4.0ms -> 7.4ms per exec (net wash).
-    let Some(script) = v8::Script::compile(try_catch, source, None) else {
+    // isolate_new 4.0ms -> 7.4ms per exec. Warm workers now prepay snapshot
+    // deserialization off-path, so only userland-bearing snapshots opt into
+    // eager compilation to cut user_code_execute.
+    let script = if eager {
+        let resource_name = v8::String::new(try_catch, label).unwrap();
+        let origin = v8::ScriptOrigin::new(
+            try_catch,
+            resource_name.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+        let mut source = v8::script_compiler::Source::new(source, Some(&origin));
+        v8::script_compiler::compile(
+            try_catch,
+            &mut source,
+            v8::script_compiler::CompileOptions::EagerCompile,
+            v8::script_compiler::NoCacheReason::NoReason,
+        )
+    } else {
+        v8::Script::compile(try_catch, source, None)
+    };
+    let Some(script) = script else {
         let message = try_catch
             .exception()
             .map(|exception| exception.to_rust_string_lossy(try_catch))
@@ -239,15 +270,15 @@ fn create_snapshot_inner_in_process(
             // Then, if present, run the userland (agent-SDK) IIFE in the SAME context so
             // its evaluated graph is captured alongside the bridge.
             let result = (|| -> Result<(), String> {
-                run_snapshot_script(scope, bridge_code, "bridge code")?;
+                run_snapshot_script(scope, bridge_code, "bridge code", false)?;
                 if let Some(userland_code) = userland_code {
                     // Some bridge-backed globals (e.g. `process.versions`) are lazy
                     // getters that dispatch a host bridge call on first access. During
                     // snapshot creation the bridge fns are stubs, so an agent SDK that
                     // reads them at module-init would fail. Freeze them to static values
                     // first; per-session config is still injected post-restore.
-                    run_snapshot_script(scope, SNAPSHOT_USERLAND_PREP, "userland prep")?;
-                    run_snapshot_script(scope, userland_code, "userland code")?;
+                    run_snapshot_script(scope, SNAPSHOT_USERLAND_PREP, "userland prep", false)?;
+                    run_snapshot_script(scope, userland_code, "userland code", true)?;
                 }
                 Ok(())
             })();
@@ -563,7 +594,7 @@ where
     isolate
 }
 
-type SnapshotCacheKey = [u8; 32];
+pub type SnapshotCacheKey = [u8; 32];
 
 /// Thread-safe snapshot cache keyed by bridge code digest.
 ///
@@ -717,7 +748,7 @@ impl SnapshotCache {
 /// Cache key over bridge + optional userland code. With no userland this is just
 /// the sha256 of the bridge code (a NUL separator is only added when userland is
 /// present), so existing bridge-only entries keep their historical keys.
-fn snapshot_cache_key(bridge_code: &str, userland_code: Option<&str>) -> SnapshotCacheKey {
+pub fn snapshot_cache_key(bridge_code: &str, userland_code: Option<&str>) -> SnapshotCacheKey {
     match userland_code {
         None => {
             let mut hasher = Sha256::new();
