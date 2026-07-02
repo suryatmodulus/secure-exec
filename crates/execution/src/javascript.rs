@@ -15,11 +15,13 @@ use secure_exec_bridge::queue_tracker::{register_queue, TrackedLimit, TrackedRec
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::fd::OwnedFd;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -61,6 +63,8 @@ const NODE_SYNC_RPC_RESPONSE_FD_ENV: &str = "AGENTOS_NODE_SYNC_RPC_RESPONSE_FD";
 const NODE_SYNC_RPC_DATA_BYTES_ENV: &str = "AGENTOS_NODE_SYNC_RPC_DATA_BYTES";
 const NODE_SYNC_RPC_WAIT_TIMEOUT_MS_ENV: &str = "AGENTOS_NODE_SYNC_RPC_WAIT_TIMEOUT_MS";
 static NEXT_V8_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static JAVASCRIPT_TIMER_WHEEL: OnceLock<Arc<TimerWheel>> = OnceLock::new();
+
 #[derive(Default)]
 struct JsStartPhaseStats {
     calls: u64,
@@ -675,12 +679,9 @@ impl Drop for LocalBridgeState {
     /// Tear down all tracked timers when the bridge state is dropped (which
     /// happens when the event-bridge service loop exits on session termination —
     /// success, error, or shutdown). Clearing the shared `timers` map cancels both
-    /// kernel and bridge timers: any in-flight timer thread that wakes afterwards
+    /// kernel and bridge timers: any in-flight wheel action that wakes afterwards
     /// finds its entry gone and suppresses its callback via `timer_should_fire`,
-    /// so a destroyed session's timers do not fire and their thread stops touching
-    /// the session. Without this, kernel-timer threads (M3) and bridge-timer
-    /// threads (H2) would outlive the session, holding a session `Arc` and firing
-    /// after the fact.
+    /// so a destroyed session's timers do not fire after the fact.
     fn drop(&mut self) {
         if let Ok(mut timers) = self.timers.lock() {
             timers.clear();
@@ -771,10 +772,8 @@ enum LocalBridgeCallResult {
 
 /// Upper bound on guest-supplied timer delays, matching the JS `TIMEOUT_MAX`
 /// ceiling (`2**31 - 1` ms, ~24.8 days). Guest code can pass a delay up to
-/// `u64::MAX` ms; without a cap each `_scheduleTimer` / `kernelTimerCreate` call
-/// spawns a thread that sleeps for an effectively unbounded duration while
-/// pinning a clone of the session `Arc`, blocking session cleanup. Clamping the
-/// delay bounds how long a timer thread can outlive its session.
+/// `u64::MAX` ms; clamping keeps the timer wheel's deadline math and session
+/// handle lifetime within Node-compatible bounds.
 const MAX_TIMER_DELAY_MS: u64 = 2_147_483_647;
 
 fn timer_delay_ms(value: Option<&Value>) -> u64 {
@@ -791,7 +790,7 @@ fn timer_delay_ms(value: Option<&Value>) -> u64 {
     }
 }
 
-/// Decide whether a woken timer thread should fire, and reclaim its tracking
+/// Decide whether a woken timer action should fire, and reclaim its tracking
 /// entry. Returns `false` (suppressing the callback) when the timer is gone from
 /// the map (cleared, or wiped on session teardown) or its generation no longer
 /// matches the one captured at scheduling time (re-armed/cancelled). A one-shot
@@ -819,6 +818,162 @@ fn timer_should_fire(
             Some(true)
         })
         .unwrap_or(false)
+}
+
+struct TimerWheel {
+    state: Mutex<TimerWheelState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct TimerWheelState {
+    heap: BinaryHeap<Reverse<(Instant, u64)>>,
+    entries: HashMap<u64, TimerAction>,
+    next_seq: u64,
+}
+
+enum TimerAction {
+    StreamEvent {
+        session: V8SessionHandle,
+        timer_id: u64,
+        generation: u64,
+        timers: Arc<Mutex<HashMap<u64, LocalTimerEntry>>>,
+    },
+    BridgeResponse {
+        session: V8SessionHandle,
+        call_id: u64,
+        timer_id: u64,
+        generation: u64,
+        timers: Arc<Mutex<HashMap<u64, LocalTimerEntry>>>,
+    },
+}
+
+impl TimerAction {
+    fn execute(self) {
+        match self {
+            Self::StreamEvent {
+                session,
+                timer_id,
+                generation,
+                timers,
+            } => {
+                if !timer_should_fire(&timers, timer_id, generation) {
+                    return;
+                }
+
+                let payload =
+                    v8_runtime::json_to_cbor_payload(&json!(timer_id)).unwrap_or_default();
+                let _ = session.send_stream_event("timer", payload);
+            }
+            Self::BridgeResponse {
+                session,
+                call_id,
+                timer_id,
+                generation,
+                timers,
+            } => {
+                if !timer_should_fire(&timers, timer_id, generation) {
+                    return;
+                }
+                let _ = session.send_bridge_response(call_id, 0, Vec::new());
+            }
+        }
+    }
+}
+
+impl TimerWheel {
+    fn get() -> &'static Arc<Self> {
+        JAVASCRIPT_TIMER_WHEEL.get_or_init(Self::start)
+    }
+
+    fn start() -> Arc<Self> {
+        let wheel = Arc::new(Self {
+            state: Mutex::new(TimerWheelState::default()),
+            ready: Condvar::new(),
+        });
+        let worker = Arc::clone(&wheel);
+        // Detached daemon: queued entries carry generation-checked session handles,
+        // matching the previous fire-and-forget timer threads without one OS
+        // thread per guest timer.
+        if let Err(error) = thread::Builder::new()
+            .name(String::from("secure-exec-js-timer-wheel"))
+            .spawn(move || worker.run())
+        {
+            tracing::warn!(?error, "failed to start JavaScript timer wheel thread");
+        }
+        wheel
+    }
+
+    fn schedule(&self, delay_ms: u64, action: TimerAction) {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_millis(delay_ms))
+            .unwrap_or(now);
+        let mut state = self.lock_state();
+        let old_earliest = state.heap.peek().map(|Reverse((deadline, _))| *deadline);
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.wrapping_add(1);
+        state.heap.push(Reverse((deadline, seq)));
+        state.entries.insert(seq, action);
+        if old_earliest.map_or(true, |old| deadline < old) {
+            self.ready.notify_one();
+        }
+    }
+
+    fn run(&self) {
+        loop {
+            let due = {
+                let mut state = self.lock_state();
+                loop {
+                    match state.heap.peek().copied() {
+                        Some(Reverse((deadline, _))) => {
+                            let now = Instant::now();
+                            if deadline <= now {
+                                break;
+                            }
+                            let timeout = deadline.saturating_duration_since(now);
+                            state = match self.ready.wait_timeout(state, timeout) {
+                                Ok((state, _)) => state,
+                                Err(poisoned) => poisoned.into_inner().0,
+                            };
+                        }
+                        None => {
+                            state = match self.ready.wait(state) {
+                                Ok(state) => state,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                        }
+                    }
+                }
+
+                let now = Instant::now();
+                let mut due = Vec::new();
+                while let Some(Reverse((deadline, seq))) = state.heap.peek().copied() {
+                    if deadline > now {
+                        break;
+                    }
+                    state.heap.pop();
+                    if let Some(action) = state.entries.remove(&seq) {
+                        due.push(action);
+                    }
+                }
+                due
+            };
+
+            for action in due {
+                if catch_unwind(AssertUnwindSafe(|| action.execute())).is_err() {
+                    tracing::warn!("JavaScript timer wheel action panicked");
+                }
+            }
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, TimerWheelState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
 impl GuestPathTranslator {
@@ -3506,7 +3661,7 @@ impl LocalBridgeState {
 
     /// Allocate a fresh timer id and register a one-shot (`repeat == false`)
     /// tracking entry at generation 0. Used by the bridge-timer path so the
-    /// spawned thread can be cancelled (its entry removed) on `clear`/teardown.
+    /// queued wheel action can be cancelled (its entry removed) on `clear`/teardown.
     fn register_oneshot_timer(&mut self, delay_ms: u64) -> u64 {
         self.next_timer_id += 1;
         let timer_id = self.next_timer_id;
@@ -3538,17 +3693,11 @@ impl LocalBridgeState {
             return;
         };
 
-        thread::spawn(move || {
-            if delay_ms > 0 {
-                thread::sleep(Duration::from_millis(delay_ms));
-            }
-
-            if !timer_should_fire(&timers, timer_id, generation) {
-                return;
-            }
-
-            let payload = v8_runtime::json_to_cbor_payload(&json!(timer_id)).unwrap_or_default();
-            let _ = session.send_stream_event("timer", payload);
+        TimerWheel::get().schedule(delay_ms, TimerAction::StreamEvent {
+            session,
+            timer_id,
+            generation,
+            timers,
         });
     }
 
@@ -3564,26 +3713,21 @@ impl LocalBridgeState {
         };
 
         // Register the bridge timer in the shared `timers` map with a generation,
-        // mirroring the kernel-timer cancellation path. Previously this spawned a
-        // bare, untracked thread holding the session `Arc` with no cancellation and
-        // no generation check, so a cleared/destroyed session's timer would still
-        // fire (and pin the session) after the full delay. Tracking it means that
+        // mirroring the kernel-timer cancellation path. Tracking it means that
         // when `LocalBridgeState` is dropped on session teardown (which clears the
-        // map) or the entry is otherwise removed, the woken thread observes the
+        // map) or the entry is otherwise removed, the timer wheel observes the
         // missing/mismatched generation via `timer_should_fire` and suppresses the
         // response instead of touching the torn-down session.
         let timer_id = self.register_oneshot_timer(delay_ms);
         let generation = 0;
         let timers = self.timers.clone();
 
-        thread::spawn(move || {
-            if delay_ms > 0 {
-                thread::sleep(Duration::from_millis(delay_ms));
-            }
-            if !timer_should_fire(&timers, timer_id, generation) {
-                return;
-            }
-            let _ = session.send_bridge_response(call_id, 0, Vec::new());
+        TimerWheel::get().schedule(delay_ms, TimerAction::BridgeResponse {
+            session,
+            call_id,
+            timer_id,
+            generation,
+            timers,
         });
     }
 
@@ -7338,8 +7482,8 @@ mod tests {
     #[test]
     fn timer_delay_is_clamped_to_the_cap() {
         // A guest can pass an arbitrarily large delay (up to u64::MAX ms); without
-        // a cap each scheduled timer spawns a thread that sleeps essentially
-        // forever while pinning the session Arc. The cap bounds that lifetime.
+        // a cap the timer wheel could retain a session Arc behind a deadline that
+        // is effectively forever away. The cap bounds that lifetime.
         assert_eq!(
             timer_delay_ms(Some(&json!(u64::MAX))),
             MAX_TIMER_DELAY_MS,
@@ -7362,7 +7506,7 @@ mod tests {
 
     #[test]
     fn cleared_timer_is_suppressed_and_entry_reclaimed() {
-        // Mirrors what a woken bridge/kernel timer thread does after sleeping: it
+        // Mirrors what a woken bridge/kernel timer action does after waiting: it
         // consults the shared map via `timer_should_fire`. When the entry has been
         // removed (clear or session teardown), the callback must be suppressed.
         let timers: Arc<Mutex<HashMap<u64, LocalTimerEntry>>> =
@@ -7377,7 +7521,7 @@ mod tests {
         );
 
         // Simulate `kernelTimerClear` / teardown removing the entry before the
-        // thread wakes.
+        // action wakes.
         timers.lock().unwrap().remove(&7);
 
         assert!(
@@ -7391,10 +7535,10 @@ mod tests {
     }
 
     #[test]
-    fn rearmed_timer_generation_mismatch_suppresses_stale_thread() {
-        // The bridge/kernel timer thread captures the generation at schedule time.
-        // If the timer is re-armed (generation bumped) before the stale thread
-        // wakes, the stale thread must observe the mismatch and suppress, while the
+    fn rearmed_timer_generation_mismatch_suppresses_stale_action() {
+        // The bridge/kernel timer action captures the generation at schedule time.
+        // If the timer is re-armed (generation bumped) before the stale action
+        // wakes, the stale action must observe the mismatch and suppress, while the
         // entry survives for the live generation.
         let timers: Arc<Mutex<HashMap<u64, LocalTimerEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -7407,7 +7551,7 @@ mod tests {
             },
         );
 
-        // Stale thread captured generation 0; current entry is at generation 1.
+        // Stale action captured generation 0; current entry is at generation 1.
         assert!(
             !timer_should_fire(&timers, 3, 0),
             "a stale generation must be suppressed"
@@ -7431,11 +7575,11 @@ mod tests {
     #[test]
     fn bridge_timer_registration_is_tracked_and_drop_clears_timers() {
         // H2: the bridge-timer path must register its timer (so it is cancellable)
-        // rather than spawning a bare untracked thread, and session teardown
+        // before queuing a wheel action, and session teardown
         // (dropping LocalBridgeState) must wipe the tracking map so in-flight timer
-        // threads are cancelled.
+        // actions are cancelled.
         let mut state = LocalBridgeState::default();
-        // Observe the same map the spawned threads would consult.
+        // Observe the same map the queued actions would consult.
         let timers = state.timers.clone();
 
         let id_a = state.register_oneshot_timer(MAX_TIMER_DELAY_MS);
@@ -7453,7 +7597,7 @@ mod tests {
         let id_c = state.register_oneshot_timer(1_000);
 
         // Session teardown: dropping the bridge state must clear every timer so any
-        // sleeping thread wakes to a missing entry and suppresses its callback.
+        // queued action wakes to a missing entry and suppresses its callback.
         drop(state);
 
         assert!(
