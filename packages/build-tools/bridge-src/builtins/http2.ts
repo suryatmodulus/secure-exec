@@ -1292,15 +1292,15 @@ var Http2Session = class extends Http2EventEmitter {
     this[HTTP2_K_SOCKET] = this.socket;
   }
   _retain() {
-    if (this._waitStarted || typeof _networkHttp2SessionWaitRaw === "undefined") {
+    if (this._waitStarted || typeof _networkHttp2SessionPollRaw === "undefined") {
       return;
     }
     this._waitStarted = true;
-    void _networkHttp2SessionWaitRaw.apply(void 0, [this._sessionId], {
-      result: { promise: true }
-    }).catch((error) => {
-      this.emit("error", error instanceof Error ? error : new Error(String(error)));
-    });
+    pollRetainedHttp2Handle(
+      () => this._waitStarted && http2Sessions.get(this._sessionId) === this,
+      () => _networkHttp2SessionPollRaw.applySyncPromise(void 0, [this._sessionId, 0]),
+      (error) => this.emit("error", error instanceof Error ? error : new Error(String(error)))
+    );
   }
   _release() {
     this._waitStarted = false;
@@ -1470,15 +1470,15 @@ var Http2Server = class extends Http2EventEmitter {
     return this._address;
   }
   _retain() {
-    if (this._waitStarted || typeof _networkHttp2ServerWaitRaw === "undefined") {
+    if (this._waitStarted || typeof _networkHttp2ServerPollRaw === "undefined") {
       return;
     }
     this._waitStarted = true;
-    void _networkHttp2ServerWaitRaw.apply(void 0, [this._serverId], {
-      result: { promise: true }
-    }).catch((error) => {
-      this.emit("error", error instanceof Error ? error : new Error(String(error)));
-    });
+    pollRetainedHttp2Handle(
+      () => this._waitStarted && http2Servers.get(this._serverId) === this,
+      () => _networkHttp2ServerPollRaw.applySyncPromise(void 0, [this._serverId, 0]),
+      (error) => this.emit("error", error instanceof Error ? error : new Error(String(error)))
+    );
   }
   _release() {
     this._waitStarted = false;
@@ -1920,6 +1920,59 @@ function http2Dispatch(kind, id, data, extra, extraNumber, extraHeaders, flags) 
     });
     void dispatchHttp2CompatibilityRequest(id, Number(extraNumber));
   }
+}
+
+function dispatchPolledHttp2Event(event) {
+  if (typeof event === "string") {
+    event = JSON.parse(event);
+  }
+  if (!event || typeof event !== "object" || typeof event.kind !== "string") {
+    return false;
+  }
+  const id = Number(event.id);
+  if (!Number.isFinite(id)) {
+    return false;
+  }
+  http2Dispatch(
+    event.kind,
+    id,
+    typeof event.data === "string" ? event.data : void 0,
+    typeof event.extra === "string" ? event.extra : void 0,
+    typeof event.extraNumber === "string" || typeof event.extraNumber === "number" ? event.extraNumber : void 0,
+    typeof event.extraHeaders === "string" ? event.extraHeaders : void 0,
+    typeof event.flags === "string" || typeof event.flags === "number" ? event.flags : void 0
+  );
+  return event.kind === "serverClose" || event.kind === "sessionClose";
+}
+
+function pollRetainedHttp2Handle(isActive, poll, onError) {
+  const tick = () => {
+    if (!isActive()) {
+      return;
+    }
+    try {
+      let sawTerminal = false;
+      for (let i = 0; i < 64 && isActive(); i++) {
+        const event = poll();
+        if (!event) {
+          break;
+        }
+        sawTerminal = dispatchPolledHttp2Event(event);
+        if (sawTerminal) {
+          break;
+        }
+      }
+      if (!sawTerminal && isActive()) {
+        setTimeout(tick, 1);
+      }
+    } catch (error) {
+      onError(error);
+      if (isActive()) {
+        setTimeout(tick, 10);
+      }
+    }
+  };
+  setTimeout(tick, 0);
 }
 
 function scheduleQueuedHttp2DispatchDrain() {

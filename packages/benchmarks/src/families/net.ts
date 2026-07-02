@@ -182,6 +182,50 @@ export const netFamily: BenchmarkOp[] = [
         server.close(() => reject(error));
       });
     });
+	  });
+	}`,
+	},
+	{
+		family: "net",
+		name: "http2_loopback_get",
+		nativeUnsupportedReason: "no native HTTP/2-loopback pair yet — Phase 2 backlog",
+		wasmUnsupportedReason: "HTTP/2 unsupported in wasm baseline",
+		fileLine: "packages/build-tools/bridge-src/builtins/http2.ts:1472",
+		reproducer: "node:http2 h2c loopback GET inside VM",
+		program: `async () => {
+  const http2 = await import("node:http2");
+  const server = http2.createServer();
+  server.on("stream", (stream, headers) => {
+    if (headers[":path"] !== "/") {
+      stream.respond({ ":status": 404 });
+      stream.end("missing");
+      return;
+    }
+    stream.respond({ ":status": 200, "content-type": "text/plain" });
+    stream.end("ok-h2");
+  });
+  await new Promise((resolve, reject) => {
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      const session = http2.connect("http://127.0.0.1:" + port);
+      const req = session.request({ ":path": "/" });
+      const chunks = [];
+      session.on("error", (error) => {
+        server.close(() => reject(error));
+      });
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        session.close();
+        server.close(() => body === "ok-h2" ? resolve() : reject(new Error("bad http2 body")));
+      });
+      req.on("error", (error) => {
+        session.close();
+        server.close(() => reject(error));
+      });
+      req.end();
+    });
   });
 }`,
 	},

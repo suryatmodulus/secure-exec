@@ -14919,6 +14919,79 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
             .expect("close http2 server");
             assert_eq!(server_close, Value::Null);
         }
+
+        fn javascript_http2_guest_h2c_round_trip_does_not_deadlock() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-http2-guest-h2c");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const http2 = require("node:http2");
+const server = http2.createServer();
+
+server.on("stream", (stream, headers) => {
+  if (headers[":path"] !== "/") {
+    stream.respond({ ":status": 404 });
+    stream.end("missing");
+    return;
+  }
+  stream.respond({ ":status": 200, "content-type": "text/plain" });
+  stream.end("hello-h2c");
+});
+
+server.listen(0, "127.0.0.1", () => {
+  const address = server.address();
+  const session = http2.connect(`http://127.0.0.1:${address.port}`);
+  const req = session.request({ ":path": "/" });
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    body += chunk;
+  });
+  req.on("end", () => {
+    console.log(`BODY:${body}`);
+    session.close();
+    server.close(() => process.exit(body === "hello-h2c" ? 0 : 2));
+  });
+  req.on("error", (error) => {
+    console.error(`REQ_ERROR:${error.message}`);
+    process.exit(1);
+  });
+  session.on("error", (error) => {
+    console.error(`SESSION_ERROR:${error.message}`);
+    process.exit(1);
+  });
+  req.end();
+});
+
+setTimeout(() => {
+  console.error("TIMEOUT:http2 round trip did not finish");
+  process.exit(3);
+}, 4_000);
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-http2-guest-h2c");
+            assert_eq!(exit_code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+            assert!(
+                stdout.contains("BODY:hello-h2c"),
+                "stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+
         fn javascript_http2_settings_pause_push_and_file_response_surfaces_work() {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
@@ -18922,6 +18995,7 @@ console.log(JSON.stringify({
             vm_fetch_response_frame_limit_counts_protocol_overhead();
             request_frame_limit_counts_generated_wire_overhead();
             javascript_http2_listen_connect_request_and_respond_round_trip();
+            javascript_http2_guest_h2c_round_trip_does_not_deadlock();
             javascript_http2_settings_pause_push_and_file_response_surfaces_work();
             javascript_http2_secure_listen_connect_request_and_respond_round_trip();
             javascript_http2_server_respond_records_pending_response();
@@ -19001,6 +19075,11 @@ console.log(JSON.stringify({
         #[test]
         fn aac_http2_respond_with_file_reads_vm_filesystem() {
             run_isolated_service_test("http2-file-response");
+        }
+
+        #[test]
+        fn aac_http2_guest_h2c_round_trip_does_not_deadlock() {
+            run_isolated_service_test("http2-guest-h2c");
         }
 
         #[test]
@@ -19096,6 +19175,9 @@ console.log(JSON.stringify({
                 }
                 "http2-file-response" => {
                     javascript_http2_settings_pause_push_and_file_response_surfaces_work();
+                }
+                "http2-guest-h2c" => {
+                    javascript_http2_guest_h2c_round_trip_does_not_deadlock();
                 }
                 "wasm-command-timeout" => {
                     wasm_command_timeout_is_enforced_by_sidecar_poll_path();
