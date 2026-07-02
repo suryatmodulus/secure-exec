@@ -44,6 +44,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) type BridgeError<B> = <B as BridgeTypes>::Error;
 pub(crate) type SidecarKernel = KernelVm<MountTable>;
+pub(crate) type KernelSocketReadinessRegistry =
+    Arc<Mutex<BTreeMap<SocketId, KernelSocketReadinessTarget>>>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -328,6 +330,7 @@ pub(crate) struct VmState {
     pub(crate) cwd: PathBuf,
     pub(crate) host_cwd: PathBuf,
     pub(crate) kernel: SidecarKernel,
+    pub(crate) kernel_socket_readiness: KernelSocketReadinessRegistry,
     pub(crate) loaded_snapshot: Option<FilesystemSnapshot>,
     pub(crate) configuration: VmConfiguration,
     pub(crate) layers: VmLayerStore,
@@ -744,6 +747,20 @@ pub(crate) struct JavascriptSocketEventPusher {
     pub(crate) socket_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KernelSocketReadinessEvent {
+    Data,
+    Datagram,
+    Accept,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KernelSocketReadinessTarget {
+    pub(crate) session: V8SessionHandle,
+    pub(crate) target_id: String,
+    pub(crate) event: KernelSocketReadinessEvent,
+}
+
 #[derive(Debug)]
 pub(crate) struct ActiveTcpSocket {
     pub(crate) stream: Option<Arc<Mutex<TcpStream>>>,
@@ -928,6 +945,7 @@ pub(crate) struct ActiveUnixSocket {
     pub(crate) stream: Arc<Mutex<UnixStream>>,
     pub(crate) events: Receiver<JavascriptTcpSocketEvent>,
     pub(crate) event_sender: Sender<JavascriptTcpSocketEvent>,
+    pub(crate) event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     pub(crate) listener_id: Option<String>,
     pub(crate) local_path: Option<String>,
     pub(crate) remote_path: Option<String>,

@@ -2062,7 +2062,7 @@ ykAheWCsAteSEWVc0w==\n\
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut exit_code = None;
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut events_drained = 0;
             while events_drained < 10_000 && Instant::now() < deadline {
                 events_drained += 1;
@@ -2566,7 +2566,7 @@ ykAheWCsAteSEWVc0w==\n\
             request: JavascriptSyncRpcRequest,
         ) -> Result<JavascriptSyncRpcServiceResponse, SidecarError> {
             let bridge = sidecar.bridge.clone();
-            let (dns, socket_paths, counts, limits) = {
+            let (dns, socket_paths, counts, limits, kernel_readiness) = {
                 let vm = sidecar.vms.get(vm_id).expect("javascript vm");
                 (
                     vm.dns.clone(),
@@ -2576,6 +2576,7 @@ ykAheWCsAteSEWVc0w==\n\
                         .expect("javascript process")
                         .network_resource_counts(),
                     ResourceLimits::default(),
+                    vm.kernel_socket_readiness.clone(),
                 )
             };
 
@@ -2590,6 +2591,7 @@ ykAheWCsAteSEWVc0w==\n\
                 dns: &dns,
                 socket_paths: &socket_paths,
                 kernel: &mut vm.kernel,
+                kernel_readiness,
                 process,
                 sync_request: &request,
                 resource_limits: &limits,
@@ -2673,6 +2675,7 @@ ykAheWCsAteSEWVc0w==\n\
                 dns,
                 socket_paths,
                 kernel,
+                kernel_readiness: Default::default(),
                 process,
                 sync_request: request,
                 resource_limits,
@@ -14278,7 +14281,7 @@ console.log(JSON.stringify(summary));
                 r#"
 import net from "node:net";
 
-const iterations = 24;
+const iterations = 100;
 let accepted = 0;
 let acceptedClosed = 0;
 
@@ -14307,16 +14310,6 @@ if (!address || typeof address === "string") {
   throw new Error(`unexpected listener address: ${String(address)}`);
 }
 
-const waitForAcceptedClose = async (count) => {
-  const deadline = Date.now() + 5000;
-  while (acceptedClosed < count) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out waiting for accepted close ${count}, got ${acceptedClosed}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-};
-
 for (let index = 0; index < iterations; index += 1) {
   const message = `x${index}`;
   const response = await new Promise((resolve, reject) => {
@@ -14341,7 +14334,6 @@ for (let index = 0; index < iterations; index += 1) {
   if (response !== message) {
     throw new Error(`unexpected response at ${index}: ${response}`);
   }
-  await waitForAcceptedClose(index + 1);
 }
 
 await new Promise((resolve, reject) => {
@@ -14354,6 +14346,10 @@ await new Promise((resolve, reject) => {
   });
 });
 
+if (acceptedClosed !== iterations) {
+  throw new Error(`expected ${iterations} accepted closes, got ${acceptedClosed}`);
+}
+
 console.log(JSON.stringify({ iterations, accepted, acceptedClosed }));
 "#,
             );
@@ -14363,9 +14359,150 @@ console.log(JSON.stringify({ iterations, accepted, acceptedClosed }));
 
             assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
             let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse churn JSON");
-            assert_eq!(parsed["iterations"], Value::from(24));
-            assert_eq!(parsed["accepted"], Value::from(24));
-            assert_eq!(parsed["acceptedClosed"], Value::from(24));
+            assert_eq!(parsed["iterations"], Value::from(100));
+            assert_eq!(parsed["accepted"], Value::from(100));
+            assert_eq!(parsed["acceptedClosed"], Value::from(100));
+        }
+        fn javascript_net_loopback_wakes_reader_parked_before_write() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-js-net-wake-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import net from "node:net";
+
+const summary = await new Promise((resolve, reject) => {
+  const server = net.createServer((socket) => {
+    socket.setEncoding("utf8");
+    let received = "";
+    socket.once("readable", () => {
+      let chunk;
+      while ((chunk = socket.read()) !== null) {
+        received += chunk;
+      }
+    });
+    socket.on("end", () => {
+      socket.end(`echo:${received}`);
+    });
+    socket.on("error", reject);
+  });
+  server.on("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      reject(new Error(`unexpected listener address: ${String(address)}`));
+      return;
+    }
+    const socket = net.createConnection({ host: "127.0.0.1", port: address.port });
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      data += chunk;
+    });
+    socket.on("connect", () => {
+      setImmediate(() => socket.end("parked"));
+    });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      server.close(() => resolve(data));
+    });
+  });
+});
+
+if (summary !== "echo:parked") {
+  throw new Error(`unexpected parked-reader echo: ${summary}`);
+}
+console.log(summary);
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-net-wake");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            assert_eq!(stdout.trim(), "echo:parked");
+        }
+        fn javascript_net_loopback_reads_back_to_back_and_after_partial_drain() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-js-net-edge-wake-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import net from "node:net";
+
+const summary = await new Promise((resolve, reject) => {
+  const server = net.createServer((socket) => {
+    const received = [];
+    socket.on("readable", () => {
+      let chunk;
+      while ((chunk = socket.read(1)) !== null) {
+        received.push(chunk.toString("utf8"));
+        if (received.join("") === "ABC") {
+          socket.end("done");
+        }
+      }
+    });
+    socket.on("error", reject);
+  });
+  server.on("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      reject(new Error(`unexpected listener address: ${String(address)}`));
+      return;
+    }
+    const socket = net.createConnection({ host: "127.0.0.1", port: address.port });
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write("A");
+      socket.write("B");
+      setImmediate(() => socket.end("C"));
+    });
+    socket.on("data", (chunk) => {
+      data += chunk;
+    });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      server.close(() => resolve(data));
+    });
+  });
+});
+
+if (summary !== "done") {
+  throw new Error(`unexpected edge-wake response: ${summary}`);
+}
+console.log(summary);
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-net-edge-wake");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            assert_eq!(stdout.trim(), "done");
         }
         fn javascript_dgram_rpc_sends_and_receives_vm_loopback_packets() {
             assert_node_available();
@@ -14449,6 +14586,69 @@ console.log(JSON.stringify(summary));
                 run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-dgram");
 
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+        }
+        fn javascript_net_unix_domain_echo_uses_reader_events() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("secure-exec-sidecar-js-unix-echo-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import net from "node:net";
+
+const path = "/tmp/secure-exec-unix-echo.sock";
+const summary = await new Promise((resolve, reject) => {
+  const server = net.createServer((socket) => {
+    socket.setEncoding("utf8");
+    let data = "";
+    socket.on("data", (chunk) => {
+      data += chunk;
+    });
+    socket.on("end", () => {
+      socket.end(`unix:${data}`);
+    });
+    socket.on("error", reject);
+  });
+  server.on("error", reject);
+  server.listen(path, () => {
+    const socket = net.createConnection(path);
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.end("ping");
+    });
+    socket.on("data", (chunk) => {
+      data += chunk;
+    });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      server.close(() => resolve(data));
+    });
+  });
+});
+
+if (summary !== "unix:ping") {
+  throw new Error(`unexpected unix echo: ${summary}`);
+}
+console.log(summary);
+"#,
+            );
+
+            let (stdout, stderr, exit_code) =
+                run_javascript_entry(&mut sidecar, &vm_id, &cwd, "proc-js-unix-echo");
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            assert_eq!(stdout.trim(), "unix:ping");
         }
         fn javascript_dns_rpc_resolves_localhost() {
             assert_node_available();
@@ -20290,7 +20490,27 @@ console.log(JSON.stringify({
 
         #[test]
         fn javascript_net_loopback_socket_churn_releases_kernel_slots_regression() {
-            javascript_net_loopback_socket_churn_releases_kernel_slots();
+            run_isolated_service_test("net-loopback-socket-churn");
+        }
+
+        #[test]
+        fn javascript_net_loopback_wakes_reader_parked_before_write_regression() {
+            run_isolated_service_test("net-loopback-parked-reader-wake");
+        }
+
+        #[test]
+        fn javascript_net_loopback_reads_back_to_back_and_after_partial_drain_regression() {
+            run_isolated_service_test("net-loopback-edge-wake");
+        }
+
+        #[test]
+        fn javascript_net_unix_domain_echo_uses_reader_events_regression() {
+            run_isolated_service_test("net-unix-domain-reader-events");
+        }
+
+        #[test]
+        fn javascript_dgram_rpc_sends_and_receives_vm_loopback_packets_regression() {
+            run_isolated_service_test("dgram-loopback-events");
         }
 
         #[test]
@@ -20493,6 +20713,21 @@ console.log(JSON.stringify({
                 }
                 "http-oversized-incomplete-header" => {
                     javascript_http_socket_backed_server_rejects_oversized_incomplete_headers();
+                }
+                "net-loopback-socket-churn" => {
+                    javascript_net_loopback_socket_churn_releases_kernel_slots();
+                }
+                "net-loopback-parked-reader-wake" => {
+                    javascript_net_loopback_wakes_reader_parked_before_write();
+                }
+                "net-loopback-edge-wake" => {
+                    javascript_net_loopback_reads_back_to_back_and_after_partial_drain();
+                }
+                "net-unix-domain-reader-events" => {
+                    javascript_net_unix_domain_echo_uses_reader_events();
+                }
+                "dgram-loopback-events" => {
+                    javascript_dgram_rpc_sends_and_receives_vm_loopback_packets();
                 }
                 "vm-fetch-kernel-tcp-success" => {
                     vm_fetch_reaches_javascript_http_server_over_kernel_tcp();

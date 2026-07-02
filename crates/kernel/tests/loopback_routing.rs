@@ -2,8 +2,11 @@ use secure_exec_kernel::command_registry::CommandDriver;
 use secure_exec_kernel::kernel::{KernelProcessHandle, KernelVm, KernelVmConfig, SpawnOptions};
 use secure_exec_kernel::permissions::Permissions;
 use secure_exec_kernel::resource_accounting::ResourceLimits;
-use secure_exec_kernel::socket_table::{InetSocketAddress, SocketSpec, SocketState};
+use secure_exec_kernel::socket_table::{
+    InetSocketAddress, SocketReadiness, SocketReadinessKind, SocketSpec, SocketState,
+};
 use secure_exec_kernel::vfs::MemoryFileSystem;
+use std::sync::{Arc, Mutex};
 
 fn spawn_shell(kernel: &mut KernelVm<MemoryFileSystem>) -> KernelProcessHandle {
     kernel
@@ -26,6 +29,11 @@ fn new_kernel(vm_id: &str) -> KernelVm<MemoryFileSystem> {
         .register_driver(CommandDriver::new("shell", ["sh"]))
         .expect("register shell");
     kernel
+}
+
+fn take_readiness_events(events: &Arc<Mutex<Vec<SocketReadiness>>>) -> Vec<SocketReadiness> {
+    let mut events = events.lock().expect("readiness events lock");
+    std::mem::take(&mut *events)
 }
 
 #[test]
@@ -109,6 +117,213 @@ fn kernel_loopback_connect_routes_into_guest_listener_and_accepts_connected_sock
     let snapshot = kernel.resource_snapshot();
     assert_eq!(snapshot.socket_listeners, 1);
     assert_eq!(snapshot.socket_connections, 2);
+}
+
+#[test]
+fn kernel_loopback_readiness_events_are_edge_triggered() {
+    let mut kernel = new_kernel("vm-loopback-readiness-edge");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
+    kernel.set_socket_readiness_sink(Some(move |readiness| {
+        captured_events
+            .lock()
+            .expect("readiness events lock")
+            .push(readiness);
+    }));
+
+    let server = spawn_shell(&mut kernel);
+    let client = spawn_shell(&mut kernel);
+
+    let listener = kernel
+        .socket_create("shell", server.pid(), SocketSpec::tcp())
+        .expect("create listener");
+    kernel
+        .socket_bind_inet(
+            "shell",
+            server.pid(),
+            listener,
+            InetSocketAddress::new("127.0.0.1", 43141),
+        )
+        .expect("bind listener");
+    kernel
+        .socket_listen("shell", server.pid(), listener, 4)
+        .expect("listen");
+
+    let client_socket = kernel
+        .socket_create("shell", client.pid(), SocketSpec::tcp())
+        .expect("create client socket");
+    kernel
+        .socket_bind_inet(
+            "shell",
+            client.pid(),
+            client_socket,
+            InetSocketAddress::new("127.0.0.1", 54041),
+        )
+        .expect("bind client");
+    kernel
+        .socket_connect_inet_loopback(
+            "shell",
+            client.pid(),
+            client_socket,
+            InetSocketAddress::new("127.0.0.1", 43141),
+        )
+        .expect("connect loopback client");
+    assert_eq!(
+        take_readiness_events(&events),
+        vec![SocketReadiness {
+            socket_id: listener,
+            kind: SocketReadinessKind::Accept,
+        }]
+    );
+
+    let second_client_socket = kernel
+        .socket_create("shell", client.pid(), SocketSpec::tcp())
+        .expect("create second client socket");
+    kernel
+        .socket_bind_inet(
+            "shell",
+            client.pid(),
+            second_client_socket,
+            InetSocketAddress::new("127.0.0.1", 54042),
+        )
+        .expect("bind second client");
+    kernel
+        .socket_connect_inet_loopback(
+            "shell",
+            client.pid(),
+            second_client_socket,
+            InetSocketAddress::new("127.0.0.1", 43141),
+        )
+        .expect("connect second loopback client");
+    assert!(
+        take_readiness_events(&events).is_empty(),
+        "second pending accept should not emit another readiness edge"
+    );
+
+    let accepted = kernel
+        .socket_accept("shell", server.pid(), listener)
+        .expect("accept first connection");
+    let _second_accepted = kernel
+        .socket_accept("shell", server.pid(), listener)
+        .expect("accept second connection");
+    assert!(take_readiness_events(&events).is_empty());
+
+    kernel
+        .socket_write("shell", client.pid(), client_socket, b"A")
+        .expect("write first byte");
+    kernel
+        .socket_write("shell", client.pid(), client_socket, b"B")
+        .expect("write second byte while peer buffer is nonempty");
+    assert_eq!(
+        take_readiness_events(&events),
+        vec![SocketReadiness {
+            socket_id: accepted,
+            kind: SocketReadinessKind::Data,
+        }]
+    );
+
+    assert_eq!(
+        kernel
+            .socket_read("shell", server.pid(), accepted, 1)
+            .expect("partial read")
+            .expect("partial payload"),
+        b"A"
+    );
+    kernel
+        .socket_write("shell", client.pid(), client_socket, b"C")
+        .expect("write while peer buffer still has data");
+    assert!(
+        take_readiness_events(&events).is_empty(),
+        "write while nonempty should not emit another data edge"
+    );
+    assert_eq!(
+        kernel
+            .socket_read("shell", server.pid(), accepted, 8)
+            .expect("drain read")
+            .expect("drained payload"),
+        b"BC"
+    );
+    kernel
+        .socket_write("shell", client.pid(), client_socket, b"D")
+        .expect("write after full drain");
+    assert_eq!(
+        take_readiness_events(&events),
+        vec![SocketReadiness {
+            socket_id: accepted,
+            kind: SocketReadinessKind::Data,
+        }]
+    );
+
+    let udp_sender = kernel
+        .socket_create("shell", client.pid(), SocketSpec::udp())
+        .expect("create udp sender");
+    kernel
+        .socket_bind_inet(
+            "shell",
+            client.pid(),
+            udp_sender,
+            InetSocketAddress::new("127.0.0.1", 54043),
+        )
+        .expect("bind udp sender");
+    let udp_receiver = kernel
+        .socket_create("shell", server.pid(), SocketSpec::udp())
+        .expect("create udp receiver");
+    kernel
+        .socket_bind_inet(
+            "shell",
+            server.pid(),
+            udp_receiver,
+            InetSocketAddress::new("127.0.0.1", 43143),
+        )
+        .expect("bind udp receiver");
+    take_readiness_events(&events);
+    kernel
+        .socket_send_to_inet_loopback(
+            "shell",
+            client.pid(),
+            udp_sender,
+            InetSocketAddress::new("127.0.0.1", 43143),
+            b"one",
+        )
+        .expect("send first datagram");
+    kernel
+        .socket_send_to_inet_loopback(
+            "shell",
+            client.pid(),
+            udp_sender,
+            InetSocketAddress::new("127.0.0.1", 43143),
+            b"two",
+        )
+        .expect("send second datagram while queue is nonempty");
+    assert_eq!(
+        take_readiness_events(&events),
+        vec![SocketReadiness {
+            socket_id: udp_receiver,
+            kind: SocketReadinessKind::Data,
+        }]
+    );
+    kernel
+        .socket_recv_datagram("shell", server.pid(), udp_receiver, 16)
+        .expect("receive first datagram");
+    kernel
+        .socket_recv_datagram("shell", server.pid(), udp_receiver, 16)
+        .expect("receive second datagram");
+    kernel
+        .socket_send_to_inet_loopback(
+            "shell",
+            client.pid(),
+            udp_sender,
+            InetSocketAddress::new("127.0.0.1", 43143),
+            b"three",
+        )
+        .expect("send datagram after drain");
+    assert_eq!(
+        take_readiness_events(&events),
+        vec![SocketReadiness {
+            socket_id: udp_receiver,
+            kind: SocketReadinessKind::Data,
+        }]
+    );
 }
 
 #[test]

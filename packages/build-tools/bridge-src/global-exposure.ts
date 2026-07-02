@@ -146,6 +146,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host-to-sandbox net socket event dispatch entrypoint."
   },
   {
+    name: "_dgramSocketDispatch",
+    classification: "hardened",
+    rationale: "Host-to-sandbox dgram socket event dispatch entrypoint."
+  },
+  {
     name: "_httpServerDispatch",
     classification: "hardened",
     rationale: "Host-to-sandbox HTTP server dispatch entrypoint."

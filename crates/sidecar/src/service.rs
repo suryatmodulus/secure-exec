@@ -2187,6 +2187,7 @@ where
                             payload.host, payload.port, payload.server_id, payload.process_id
                         )));
                     }
+                    let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
                     let Some(target_process) = vm.active_processes.get_mut(&payload.process_id)
                     else {
                         return Err(SidecarError::InvalidState(format!(
@@ -2200,6 +2201,7 @@ where
                         dns: &vm.dns,
                         socket_paths: &socket_paths,
                         kernel: &mut vm.kernel,
+                        kernel_readiness,
                         process: target_process,
                         resource_limits: &resource_limits,
                         server_id: payload.server_id,
@@ -2253,6 +2255,7 @@ where
                     let resource_limits = vm.kernel.resource_limits().clone();
                     let network_counts = vm_network_resource_counts(vm);
                     let socket_paths = build_javascript_socket_path_context(vm)?;
+                    let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
                     let Some(process) = vm.active_processes.get_mut(process_id) else {
                         log_stale_process_event(
                             &self.bridge,
@@ -2268,6 +2271,7 @@ where
                         dns: &vm.dns,
                         socket_paths: &socket_paths,
                         kernel: &mut vm.kernel,
+                        kernel_readiness,
                         process,
                         sync_request: &request,
                         resource_limits: &resource_limits,

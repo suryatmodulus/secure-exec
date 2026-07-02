@@ -13,6 +13,8 @@ var registeredNetServersByPort = /* @__PURE__ */ new Map();
 
 var registeredNetServersByPath = /* @__PURE__ */ new Map();
 
+var registeredNetServersById = /* @__PURE__ */ new Map();
+
 function getRegisteredNetSocket(socketId) {
   return globalThis[`${NET_SOCKET_REGISTRY_PREFIX}${socketId}`];
 }
@@ -27,6 +29,25 @@ function unregisterNetSocket(socketId) {
   registeredNetSockets.delete(socketId);
 }
 
+function isRegisteredNetSocket(socket) {
+  return !!socket && socket._socketId !== 0 && registeredNetSockets.get(socket._socketId) === socket;
+}
+
+function queueSocketBridgeReadPump(socket, origin) {
+  if (socket._bridgeReadPumpQueued) {
+    countNetBridgeMetric("readPumpQueueCoalesced");
+    return;
+  }
+  socket._bridgeReadPumpQueued = true;
+  queueMicrotask(() => {
+    socket._bridgeReadPumpQueued = false;
+    if (!socket.destroyed && isRegisteredNetSocket(socket) && socket._socketId !== 0) {
+      socket._nextReadPumpOrigin = origin;
+      void socket._pumpBridgeReads();
+    }
+  });
+}
+
 function netServerUnixPath(server) {
   const address = server?._address;
   if (typeof address === "string") {
@@ -37,6 +58,9 @@ function netServerUnixPath(server) {
 }
 
 function registerNetServer(server) {
+  if (server?._serverId) {
+    registeredNetServersById.set(server._serverId, server);
+  }
   const port = server?._address?.port;
   if (typeof port === "number") {
     registeredNetServersByPort.set(port, server);
@@ -48,6 +72,9 @@ function registerNetServer(server) {
 }
 
 function unregisterNetServer(server) {
+  if (server?._serverId && registeredNetServersById.get(server._serverId) === server) {
+    registeredNetServersById.delete(server._serverId);
+  }
   const port = server?._address?.port;
   if (typeof port === "number" && registeredNetServersByPort.get(port) === server) {
     registeredNetServersByPort.delete(port);
@@ -64,6 +91,8 @@ function wakeSocketBridgeReads(socket) {
     countNetBridgeMetric("readWakeInvalidTargets");
     return;
   }
+  socket._pendingBridgeWake = true;
+  socket._pendingBridgeWakeRetries = 0;
   if (socket._bridgeReadLoopRunning) {
     countNetBridgeMetric("readWakeAlreadyRunning");
   }
@@ -157,20 +186,18 @@ function wakeSocketBridgeReads(socket) {
         });
       }
     }
+    if (!socket._bridgeReadLoopRunning && socket._connected && socket._refed) {
+      queueSocketBridgeReadPump(socket, "eventWake");
+    }
     return;
   }
-	    clearTimeout(socket._bridgeReadPollTimer);
-	    socket._bridgeReadPollTimer = null;
-	    countNetBridgeMetric("readEventWakeups");
-	    if (isNetBridgeMetricsEnabled()) {
-	      socket._readWakeQueuedAtUs = netBridgeNowUs();
-	    }
-	    queueMicrotask(() => {
-	      if (!socket.destroyed) {
-	        socket._nextReadPumpOrigin = "eventWake";
-	        void socket._pumpBridgeReads();
-    }
-  });
+  clearTimeout(socket._bridgeReadPollTimer);
+  socket._bridgeReadPollTimer = null;
+  countNetBridgeMetric("readEventWakeups");
+  if (isNetBridgeMetricsEnabled()) {
+    socket._readWakeQueuedAtUs = netBridgeNowUs();
+  }
+  queueSocketBridgeReadPump(socket, "eventWake");
 }
 
 function wakePeerBridgeReads(socket) {
@@ -226,6 +253,7 @@ function wakeNetServerAccept(server) {
     if (!server || !server.listening || server._serverId === 0) {
       countNetBridgeMetric("acceptWakeInvalidTargets");
     } else {
+      server._pendingAcceptWake = true;
       countNetBridgeMetric("acceptWakeNoTimer");
       countNetBridgeMetric(server._acceptPumpStarted ? "acceptWakeNoTimerAfterFirstPump" : "acceptWakeNoTimerBeforeFirstPump");
       if (server._acceptLoopRunning) {
@@ -1380,6 +1408,17 @@ function yieldBridgeMacrotask() {
 function netSocketDispatch(socketId, event, data) {
   if (socketId === "net_socket" && event && typeof event === "object") {
     const payload = event;
+    if (payload.event === "accept") {
+      const server = registeredNetServersById.get(payload.serverId);
+      if (server) {
+        wakeNetServerAccept(server);
+      }
+      return;
+    }
+    if (payload.event === "dgram") {
+      globalThis._dgramSocketDispatch?.(payload);
+      return;
+    }
     const target = getRegisteredNetSocket(payload.socketId);
     if (target) {
       countNetBridgeMetric("readEventWakeups");
@@ -1389,6 +1428,17 @@ function netSocketDispatch(socketId, event, data) {
   }
   if (socketId && typeof socketId === "object") {
     const payload = socketId;
+    if (payload.event === "accept") {
+      const server = registeredNetServersById.get(payload.serverId);
+      if (server) {
+        wakeNetServerAccept(server);
+      }
+      return;
+    }
+    if (payload.event === "dgram") {
+      globalThis._dgramSocketDispatch?.(payload);
+      return;
+    }
     const target = getRegisteredNetSocket(payload.socketId);
     if (target) {
       countNetBridgeMetric("readEventWakeups");
@@ -1492,9 +1542,12 @@ var NetSocket = class _NetSocket {
   _keepAliveState = false;
   _keepAliveDelaySeconds = 0;
   _refed = true;
-  _bridgeReadLoopRunning = false;
-  _bridgeReadPollTimer = null;
-  _bridgeReadPumpStarted = false;
+	  _bridgeReadLoopRunning = false;
+	  _bridgeReadPumpQueued = false;
+	  _bridgeReadPollTimer = null;
+	  _pendingBridgeWake = false;
+	  _pendingBridgeWakeRetries = 0;
+	  _bridgeReadPumpStarted = false;
   _bridgeReadFirstPumpBenchmarkScheduled = false;
   _readFirstPumpScheduleActive = false;
   _readFirstPumpScheduleQueuedAtUs = 0;
@@ -1507,9 +1560,10 @@ var NetSocket = class _NetSocket {
 	    _pendingBridgeWriteBytes = 0;
 	    _bridgeWriteFlushScheduled = false;
 	    _bridgeWriteFlushQueuedAtUs = 0;
-	    _lastReadDeliveryEndUs = 0;
-	    _currentDataEmitStartUs = 0;
-	    _lastDataEmitEndUs = 0;
+		    _lastReadDeliveryEndUs = 0;
+		    _currentDataEmitStartUs = 0;
+		    _wroteDuringDataEmit = false;
+		    _lastDataEmitEndUs = 0;
 	    _readWakeQueuedAtUs = 0;
 	    _tlsUpgrading = false;
   _remoteEnded = false;
@@ -1652,10 +1706,11 @@ var NetSocket = class _NetSocket {
 	      countNetBridgeMetric("userWriteBytes", buf.length);
 	      if (isNetBridgeMetricsEnabled()) {
 	        const nowUs = netBridgeNowUs();
-	        if (this._currentDataEmitStartUs > 0) {
-	          countNetBridgeMetric("userWriteDuringDataEmitCalls");
-	          countNetBridgeMetric("dataEmitStartToUserWriteUs", nowUs - this._currentDataEmitStartUs);
-	        } else if (this._lastDataEmitEndUs > 0) {
+		        if (this._currentDataEmitStartUs > 0) {
+		          countNetBridgeMetric("userWriteDuringDataEmitCalls");
+		          countNetBridgeMetric("dataEmitStartToUserWriteUs", nowUs - this._currentDataEmitStartUs);
+		          this._wroteDuringDataEmit = true;
+		        } else if (this._lastDataEmitEndUs > 0) {
 	          countNetBridgeMetric("dataEmitEndToUserWriteUs", nowUs - this._lastDataEmitEndUs);
 	        }
 	      }
@@ -1759,15 +1814,18 @@ var NetSocket = class _NetSocket {
     if (callback) {
       this._pendingBridgeWriteCallbacks.push(callback);
     }
-	      if (!this._bridgeWriteFlushScheduled) {
-	        this._bridgeWriteFlushScheduled = true;
-	        if (isNetBridgeMetricsEnabled()) {
-	          this._bridgeWriteFlushQueuedAtUs = netBridgeNowUs();
-	        }
-	        queueMicrotask(() => {
-	          this._flushBridgeWrites();
-	        });
-    }
+		      if (this._currentDataEmitStartUs > 0) {
+		        countNetBridgeMetric("writeFlushInlineDuringDataEmit");
+		        this._flushBridgeWrites();
+		      } else if (!this._bridgeWriteFlushScheduled) {
+		        this._bridgeWriteFlushScheduled = true;
+		        if (isNetBridgeMetricsEnabled()) {
+		          this._bridgeWriteFlushQueuedAtUs = netBridgeNowUs();
+		        }
+		        queueMicrotask(() => {
+		          this._flushBridgeWrites();
+		        });
+	    }
   }
   _flushBridgeWrites() {
 	      const chunks = this._pendingBridgeWriteChunks;
@@ -2277,7 +2335,7 @@ var NetSocket = class _NetSocket {
     }
   }
 	    async _pumpBridgeReads() {
-	      if (this._bridgeReadLoopRunning || typeof _netSocketReadRaw === "undefined" || this._socketId === 0) {
+	      if (this._bridgeReadLoopRunning || typeof _netSocketReadRaw === "undefined" || !isRegisteredNetSocket(this)) {
 	        return;
 	      }
 	      countNetBridgeMetric("readPumpRuns");
@@ -2310,8 +2368,9 @@ var NetSocket = class _NetSocket {
 	        this._readWakeQueuedAtUs = 0;
 	      }
 	      this._bridgeReadLoopRunning = true;
+	      let deliveredPayloads = 0;
 	      try {
-	        while (!this.destroyed) {
+	        while (!this.destroyed && isRegisteredNetSocket(this)) {
 	          countNetBridgeMetric("readRawCalls");
 	          const traceMetrics = isNetBridgeMetricsEnabled();
 	          const postDeliveryProbeStartUs = traceMetrics && this._lastReadDeliveryEndUs > 0 ? netBridgeNowUs() : 0;
@@ -2324,6 +2383,9 @@ var NetSocket = class _NetSocket {
 	              countNetBridgeMetric("readPostDeliveryPendingWriteBytes", this._pendingBridgeWriteBytes);
 	            }
 	            this._lastReadDeliveryEndUs = 0;
+	          }
+	          if (!isRegisteredNetSocket(this)) {
+	            return;
 	          }
 	          const readStartUs = traceMetrics ? netBridgeNowUs() : 0;
 	          const chunk = _netSocketReadRaw.applySync(void 0, [this._socketId]);
@@ -2352,9 +2414,27 @@ var NetSocket = class _NetSocket {
 	              countNetBridgeMetric("readPostDeliveryProbeTimeoutSentinels");
 	              countNetBridgeMetric("readPostDeliveryNextRawTimeoutSentinels");
 	            }
-          if (!this._refed) {
+	          if (!this._refed) {
             return;
 	            }
+		            if (this._pendingBridgeWake) {
+		              if (this._pendingBridgeWakeRetries < 2) {
+		                this._pendingBridgeWakeRetries++;
+		                countNetBridgeMetric("readPendingWakeImmediateRetries");
+		                this._nextReadPumpOrigin = "eventWake";
+		                await Promise.resolve();
+		                continue;
+		              }
+		              this._pendingBridgeWake = false;
+		              this._pendingBridgeWakeRetries = 0;
+		              countNetBridgeMetric("readPendingWakeShortRetryTimers");
+		              this._bridgeReadPollTimer = setTimeout(() => {
+		                this._bridgeReadPollTimer = null;
+		                this._nextReadPumpOrigin = "eventWake";
+		                void this._pumpBridgeReads();
+		              }, 1);
+		              return;
+		            }
 	            countNetBridgeMetric("readPollTimersScheduled");
 	            const pollDelayMs = netBridgePollDelayMs();
 	            const scheduledAtUs = isNetBridgeMetricsEnabled() ? netBridgeNowUs() : 0;
@@ -2380,9 +2460,11 @@ var NetSocket = class _NetSocket {
             scheduleResultRecorded = true;
             countNetBridgeMetric("readFirstPumpScheduleResultEnd");
           }
-          countNetBridgeMetric("readEndEvents");
-          this._handleRemoteReadableEnd();
-          return;
+	          countNetBridgeMetric("readEndEvents");
+	          this._pendingBridgeWake = false;
+	          this._pendingBridgeWakeRetries = 0;
+	          this._handleRemoteReadableEnd();
+	          return;
 	          }
 	          if (postDeliveryProbeStartUs > 0) {
 	            countNetBridgeMetric("readPostDeliveryProbeDataEvents");
@@ -2417,9 +2499,9 @@ var NetSocket = class _NetSocket {
         }
         debugBridgeNetwork("socket data", this._socketId, payload.length);
         countNetBridgeMetric("readDataEvents");
-        countNetBridgeMetric("readBytes", payload.length);
-        this.bytesRead += payload.length;
-        this._touchTimeout();
+	        countNetBridgeMetric("readBytes", payload.length);
+	        this.bytesRead += payload.length;
+	        this._touchTimeout();
         // Yield to a macrotask before delivering each payload so that socket
         // bytes surface across distinct event-loop turns, exactly as they do
         // on real Node where each readable arrives in its own I/O callback.
@@ -2431,24 +2513,45 @@ var NetSocket = class _NetSocket {
         // pool keeps every Client at kNeedDrain and allocates a fresh
         // Client+socket per request — leaking EventEmitter listeners
 	          // (MaxListenersExceededWarning) and unbounded memory until the VM dies.
-	          countNetBridgeMetric("readMacrotaskYields");
-	          const yieldStartUs = traceMetrics ? netBridgeNowUs() : 0;
-	          await yieldBridgeMacrotask();
-	          if (traceMetrics) {
-	            const yieldElapsedUs = netBridgeNowUs() - yieldStartUs;
-	            countNetBridgeMetric("readMacrotaskYieldElapsedUs", yieldElapsedUs);
-	            maxNetBridgeMetric("readMacrotaskYieldMaxUs", yieldElapsedUs);
-	          }
-	          if (this.destroyed) {
-	            return;
-	          }
-	          this._queueReadablePayload(payload);
-	          if (traceMetrics) {
-	            this._lastReadDeliveryEndUs = netBridgeNowUs();
-	          }
+		          if (deliveredPayloads > 0) {
+		            countNetBridgeMetric("readMacrotaskYields");
+		            const yieldStartUs = traceMetrics ? netBridgeNowUs() : 0;
+		            await yieldBridgeMacrotask();
+		            if (traceMetrics) {
+		              const yieldElapsedUs = netBridgeNowUs() - yieldStartUs;
+		              countNetBridgeMetric("readMacrotaskYieldElapsedUs", yieldElapsedUs);
+		              maxNetBridgeMetric("readMacrotaskYieldMaxUs", yieldElapsedUs);
+		            }
+		            if (this.destroyed) {
+		              return;
+		            }
+		          } else {
+		            countNetBridgeMetric("readFirstPayloadImmediateDeliveries");
+		          }
+		          this._pendingBridgeWake = false;
+		          this._pendingBridgeWakeRetries = 0;
+		          deliveredPayloads++;
+		          this._queueReadablePayload(payload);
+		          if (this._wroteDuringDataEmit) {
+		            this._wroteDuringDataEmit = false;
+		            countNetBridgeMetric("readPumpYieldAfterInlineDataWrite");
+		            queueSocketBridgeReadPump(this, "postDeliveryInlineWrite");
+		            return;
+		          }
+		          if (this._bridgeWriteFlushScheduled) {
+		            countNetBridgeMetric("readPumpYieldToPendingWriteFlush");
+		            queueSocketBridgeReadPump(this, "postDeliveryWriteFlush");
+		            return;
+		          }
+		          if (traceMetrics) {
+		            this._lastReadDeliveryEndUs = netBridgeNowUs();
+		          }
 	        }
     } finally {
       this._bridgeReadLoopRunning = false;
+	      if (this._pendingBridgeWake && !this.destroyed && isRegisteredNetSocket(this)) {
+	        queueSocketBridgeReadPump(this, "eventWake");
+	      }
     }
   }
   _dispatchLoopbackHttpRequest() {
@@ -2681,6 +2784,7 @@ var NetServer = class {
 	    _acceptLoopActive = false;
 	    _acceptLoopRunning = false;
 	    _acceptPollTimer = null;
+	    _pendingAcceptWake = false;
 	    _acceptPumpStarted = false;
 	    _nextAcceptPumpOrigin = null;
 	    _firstAcceptNoTimerWakeAtUs = 0;
@@ -2955,10 +3059,15 @@ var NetServer = class {
             countNetBridgeMetric("acceptFirstPumpResultTimeout");
           }
           countNetBridgeMetric("acceptTimeoutSentinels");
-          if (!this._refed) {
+	          if (!this._refed) {
             return;
-	            }
-	            countNetBridgeMetric("acceptPollTimersScheduled");
+		            }
+		            if (this._pendingAcceptWake) {
+		              this._pendingAcceptWake = false;
+		              this._nextAcceptPumpOrigin = "eventWake";
+		              continue;
+		            }
+		            countNetBridgeMetric("acceptPollTimersScheduled");
 	            const pollDelayMs = netBridgePollDelayMs();
 	            const scheduledAtUs = isNetBridgeMetricsEnabled() ? netBridgeNowUs() : 0;
 	            this._acceptPollTimer = setTimeout(() => {
@@ -3004,6 +3113,15 @@ var NetServer = class {
       }
     } finally {
       this._acceptLoopRunning = false;
+      if (this._pendingAcceptWake && this.listening && this._serverId !== 0) {
+        this._pendingAcceptWake = false;
+        this._nextAcceptPumpOrigin = "eventWake";
+        queueMicrotask(() => {
+          if (this.listening && this._serverId !== 0) {
+            void this._pumpAccepts();
+          }
+        });
+      }
     }
   }
 };

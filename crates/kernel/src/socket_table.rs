@@ -11,6 +11,20 @@ use std::time::Instant;
 pub type SocketId = u64;
 pub type SocketResult<T> = Result<T, SocketTableError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketReadinessKind {
+    Data,
+    Accept,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketReadiness {
+    pub socket_id: SocketId,
+    pub kind: SocketReadinessKind,
+}
+
+type SocketReadinessSink = Arc<dyn Fn(SocketReadiness) + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SocketReadTraceSnapshot {
     pub socket_record_clone_calls: u64,
@@ -578,9 +592,26 @@ struct QueuedDatagram {
     payload: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
 struct SocketTableInner {
     state: Mutex<SocketTableState>,
+    readiness_sink: Mutex<Option<SocketReadinessSink>>,
+}
+
+impl Default for SocketTableInner {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(SocketTableState::default()),
+            readiness_sink: Mutex::new(None),
+        }
+    }
+}
+
+impl fmt::Debug for SocketTableInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SocketTableInner")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -591,6 +622,24 @@ pub struct SocketTable {
 impl SocketTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_readiness_sink<F>(&self, sink: Option<F>)
+    where
+        F: Fn(SocketReadiness) + Send + Sync + 'static,
+    {
+        let mut target = lock_or_recover(&self.inner.readiness_sink);
+        *target = sink.map(|sink| Arc::new(sink) as SocketReadinessSink);
+    }
+
+    fn emit_readiness(&self, readiness: Option<SocketReadiness>) {
+        let Some(readiness) = readiness else {
+            return;
+        };
+        let sink = lock_or_recover(&self.inner.readiness_sink).clone();
+        if let Some(sink) = sink {
+            sink(readiness);
+        }
     }
 
     pub fn allocate(&self, owner_pid: u32, spec: SocketSpec) -> SocketRecord {
@@ -929,35 +978,43 @@ impl SocketTable {
         listener_socket_id: SocketId,
         peer_address: InetSocketAddress,
     ) -> SocketResult<()> {
-        let mut table = lock_or_recover(&self.inner.state);
-        let record = table
-            .sockets
-            .get_mut(&listener_socket_id)
-            .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
+        let readiness = {
+            let mut table = lock_or_recover(&self.inner.state);
+            let record = table
+                .sockets
+                .get_mut(&listener_socket_id)
+                .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
 
-        if record.state != SocketState::Listening {
-            return Err(SocketTableError::invalid_argument(format!(
-                "socket {listener_socket_id} is not listening"
-            )));
-        }
+            if record.state != SocketState::Listening {
+                return Err(SocketTableError::invalid_argument(format!(
+                    "socket {listener_socket_id} is not listening"
+                )));
+            }
 
-        let listener_state = record.listener_state.as_mut().ok_or_else(|| {
-            SocketTableError::invalid_argument(format!(
-                "socket {listener_socket_id} has no listener state"
-            ))
-        })?;
+            let listener_state = record.listener_state.as_mut().ok_or_else(|| {
+                SocketTableError::invalid_argument(format!(
+                    "socket {listener_socket_id} has no listener state"
+                ))
+            })?;
 
-        if listener_state.pending_accepts.len() >= listener_state.backlog {
-            return Err(SocketTableError::would_block(format!(
-                "listener {listener_socket_id} backlog is full"
-            )));
-        }
+            if listener_state.pending_accepts.len() >= listener_state.backlog {
+                return Err(SocketTableError::would_block(format!(
+                    "listener {listener_socket_id} backlog is full"
+                )));
+            }
 
-        listener_state.pending_accepts.push_back(PendingConnection {
-            peer_address: Some(peer_address),
-            peer_unix_path: None,
-            accepted_socket_id: None,
-        });
+            let was_empty = listener_state.pending_accepts.is_empty();
+            listener_state.pending_accepts.push_back(PendingConnection {
+                peer_address: Some(peer_address),
+                peer_unix_path: None,
+                accepted_socket_id: None,
+            });
+            was_empty.then_some(SocketReadiness {
+                socket_id: listener_socket_id,
+                kind: SocketReadinessKind::Accept,
+            })
+        };
+        self.emit_readiness(readiness);
         Ok(())
     }
 
@@ -1095,28 +1152,30 @@ impl SocketTable {
         target_address: InetSocketAddress,
     ) -> SocketResult<()> {
         let target_address = normalize_inet_address(target_address);
-        let mut table = lock_or_recover(&self.inner.state);
-        let listener_socket_id =
-            lookup_bound_inet_socket_in_table(&table.bound_inet_streams, &target_address)
-                .ok_or_else(|| {
-                    SocketTableError::not_found_address(format!(
-                        "no listening socket bound at {}:{}",
-                        target_address.host(),
-                        target_address.port()
-                    ))
-                })?;
+        let (result, readiness) = {
+            let mut table = lock_or_recover(&self.inner.state);
+            let listener_socket_id =
+                lookup_bound_inet_socket_in_table(&table.bound_inet_streams, &target_address)
+                    .ok_or_else(|| {
+                        SocketTableError::not_found_address(format!(
+                            "no listening socket bound at {}:{}",
+                            target_address.host(),
+                            target_address.port()
+                        ))
+                    })?;
 
-        if socket_id == listener_socket_id {
-            return Err(SocketTableError::invalid_argument(
-                "socket cannot connect to its own listening endpoint",
-            ));
-        }
+            if socket_id == listener_socket_id {
+                return Err(SocketTableError::invalid_argument(
+                    "socket cannot connect to its own listening endpoint",
+                ));
+            }
 
-        let mut client = table
-            .sockets
-            .remove(&socket_id)
-            .ok_or_else(|| SocketTableError::not_found(socket_id))?;
-        let result = (|| {
+            let mut client = table
+                .sockets
+                .remove(&socket_id)
+                .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+            let mut accept_was_empty = false;
+            let result = (|| {
             // Validate the listener and confirm backlog capacity BEFORE consuming a
             // socket id. The id counter is monotonic (saturating_add) and never
             // reclaims, so allocating an id before this check leaks one on every
@@ -1169,6 +1228,7 @@ impl SocketTable {
                 datagram_state: default_datagram_state(listener.spec),
             };
 
+            accept_was_empty = listener_state.pending_accepts.is_empty();
             listener_state.pending_accepts.push_back(PendingConnection {
                 peer_address: client.local_address.clone(),
                 peer_unix_path: None,
@@ -1185,25 +1245,35 @@ impl SocketTable {
             });
 
             Ok(accepted)
-        })();
+            })();
 
-        match result {
-            Ok(accepted) => {
-                let accepted_socket_id = accepted.id;
-                table.sockets.insert(socket_id, client);
-                table.sockets.insert(accepted_socket_id, accepted.clone());
-                table
-                    .by_owner
-                    .entry(accepted.owner_pid)
-                    .or_default()
-                    .insert(accepted_socket_id);
-                Ok(())
-            }
-            Err(error) => {
-                table.sockets.insert(socket_id, client);
-                Err(error)
-            }
-        }
+            let result = match result {
+                Ok(accepted) => {
+                    let accepted_socket_id = accepted.id;
+                    table.sockets.insert(socket_id, client);
+                    table.sockets.insert(accepted_socket_id, accepted.clone());
+                    table
+                        .by_owner
+                        .entry(accepted.owner_pid)
+                        .or_default()
+                        .insert(accepted_socket_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    table.sockets.insert(socket_id, client);
+                    Err(error)
+                }
+            };
+            let readiness = result.is_ok().then_some(()).and_then(|()| {
+                accept_was_empty.then_some(SocketReadiness {
+                    socket_id: listener_socket_id,
+                    kind: SocketReadinessKind::Accept,
+                })
+            });
+            (result, readiness)
+        };
+        self.emit_readiness(readiness);
+        result
     }
 
     pub fn find_bound_unix_socket(&self, path: &str) -> Option<SocketRecord> {
@@ -1219,115 +1289,128 @@ impl SocketTable {
         target_path: impl Into<String>,
     ) -> SocketResult<()> {
         let target_path = normalize_unix_socket_path(target_path.into())?;
-        let mut table = lock_or_recover(&self.inner.state);
-        let listener_socket_id = table
-            .bound_unix_streams
-            .get(&target_path)
-            .copied()
-            .ok_or_else(|| {
-                SocketTableError::not_found_address(format!(
-                    "no listening socket bound at path {target_path}"
-                ))
-            })?;
+        let (result, readiness) = {
+            let mut table = lock_or_recover(&self.inner.state);
+            let listener_socket_id = table
+                .bound_unix_streams
+                .get(&target_path)
+                .copied()
+                .ok_or_else(|| {
+                    SocketTableError::not_found_address(format!(
+                        "no listening socket bound at path {target_path}"
+                    ))
+                })?;
 
-        if socket_id == listener_socket_id {
-            return Err(SocketTableError::invalid_argument(
-                "socket cannot connect to its own listening endpoint",
-            ));
-        }
+            if socket_id == listener_socket_id {
+                return Err(SocketTableError::invalid_argument(
+                    "socket cannot connect to its own listening endpoint",
+                ));
+            }
 
-        let mut client = table
-            .sockets
-            .remove(&socket_id)
-            .ok_or_else(|| SocketTableError::not_found(socket_id))?;
-        let result = (|| {
-            // Validate the listener and confirm backlog capacity BEFORE consuming a
-            // socket id. The id counter is monotonic (saturating_add) and never
-            // reclaims, so allocating an id before this check leaks one on every
-            // rejected connect (for example when the backlog is full).
-            {
+            let mut client = table
+                .sockets
+                .remove(&socket_id)
+                .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+            let mut accept_was_empty = false;
+            let result = (|| {
+                // Validate the listener and confirm backlog capacity BEFORE consuming a
+                // socket id. The id counter is monotonic (saturating_add) and never
+                // reclaims, so allocating an id before this check leaks one on every
+                // rejected connect (for example when the backlog is full).
+                {
+                    let listener = table
+                        .sockets
+                        .get(&listener_socket_id)
+                        .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
+                    validate_connect_to_listener(&client, listener)?;
+
+                    let listener_state = listener.listener_state.as_ref().ok_or_else(|| {
+                        SocketTableError::invalid_argument(format!(
+                            "socket {listener_socket_id} has no listener state"
+                        ))
+                    })?;
+                    if listener_state.pending_accepts.len() >= listener_state.backlog {
+                        return Err(SocketTableError::would_block(format!(
+                            "listener {listener_socket_id} backlog is full"
+                        )));
+                    }
+                }
+
+                // Capacity confirmed: only now is it safe to consume a socket id.
+                let accepted_socket_id = next_socket_id(&mut table);
                 let listener = table
                     .sockets
-                    .get(&listener_socket_id)
+                    .get_mut(&listener_socket_id)
                     .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
-                validate_connect_to_listener(&client, listener)?;
-
-                let listener_state = listener.listener_state.as_ref().ok_or_else(|| {
+                let listener_state = listener.listener_state.as_mut().ok_or_else(|| {
                     SocketTableError::invalid_argument(format!(
                         "socket {listener_socket_id} has no listener state"
                     ))
                 })?;
-                if listener_state.pending_accepts.len() >= listener_state.backlog {
-                    return Err(SocketTableError::would_block(format!(
-                        "listener {listener_socket_id} backlog is full"
-                    )));
-                }
-            }
 
-            // Capacity confirmed: only now is it safe to consume a socket id.
-            let accepted_socket_id = next_socket_id(&mut table);
-            let listener = table
-                .sockets
-                .get_mut(&listener_socket_id)
-                .ok_or_else(|| SocketTableError::not_found(listener_socket_id))?;
-            let listener_state = listener.listener_state.as_mut().ok_or_else(|| {
-                SocketTableError::invalid_argument(format!(
-                    "socket {listener_socket_id} has no listener state"
-                ))
-            })?;
+                let accepted = SocketRecord {
+                    id: accepted_socket_id,
+                    owner_pid: listener.owner_pid,
+                    spec: listener.spec,
+                    state: SocketState::Connected,
+                    local_address: None,
+                    peer_address: None,
+                    local_unix_path: listener.local_unix_path.clone(),
+                    peer_unix_path: client.local_unix_path.clone(),
+                    listener_state: None,
+                    connection_state: Some(ConnectionState {
+                        peer_socket_id: Some(socket_id),
+                        ..ConnectionState::default()
+                    }),
+                    datagram_state: default_datagram_state(listener.spec),
+                };
 
-            let accepted = SocketRecord {
-                id: accepted_socket_id,
-                owner_pid: listener.owner_pid,
-                spec: listener.spec,
-                state: SocketState::Connected,
-                local_address: None,
-                peer_address: None,
-                local_unix_path: listener.local_unix_path.clone(),
-                peer_unix_path: client.local_unix_path.clone(),
-                listener_state: None,
-                connection_state: Some(ConnectionState {
-                    peer_socket_id: Some(socket_id),
+                accept_was_empty = listener_state.pending_accepts.is_empty();
+                listener_state.pending_accepts.push_back(PendingConnection {
+                    peer_address: None,
+                    peer_unix_path: client.local_unix_path.clone(),
+                    accepted_socket_id: Some(accepted_socket_id),
+                });
+
+                client.state = SocketState::Connected;
+                client.peer_address = None;
+                client.peer_unix_path = listener.local_unix_path.clone();
+                client.listener_state = None;
+                client.connection_state = Some(ConnectionState {
+                    peer_socket_id: Some(accepted_socket_id),
                     ..ConnectionState::default()
-                }),
-                datagram_state: default_datagram_state(listener.spec),
+                });
+
+                Ok(accepted)
+            })();
+
+            let result = match result {
+                Ok(accepted) => {
+                    let accepted_socket_id = accepted.id;
+                    table.sockets.insert(socket_id, client);
+                    table.sockets.insert(accepted_socket_id, accepted.clone());
+                    table
+                        .by_owner
+                        .entry(accepted.owner_pid)
+                        .or_default()
+                        .insert(accepted_socket_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    table.sockets.insert(socket_id, client);
+                    Err(error)
+                }
             };
-
-            listener_state.pending_accepts.push_back(PendingConnection {
-                peer_address: None,
-                peer_unix_path: client.local_unix_path.clone(),
-                accepted_socket_id: Some(accepted_socket_id),
+            let readiness = result.is_ok().then_some(()).and_then(|()| {
+                accept_was_empty.then_some(SocketReadiness {
+                    socket_id: listener_socket_id,
+                    kind: SocketReadinessKind::Accept,
+                })
             });
-
-            client.state = SocketState::Connected;
-            client.peer_address = None;
-            client.peer_unix_path = listener.local_unix_path.clone();
-            client.listener_state = None;
-            client.connection_state = Some(ConnectionState {
-                peer_socket_id: Some(accepted_socket_id),
-                ..ConnectionState::default()
-            });
-
-            Ok(accepted)
-        })();
-
-        match result {
-            Ok(accepted) => {
-                let accepted_socket_id = accepted.id;
-                table.sockets.insert(socket_id, client);
-                table.sockets.insert(accepted_socket_id, accepted.clone());
-                table
-                    .by_owner
-                    .entry(accepted.owner_pid)
-                    .or_default()
-                    .insert(accepted_socket_id);
-                Ok(())
-            }
-            Err(error) => {
-                table.sockets.insert(socket_id, client);
-                Err(error)
-            }
-        }
+            (result, readiness)
+        };
+        self.emit_readiness(readiness);
+        result
     }
 
     pub fn send_to_bound_udp_socket(
@@ -1337,40 +1420,48 @@ impl SocketTable {
         data: &[u8],
     ) -> SocketResult<usize> {
         let target_address = normalize_inet_address(target_address);
-        let mut table = lock_or_recover(&self.inner.state);
-        let sender = table
-            .sockets
-            .get(&socket_id)
-            .cloned()
-            .ok_or_else(|| SocketTableError::not_found(socket_id))?;
-        validate_bound_udp_sender(&sender)?;
+        let readiness = {
+            let mut table = lock_or_recover(&self.inner.state);
+            let sender = table
+                .sockets
+                .get(&socket_id)
+                .cloned()
+                .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+            validate_bound_udp_sender(&sender)?;
 
-        let receiver_socket_id = lookup_bound_inet_datagram_socket_in_table(
-            &table.bound_inet_datagrams,
-            &target_address,
-        )
-        .ok_or_else(|| {
-            SocketTableError::not_found_address(format!(
-                "no UDP socket bound at {}:{}",
-                target_address.host(),
-                target_address.port()
-            ))
-        })?;
-        let receiver = table
-            .sockets
-            .get_mut(&receiver_socket_id)
-            .ok_or_else(|| SocketTableError::not_found(receiver_socket_id))?;
-        validate_bound_udp_receiver(receiver)?;
+            let receiver_socket_id = lookup_bound_inet_datagram_socket_in_table(
+                &table.bound_inet_datagrams,
+                &target_address,
+            )
+            .ok_or_else(|| {
+                SocketTableError::not_found_address(format!(
+                    "no UDP socket bound at {}:{}",
+                    target_address.host(),
+                    target_address.port()
+                ))
+            })?;
+            let receiver = table
+                .sockets
+                .get_mut(&receiver_socket_id)
+                .ok_or_else(|| SocketTableError::not_found(receiver_socket_id))?;
+            validate_bound_udp_receiver(receiver)?;
 
-        let datagram_state = receiver.datagram_state.as_mut().ok_or_else(|| {
-            SocketTableError::invalid_argument(format!(
-                "socket {receiver_socket_id} does not support datagrams"
-            ))
-        })?;
-        datagram_state.recv_queue.push_back(QueuedDatagram {
-            source_address: sender.local_address.clone(),
-            payload: data.to_vec(),
-        });
+            let datagram_state = receiver.datagram_state.as_mut().ok_or_else(|| {
+                SocketTableError::invalid_argument(format!(
+                    "socket {receiver_socket_id} does not support datagrams"
+                ))
+            })?;
+            let was_empty = datagram_state.recv_queue.is_empty();
+            datagram_state.recv_queue.push_back(QueuedDatagram {
+                source_address: sender.local_address.clone(),
+                payload: data.to_vec(),
+            });
+            was_empty.then_some(SocketReadiness {
+                socket_id: receiver_socket_id,
+                kind: SocketReadinessKind::Data,
+            })
+        };
+        self.emit_readiness(readiness);
         Ok(data.len())
     }
 
@@ -1501,42 +1592,50 @@ impl SocketTable {
     }
 
     pub fn write(&self, socket_id: SocketId, data: &[u8]) -> SocketResult<usize> {
-        let mut table = lock_or_recover(&self.inner.state);
-        let record = table
-            .sockets
-            .get(&socket_id)
-            .cloned()
-            .ok_or_else(|| SocketTableError::not_found(socket_id))?;
-        let connection = record.connection_state.as_ref().ok_or_else(|| {
-            SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
-        })?;
-        if record.state != SocketState::Connected {
-            return Err(SocketTableError::not_connected(format!(
-                "socket {socket_id} is not connected"
-            )));
-        }
-        if connection.write_shutdown {
-            return Err(SocketTableError::broken_pipe(format!(
-                "socket {socket_id} write side is shut down"
-            )));
-        }
+        let readiness = {
+            let mut table = lock_or_recover(&self.inner.state);
+            let record = table
+                .sockets
+                .get(&socket_id)
+                .cloned()
+                .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+            let connection = record.connection_state.as_ref().ok_or_else(|| {
+                SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
+            })?;
+            if record.state != SocketState::Connected {
+                return Err(SocketTableError::not_connected(format!(
+                    "socket {socket_id} is not connected"
+                )));
+            }
+            if connection.write_shutdown {
+                return Err(SocketTableError::broken_pipe(format!(
+                    "socket {socket_id} write side is shut down"
+                )));
+            }
 
-        let peer_socket_id = connection.peer_socket_id.ok_or_else(|| {
-            SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
-        })?;
-        let peer = table.sockets.get_mut(&peer_socket_id).ok_or_else(|| {
-            SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
-        })?;
-        let peer_connection = peer.connection_state.as_mut().ok_or_else(|| {
-            SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
-        })?;
-        if peer_connection.read_shutdown {
-            return Err(SocketTableError::broken_pipe(format!(
-                "socket {peer_socket_id} read side is shut down"
-            )));
-        }
+            let peer_socket_id = connection.peer_socket_id.ok_or_else(|| {
+                SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
+            })?;
+            let peer = table.sockets.get_mut(&peer_socket_id).ok_or_else(|| {
+                SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
+            })?;
+            let peer_connection = peer.connection_state.as_mut().ok_or_else(|| {
+                SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
+            })?;
+            if peer_connection.read_shutdown {
+                return Err(SocketTableError::broken_pipe(format!(
+                    "socket {peer_socket_id} read side is shut down"
+                )));
+            }
 
-        peer_connection.push_recv(data);
+            let was_empty = !peer_connection.has_buffered_data();
+            peer_connection.push_recv(data);
+            (was_empty && !data.is_empty()).then_some(SocketReadiness {
+                socket_id: peer_socket_id,
+                kind: SocketReadinessKind::Data,
+            })
+        };
+        self.emit_readiness(readiness);
         Ok(data.len())
     }
 

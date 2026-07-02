@@ -7,7 +7,12 @@ var DGRAM_HANDLE_PREFIX = "dgram-socket:";
 
 var registeredDgramSocketsByPort = /* @__PURE__ */ new Map();
 
+var registeredDgramSocketsById = /* @__PURE__ */ new Map();
+
 function registerDgramSocket(socket) {
+  if (socket?._socketId) {
+    registeredDgramSocketsById.set(socket._socketId, socket);
+  }
   const port = socket?._localPort;
   if (typeof port !== "number") {
     return;
@@ -21,6 +26,9 @@ function registerDgramSocket(socket) {
 }
 
 function unregisterDgramSocket(socket) {
+  if (socket?._socketId && registeredDgramSocketsById.get(socket._socketId) === socket) {
+    registeredDgramSocketsById.delete(socket._socketId);
+  }
   const port = socket?._localPort;
   if (typeof port !== "number") {
     return;
@@ -47,10 +55,19 @@ function wakeDgramSocketReads(socket) {
   }
   if (socket._receiveLoopRunning) {
     countNetBridgeMetric("dgramWakeAlreadyRunning");
+    socket._pendingReceiveWake = true;
     return;
   }
   if (!socket._receivePollTimer) {
     countNetBridgeMetric("dgramWakeNoTimer");
+    socket._pendingReceiveWake = true;
+    queueMicrotask(() => {
+      if (!socket._closed && socket._bound && socket._pendingReceiveWake && !socket._receiveLoopRunning) {
+        socket._pendingReceiveWake = false;
+        socket._nextReceivePumpOrigin = "eventWake";
+        void socket._pumpMessages();
+      }
+    });
     return;
   }
   clearTimeout(socket._receivePollTimer);
@@ -433,6 +450,7 @@ var DgramSocket = class {
   _bindPromise = null;
   _receiveLoopRunning = false;
   _receivePollTimer = null;
+  _pendingReceiveWake = false;
   _nextReceivePumpOrigin = null;
   _refed = true;
   _closed = false;
@@ -832,6 +850,11 @@ var DgramSocket = class {
           _dgramSocketRecvRaw.applySync(void 0, [this._socketId, waitMs])
         );
         if (payload === NET_BRIDGE_TIMEOUT_SENTINEL || !payload) {
+          if (this._pendingReceiveWake) {
+            this._pendingReceiveWake = false;
+            this._nextReceivePumpOrigin = "eventWake";
+            continue;
+          }
           this._receivePollTimer = setTimeout(() => {
             this._receivePollTimer = null;
             this._nextReceivePumpOrigin = "timer";
@@ -866,6 +889,15 @@ var DgramSocket = class {
       this._emit("error", error);
     } finally {
       this._receiveLoopRunning = false;
+      if (this._pendingReceiveWake && !this._closed && this._bound) {
+        this._pendingReceiveWake = false;
+        this._nextReceivePumpOrigin = "eventWake";
+        queueMicrotask(() => {
+          if (!this._closed && this._bound) {
+            void this._pumpMessages();
+          }
+        });
+      }
     }
   }
   _applyBoundAddress(info) {
@@ -983,4 +1015,10 @@ var dgramModule = {
 };
 
 exposeCustomGlobal("_tlsModule", tlsModule);
+exposeCustomGlobal("_dgramSocketDispatch", (payload) => {
+  const socket = registeredDgramSocketsById.get(payload?.socketId);
+  if (socket) {
+    wakeDgramSocketReads(socket);
+  }
+});
 export { DGRAM_HANDLE_PREFIX, DgramSocket, createBadDgramSocketTypeError, createDgramAddressError, createDgramAlreadyBoundError, createDgramArgTypeError, createDgramBufferSizeSystemError, createDgramBufferSizeTypeError, createDgramMessageBuffer, createDgramMessageListBuffer, createDgramMissingArgError, createDgramNotRunningError, createDgramSyscallError, createDgramTtlArgTypeError, decodeDgramBridgeBytes, dgramModule, getDgramErrno, getPlatformDgramBufferSize, isIPv4MulticastAddress, isIPv4UnicastAddress, isIPv6MulticastAddress, normalizeDgramAddressValue, normalizeDgramBindArgs, normalizeDgramBridgeResult, normalizeDgramPortValue, normalizeDgramSendArgs, normalizeDgramSocketOptions, normalizeDgramSocketType, normalizeDgramTtlValue, validateDgramMulticastAddress, validateDgramSourceAddress };

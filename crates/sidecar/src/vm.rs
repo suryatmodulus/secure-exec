@@ -20,9 +20,10 @@ use crate::service::{
     normalize_path, plugin_error, root_filesystem_error, validate_permissions_policy, vfs_error,
 };
 use crate::state::{
-    BridgeError, VmConfiguration, VmDnsConfig, VmListenPolicy, VmState, DISPOSE_VM_SIGKILL_GRACE,
-    DISPOSE_VM_SIGTERM_GRACE, EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND, PYTHON_COMMAND,
-    WASM_COMMAND,
+    BridgeError, KernelSocketReadinessEvent, KernelSocketReadinessRegistry,
+    KernelSocketReadinessTarget, VmConfiguration, VmDnsConfig, VmListenPolicy, VmState,
+    DISPOSE_VM_SIGKILL_GRACE, DISPOSE_VM_SIGTERM_GRACE, EXECUTION_DRIVER_NAME,
+    JAVASCRIPT_COMMAND, PYTHON_COMMAND, WASM_COMMAND,
 };
 use crate::{DispatchResult, NativeSidecar, NativeSidecarBridge, SidecarError};
 
@@ -41,6 +42,7 @@ use secure_exec_kernel::root_fs::{
     is_supported_root_filesystem_snapshot_format, FilesystemEntryKind as KernelFilesystemEntryKind,
     RootFilesystemImportLimits, ROOT_FILESYSTEM_SNAPSHOT_FORMAT,
 };
+use secure_exec_kernel::socket_table::{SocketReadiness, SocketReadinessKind};
 use secure_exec_sidecar_core::permissions::{allow_all_policy, deny_all_policy};
 use secure_exec_sidecar_core::{
     layer_created_response, layer_sealed_response, overlay_created_response,
@@ -56,6 +58,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SHADOW_ROOT_BOOTSTRAP_DIRS: &[(&str, u32)] = &[
@@ -104,6 +107,34 @@ const SHADOW_ROOT_BOOTSTRAP_DIRS: &[(&str, u32)] = &[
     // kept separate from $HOME (/home/agentos).
     ("/workspace", 0o755),
 ];
+
+fn send_kernel_socket_readiness_event(
+    target: KernelSocketReadinessTarget,
+    readiness: SocketReadiness,
+) {
+    let event = match (target.event, readiness.kind) {
+        (KernelSocketReadinessEvent::Accept, SocketReadinessKind::Accept) => "accept",
+        (KernelSocketReadinessEvent::Data, SocketReadinessKind::Data) => "data",
+        (KernelSocketReadinessEvent::Datagram, SocketReadinessKind::Data) => "dgram",
+        _ => return,
+    };
+    let payload = match target.event {
+        KernelSocketReadinessEvent::Accept => {
+            secure_exec_execution::v8_runtime::json_to_cbor_payload(&serde_json::json!({
+                "serverId": target.target_id,
+                "event": event,
+            }))
+        }
+        KernelSocketReadinessEvent::Data | KernelSocketReadinessEvent::Datagram => {
+            secure_exec_execution::v8_runtime::json_to_cbor_payload(&serde_json::json!({
+                "socketId": target.target_id,
+                "event": event,
+            }))
+        }
+    }
+    .unwrap_or_default();
+    let _ = target.session.send_stream_event("net_socket", payload);
+}
 
 pub(crate) const DEFAULT_GUEST_PATH_ENV: &str =
     "/usr/local/sbin:/usr/local/bin:/opt/agentos/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -221,6 +252,18 @@ where
         };
         config.resources = resource_limits;
         let mut kernel = KernelVm::new(root_mount_table, config);
+        let kernel_socket_readiness: KernelSocketReadinessRegistry =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let readiness_targets = Arc::clone(&kernel_socket_readiness);
+        kernel.set_socket_readiness_sink(Some(move |readiness: SocketReadiness| {
+            let target = readiness_targets
+                .lock()
+                .ok()
+                .and_then(|targets| targets.get(&readiness.socket_id).cloned());
+            if let Some(target) = target {
+                send_kernel_socket_readiness_event(target, readiness);
+            }
+        }));
         let command_guest_paths = discover_command_guest_paths(&mut kernel);
         refresh_guest_command_path_env(&mut guest_env, &command_guest_paths);
         let mut execution_commands = vec![
@@ -274,6 +317,7 @@ where
                 cwd,
                 host_cwd,
                 kernel,
+                kernel_socket_readiness,
                 loaded_snapshot,
                 configuration: VmConfiguration {
                     permissions: permissions_policy,

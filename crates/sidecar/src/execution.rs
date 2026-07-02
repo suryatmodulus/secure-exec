@@ -39,7 +39,8 @@ use crate::state::{
     JavascriptSocketFamily, JavascriptSocketPathContext, JavascriptTcpListenerEvent,
     JavascriptTcpSocketEvent, JavascriptTlsBridgeOptions, JavascriptTlsClientHello,
     JavascriptTlsDataValue, JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
-    JavascriptUnixListenerEvent, LoopbackTlsPendingWriteHandle, LoopbackTlsPendingWriteState,
+    JavascriptUnixListenerEvent, KernelSocketReadinessEvent, KernelSocketReadinessRegistry,
+    KernelSocketReadinessTarget, LoopbackTlsPendingWriteHandle, LoopbackTlsPendingWriteState,
     NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket, ProcNetEntry, ProcessEventEnvelope,
     PythonHostSocket, ResolvedChildProcessExecution, ResolvedTcpConnectAddr, SharedBridge,
     SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution, VmDnsConfig,
@@ -1144,7 +1145,7 @@ fn wait_for_loopback_peer_socket_id(
             break;
         }
         std::thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
-        backoff = (backoff * 2).min(Duration::from_millis(10));
+        backoff = (backoff * 2).min(Duration::from_millis(1));
     }
     None
 }
@@ -1386,6 +1387,7 @@ pub(crate) struct JavascriptSyncRpcServiceRequest<'a, B> {
     pub(crate) dns: &'a VmDnsConfig,
     pub(crate) socket_paths: &'a JavascriptSocketPathContext,
     pub(crate) kernel: &'a mut SidecarKernel,
+    pub(crate) kernel_readiness: KernelSocketReadinessRegistry,
     pub(crate) process: &'a mut ActiveProcess,
     pub(crate) sync_request: &'a JavascriptSyncRpcRequest,
     pub(crate) resource_limits: &'a ResourceLimits,
@@ -1418,6 +1420,7 @@ pub(crate) struct JavascriptNetSyncRpcServiceRequest<'a, B> {
     pub(crate) dns: &'a VmDnsConfig,
     pub(crate) socket_paths: &'a JavascriptSocketPathContext,
     pub(crate) kernel: &'a mut SidecarKernel,
+    pub(crate) kernel_readiness: KernelSocketReadinessRegistry,
     pub(crate) process: &'a mut ActiveProcess,
     pub(crate) sync_request: &'a JavascriptSyncRpcRequest,
     pub(crate) resource_limits: &'a ResourceLimits,
@@ -1430,6 +1433,7 @@ struct LoopbackHttpResponseWaitRequest<'a, B> {
     dns: &'a VmDnsConfig,
     socket_paths: &'a JavascriptSocketPathContext,
     kernel: &'a mut SidecarKernel,
+    kernel_readiness: KernelSocketReadinessRegistry,
     process: &'a mut ActiveProcess,
     resource_limits: &'a ResourceLimits,
     request_key: (u64, u64),
@@ -1441,6 +1445,7 @@ pub(crate) struct LoopbackHttpDispatchRequest<'a, B> {
     pub(crate) dns: &'a VmDnsConfig,
     pub(crate) socket_paths: &'a JavascriptSocketPathContext,
     pub(crate) kernel: &'a mut SidecarKernel,
+    pub(crate) kernel_readiness: KernelSocketReadinessRegistry,
     pub(crate) process: &'a mut ActiveProcess,
     pub(crate) resource_limits: &'a ResourceLimits,
     pub(crate) server_id: u64,
@@ -1454,6 +1459,7 @@ struct JavascriptDgramSyncRpcServiceRequest<'a, B> {
     dns: &'a VmDnsConfig,
     socket_paths: &'a JavascriptSocketPathContext,
     process: &'a mut ActiveProcess,
+    kernel_readiness: KernelSocketReadinessRegistry,
     sync_request: &'a JavascriptSyncRpcRequest,
     resource_limits: &'a ResourceLimits,
     network_counts: NetworkResourceCounts,
@@ -2295,12 +2301,48 @@ fn close_kernel_socket_idempotent(
     }
 }
 
+fn register_kernel_readiness_target(
+    registry: &KernelSocketReadinessRegistry,
+    kernel_socket_id: Option<SocketId>,
+    session: Option<V8SessionHandle>,
+    target_id: String,
+    event: KernelSocketReadinessEvent,
+) {
+    let (Some(kernel_socket_id), Some(session)) = (kernel_socket_id, session) else {
+        return;
+    };
+    if let Ok(mut targets) = registry.lock() {
+        targets.insert(
+            kernel_socket_id,
+            KernelSocketReadinessTarget {
+                session,
+                target_id,
+                event,
+            },
+        );
+    }
+}
+
+fn unregister_kernel_readiness_target(
+    registry: &KernelSocketReadinessRegistry,
+    kernel_socket_id: Option<SocketId>,
+) {
+    let Some(kernel_socket_id) = kernel_socket_id else {
+        return;
+    };
+    if let Ok(mut targets) = registry.lock() {
+        targets.remove(&kernel_socket_id);
+    }
+}
+
 fn release_tcp_socket_handle(
     process: &mut ActiveProcess,
     socket_id: &str,
     socket: ActiveTcpSocket,
     kernel: &mut SidecarKernel,
+    kernel_readiness: &KernelSocketReadinessRegistry,
 ) {
+    unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
     if let Some(listener_id) = socket.listener_id.as_deref() {
         if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
             listener.release_connection(socket_id);
@@ -2473,12 +2515,14 @@ impl ActiveUnixSocket {
         let read_stream = stream.try_clone().map_err(sidecar_net_error)?;
         let stream = Arc::new(Mutex::new(stream));
         let (sender, events) = mpsc::channel();
+        let event_pusher = Arc::new(Mutex::new(None));
         let saw_local_shutdown = Arc::new(AtomicBool::new(false));
         let saw_remote_end = Arc::new(AtomicBool::new(false));
         let close_notified = Arc::new(AtomicBool::new(false));
         spawn_unix_socket_reader(
             read_stream,
             sender.clone(),
+            Arc::clone(&event_pusher),
             Arc::clone(&saw_local_shutdown),
             Arc::clone(&saw_remote_end),
             Arc::clone(&close_notified),
@@ -2488,6 +2532,7 @@ impl ActiveUnixSocket {
             stream,
             events,
             event_sender: sender,
+            event_pusher,
             listener_id,
             local_path,
             remote_path,
@@ -2495,6 +2540,15 @@ impl ActiveUnixSocket {
             saw_remote_end,
             close_notified,
         })
+    }
+
+    fn set_event_pusher(&self, session: Option<V8SessionHandle>, socket_id: String) {
+        let Some(session) = session else {
+            return;
+        };
+        if let Ok(mut pusher) = self.event_pusher.lock() {
+            *pusher = Some(JavascriptSocketEventPusher { session, socket_id });
+        }
     }
 
     fn poll(&mut self, wait: Duration) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
@@ -4422,6 +4476,7 @@ where
         };
         let socket_paths = build_javascript_socket_path_context(vm)?;
         let resource_limits = vm.kernel.resource_limits().clone();
+        let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
         let process = vm
             .active_processes
             .get_mut(&target_process_id)
@@ -4437,6 +4492,7 @@ where
             dns: &vm.dns,
             socket_paths: &socket_paths,
             kernel: &mut vm.kernel,
+            kernel_readiness,
             process,
             resource_limits: &resource_limits,
             server_id,
@@ -5440,7 +5496,8 @@ where
             phase_start.elapsed(),
         );
         let phase_start = Instant::now();
-        terminate_child_process_tree(&mut vm.kernel, &mut process);
+        let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
+        terminate_child_process_tree(&mut vm.kernel, &mut process, &kernel_readiness);
         record_execute_phase(
             "process_exit_cleanup_terminate_child_tree",
             phase_start.elapsed(),
@@ -8013,7 +8070,8 @@ where
                     let detached_children =
                         Self::adopt_detached_child_processes(&child_process_label, &mut child);
                     sync_process_host_writes_to_kernel(vm, &child)?;
-                    terminate_child_process_tree(&mut vm.kernel, &mut child);
+                    let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
+                    terminate_child_process_tree(&mut vm.kernel, &mut child, &kernel_readiness);
                     child.kernel_handle.finish(exit_code);
                     let _ = vm.kernel.wait_and_reap(child.kernel_pid);
                     vm.signal_states.remove(child_process_id);
@@ -8158,6 +8216,7 @@ where
                         let resource_limits = vm.kernel.resource_limits().clone();
                         let network_counts = vm_network_resource_counts(vm);
                         let socket_paths = build_javascript_socket_path_context(vm)?;
+                        let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
                         let Some(root) = vm.active_processes.get_mut(process_id) else {
                             return Ok(Value::Null);
                         };
@@ -8175,6 +8234,7 @@ where
                             dns: &vm.dns,
                             socket_paths: &socket_paths,
                             kernel: &mut vm.kernel,
+                            kernel_readiness,
                             process: child,
                             sync_request: &request,
                             resource_limits: &resource_limits,
@@ -14543,6 +14603,7 @@ fn spawn_tls_socket_reader(
 fn spawn_unix_socket_reader(
     stream: UnixStream,
     sender: Sender<JavascriptTcpSocketEvent>,
+    event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     saw_local_shutdown: Arc<AtomicBool>,
     saw_remote_end: Arc<AtomicBool>,
     close_notified: Arc<AtomicBool>,
@@ -14555,10 +14616,12 @@ fn spawn_unix_socket_reader(
                 Ok(0) => {
                     saw_remote_end.store(true, Ordering::SeqCst);
                     let _ = sender.send(JavascriptTcpSocketEvent::End);
+                    push_socket_event(&event_pusher, "end");
                     if saw_local_shutdown.load(Ordering::SeqCst)
                         && !close_notified.swap(true, Ordering::SeqCst)
                     {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: false });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -14571,6 +14634,7 @@ fn spawn_unix_socket_reader(
                     {
                         break;
                     }
+                    push_socket_event(&event_pusher, "data");
                 }
                 Err(error) => {
                     let code = io_error_code(&error);
@@ -14578,8 +14642,10 @@ fn spawn_unix_socket_reader(
                         code,
                         message: error.to_string(),
                     });
+                    push_socket_event(&event_pusher, "error");
                     if !close_notified.swap(true, Ordering::SeqCst) {
                         let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: true });
+                        push_socket_event(&event_pusher, "close");
                     }
                     break;
                 }
@@ -14601,7 +14667,11 @@ fn flush_parked_kernel_wait_rpc(process: &mut ActiveProcess) {
     }
 }
 
-fn terminate_child_process_tree(kernel: &mut SidecarKernel, process: &mut ActiveProcess) {
+fn terminate_child_process_tree(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+    kernel_readiness: &KernelSocketReadinessRegistry,
+) {
     flush_parked_kernel_wait_rpc(process);
     let sqlite_database_ids = process.sqlite_databases.keys().copied().collect::<Vec<_>>();
     for database_id in sqlite_database_ids {
@@ -14630,6 +14700,7 @@ fn terminate_child_process_tree(kernel: &mut SidecarKernel, process: &mut Active
     let listener_ids = process.tcp_listeners.keys().cloned().collect::<Vec<_>>();
     for listener_id in listener_ids {
         if let Some(listener) = process.tcp_listeners.remove(&listener_id) {
+            unregister_kernel_readiness_target(kernel_readiness, listener.kernel_socket_id);
             let _ = listener.close(kernel, process.kernel_pid);
         }
     }
@@ -14637,6 +14708,7 @@ fn terminate_child_process_tree(kernel: &mut SidecarKernel, process: &mut Active
     let sockets = process.tcp_sockets.keys().cloned().collect::<Vec<_>>();
     for socket_id in sockets {
         if let Some(socket) = process.tcp_sockets.remove(&socket_id) {
+            unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
             let _ = socket.close(kernel, process.kernel_pid);
         }
     }
@@ -14658,6 +14730,7 @@ fn terminate_child_process_tree(kernel: &mut SidecarKernel, process: &mut Active
     let udp_socket_ids = process.udp_sockets.keys().cloned().collect::<Vec<_>>();
     for socket_id in udp_socket_ids {
         if let Some(mut socket) = process.udp_sockets.remove(&socket_id) {
+            unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
             socket.close(kernel, process.kernel_pid);
         }
     }
@@ -14667,7 +14740,7 @@ fn terminate_child_process_tree(kernel: &mut SidecarKernel, process: &mut Active
         let Some(mut child) = process.child_processes.remove(&child_id) else {
             continue;
         };
-        terminate_child_process_tree(kernel, &mut child);
+        terminate_child_process_tree(kernel, &mut child, kernel_readiness);
         let _ = kernel.kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, SIGTERM);
         let _ = signal_runtime_process(child.execution.child_pid(), SIGTERM);
         child.kernel_handle.finish(0);
@@ -16037,6 +16110,7 @@ where
         dns,
         socket_paths,
         kernel,
+        kernel_readiness,
         process,
         sync_request: request,
         resource_limits,
@@ -16138,6 +16212,7 @@ where
                 dns,
                 socket_paths,
                 kernel,
+                kernel_readiness: Arc::clone(&kernel_readiness),
                 process,
                 sync_request: request,
                 resource_limits,
@@ -16207,6 +16282,7 @@ where
                 dns,
                 socket_paths,
                 kernel,
+                kernel_readiness: Arc::clone(&kernel_readiness),
                 process,
                 sync_request: request,
                 resource_limits,
@@ -16228,6 +16304,7 @@ where
                 dns,
                 socket_paths,
                 process,
+                kernel_readiness,
                 sync_request: request,
                 resource_limits,
                 network_counts,
@@ -19212,6 +19289,7 @@ fn service_host_fetch_target_event<B>(
     dns: &VmDnsConfig,
     socket_paths: &JavascriptSocketPathContext,
     kernel: &mut SidecarKernel,
+    kernel_readiness: &KernelSocketReadinessRegistry,
     process: &mut ActiveProcess,
     resource_limits: &ResourceLimits,
     wait: Duration,
@@ -19237,6 +19315,7 @@ where
                 dns,
                 socket_paths,
                 kernel,
+                kernel_readiness: Arc::clone(kernel_readiness),
                 process,
                 sync_request: &request,
                 resource_limits,
@@ -19283,6 +19362,7 @@ where
 {
     for _ in 0..32 {
         let dns = vm.dns.clone();
+        let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
         let Some(process) = vm.active_processes.get_mut(target_process_id) else {
             break;
         };
@@ -19292,6 +19372,7 @@ where
             &dns,
             socket_paths,
             &mut vm.kernel,
+            &kernel_readiness,
             process,
             resource_limits,
             Duration::from_millis(1),
@@ -19462,6 +19543,7 @@ where
 
         {
             let dns = vm.dns.clone();
+            let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
             let process = vm
                 .active_processes
                 .get_mut(target_process_id)
@@ -19476,6 +19558,7 @@ where
                 &dns,
                 socket_paths,
                 &mut vm.kernel,
+                &kernel_readiness,
                 process,
                 resource_limits,
                 Duration::from_millis(5),
@@ -19669,6 +19752,7 @@ where
         dns,
         socket_paths,
         kernel,
+        kernel_readiness,
         process,
         resource_limits,
         request_key,
@@ -19708,6 +19792,7 @@ where
                     dns,
                     socket_paths,
                     kernel,
+                    kernel_readiness: Arc::clone(&kernel_readiness),
                     process,
                     sync_request: &request,
                     resource_limits,
@@ -19755,6 +19840,7 @@ where
         dns,
         socket_paths,
         kernel,
+        kernel_readiness,
         process,
         resource_limits,
         server_id,
@@ -19784,6 +19870,7 @@ where
         dns,
         socket_paths,
         kernel,
+        kernel_readiness,
         process,
         resource_limits,
         request_key: (server_id, request_id),
@@ -19921,6 +20008,7 @@ where
         dns,
         socket_paths,
         process,
+        kernel_readiness,
         sync_request: request,
         resource_limits,
         network_counts,
@@ -19953,10 +20041,15 @@ where
                 })?;
             let family = JavascriptUdpFamily::from_socket_type(&payload.socket_type)?;
             let socket_id = process.allocate_udp_socket_id();
-            process.udp_sockets.insert(
+            let socket = ActiveUdpSocket::new(kernel, process.kernel_pid, family)?;
+            register_kernel_readiness_target(
+                &kernel_readiness,
+                socket.kernel_socket_id,
+                process.execution.javascript_v8_session_handle(),
                 socket_id.clone(),
-                ActiveUdpSocket::new(kernel, process.kernel_pid, family)?,
+                KernelSocketReadinessEvent::Datagram,
             );
+            process.udp_sockets.insert(socket_id.clone(), socket);
             Ok(json!({
                 "socketId": socket_id,
                 "type": family.socket_type(),
@@ -20070,6 +20163,7 @@ where
             let mut socket = process.udp_sockets.remove(socket_id).ok_or_else(|| {
                 SidecarError::InvalidState(format!("unknown UDP socket {socket_id}"))
             })?;
+            unregister_kernel_readiness_target(&kernel_readiness, socket.kernel_socket_id);
             socket.close(kernel, process.kernel_pid);
             Ok(Value::Null)
         }
@@ -22545,6 +22639,7 @@ where
         dns,
         socket_paths,
         kernel,
+        kernel_readiness,
         process,
         sync_request: request,
         resource_limits,
@@ -22732,6 +22827,10 @@ where
                 let host_path = resolve_guest_socket_host_path(socket_paths, &guest_path);
                 let socket = ActiveUnixSocket::connect(&host_path, &guest_path)?;
                 let socket_id = process.allocate_unix_socket_id();
+                socket.set_event_pusher(
+                    process.execution.javascript_v8_session_handle(),
+                    socket_id.clone(),
+                );
                 process.unix_sockets.insert(socket_id.clone(), socket);
                 Ok(json!({
                     "socketId": socket_id,
@@ -22822,6 +22921,13 @@ where
                 socket.set_event_pusher(
                     process.execution.javascript_v8_session_handle(),
                     socket_id.clone(),
+                );
+                register_kernel_readiness_target(
+                    &kernel_readiness,
+                    socket.kernel_socket_id,
+                    process.execution.javascript_v8_session_handle(),
+                    socket_id.clone(),
+                    KernelSocketReadinessEvent::Data,
                 );
                 process.tcp_sockets.insert(socket_id.clone(), socket);
                 Ok(json!({
@@ -22939,6 +23045,13 @@ where
                 let listener = listener_result?;
                 let listener_id = process.allocate_tcp_listener_id();
                 let local_addr = listener.guest_local_addr();
+                register_kernel_readiness_target(
+                    &kernel_readiness,
+                    listener.kernel_socket_id,
+                    process.execution.javascript_v8_session_handle(),
+                    listener_id.clone(),
+                    KernelSocketReadinessEvent::Accept,
+                );
                 process.tcp_listeners.insert(listener_id.clone(), listener);
                 Ok(json!({
                     "serverId": listener_id,
@@ -22979,7 +23092,13 @@ where
                 })),
                 Some(JavascriptTcpSocketEvent::Close { had_error }) => {
                     if let Some(socket) = process.tcp_sockets.remove(socket_id) {
-                        release_tcp_socket_handle(process, socket_id, socket, kernel);
+                        release_tcp_socket_handle(
+                            process,
+                            socket_id,
+                            socket,
+                            kernel,
+                            &kernel_readiness,
+                        );
                     } else if let Some(socket) = process.unix_sockets.remove(socket_id) {
                         release_unix_socket_handle(process, socket_id, socket);
                     }
@@ -23190,6 +23309,13 @@ where
                             process.execution.javascript_v8_session_handle(),
                             socket_id.clone(),
                         );
+                        register_kernel_readiness_target(
+                            &kernel_readiness,
+                            socket.kernel_socket_id,
+                            process.execution.javascript_v8_session_handle(),
+                            socket_id.clone(),
+                            KernelSocketReadinessEvent::Data,
+                        );
                         if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
                             listener.register_connection(&socket_id);
                         }
@@ -23250,6 +23376,10 @@ where
                         pending.remote_path.clone(),
                     )?;
                     let socket_id = process.allocate_unix_socket_id();
+                    socket.set_event_pusher(
+                        process.execution.javascript_v8_session_handle(),
+                        socket_id.clone(),
+                    );
                     if let Some(listener) = process.unix_listeners.get_mut(listener_id) {
                         listener.register_connection(&socket_id);
                     }
@@ -23334,6 +23464,13 @@ where
                             process.execution.javascript_v8_session_handle(),
                             socket_id.clone(),
                         );
+                        register_kernel_readiness_target(
+                            &kernel_readiness,
+                            socket.kernel_socket_id,
+                            process.execution.javascript_v8_session_handle(),
+                            socket_id.clone(),
+                            KernelSocketReadinessEvent::Data,
+                        );
                         if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
                             listener.register_connection(&socket_id);
                         }
@@ -23382,6 +23519,10 @@ where
                         pending.remote_path,
                     )?;
                     let socket_id = process.allocate_unix_socket_id();
+                    socket.set_event_pusher(
+                        process.execution.javascript_v8_session_handle(),
+                        socket_id.clone(),
+                    );
                     if let Some(listener) = process.unix_listeners.get_mut(listener_id) {
                         listener.register_connection(&socket_id);
                     }
@@ -23449,7 +23590,7 @@ where
             let socket = process.tcp_sockets.remove(socket_id).ok_or_else(|| {
                 SidecarError::InvalidState(format!("unknown TCP socket {socket_id}"))
             })?;
-            release_tcp_socket_handle(process, socket_id, socket, kernel);
+            release_tcp_socket_handle(process, socket_id, socket, kernel, &kernel_readiness);
             Ok(Value::Null)
         }
         "net.write" => {
@@ -23511,7 +23652,7 @@ where
         "net.destroy" => {
             let socket_id = javascript_sync_rpc_arg_str(&request.args, 0, "net.destroy socket id")?;
             if let Some(socket) = process.tcp_sockets.remove(socket_id) {
-                release_tcp_socket_handle(process, socket_id, socket, kernel);
+                release_tcp_socket_handle(process, socket_id, socket, kernel, &kernel_readiness);
                 Ok(Value::Null)
             } else if let Some(socket) = process.unix_sockets.remove(socket_id) {
                 release_unix_socket_handle(process, socket_id, socket);
@@ -23524,6 +23665,7 @@ where
             let listener_id =
                 javascript_sync_rpc_arg_str(&request.args, 0, "net.server_close listener id")?;
             if let Some(listener) = process.tcp_listeners.remove(listener_id) {
+                unregister_kernel_readiness_target(&kernel_readiness, listener.kernel_socket_id);
                 listener.close(kernel, process.kernel_pid)?;
                 Ok(Value::Null)
             } else {

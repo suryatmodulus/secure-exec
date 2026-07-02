@@ -212,6 +212,7 @@ async function validateBridgeContractGlobals(sourceText) {
 		"_netModule",
 		"_tlsModule",
 		"_netSocketDispatch",
+		"_dgramSocketDispatch",
 		"_httpServerDispatch",
 		"_httpServerUpgradeDispatch",
 		"_httpServerConnectDispatch",

@@ -38,8 +38,8 @@ use crate::resource_accounting::{
 use crate::root_fs::{RootFileSystem, RootFilesystemError, RootFilesystemSnapshot};
 use crate::socket_table::{
     DatagramSocketOption, InetSocketAddress, ReceivedDatagram, SocketId, SocketMulticastMembership,
-    SocketRecord, SocketShutdown, SocketSpec, SocketState, SocketTable, SocketTableError,
-    SocketType,
+    SocketReadiness, SocketRecord, SocketShutdown, SocketSpec, SocketState, SocketTable,
+    SocketTableError, SocketType,
 };
 use crate::user::{ProcessIdentity, UserConfig, UserManager};
 use crate::vfs::{
@@ -1437,6 +1437,13 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.resources
             .check_socket_allocation(&self.resource_snapshot())?;
         Ok(self.sockets.allocate(pid, spec).id())
+    }
+
+    pub fn set_socket_readiness_sink<S>(&mut self, sink: Option<S>)
+    where
+        S: Fn(SocketReadiness) + Send + Sync + 'static,
+    {
+        self.sockets.set_readiness_sink(sink);
     }
 
     pub fn socket_get(&self, socket_id: SocketId) -> Option<SocketRecord> {
