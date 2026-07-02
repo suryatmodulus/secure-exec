@@ -1,11 +1,11 @@
 // Session management: create/destroy sessions with V8 isolates on dedicated threads
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 #[cfg(not(test))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 #[cfg(not(test))]
@@ -58,6 +58,57 @@ const DEFERRED_COMMAND_LIMIT_ERROR_CODE: &str = "ERR_SESSION_DEFERRED_COMMAND_LI
 const SESSION_COMMAND_CHANNEL_CAPACITY: usize = 256;
 const MAX_DEFERRED_SESSION_COMMANDS: usize = SESSION_COMMAND_CHANNEL_CAPACITY;
 const MAX_DEFERRED_SYNC_MESSAGES: usize = SESSION_COMMAND_CHANNEL_CAPACITY;
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct V8SessionPhaseStats {
+    calls: u64,
+    total_ns: u128,
+    max_ns: u128,
+}
+
+#[cfg(not(test))]
+static V8_SESSION_PHASES: OnceLock<Mutex<BTreeMap<String, V8SessionPhaseStats>>> = OnceLock::new();
+
+#[cfg(not(test))]
+fn v8_session_phases_enabled() -> bool {
+    std::env::var("AGENTOS_V8_SESSION_PHASES").as_deref() == Ok("1")
+}
+
+#[cfg(not(test))]
+fn record_v8_session_phase(stage: &str, elapsed: Duration) {
+    if !v8_session_phases_enabled() {
+        return;
+    }
+    let phases = V8_SESSION_PHASES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut phases) = phases.lock() else {
+        return;
+    };
+    let stats = phases.entry(stage.to_string()).or_default();
+    stats.calls += 1;
+    let elapsed_ns = elapsed.as_nanos();
+    stats.total_ns += elapsed_ns;
+    stats.max_ns = stats.max_ns.max(elapsed_ns);
+
+    let Some(path) = std::env::var_os("AGENTOS_V8_SESSION_PHASES_FILE") else {
+        return;
+    };
+    let mut output = String::new();
+    for (stage, stats) in phases.iter() {
+        let total_us = stats.total_ns / 1_000;
+        let avg_us = if stats.calls == 0 {
+            0
+        } else {
+            total_us / u128::from(stats.calls)
+        };
+        let max_us = stats.max_ns / 1_000;
+        output.push_str(&format!(
+            "stage={stage} calls={} total_us={total_us} avg_us={avg_us} max_us={max_us}\n",
+            stats.calls
+        ));
+    }
+    let _ = std::fs::write(path, output);
+}
 
 /// Normalize an opt-in CPU-time budget: `Some(0)` means "disabled" and folds to
 /// `None` so the CPU-budget watchdog is NOT armed. There is no default — when the
@@ -926,6 +977,7 @@ fn session_thread(
                             // The snapshot captures the bridge AND (when present) the
                             // agent-SDK userland bundle, keyed process-wide by both, so
                             // the SDK is evaluated once per sidecar and reused here.
+                            let phase_start = Instant::now();
                             let snapshot_blob = match snapshot_cache.get_or_create_with_userland(
                                 &effective_bridge_code,
                                 (!effective_userland_code.is_empty())
@@ -944,20 +996,33 @@ fn session_thread(
                                     None
                                 }
                             };
+                            record_v8_session_phase("snapshot_get", phase_start.elapsed());
                             let mut iso = match snapshot_blob {
                                 Some(blob) => {
                                     from_snapshot = true;
                                     eprintln!(
                                         "secure-exec-v8-runtime: restored session isolate from_snapshot=true"
                                     );
-                                    snapshot::create_isolate_from_snapshot(
-                                        (*blob).clone(),
+                                    let phase_start = Instant::now();
+                                    // rusty_v8 0.130's CreateParams::snapshot_blob
+                                    // takes owned 'static data, so this copy remains
+                                    // per exec until the API can accept cached bytes.
+                                    let snapshot_blob = (*blob).clone();
+                                    record_v8_session_phase("blob_clone", phase_start.elapsed());
+                                    let phase_start = Instant::now();
+                                    let isolate = snapshot::create_isolate_from_snapshot(
+                                        snapshot_blob,
                                         heap_limit_mb,
-                                    )
+                                    );
+                                    record_v8_session_phase("isolate_new", phase_start.elapsed());
+                                    isolate
                                 }
                                 None => {
                                     from_snapshot = false;
-                                    isolate::create_isolate(heap_limit_mb)
+                                    let phase_start = Instant::now();
+                                    let isolate = isolate::create_isolate(heap_limit_mb);
+                                    record_v8_session_phase("isolate_new", phase_start.elapsed());
+                                    isolate
                                 }
                             };
                             iso.set_host_import_module_dynamically_callback(
@@ -1234,6 +1299,7 @@ fn session_thread(
                         } else {
                             Some(file_path.as_str())
                         };
+                        let phase_start = Instant::now();
                         let (mut code, mut exports, mut error) = if mode == 0 {
                             let scope = &mut v8::HandleScope::new(iso);
                             let ctx = v8::Local::new(scope, &exec_context);
@@ -1276,6 +1342,7 @@ fn session_thread(
                                 error = next_error;
                             }
                         }
+                        record_v8_session_phase("user_code_execute", phase_start.elapsed());
 
                         // Run event loop while bridge work or async ESM
                         // evaluation is still pending. For ESM modules (mode != 0),

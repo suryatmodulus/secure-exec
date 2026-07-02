@@ -46,6 +46,16 @@ impl EnvVarGuard {
         }
         Self { key, previous }
     }
+
+    fn set_value(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: The wasm suite runs these env-sensitive cases serially inside
+        // one libtest entry.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -919,6 +929,116 @@ fn wasm_execution_runs_guest_module_through_v8() {
 
     let stdout = String::from_utf8(result.stdout).expect("stdout utf8");
     assert!(stdout.contains("stdout:wasm-smoke"));
+}
+
+fn wasm_snapshot_runner_block_round_trips_twice() {
+    assert_node_available();
+    let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "block");
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("guest.wasm"),
+        &wasm_stdout_chunks_module(&["hello\n"]),
+    );
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    let (first_stdout, first_stderr, first_exit) = run_wasm_execution(
+        &mut engine,
+        context.context_id.clone(),
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+    assert_eq!(first_exit, 0, "stderr={first_stderr}");
+    assert_eq!(first_stdout, "hello\n");
+
+    let (second_stdout, second_stderr, second_exit) = run_wasm_execution(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+    assert_eq!(second_exit, 0, "stderr={second_stderr}");
+    assert_eq!(second_stdout, "hello\n");
+}
+
+fn wasm_snapshot_runner_off_fallback_matches_inline() {
+    assert_node_available();
+    let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "off");
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("guest.wasm"),
+        &wasm_stdout_chunks_module(&["hello\n"]),
+    );
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    let (stdout, stderr, exit_code) = run_wasm_execution(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+
+    assert_eq!(exit_code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "hello\n");
+}
+
+fn wasm_module_base64_cache_invalidates_when_file_changes() {
+    assert_node_available();
+    let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "block");
+
+    let temp = tempdir().expect("create temp dir");
+    let module_path = temp.path().join("guest.wasm");
+    write_fixture(&module_path, &wasm_stdout_chunks_module(&["first\n"]));
+
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+
+    let (first_stdout, first_stderr, first_exit) = run_wasm_execution(
+        &mut engine,
+        context.context_id.clone(),
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+    assert_eq!(first_exit, 0, "stderr={first_stderr}");
+    assert_eq!(first_stdout, "first\n");
+
+    write_fixture(
+        &module_path,
+        &wasm_stdout_chunks_module(&["second-output\n"]),
+    );
+
+    let (second_stdout, second_stderr, second_exit) = run_wasm_execution(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+    );
+    assert_eq!(second_exit, 0, "stderr={second_stderr}");
+    assert_eq!(second_stdout, "second-output\n");
 }
 
 fn wasm_execution_supports_fd_fdstat_set_flags() {
@@ -2491,6 +2611,9 @@ fn wasm_suite() {
     wasm_contexts_preserve_vm_and_module_configuration();
     wasm_execution_stays_inside_v8_runtime_without_host_node_launches();
     wasm_execution_runs_guest_module_through_v8();
+    wasm_snapshot_runner_block_round_trips_twice();
+    wasm_snapshot_runner_off_fallback_matches_inline();
+    wasm_module_base64_cache_invalidates_when_file_changes();
     wasm_execution_supports_fd_fdstat_set_flags();
     wasm_execution_ignores_guest_overrides_for_internal_node_env();
     wasm_execution_freezes_wasi_clock_time();

@@ -2136,6 +2136,43 @@ impl JavascriptExecutionEngine {
         self.start_execution_with_module_reader(request, None, None)
     }
 
+    fn ensure_v8_host(&mut self) -> Result<(), JavascriptExecutionError> {
+        let should_spawn_v8_host = match self.v8_host.as_mut() {
+            Some(v8_host) => !v8_host
+                .is_alive()
+                .map_err(JavascriptExecutionError::Spawn)?,
+            None => true,
+        };
+        if should_spawn_v8_host {
+            self.v8_host = Some(V8RuntimeHost::spawn().map_err(JavascriptExecutionError::Spawn)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_userland_ready(
+        &mut self,
+        userland_code: &str,
+    ) -> Result<bool, JavascriptExecutionError> {
+        self.ensure_v8_host()?;
+        Ok(self
+            .v8_host
+            .as_ref()
+            .expect("V8 host initialized")
+            .snapshot_ready(userland_code))
+    }
+
+    pub(crate) fn pre_warm_snapshot(
+        &mut self,
+        userland_code: &str,
+    ) -> Result<(), JavascriptExecutionError> {
+        self.ensure_v8_host()?;
+        self.v8_host
+            .as_ref()
+            .expect("V8 host initialized")
+            .pre_warm_snapshot(userland_code)
+            .map_err(JavascriptExecutionError::Spawn)
+    }
+
     /// Like [`start_execution`](Self::start_execution) but with an optional
     /// read-only VFS reader over the mounted `node_modules` tree. When supplied,
     /// the bridge thread resolves module-resolution RPCs inline against this
@@ -2179,16 +2216,7 @@ impl JavascriptExecutionEngine {
         let sync_rpc_timeout = javascript_sync_rpc_timeout(&request);
 
         let phase_start = Instant::now();
-        // Lazily spawn the V8 runtime host, or replace a dead shared host.
-        let should_spawn_v8_host = match self.v8_host.as_mut() {
-            Some(v8_host) => !v8_host
-                .is_alive()
-                .map_err(JavascriptExecutionError::Spawn)?,
-            None => true,
-        };
-        if should_spawn_v8_host {
-            self.v8_host = Some(V8RuntimeHost::spawn().map_err(JavascriptExecutionError::Spawn)?);
-        }
+        self.ensure_v8_host()?;
         let v8_host = self.v8_host.as_ref().unwrap();
         record_js_start_phase("js_start_v8_host_ready", phase_start.elapsed());
 

@@ -105,6 +105,38 @@ impl V8RuntimeHost {
         })
     }
 
+    /// True when the process-wide snapshot cache already has this userland
+    /// bundle. This is a lookup only; it never creates a snapshot.
+    pub fn snapshot_ready(&self, userland_code: &str) -> bool {
+        self.shared
+            .runtime
+            .snapshot_ready(Self::bridge_code(), userland_code)
+    }
+
+    /// Kick a process-wide async warm for the wasm runner snapshot. At most one
+    /// warm thread is spawned per process; blocking callers should use
+    /// [`pre_warm_snapshot`](Self::pre_warm_snapshot).
+    pub fn warm_snapshot_async(userland_code: String) {
+        if userland_code.is_empty() {
+            return;
+        }
+        static WASM_RUNNER_WARM_STARTED: OnceLock<()> = OnceLock::new();
+        let _ = WASM_RUNNER_WARM_STARTED.get_or_init(|| {
+            let _ = thread::Builder::new()
+                .name(String::from("secure-exec-wasm-snapshot-warm"))
+                .spawn(move || {
+                    let Ok(host) = V8RuntimeHost::spawn() else {
+                        return;
+                    };
+                    if let Err(error) = host.pre_warm_snapshot(&userland_code) {
+                        eprintln!(
+                            "secure-exec-v8-runtime: wasm runner snapshot warm failed: {error}"
+                        );
+                    }
+                });
+        });
+    }
+
     /// Create a session handle for sending session-scoped frames and cleanup.
     pub fn session_handle(&self, session_id: String) -> V8SessionHandle {
         V8SessionHandle::new(session_id, Arc::clone(&self.shared.runtime))

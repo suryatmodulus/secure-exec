@@ -51,7 +51,9 @@ impl EmbeddedV8Runtime {
         bridge::acquire_embedded_cbor_codec();
         isolate::init_v8_platform();
 
-        let snapshot_cache = Arc::new(SnapshotCache::new(4));
+        // Keep bridge-only, agent-SDK, and wasm-runner userland variants warm
+        // without immediately evicting each other.
+        let snapshot_cache = Arc::new(SnapshotCache::new(8));
         let (event_tx, event_rx) = crossbeam_channel::bounded::<RuntimeEventEnvelope>(1024);
         let (dispatch_shutdown_tx, dispatch_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let call_id_router: CallIdRouter = Arc::new(Mutex::new(HashMap::new()));
@@ -104,6 +106,15 @@ impl EmbeddedV8Runtime {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    pub fn snapshot_ready(&self, bridge_code: &str, userland_code: &str) -> bool {
+        if userland_code.is_empty() {
+            return true;
+        }
+        self.snapshot_cache
+            .try_get_with_userland(bridge_code, Some(userland_code))
+            .is_some()
     }
 
     pub fn register_session(&self, session_id: &str) -> io::Result<mpsc::Receiver<RuntimeEvent>> {
@@ -468,7 +479,9 @@ fn default_max_concurrency() -> usize {
 }
 
 fn run_embedded_runtime(stream: UnixStream, max_concurrency: usize) {
-    let snapshot_cache = Arc::new(SnapshotCache::new(4));
+    // Keep bridge-only, agent-SDK, and wasm-runner userland variants warm
+    // without immediately evicting each other.
+    let snapshot_cache = Arc::new(SnapshotCache::new(8));
     let writer_stream = match stream.try_clone() {
         Ok(writer_stream) => writer_stream,
         Err(error) => {

@@ -137,6 +137,11 @@ fn run_snapshot_script(scope: &mut v8::HandleScope, code: &str, label: &str) -> 
         Some(source) => source,
         None => return Err(format!("failed to create V8 string for {label}")),
     };
+    // NOTE(perf, measured 2026-07-02): do NOT switch this to
+    // script_compiler::compile(EagerCompile) to bake function bytecode into the
+    // blob. It moves cost instead of removing it: user_code_execute dropped
+    // 8.9ms -> 7.9ms on the wasm-runner floor, but the fatter blob made
+    // isolate_new 4.0ms -> 7.4ms per exec (net wash).
     let Some(script) = v8::Script::compile(try_catch, source, None) else {
         let message = try_catch
             .exception()
@@ -611,6 +616,25 @@ impl SnapshotCache {
     /// prevents duplicate snapshot creation for the same bridge code.
     pub fn get_or_create(&self, bridge_code: &str) -> Result<Arc<Vec<u8>>, String> {
         self.get_or_create_with_userland(bridge_code, None)
+    }
+
+    /// Return a cached snapshot if present. This never creates a snapshot or
+    /// waits on in-flight creation.
+    pub fn try_get_with_userland(
+        &self,
+        bridge_code: &str,
+        userland_code: Option<&str>,
+    ) -> Option<Arc<Vec<u8>>> {
+        let key = snapshot_cache_key(bridge_code, userland_code);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(pos) = inner.entries.iter().position(|e| e.key == key) {
+            let entry = inner.entries.remove(pos);
+            let blob = Arc::clone(&entry.blob);
+            inner.entries.push(entry);
+            Some(blob)
+        } else {
+            None
+        }
     }
 
     /// Like [`get_or_create`], but the snapshot also captures an evaluated userland

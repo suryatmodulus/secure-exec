@@ -9,21 +9,21 @@ use crate::javascript::{
 use crate::node_import_cache::NodeImportCache;
 use crate::runtime_support::{env_flag_enabled, file_fingerprint, warmup_marker_path};
 use crate::signal::{NodeSignalDispositionAction, NodeSignalHandlerRegistration};
-use crate::v8_host::V8SessionHandle;
+use crate::v8_host::{V8RuntimeHost, V8SessionHandle};
 use crate::v8_runtime;
 use base64::Engine as _;
 use secure_exec_bridge::queue_tracker::{
     register_limit, warn_limit_exhausted, QueueGauge, TrackedLimit,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const WASM_MODULE_PATH_ENV: &str = "AGENTOS_WASM_MODULE_PATH";
@@ -92,6 +92,9 @@ const MAX_SYNC_WASM_PREWARM_MODULE_BYTES: u64 = 16 * 1024 * 1024;
 const WASM_CAPTURED_OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const WASM_SYNC_READ_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const WASM_INLINE_RUNNER_ENTRYPOINT: &str = "./__agentos_wasm_runner__.mjs";
+const WASM_SNAPSHOT_RUNNER_ENV: &str = "AGENTOS_WASM_SNAPSHOT_RUNNER";
+const WASM_RUNNER_NO_CACHE_ENV: &str = "AGENTOS_WASM_RUNNER_NO_CACHE";
+const WASM_MODULE_BASE64_CACHE_CAPACITY: usize = 64;
 const NODE_WASI_MODULE_SOURCE: &str = include_str!("../assets/runners/wasi-module.js");
 const WASM_SIDECAR_ROUTED_FS_SYNC_METHODS: &[&str] = &[
     "fs.accessSync",
@@ -1068,6 +1071,20 @@ fn handle_internal_wasm_sync_rpc_request(
 
     if wasm_sync_rpc_method_routes_through_sidecar_kernel(request, internal_sync_rpc) {
         return Ok(false);
+    }
+
+    if request.method == "__kernel_isatty" {
+        execution
+            .respond_sync_rpc_success(request.id, Value::Bool(false))
+            .map_err(map_javascript_error)?;
+        return Ok(true);
+    }
+
+    if request.method == "__kernel_tty_size" {
+        execution
+            .respond_sync_rpc_success(request.id, json!([80, 24]))
+            .map_err(map_javascript_error)?;
+        return Ok(true);
     }
 
     if request.method == "fs.openSync" {
@@ -2158,6 +2175,29 @@ struct WasmJavascriptExecutionOptions<'a> {
     warmup_metrics: Option<&'a [u8]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WasmSnapshotRunnerMode {
+    Auto,
+    Block,
+    Off,
+}
+
+fn wasm_snapshot_runner_mode() -> WasmSnapshotRunnerMode {
+    match std::env::var(WASM_SNAPSHOT_RUNNER_ENV) {
+        Ok(value) if value.eq_ignore_ascii_case("block") => WasmSnapshotRunnerMode::Block,
+        Ok(value) if value.eq_ignore_ascii_case("off") => WasmSnapshotRunnerMode::Off,
+        Ok(value) if value.eq_ignore_ascii_case("auto") => WasmSnapshotRunnerMode::Auto,
+        Ok(value) => {
+            tracing::warn!(
+                value,
+                "{WASM_SNAPSHOT_RUNNER_ENV} must be auto, block, or off; using auto"
+            );
+            WasmSnapshotRunnerMode::Auto
+        }
+        Err(_) => WasmSnapshotRunnerMode::Auto,
+    }
+}
+
 fn start_wasm_javascript_execution(
     javascript_engine: &mut JavascriptExecutionEngine,
     import_cache: &NodeImportCache,
@@ -2171,16 +2211,71 @@ fn start_wasm_javascript_execution(
         request,
         options.frozen_time_ms,
         options.prewarm_only,
-    );
-    let inline_code =
-        build_wasm_runner_module_source(import_cache, &internal_env, options.warmup_metrics)?;
+    )?;
+    let snapshot_mode = wasm_snapshot_runner_mode();
     let mut env = request.env.clone();
-    env.extend(
-        internal_env
-            .iter()
-            .filter(|(key, _)| key.as_str() != "AGENTOS_WASM_MODULE_BASE64")
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
+    let mut guest_runtime = request.guest_runtime.clone();
+
+    let inline_code = match snapshot_mode {
+        WasmSnapshotRunnerMode::Off => {
+            env.extend(
+                internal_env
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "AGENTOS_WASM_MODULE_BASE64")
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            build_wasm_runner_module_source(import_cache, &internal_env, options.warmup_metrics)?
+        }
+        WasmSnapshotRunnerMode::Auto | WasmSnapshotRunnerMode::Block => {
+            let userland_bundle = build_wasm_runner_userland_bundle(import_cache)?;
+            V8RuntimeHost::warm_snapshot_async(userland_bundle.clone());
+            let use_snapshot = match snapshot_mode {
+                WasmSnapshotRunnerMode::Block => {
+                    if !javascript_engine
+                        .snapshot_userland_ready(&userland_bundle)
+                        .map_err(map_javascript_error)?
+                    {
+                        javascript_engine
+                            .pre_warm_snapshot(&userland_bundle)
+                            .map_err(map_javascript_error)?;
+                    }
+                    true
+                }
+                WasmSnapshotRunnerMode::Auto => javascript_engine
+                    .snapshot_userland_ready(&userland_bundle)
+                    .unwrap_or(false),
+                WasmSnapshotRunnerMode::Off => false,
+            };
+
+            if use_snapshot {
+                env = request
+                    .env
+                    .iter()
+                    .filter(|(key, _)| !is_internal_wasm_guest_env_key(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                env.extend(
+                    internal_env
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+                guest_runtime.snapshot_userland_code = Some(userland_bundle);
+                build_wasm_snapshot_runner_inline_code(options.warmup_metrics)
+            } else {
+                env.extend(
+                    internal_env
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "AGENTOS_WASM_MODULE_BASE64")
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+                build_wasm_runner_module_source(
+                    import_cache,
+                    &internal_env,
+                    options.warmup_metrics,
+                )?
+            }
+        }
+    };
 
     javascript_engine
         .start_execution(StartJavascriptExecutionRequest {
@@ -2200,10 +2295,69 @@ fn start_wasm_javascript_execution(
             },
             // Forward the guest-runtime identity so the runner's shim sets
             // process.* from typed config rather than env.
-            guest_runtime: request.guest_runtime.clone(),
+            guest_runtime,
             inline_code: Some(inline_code),
         })
         .map_err(map_javascript_error)
+}
+
+struct WasmModuleBase64Cache {
+    entries: HashMap<PathBuf, (String, Arc<String>)>,
+}
+
+fn wasm_module_base64_cache() -> &'static Mutex<WasmModuleBase64Cache> {
+    static CACHE: OnceLock<Mutex<WasmModuleBase64Cache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(WasmModuleBase64Cache {
+            entries: HashMap::new(),
+        })
+    })
+}
+
+fn cached_wasm_module_base64(path: &Path) -> Result<Arc<String>, WasmExecutionError> {
+    let current_fingerprint = file_fingerprint(path);
+    {
+        let cache = wasm_module_base64_cache()
+            .lock()
+            .expect("wasm module base64 cache lock poisoned");
+        if let Some((fingerprint, encoded)) = cache.entries.get(path) {
+            if fingerprint == &current_fingerprint {
+                return Ok(Arc::clone(encoded));
+            }
+        }
+    }
+
+    let module_bytes = fs::read(path).map_err(WasmExecutionError::PrepareWarmPath)?;
+    let encoded = Arc::new(v8_runtime::base64_encode_pub(&module_bytes));
+    let fingerprint = file_fingerprint(path);
+    let mut cache = wasm_module_base64_cache()
+        .lock()
+        .expect("wasm module base64 cache lock poisoned");
+    if !cache.entries.contains_key(path) && cache.entries.len() >= WASM_MODULE_BASE64_CACHE_CAPACITY
+    {
+        if let Some(evicted_path) = cache.entries.keys().next().cloned() {
+            cache.entries.remove(&evicted_path);
+            tracing::warn!(
+                path = %evicted_path.display(),
+                "evicting cached wasm module base64 entry"
+            );
+        }
+    }
+    cache
+        .entries
+        .insert(path.to_path_buf(), (fingerprint, Arc::clone(&encoded)));
+    let cumulative_bytes: usize = cache
+        .entries
+        .values()
+        .map(|(_, encoded)| encoded.len())
+        .sum();
+    tracing::debug!(
+        path = %path.display(),
+        encoded_bytes = encoded.len(),
+        cumulative_bytes,
+        "cached wasm module base64 entry"
+    );
+    Ok(encoded)
 }
 
 fn build_wasm_internal_env(
@@ -2211,7 +2365,7 @@ fn build_wasm_internal_env(
     request: &StartWasmExecutionRequest,
     frozen_time_ms: u128,
     prewarm_only: bool,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>, WasmExecutionError> {
     let guest_path_mappings = wasm_guest_path_mappings(request);
     let mut internal_env = request
         .env
@@ -2230,12 +2384,11 @@ fn build_wasm_internal_env(
         String::from("AGENTOS_FORWARD_KERNEL_STDIN_RPC"),
         String::from("1"),
     );
-    if let Ok(module_bytes) = fs::read(&resolved_module.resolved_path) {
-        internal_env.insert(
-            String::from("AGENTOS_WASM_MODULE_BASE64"),
-            v8_runtime::base64_encode_pub(&module_bytes),
-        );
-    }
+    let module_base64 = cached_wasm_module_base64(&resolved_module.resolved_path)?;
+    internal_env.insert(
+        String::from("AGENTOS_WASM_MODULE_BASE64"),
+        module_base64.as_ref().clone(),
+    );
     internal_env.insert(
         WASM_GUEST_ARGV_ENV.to_string(),
         encode_json_string_array(&warmup_guest_argv(resolved_module, request)),
@@ -2267,7 +2420,7 @@ fn build_wasm_internal_env(
     } else {
         internal_env.remove(WASM_PREWARM_ONLY_ENV);
     }
-    internal_env
+    Ok(internal_env)
 }
 
 fn insert_optional_u64_env(env: &mut BTreeMap<String, String>, key: &str, value: Option<u64>) {
@@ -2309,14 +2462,100 @@ fn build_wasm_runner_module_source(
     internal_env: &BTreeMap<String, String>,
     warmup_metrics: Option<&[u8]>,
 ) -> Result<String, WasmExecutionError> {
-    let runner_source = fs::read_to_string(import_cache.wasm_runner_path())
-        .map_err(WasmExecutionError::PrepareWarmPath)?;
-    let runner_source = runner_source.replace(
-        "import { WASI } from 'node:wasi';\n",
-        "const { WASI } = globalThis.__agentOSWasiModule;\n",
-    );
+    let runner_source = transformed_wasm_runner_source(import_cache)?;
     let bootstrap = build_wasm_runner_bootstrap(internal_env, warmup_metrics);
     Ok(insert_wasm_runner_bootstrap(&runner_source, &bootstrap))
+}
+
+fn transformed_wasm_runner_source(
+    import_cache: &NodeImportCache,
+) -> Result<String, WasmExecutionError> {
+    if std::env::var(WASM_RUNNER_NO_CACHE_ENV).as_deref() == Ok("1") {
+        return read_transformed_wasm_runner_source(import_cache);
+    }
+
+    static RUNNER_SOURCE: OnceLock<Result<Arc<str>, Arc<str>>> = OnceLock::new();
+    RUNNER_SOURCE
+        .get_or_init(|| {
+            read_transformed_wasm_runner_source(import_cache)
+                .map(Arc::<str>::from)
+                .map_err(|error| Arc::<str>::from(error.to_string()))
+        })
+        .as_ref()
+        .map(|source| source.to_string())
+        .map_err(|message| {
+            WasmExecutionError::PrepareWarmPath(std::io::Error::other(message.to_string()))
+        })
+}
+
+fn read_transformed_wasm_runner_source(
+    import_cache: &NodeImportCache,
+) -> Result<String, WasmExecutionError> {
+    let runner_source = fs::read_to_string(import_cache.wasm_runner_path())
+        .map_err(WasmExecutionError::PrepareWarmPath)?;
+    Ok(runner_source.replace(
+        "import { WASI } from 'node:wasi';\n",
+        "const { WASI } = globalThis.__agentOSWasiModule;\n",
+    ))
+}
+
+fn build_wasm_runner_userland_bundle(
+    import_cache: &NodeImportCache,
+) -> Result<String, WasmExecutionError> {
+    if std::env::var(WASM_RUNNER_NO_CACHE_ENV).as_deref() == Ok("1") {
+        return build_wasm_runner_userland_bundle_uncached(import_cache);
+    }
+
+    static USERLAND_BUNDLE: OnceLock<Result<Arc<str>, Arc<str>>> = OnceLock::new();
+    USERLAND_BUNDLE
+        .get_or_init(|| {
+            build_wasm_runner_userland_bundle_uncached(import_cache)
+                .map(Arc::<str>::from)
+                .map_err(|error| Arc::<str>::from(error.to_string()))
+        })
+        .as_ref()
+        .map(|bundle| bundle.to_string())
+        .map_err(|message| {
+            WasmExecutionError::PrepareWarmPath(std::io::Error::other(message.to_string()))
+        })
+}
+
+fn build_wasm_runner_userland_bundle_uncached(
+    import_cache: &NodeImportCache,
+) -> Result<String, WasmExecutionError> {
+    let runner_source = transformed_wasm_runner_source(import_cache)?;
+    if runner_source
+        .lines()
+        .any(|line| line.trim_start().starts_with("import "))
+    {
+        return Err(WasmExecutionError::PrepareWarmPath(std::io::Error::other(
+            "transformed wasm runner still contains an ESM import statement",
+        )));
+    }
+
+    let mut bundle = build_wasm_runner_snapshot_prelude();
+    bundle.push_str("\nglobalThis.__agentOSWasmRunnerRun = async function () {\n");
+    bundle.push_str(&runner_source);
+    bundle.push_str("\n};\n");
+    Ok(bundle)
+}
+
+fn build_wasm_runner_snapshot_prelude() -> String {
+    let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+    let bootstrap = bootstrap
+        .strip_prefix("const __agentOSWasmInternalEnv = {};\n")
+        .unwrap_or(&bootstrap);
+    bootstrap.replace(wasm_internal_env_merge_source(), "")
+}
+
+fn build_wasm_snapshot_runner_inline_code(warmup_metrics: Option<&[u8]>) -> String {
+    let warmup_emit = wasm_warmup_metrics_emit_source(warmup_metrics);
+    format!(
+        r#"{warmup_emit}if (typeof process !== "undefined" && typeof globalThis.__agentOSProcessConfigEnv === "object") {{
+  process.env = {{ ...(process.env || {{}}), ...globalThis.__agentOSProcessConfigEnv }};
+}}
+await globalThis.__agentOSWasmRunnerRun();"#
+    )
 }
 
 fn build_wasm_runner_bootstrap(
@@ -2325,18 +2564,9 @@ fn build_wasm_runner_bootstrap(
 ) -> String {
     let internal_env_json =
         serde_json::to_string(internal_env).unwrap_or_else(|_| String::from("{}"));
-    let warmup_metrics_json = warmup_metrics.map(|bytes| {
-        serde_json::to_string(&String::from_utf8_lossy(bytes).to_string())
-            .unwrap_or_else(|_| String::from("\"\""))
-    });
-    let warmup_emit = warmup_metrics_json
-		.map(|metrics| {
-			format!(
-				"if (typeof process?.stderr?.write === \"function\") {{\n  process.stderr.write({metrics});\n}}\n"
-			)
-		})
-		.unwrap_or_default();
+    let warmup_emit = wasm_warmup_metrics_emit_source(warmup_metrics);
     let wasi_module_source = render_native_wasi_module_source();
+    let env_merge_source = wasm_internal_env_merge_source();
 
     format!(
         r#"const __agentOSWasmInternalEnv = {internal_env_json};
@@ -2350,10 +2580,8 @@ const __agentOSRequireBuiltin = (specifier) => {{
   throw new Error(`secure-exec WASM bootstrap cannot load ${{specifier}}`);
 }};
 {wasi_module_source}
-if (typeof process !== "undefined") {{
-  process.env = {{ ...(process.env || {{}}), ...__agentOSWasmInternalEnv }};
-}}
-if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSSyncRpc === "undefined") {{
+{env_merge_source}
+if (typeof globalThis !== "undefined") {{
   const __agentOSNormalizeBytes = (value) => {{
     if (value == null) {{
       return value;
@@ -2611,11 +2839,35 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSSyncRpc === 
     )
 }
 
-fn render_native_wasi_module_source() -> String {
-    NODE_WASI_MODULE_SOURCE.replace(
-        "__SECURE_EXEC_WASM_SYNC_READ_LIMIT_BYTES__",
-        &WASM_SYNC_READ_LIMIT_BYTES.to_string(),
-    )
+fn wasm_warmup_metrics_emit_source(warmup_metrics: Option<&[u8]>) -> String {
+    let warmup_metrics_json = warmup_metrics.map(|bytes| {
+        serde_json::to_string(&String::from_utf8_lossy(bytes).to_string())
+            .unwrap_or_else(|_| String::from("\"\""))
+    });
+    warmup_metrics_json
+        .map(|metrics| {
+            format!(
+                "if (typeof process?.stderr?.write === \"function\") {{\n  process.stderr.write({metrics});\n}}\n"
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn wasm_internal_env_merge_source() -> &'static str {
+    r#"if (typeof process !== "undefined") {
+  process.env = { ...(process.env || {}), ...__agentOSWasmInternalEnv };
+}
+"#
+}
+
+fn render_native_wasi_module_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| {
+        NODE_WASI_MODULE_SOURCE.replace(
+            "__SECURE_EXEC_WASM_SYNC_READ_LIMIT_BYTES__",
+            &WASM_SYNC_READ_LIMIT_BYTES.to_string(),
+        )
+    })
 }
 
 fn insert_wasm_runner_bootstrap(source: &str, bootstrap: &str) -> String {
