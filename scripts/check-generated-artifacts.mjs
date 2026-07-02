@@ -24,13 +24,9 @@ const checkedPaths = [
 
 assertNoLegacyVmConfigBindings();
 assertNoLegacyBuildSupportShims();
-const beforeDiff = capture("jj", [
-	"diff",
-	"--git",
-	"--color=never",
-	"--",
-	...checkedPaths,
-]);
+// CI runners have plain git checkouts (no jj); local workspaces are jj-first.
+const vcs = detectVcs();
+const beforeDiff = capture(vcs.cmd, [...vcs.diffArgs, "--", ...checkedPaths]);
 run("pnpm", ["--dir", "packages/build-tools", "build:protocol"]);
 run("node", ["packages/build-tools/scripts/build-browser-util-polyfill.mjs"]);
 run("node", ["packages/build-tools/scripts/build-browser-buffer-polyfill.mjs"]);
@@ -49,16 +45,10 @@ run("pnpm", ["--dir", "packages/browser", "check:signals"]);
 run("pnpm", ["--dir", "packages/browser", "check:wasi-surface"]);
 run("cargo", ["test", "-p", "secure-exec-bridge", "bridge_contract", "--quiet"]);
 run("cargo", ["test", "-p", "secure-exec-vm-config", "--quiet"]);
-const afterDiff = capture("jj", [
-	"diff",
-	"--git",
-	"--color=never",
-	"--",
-	...checkedPaths,
-]);
+const afterDiff = capture(vcs.cmd, [...vcs.diffArgs, "--", ...checkedPaths]);
 
 if (afterDiff !== beforeDiff) {
-	const changed = capture("jj", ["diff", "--name-only", "--", ...checkedPaths])
+	const changed = capture(vcs.cmd, [...vcs.nameOnlyArgs, "--", ...checkedPaths])
 		.split("\n")
 		.map((line) => line.trim())
 		.filter(Boolean);
@@ -79,8 +69,26 @@ if (afterDiff !== beforeDiff) {
 			"",
 		].join("\n"),
 	);
-	run("jj", ["diff", "--stat", "--", ...checkedPaths], { allowFailure: true });
+	run(vcs.cmd, [...vcs.statArgs, "--", ...checkedPaths], { allowFailure: true });
 	process.exit(1);
+}
+
+function detectVcs() {
+	const probe = spawnSync("jj", ["root"], { cwd: repoRoot, encoding: "utf8" });
+	if (!probe.error && probe.status === 0) {
+		return {
+			cmd: "jj",
+			diffArgs: ["diff", "--git", "--color=never"],
+			nameOnlyArgs: ["diff", "--name-only"],
+			statArgs: ["diff", "--stat"],
+		};
+	}
+	return {
+		cmd: "git",
+		diffArgs: ["diff", "--no-color"],
+		nameOnlyArgs: ["diff", "--name-only"],
+		statArgs: ["diff", "--stat"],
+	};
 }
 
 function run(command, args, options = {}) {

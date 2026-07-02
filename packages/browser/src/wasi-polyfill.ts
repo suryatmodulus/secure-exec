@@ -207,6 +207,8 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       this.returnOnExit = options.returnOnExit === true;
       this.instance = null;
       this.nextFd = 3;
+      this.fsModule = null;
+      this.pathModule = null;
       this.fdTable = new Map([
         [0, { kind: "stdin", fdFlags: 0 }],
         [1, { kind: "stdout", fdFlags: 0 }],
@@ -266,6 +268,20 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         sched_yield: (...args) => this._schedYield(...args),
       };
       this._installSyscallCounterWrappers();
+    }
+
+    _fs() {
+      if (!this.fsModule) {
+        this.fsModule = __agentOSFs();
+      }
+      return this.fsModule;
+    }
+
+    _path() {
+      if (!this.pathModule) {
+        this.pathModule = __agentOSPath();
+      }
+      return this.pathModule;
     }
 
     _recordWasiSyscallMetric(name, startedAt, details = {}) {
@@ -783,6 +799,25 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       if (!stats) {
         return __agentOSWasiFiletypeUnknown;
       }
+      const mode = Number(stats.mode);
+      if (Number.isFinite(mode)) {
+        switch (mode & 0o170000) {
+          case 0o040000:
+            return __agentOSWasiFiletypeDirectory;
+          case 0o100000:
+            return __agentOSWasiFiletypeRegularFile;
+          case 0o120000:
+            return __agentOSWasiFiletypeSymbolicLink;
+          case 0o020000:
+            return __agentOSWasiFiletypeCharacterDevice;
+        }
+      }
+      if (stats.isDirectory === true) {
+        return __agentOSWasiFiletypeDirectory;
+      }
+      if (stats.isSymbolicLink === true) {
+        return __agentOSWasiFiletypeSymbolicLink;
+      }
       if (typeof stats.isDirectory === "function" && stats.isDirectory()) {
         return __agentOSWasiFiletypeDirectory;
       }
@@ -793,6 +828,28 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         return __agentOSWasiFiletypeSymbolicLink;
       }
       if (typeof stats.isCharacterDevice === "function" && stats.isCharacterDevice()) {
+        return __agentOSWasiFiletypeCharacterDevice;
+      }
+      if (stats.isDirectory === false && stats.isSymbolicLink === false) {
+        return __agentOSWasiFiletypeRegularFile;
+      }
+      return __agentOSWasiFiletypeUnknown;
+    }
+
+    _filetypeForDirent(dirent) {
+      if (!dirent || typeof dirent !== "object") {
+        return __agentOSWasiFiletypeUnknown;
+      }
+      if (typeof dirent.isDirectory === "function" && dirent.isDirectory()) {
+        return __agentOSWasiFiletypeDirectory;
+      }
+      if (typeof dirent.isFile === "function" && dirent.isFile()) {
+        return __agentOSWasiFiletypeRegularFile;
+      }
+      if (typeof dirent.isSymbolicLink === "function" && dirent.isSymbolicLink()) {
+        return __agentOSWasiFiletypeSymbolicLink;
+      }
+      if (typeof dirent.isCharacterDevice === "function" && dirent.isCharacterDevice()) {
         return __agentOSWasiFiletypeCharacterDevice;
       }
       return __agentOSWasiFiletypeUnknown;
@@ -866,7 +923,8 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       if (__agentOSWasiHost.disableLocalFdPassthrough === true) {
         return null;
       }
-      const entry = this._descriptorEntry(fd);
+      const descriptor = Number(fd) >>> 0;
+      const entry = this._descriptorEntry(descriptor);
       if (!entry || typeof entry.realFd !== "number") {
         return null;
       }
@@ -1261,6 +1319,33 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       return resolved?.hostPath ?? null;
     }
 
+    _statResolvedPath(resolved, follow) {
+      if (
+        typeof globalThis?.__agentOSSyncRpc?.callSync === "function" &&
+        typeof resolved?.guestPath === "string"
+      ) {
+        return this._measureWasiPhase(follow ? "syncRpcStat" : "syncRpcLstat", () =>
+          __agentOSWasiSyncRpc().callSync(follow ? "fs.statSync" : "fs.lstatSync", [
+            resolved.guestPath,
+          ])
+        );
+      }
+      const bridgeStat = follow ? globalThis?._fsStat : globalThis?._fsLstat;
+      if (
+        typeof bridgeStat?.applySyncPromise === "function" &&
+        typeof resolved?.guestPath === "string"
+      ) {
+        return this._measureWasiPhase(follow ? "bridgeStatSync" : "bridgeLstatSync", () =>
+          bridgeStat.applySyncPromise(void 0, [resolved.guestPath])
+        );
+      }
+      const fsPath = this._resolvedFsPath(resolved);
+      return this._measureWasiPhase(follow ? "fsModuleStatSync" : "fsModuleLstatSync", () =>
+        follow ? this._fs().statSync(fsPath) : this._fs().lstatSync(fsPath)
+      );
+    }
+
+
     _resolveDescriptorDirectStatPath(fd, target) {
       if (
         typeof target !== "string" ||
@@ -1293,8 +1378,8 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
       }
       return {
         error: __agentOSWasiErrnoSuccess,
-        guestPath: __agentOSPath().posix.resolve(baseGuestPath, target),
-        hostPath: __agentOSPath().join(entry.hostPath, target),
+        guestPath: this._path().posix.resolve(baseGuestPath, target),
+        hostPath: this._path().join(entry.hostPath, target),
         readOnly: entry.readOnly === true,
       };
     }
@@ -2027,9 +2112,16 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
             : null;
         if (!dirents) {
           dirents = __agentOSFs()
-            .readdirSync(fsPath)
-            .map((entry) => String(entry))
-            .sort((left, right) => left.localeCompare(right));
+            .readdirSync(fsPath, { withFileTypes: true })
+            .map((entry) =>
+              typeof entry === "string"
+                ? { name: entry, filetype: __agentOSWasiFiletypeUnknown }
+                : {
+                    name: String(entry?.name ?? ""),
+                    filetype: this._filetypeForDirent(entry),
+                  }
+            )
+            .sort((left, right) => left.name.localeCompare(right.name));
           entry.readdirCache = dirents;
         }
         const view = this._memoryView();
@@ -2042,6 +2134,10 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
         for (let index = requestedCookie; index < dirents.length; index += 1) {
           const dirent = dirents[index];
           const name = typeof dirent === "string" ? dirent : String(dirent?.name ?? "");
+          const filetype =
+            typeof dirent === "object"
+              ? Number(dirent?.filetype ?? __agentOSWasiFiletypeUnknown) >>> 0
+              : __agentOSWasiFiletypeUnknown;
           const nameBytes = Buffer.from(name, "utf8");
           const recordLen = 24 + nameBytes.length;
           if (offset + recordLen > limit) {
@@ -2058,7 +2154,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
               recordView.setUint32(16, nameBytes.length, true);
               recordView.setUint8(
                 20,
-                __agentOSWasiFiletypeUnknown,
+                filetype,
               );
               record.set(nameBytes, 24);
               memory.set(record.subarray(0, remaining), offset);
@@ -2073,7 +2169,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
           view.setUint32(offset + 16, nameBytes.length, true);
           view.setUint8(
             offset + 20,
-            __agentOSWasiFiletypeUnknown,
+            filetype,
           );
           memory.set(nameBytes, offset + 24);
           offset += recordLen;
@@ -2327,9 +2423,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOSWasiModule =
           this._measureWasiPhase("statCacheHit", () => undefined);
         } else {
           stats = this._measureWasiPhase(follow ? "statSync" : "lstatSync", () =>
-            follow
-              ? __agentOSFs().statSync(this._resolvedFsPath(resolved))
-              : __agentOSFs().lstatSync(this._resolvedFsPath(resolved))
+            this._statResolvedPath(resolved, follow)
           );
           if (cacheKey) {
             this.statCache.set(cacheKey, stats);
