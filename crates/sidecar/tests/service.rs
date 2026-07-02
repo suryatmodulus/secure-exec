@@ -1339,7 +1339,7 @@ ykAheWCsAteSEWVc0w==\n\
             let vendored = repo_root.join("packages/core/commands");
             if vendored.exists() {
                 let staged = temp_dir("secure-exec-sidecar-vendored-commands");
-                for command in ["bash", "mkdir", "sh"] {
+                for command in ["bash", "cat", "mkdir", "printf", "sh"] {
                     let source = vendored.join(command);
                     let target = staged.join(command);
                     fs::copy(&source, &target).unwrap_or_else(|error| {
@@ -11781,6 +11781,226 @@ console.log(
             );
         }
 
+        fn with_wasm_shell_redirect_vm(
+            test: impl FnOnce(
+                &mut NativeSidecar<RecordingBridge>,
+                &str,
+                &str,
+                &str,
+                &mut secure_exec_sidecar::protocol::RequestId,
+            ),
+        ) {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+            configure_registry_command_mount(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                next_request_id,
+            );
+            next_request_id += 1;
+
+            test(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+            );
+        }
+
+        fn wasm_shell_external_stdout_redirect_writes_file() {
+            with_wasm_shell_redirect_vm(
+                |sidecar, vm_id, connection_id, session_id, next_request_id| {
+                    let (_stdout, stderr, exit_code) = run_guest_command(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-wasm-redirect-stdout",
+                        "sh",
+                        &[
+                            "-c",
+                            "mkdir -p /tmp/rp && printf 'aaaaaaaaaa' > /tmp/rp/printf.txt",
+                        ],
+                        BTreeMap::new(),
+                    );
+                    assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+                    let (stdout, stderr, exit_code) = run_guest_node_eval(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-js-read-redirect-stdout",
+                        r#"
+const fs = require("node:fs");
+const path = "/tmp/rp/printf.txt";
+process.stdout.write(`${JSON.stringify({
+  text: fs.readFileSync(path, "utf8"),
+  size: fs.statSync(path).size,
+})}\n`);
+"#,
+                    );
+                    assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+                    let payload = stdout_json(&stdout);
+                    assert_eq!(payload["text"], json!("aaaaaaaaaa"), "stdout: {stdout}");
+                    assert_eq!(payload["size"], json!(10), "stdout: {stdout}");
+                },
+            );
+        }
+
+        fn wasm_shell_external_append_redirect_creates_and_concatenates() {
+            with_wasm_shell_redirect_vm(
+                |sidecar, vm_id, connection_id, session_id, next_request_id| {
+                    let (_stdout, stderr, exit_code) = run_guest_command(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-wasm-redirect-append",
+                        "sh",
+                        &[
+                            "-c",
+                            "mkdir -p /tmp/rp && printf 'abc' >> /tmp/rp/append.txt && printf 'xyz' >> /tmp/rp/append.txt",
+                        ],
+                        BTreeMap::new(),
+                    );
+                    assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+                    let (stdout, stderr, exit_code) = run_guest_node_eval(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-js-read-redirect-append",
+                        r#"
+const fs = require("node:fs");
+const path = "/tmp/rp/append.txt";
+process.stdout.write(`${JSON.stringify({
+  text: fs.readFileSync(path, "utf8"),
+  size: fs.statSync(path).size,
+})}\n`);
+"#,
+                    );
+                    assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+                    let payload = stdout_json(&stdout);
+                    assert_eq!(payload["text"], json!("abcxyz"), "stdout: {stdout}");
+                    assert_eq!(payload["size"], json!(6), "stdout: {stdout}");
+                },
+            );
+        }
+
+        fn wasm_shell_external_stderr_redirect_writes_file() {
+            with_wasm_shell_redirect_vm(
+                |sidecar, vm_id, connection_id, session_id, next_request_id| {
+                    let (_stdout, stderr, exit_code) = run_guest_command(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-wasm-redirect-stderr",
+                        "sh",
+                        &[
+                            "-c",
+                            "mkdir -p /tmp/rp && cat /tmp/rp/does-not-exist 2> /tmp/rp/stderr.txt || true",
+                        ],
+                        BTreeMap::new(),
+                    );
+                    assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+                    let (stdout, stderr, exit_code) = run_guest_node_eval(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-js-read-redirect-stderr",
+                        r#"
+const fs = require("node:fs");
+const path = "/tmp/rp/stderr.txt";
+const text = fs.readFileSync(path, "utf8");
+process.stdout.write(`${JSON.stringify({
+  text,
+  size: fs.statSync(path).size,
+})}\n`);
+"#,
+                    );
+                    assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+                    let payload = stdout_json(&stdout);
+                    assert!(
+                        payload["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("does-not-exist")),
+                        "stdout: {stdout}"
+                    );
+                    assert!(
+                        payload["size"].as_u64().is_some_and(|size| size > 0),
+                        "stdout: {stdout}"
+                    );
+                },
+            );
+        }
+
+        fn wasm_shell_builtin_and_external_redirects_match() {
+            with_wasm_shell_redirect_vm(
+                |sidecar, vm_id, connection_id, session_id, next_request_id| {
+                    let (_stdout, stderr, exit_code) = run_guest_command(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-wasm-redirect-parity",
+                        "sh",
+                        &[
+                            "-c",
+                            "mkdir -p /tmp/rp && echo hi > /tmp/rp/builtin.txt && printf 'hi\n' > /tmp/rp/external.txt",
+                        ],
+                        BTreeMap::new(),
+                    );
+                    assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+                    let (stdout, stderr, exit_code) = run_guest_node_eval(
+                        sidecar,
+                        vm_id,
+                        connection_id,
+                        session_id,
+                        next_request_id,
+                        "proc-js-read-redirect-parity",
+                        r#"
+const fs = require("node:fs");
+process.stdout.write(`${JSON.stringify({
+  builtin: fs.readFileSync("/tmp/rp/builtin.txt", "utf8"),
+  external: fs.readFileSync("/tmp/rp/external.txt", "utf8"),
+})}\n`);
+"#,
+                    );
+                    assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+                    let payload = stdout_json(&stdout);
+                    assert_eq!(payload["builtin"], json!("hi\n"), "stdout: {stdout}");
+                    assert_eq!(payload["external"], json!("hi\n"), "stdout: {stdout}");
+                },
+            );
+        }
+
         fn javascript_mapped_shadow_readdir_sees_wasm_created_directory() {
             assert_node_available();
 
@@ -20486,6 +20706,10 @@ console.log(JSON.stringify({
             javascript_fs_sync_rpc_resolves_proc_self_against_the_kernel_process();
             javascript_fd_and_stream_rpc_requests_proxy_into_the_vm_kernel_filesystem();
             javascript_mapped_tmp_open_wx_uses_exclusive_create_once();
+            wasm_shell_external_stdout_redirect_writes_file();
+            wasm_shell_external_append_redirect_creates_and_concatenates();
+            wasm_shell_external_stderr_redirect_writes_file();
+            wasm_shell_builtin_and_external_redirects_match();
             javascript_imports_guest_written_modules_after_miss_work();
             javascript_fs_promises_batch_requests_before_waiting_on_sidecar_responses();
             javascript_crypto_basic_sync_rpcs_round_trip_through_sidecar();
@@ -20642,6 +20866,26 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn wasm_shell_external_stdout_redirect_writes_file_regression() {
+            run_isolated_service_test("wasm-shell-external-stdout-redirect");
+        }
+
+        #[test]
+        fn wasm_shell_external_append_redirect_creates_and_concatenates_regression() {
+            run_isolated_service_test("wasm-shell-external-append-redirect");
+        }
+
+        #[test]
+        fn wasm_shell_external_stderr_redirect_writes_file_regression() {
+            run_isolated_service_test("wasm-shell-external-stderr-redirect");
+        }
+
+        #[test]
+        fn wasm_shell_builtin_and_external_redirects_match_regression() {
+            run_isolated_service_test("wasm-shell-builtin-external-redirect-parity");
+        }
+
+        #[test]
         fn javascript_mapped_shadow_readdir_sees_wasm_created_directory_regression() {
             run_isolated_service_test("mapped-shadow-readdir-wasm-directory");
         }
@@ -20781,6 +21025,18 @@ console.log(JSON.stringify({
                 }
                 "javascript-fs-promises-hot-metadata" => {
                     javascript_fs_promises_hot_metadata_ops_use_sync_semantics();
+                }
+                "wasm-shell-external-stdout-redirect" => {
+                    wasm_shell_external_stdout_redirect_writes_file();
+                }
+                "wasm-shell-external-append-redirect" => {
+                    wasm_shell_external_append_redirect_creates_and_concatenates();
+                }
+                "wasm-shell-external-stderr-redirect" => {
+                    wasm_shell_external_stderr_redirect_writes_file();
+                }
+                "wasm-shell-builtin-external-redirect-parity" => {
+                    wasm_shell_builtin_and_external_redirects_match();
                 }
                 "mapped-shadow-readdir-wasm-directory" => {
                     javascript_mapped_shadow_readdir_sees_wasm_created_directory();

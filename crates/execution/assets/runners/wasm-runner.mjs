@@ -1091,9 +1091,17 @@ if (typeof wasiImport.fd_filestat_set_times !== 'function') {
   };
 }
 
-function precreatePathOpenTarget(fd, pathPtr, pathLen, oflags) {
+function pathOpenMayCreateTarget(oflags, rightsBase, fdflags) {
   const normalizedOflags = Number(oflags) >>> 0;
-  if ((normalizedOflags & WASI_OFLAGS_CREAT) === 0) {
+  const normalizedFdflags = Number(fdflags) >>> 0;
+  return (
+    (normalizedOflags & WASI_OFLAGS_CREAT) !== 0 ||
+    ((normalizedFdflags & WASI_FDFLAGS_APPEND) !== 0 && hasWriteRights(rightsBase))
+  );
+}
+
+function precreatePathOpenTarget(fd, pathPtr, pathLen, oflags, rightsBase, fdflags) {
+  if (!pathOpenMayCreateTarget(oflags, rightsBase, fdflags)) {
     return null;
   }
 
@@ -1152,11 +1160,12 @@ function allocateSyntheticFd() {
 }
 
 function openGuestFileForPathOpen(fd, pathPtr, pathLen, oflags, rightsBase, fdflags, openedFdPtr) {
-  const normalizedOflags = Number(oflags) >>> 0;
-  const normalizedFdflags = Number(fdflags) >>> 0;
-  if ((normalizedOflags & WASI_OFLAGS_CREAT) === 0) {
+  if (!pathOpenMayCreateTarget(oflags, rightsBase, fdflags)) {
     return null;
   }
+
+  const normalizedOflags = Number(oflags) >>> 0;
+  const normalizedFdflags = Number(fdflags) >>> 0;
 
   const guestPath = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
   if (typeof guestPath !== 'string') {
@@ -1188,13 +1197,14 @@ function openGuestFileForPathOpen(fd, pathPtr, pathLen, oflags, rightsBase, fdfl
   return writeGuestUint32(openedFdPtr, openedFd);
 }
 
-function retainPathOpenDelegateFd(openedFdPtr, guestPath) {
+function retainPathOpenDelegateFd(openedFdPtr, guestPath, fdflags) {
   if (!(instanceMemory instanceof WebAssembly.Memory)) {
     return WASI_ERRNO_SUCCESS;
   }
 
   try {
     const openedFd = new DataView(instanceMemory.buffer).getUint32(Number(openedFdPtr), true);
+    const append = (Number(fdflags) & WASI_FDFLAGS_APPEND) !== 0;
     retainDelegateFd(openedFd);
     if (openedFd > 2 && !passthroughHandles.has(openedFd)) {
       closedPassthroughFds.delete(openedFd);
@@ -1207,6 +1217,7 @@ function retainPathOpenDelegateFd(openedFdPtr, guestPath) {
         readOnly:
           typeof guestPath === 'string' &&
           resolveModuleGuestPathToHostMapping(guestPath)?.readOnly === true,
+        append,
         ...(typeof guestPath === 'string' ? { guestPath } : {}),
       });
     }
@@ -1646,7 +1657,7 @@ function retainSpawnOutputHandle(fd) {
   }
 
   const handle = lookupFdHandle(numericFd);
-  if (handle?.kind !== 'guest-file') {
+  if (handle?.kind !== 'guest-file' && handle?.kind !== 'passthrough') {
     return null;
   }
 
@@ -1980,6 +1991,10 @@ function routeChunkToFd(fd, bytes) {
   }
 
   if (handle.kind === 'passthrough') {
+    if (handle.append === true && typeof handle.guestPath === 'string') {
+      fsModule.appendFileSync(handle.guestPath, Buffer.from(bytes ?? []));
+      return;
+    }
     if (routeChunkToDelegateFd(handle.targetFd, bytes)) {
       return;
     }
@@ -4336,7 +4351,8 @@ if (delegatePathOpen) {
     if (guestReadOnlyDenied) {
       return denyReadOnlyMutation();
     }
-    if (!SIDECAR_MANAGED_PROCESS && (Number(oflags) & WASI_OFLAGS_CREAT) !== 0) {
+    const mayCreateTarget = pathOpenMayCreateTarget(oflags, rightsBase, fdflags);
+    if (!SIDECAR_MANAGED_PROCESS && mayCreateTarget) {
       try {
         const syntheticResult = __agentOSWasiMeasurePhase(
           'path_open',
@@ -4376,13 +4392,12 @@ if (delegatePathOpen) {
     );
 
     if (
-      !SIDECAR_MANAGED_PROCESS &&
       result !== WASI_ERRNO_SUCCESS &&
-      (Number(oflags) & WASI_OFLAGS_CREAT) !== 0
+      mayCreateTarget
     ) {
       try {
         __agentOSWasiMeasurePhase('path_open', 'synthetic_precreate', () =>
-          precreatePathOpenTarget(fd, pathPtr, pathLen, oflags)
+          precreatePathOpenTarget(fd, pathPtr, pathLen, oflags, rightsBase, fdflags)
         );
         result = __agentOSWasiMeasurePhase(
           'path_open',
@@ -4399,7 +4414,7 @@ if (delegatePathOpen) {
             openedFdPtr,
           ),
         );
-        if (result !== WASI_ERRNO_SUCCESS) {
+        if (!SIDECAR_MANAGED_PROCESS && result !== WASI_ERRNO_SUCCESS) {
           const fallbackResult = __agentOSWasiMeasurePhase(
             'path_open',
             'synthetic_open',
@@ -4424,7 +4439,7 @@ if (delegatePathOpen) {
 
     if (result === WASI_ERRNO_SUCCESS) {
       return __agentOSWasiMeasurePhase('path_open', 'fd_bookkeeping', () =>
-        retainPathOpenDelegateFd(openedFdPtr, guestPath)
+        retainPathOpenDelegateFd(openedFdPtr, guestPath, fdflags)
       );
     }
     return result;
