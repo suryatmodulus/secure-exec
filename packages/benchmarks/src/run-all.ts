@@ -27,7 +27,13 @@ import {
 	type BenchVmOptions,
 	type SidecarBinaryProvenance,
 } from "./lib/vm.js";
-import { findingsFromLatency, refutedFromLatency, writeJson } from "./lib/report.js";
+import {
+	findingsFromLatency,
+	permissionPolicyFindings,
+	permissionPolicyTaxFromLatency,
+	refutedFromLatency,
+	writeJson,
+} from "./lib/report.js";
 import { getHardware, printTable } from "./lib/perf-utils.js";
 import {
 	SidecarPeakMemorySampler,
@@ -122,8 +128,11 @@ async function main(): Promise<void> {
 	const matrix = await runLatencyMatrix();
 	const latency = matrix.results;
 	const layerLatency = latency.filter(isLayerOpResult);
-	const findings = findingsFromLatency(layerLatency);
-	const refuted = refutedFromLatency(layerLatency);
+	const nonPermissionsLatency = layerLatency.filter((result) => result.family !== "permissions");
+	const findings = findingsFromLatency(nonPermissionsLatency);
+	const refuted = refutedFromLatency(nonPermissionsLatency);
+	const permissionPolicyTax = permissionPolicyTaxFromLatency(layerLatency);
+	const permissionFindings = permissionPolicyFindings(permissionPolicyTax);
 	const resourceSnapshotStubbed = false;
 	const fuzz = FAMILY_FILTER
 		? { programs: [], findings: [], refuted: [] }
@@ -142,11 +151,13 @@ async function main(): Promise<void> {
 		warmup: WARMUP,
 		resourceSnapshotStubbed,
 		latency,
+		permissionPolicyTax,
 		fuzz,
 		leak,
 		footprint,
 		findings: [
 			...findings,
+			...permissionFindings,
 			...fuzz.findings,
 			...leak.findings,
 			...footprint.findings,
@@ -168,6 +179,7 @@ async function main(): Promise<void> {
 		matrixMode: matrix.mode,
 		wallTimeMs: matrix.wallTimeMs,
 		latency,
+		permissionPolicyTax,
 	});
 	writeJson(`${RESULTS_DIR}/findings.json`, findingsJson);
 	const baselinePath = `${RESULTS_DIR}/baseline/findings-baseline.json`;
@@ -240,6 +252,18 @@ async function main(): Promise<void> {
 			];
 		}),
 	);
+
+	if (permissionPolicyTax.length > 0) {
+		printTable(
+			["op", "allow guest p50", "policy guest p50", "policyTax"],
+			permissionPolicyTax.map((row) => [
+				row.op,
+				`${row.allowP50Ms}ms`,
+				`${row.policyP50Ms}ms`,
+				row.policyTax,
+			]),
+		);
+	}
 
 	printTable(
 		["family", "op", "guest/node", "guest/native", "file:line"],

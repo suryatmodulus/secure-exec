@@ -5,6 +5,7 @@ import {
 	resolveNodeRuntimeCommandsDir,
 	SidecarProcess,
 	type HostDirectoryMount,
+	type NodeRuntimeCreateOptions,
 	type NodeRuntimeProcess,
 	type NodeRuntimeResourceSnapshot,
 	type SidecarSpawnOptions,
@@ -20,6 +21,7 @@ export interface BenchVmOptions {
 	commandsDir?: string;
 	loopbackExemptPorts?: number[];
 	mounts?: HostDirectoryMount[];
+	permissions?: NodeRuntimeCreateOptions["permissions"];
 	wasmCommandDirs?: string[];
 	sidecar?: SidecarProcess;
 }
@@ -109,6 +111,7 @@ export async function createBenchVm(options: BenchVmOptions = {}): Promise<Bench
 			childProcess: "allow",
 			process: "allow",
 			env: "allow",
+			...options.permissions,
 		},
 		mounts: options.mounts,
 		commandsDir: options.commandsDir,

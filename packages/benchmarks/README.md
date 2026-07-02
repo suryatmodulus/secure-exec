@@ -49,6 +49,7 @@ Run one matrix family:
 BENCH_FAMILIES=fs pnpm --dir packages/benchmarks bench:matrix
 BENCH_FAMILIES=modules pnpm --dir packages/benchmarks bench:matrix
 BENCH_FAMILIES=ecosystem pnpm --dir packages/benchmarks bench:matrix
+BENCH_FAMILIES=permissions pnpm --dir packages/benchmarks bench:matrix
 ```
 
 Run one matrix op:
@@ -126,6 +127,18 @@ Rows:
 - **`tcp_concurrent_4`**: four concurrent TCP loopback clients connect to one server.
 - **`tcp_throughput_64k`**: TCP loopback echo of one 64 KiB payload.
 - **`tcp_tiny_writes_16`**: TCP loopback echo using sixteen one-byte writes.
+
+## Permissions Family
+
+`BENCH_FAMILIES=permissions pnpm --dir packages/benchmarks bench:matrix` runs a guest-only policy-overhead A/B over hot fs and net rows. Each reused op has an `<op>_allow` row using the benchmark default allow-all VM permissions and an `<op>_policy` row using a realistic restrictive policy.
+
+Policy shape:
+
+- **Filesystem**: default deny, then 15 allow glob rules for runtime paths plus benchmark script and working paths. The op's actual `/tmp/fuzz-perf-*` paths are placed at the tail so last-match policy evaluation walks the list.
+- **Network**: default deny, then five TCP loopback allowlist rules. The real `tcp://127.0.0.1:*` rule is last so loopback listen/connect checks walk the list.
+- **Other scopes**: `childProcess`, `process`, and `env` stay allowed so the measurement isolates fs and network syscall permission overhead.
+
+The matrix prints a dedicated permissions table and writes `permissionPolicyTax` to `results/latency-matrix.json` and `results/findings.json`. `policyTax = policy guest p50 / allow guest p50`; any row above `1.2` emits a finding. A one-off 200-rule local variant can validate methodology by increasing the rule list temporarily, running one op, and removing that variant before committing.
 
 ## Modules Family
 
