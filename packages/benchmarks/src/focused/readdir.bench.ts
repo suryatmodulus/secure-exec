@@ -1,7 +1,7 @@
 /**
  * Focused readdir scaling benchmark.
  *
- * Matches fs/readdir_large by preparing fixtures outside the timed loop so the
+ * Matches fs/readdir_small by preparing fixtures outside the timed loop so the
  * measurement isolates fs.readdirSync cost.
  */
 

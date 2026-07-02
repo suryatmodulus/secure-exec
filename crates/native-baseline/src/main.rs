@@ -72,6 +72,11 @@ enum Op {
     AllocFree,
 }
 
+struct BenchConfig {
+    size_bytes: Option<usize>,
+    entry_count: Option<usize>,
+}
+
 impl Op {
     #[cfg(target_family = "wasm")]
     fn supported_on_wasm(self) -> bool {
@@ -128,7 +133,7 @@ fn elapsed_ns(timer: Timer) -> u128 {
     timer.system.elapsed().map(|d| d.as_nanos()).unwrap_or(0)
 }
 
-fn run_once(op: Op, iter: usize, base_dir: &Path) {
+fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
     match op {
         #[cfg(not(target_family = "wasm"))]
         Op::SpawnExit => {
@@ -148,8 +153,11 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
         }
         #[cfg(not(target_family = "wasm"))]
         Op::NodeStdoutDiscard2b => {
+            let size_bytes = config.size_bytes.unwrap_or(2);
+            let script = format!("process.stdout.write(Buffer.alloc({size_bytes}, 55))");
             let status = Command::new("node")
-                .args(["-e", "process.stdout.write('hi')"])
+                .arg("-e")
+                .arg(&script)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -158,8 +166,11 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
         }
         #[cfg(not(target_family = "wasm"))]
         Op::NodeStdoutCapture2b => {
+            let size_bytes = config.size_bytes.unwrap_or(2);
+            let script = format!("process.stdout.write(Buffer.alloc({size_bytes}, 55))");
             let out = Command::new("node")
-                .args(["-e", "process.stdout.write('hi')"])
+                .arg("-e")
+                .arg(&script)
                 .output()
                 .expect("spawn node failed");
             assert!(
@@ -167,12 +178,15 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
                 "expected exit 0, got {:?}",
                 out.status
             );
-            assert_eq!(out.stdout, b"hi", "unexpected stdout");
+            assert_eq!(out.stdout.len(), size_bytes, "unexpected stdout byte count");
         }
         #[cfg(not(target_family = "wasm"))]
         Op::NodeStdoutListenerOnly2b => {
+            let size_bytes = config.size_bytes.unwrap_or(2);
+            let script = format!("process.stdout.write(Buffer.alloc({size_bytes}, 55))");
             let mut child = Command::new("node")
-                .args(["-e", "process.stdout.write('hi')"])
+                .arg("-e")
+                .arg(&script)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
@@ -182,7 +196,7 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
             stdout.read_to_end(&mut bytes).expect("read stdout");
             let status = child.wait().expect("wait node child");
             assert!(status.success(), "expected exit 0, got {status:?}");
-            assert_eq!(bytes.len(), 2, "unexpected stdout byte count");
+            assert_eq!(bytes.len(), size_bytes, "unexpected stdout byte count");
         }
         // Real host node process that immediately exits. This is the apples-to-apples
         // floor for the guest layer, where the same logical op spins a V8 isolate.
@@ -226,15 +240,23 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
         }
         Op::FsWrite => {
             let path = base_dir.join("secure-exec-native-fs-write.txt");
-            std::fs::write(path, format!("hello-{iter:08}")).expect("write fixture");
+            if let Some(size_bytes) = config.size_bytes {
+                std::fs::write(path, vec![(iter & 255) as u8; size_bytes]).expect("write fixture");
+            } else {
+                std::fs::write(path, format!("hello-{iter:08}")).expect("write fixture");
+            }
         }
         Op::FsRead => {
+            let size_bytes = config.size_bytes.unwrap_or(64 * 1024);
             let path = base_dir.join("secure-exec-native-fs-read.bin");
-            if !path.exists() {
-                std::fs::write(&path, vec![7_u8; 64 * 1024]).expect("write read fixture");
+            let rewrite = std::fs::metadata(&path)
+                .map(|meta| meta.len() != size_bytes as u64)
+                .unwrap_or(true);
+            if rewrite {
+                std::fs::write(&path, vec![7_u8; size_bytes]).expect("write read fixture");
             }
             let data = std::fs::read(path).expect("read fixture");
-            assert_eq!(data.len(), 64 * 1024);
+            assert_eq!(data.len(), size_bytes);
         }
         Op::FsOpenClose => {
             let path = base_dir.join("secure-exec-native-fs-open-close.txt");
@@ -255,16 +277,17 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
             std::fs::remove_file(&to).expect("remove rename fixture");
         }
         Op::FsReaddir => {
+            let entry_count = config.entry_count.unwrap_or(32);
             let dir = base_dir.join("secure-exec-native-readdir");
             std::fs::create_dir_all(&dir).expect("create readdir dir");
-            for i in 0..32 {
+            for i in 0..entry_count {
                 let path = dir.join(format!("{i}.txt"));
                 if !path.exists() {
                     std::fs::write(&path, b"hi").expect("write readdir fixture");
                 }
             }
             let count = std::fs::read_dir(dir).expect("read dir").count();
-            assert!(count >= 32);
+            assert!(count >= entry_count);
         }
         Op::FsFsync => {
             let path = base_dir.join("secure-exec-native-fsync.txt");
@@ -309,19 +332,21 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
         }
         #[cfg(not(target_family = "wasm"))]
         Op::TcpEcho => {
+            let payload = vec![7_u8; config.size_bytes.unwrap_or(5)];
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
             let addr = listener.local_addr().expect("listener addr");
+            let expected_len = payload.len();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accept tcp echo");
-                let mut buf = [0_u8; 16];
-                let n = stream.read(&mut buf).expect("read tcp echo");
-                stream.write_all(&buf[..n]).expect("write tcp echo");
+                let mut buf = vec![0_u8; expected_len];
+                stream.read_exact(&mut buf).expect("read tcp echo");
+                stream.write_all(&buf).expect("write tcp echo");
             });
             let mut stream = TcpStream::connect(addr).expect("connect tcp echo");
-            stream.write_all(b"hello").expect("write client echo");
-            let mut buf = [0_u8; 5];
+            stream.write_all(&payload).expect("write client echo");
+            let mut buf = vec![0_u8; payload.len()];
             stream.read_exact(&mut buf).expect("read client echo");
-            assert_eq!(&buf, b"hello");
+            assert_eq!(buf, payload);
             server.join().expect("join tcp server");
         }
         #[cfg(not(target_family = "wasm"))]
@@ -346,7 +371,7 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
         }
         #[cfg(not(target_family = "wasm"))]
         Op::TcpThroughput => {
-            let payload = vec![7_u8; 64 * 1024];
+            let payload = vec![7_u8; config.size_bytes.unwrap_or(64 * 1024)];
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
             let addr = listener.local_addr().expect("listener addr");
             let server = thread::spawn(move || {
@@ -382,18 +407,21 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
         }
         #[cfg(not(target_family = "wasm"))]
         Op::UdpEcho => {
+            let payload = vec![7_u8; config.size_bytes.unwrap_or(5)];
             let server = UdpSocket::bind("127.0.0.1:0").expect("bind udp server");
             let addr = server.local_addr().expect("udp addr");
+            let expected_len = payload.len();
             let handle = thread::spawn(move || {
-                let mut buf = [0_u8; 32];
+                let mut buf = vec![0_u8; expected_len];
                 let (n, peer) = server.recv_from(&mut buf).expect("recv udp");
                 server.send_to(&buf[..n], peer).expect("send udp");
             });
             let client = UdpSocket::bind("127.0.0.1:0").expect("bind udp client");
-            client.send_to(b"hello", addr).expect("send udp client");
-            let mut buf = [0_u8; 5];
+            client.send_to(&payload, addr).expect("send udp client");
+            let mut buf = vec![0_u8; payload.len()];
             let (n, _) = client.recv_from(&mut buf).expect("recv udp client");
-            assert_eq!(n, 5);
+            assert_eq!(n, payload.len());
+            assert_eq!(buf, payload);
             handle.join().expect("join udp server");
         }
         #[cfg(not(target_family = "wasm"))]
@@ -409,7 +437,7 @@ fn run_once(op: Op, iter: usize, base_dir: &Path) {
             #[cfg(unix)]
             {
                 let (mut left, mut right) = UnixStream::pair().expect("unix stream pair");
-                let payload = vec![9_u8; 64 * 1024];
+                let payload = vec![9_u8; config.size_bytes.unwrap_or(64 * 1024)];
                 let expected_len = payload.len();
                 let reader = thread::spawn(move || {
                     let mut out = vec![0_u8; expected_len];
@@ -634,6 +662,10 @@ fn main() {
     } else {
         std::env::temp_dir()
     };
+    let config = BenchConfig {
+        size_bytes: arg_value(&args, "--size-bytes").and_then(|s| s.parse().ok()),
+        entry_count: arg_value(&args, "--entry-count").and_then(|s| s.parse().ok()),
+    };
     let phases = args.iter().any(|arg| arg == "--phases");
 
     let total = warmup + iters;
@@ -666,7 +698,7 @@ fn main() {
     let mut samples: Vec<u128> = Vec::with_capacity(iters);
     for i in 0..total {
         let t = timer_start();
-        run_once(op, i, &base_dir);
+        run_once(op, i, &base_dir, &config);
         let ns = elapsed_ns(t);
         if i >= warmup {
             samples.push(ns);

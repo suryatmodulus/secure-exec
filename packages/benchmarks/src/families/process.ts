@@ -140,6 +140,31 @@ async function runGuestFanout(vm: Parameters<NonNullable<BenchmarkOp["runGuest"]
 	return samples;
 }
 
+function spawnStdoutCaptureOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
+		family: "process",
+		name,
+		nativeOp: "node_stdout_capture_2b",
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
+		fileLine: "crates/execution/src/v8_host.rs:296",
+		reproducer: `spawn node child writing ${sizeBytes} stdout bytes, capture and verify byte count`,
+		program: `async () => {
+  const { spawn } = await import("node:child_process");
+  const child = spawn("node", ["-e", "process.stdout.write(Buffer.alloc(${sizeBytes}, 55))"], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const chunks = [];
+  child.stdout.on("data", (chunk) => chunks.push(chunk));
+  await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error("exit " + code)));
+  });
+  const got = Buffer.concat(chunks);
+  if (got.length !== ${sizeBytes}) throw new Error("stdout byte mismatch: " + got.length);
+}`,
+	};
+}
+
 export const processFamily: BenchmarkOp[] = [
 	{
 		family: "process",
@@ -218,27 +243,8 @@ export const processFamily: BenchmarkOp[] = [
   if (Buffer.concat(chunks).toString("utf8") !== "hello") throw new Error("bad pipe chain");
 }`,
 	},
-	{
-		family: "process",
-		name: "spawn_stdout_256k_capture",
-		nativeOp: "exec_capture",
-		fileLine: "crates/execution/src/v8_host.rs:296",
-		reproducer: "spawn node child writing 256KiB stdout, capture and verify byte count",
-		program: `async () => {
-  const { spawn } = await import("node:child_process");
-  const child = spawn("node", ["-e", "process.stdout.write(Buffer.alloc(262144, 55))"], {
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  const chunks = [];
-  child.stdout.on("data", (chunk) => chunks.push(chunk));
-  await new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolve() : reject(new Error("exit " + code)));
-  });
-  const got = Buffer.concat(chunks);
-  if (got.length !== 262144) throw new Error("stdout byte mismatch: " + got.length);
-}`,
-	},
+	spawnStdoutCaptureOp("spawn_stdout_capture_small", 4 * 1024),
+	spawnStdoutCaptureOp("spawn_stdout_capture_big", 256 * 1024),
 	{
 		family: "process",
 		name: "spawn_stdin_roundtrip",

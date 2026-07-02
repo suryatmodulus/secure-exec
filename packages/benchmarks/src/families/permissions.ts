@@ -4,8 +4,8 @@ import { netFamily } from "./net.js";
 import type { BenchmarkOp } from "../lib/layers.js";
 
 const PERMISSION_OPS = [
-	...selectOps(fsFamily, ["small_write", "stat_storm", "readdir_large"]),
-	...selectOps(netFamily, ["tcp_echo", "http_loopback_get"]),
+	...selectOps(fsFamily, ["fs_write_small", "stat_storm", "readdir_small"]),
+	...selectOps(netFamily, ["tcp_echo_small", "http_loopback_get"]),
 ];
 
 // Policy shape under test:
@@ -33,8 +33,8 @@ export const restrictivePermissionsPolicy: NodeRuntimeCreateOptions["permissions
 			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-permissions-*.mjs"] },
 			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-write.txt"] },
 			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-stat.txt"] },
-			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-readdir"] },
-			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-readdir/**"] },
+			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-readdir-*"] },
+			{ mode: "allow", operations: ["*"], paths: ["/tmp/fuzz-perf-readdir-*/**"] },
 		],
 	},
 	network: {

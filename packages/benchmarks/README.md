@@ -117,16 +117,32 @@ The shell/coreutils focused lanes use the local `NodeRuntime` command-dir resolu
 
 Rows:
 
-- **`udp_echo_small`**: UDP loopback echo of one small datagram, currently expected to surface unsupported guest behavior.
-- **`unix_echo_small`**: Unix-domain socket echo of one small payload.
+- **`udp_echo_small` / `udp_echo_big`**: UDP loopback echo of one 16 byte datagram or one 60 KiB datagram, currently expected to surface unsupported guest behavior.
+- **`unix_echo_small` / `unix_echo_big`**: Unix-domain socket echo of one 16 byte or 64 KiB payload.
 - **`http_loopback_get`**: persistent `node:http` loopback server, fresh GET per iteration.
 - **`fetch_loopback_get`**: persistent HTTP loopback server, fresh global `fetch()` per iteration.
 - **`tls_loopback_get`**: persistent `node:https` loopback server, fresh `https.get` per iteration, verifies `hello-loopback-tls`. Native is unsupported until a native TLS-loopback pair exists, and WASM is unsupported because the native baseline has no TLS lane.
 - **`tcp_connect_close`**: TCP client connects to a loopback server and closes.
-- **`tcp_echo`**: TCP loopback echo of one small payload.
+- **`tcp_echo_small` / `tcp_echo_big`**: TCP loopback echo of one 16 byte or 64 KiB payload. The big tier carries forward the old throughput row's full-payload verification.
 - **`tcp_concurrent_4`**: four concurrent TCP loopback clients connect to one server.
-- **`tcp_throughput_64k`**: TCP loopback echo of one 64 KiB payload.
-- **`tcp_tiny_writes_16`**: TCP loopback echo using sixteen one-byte writes.
+- **`tcp_tiny_writes_16`**: TCP loopback echo using sixteen one-byte writes. This is a write-count/cadence row, not a payload-size tier.
+
+## Payload Tier Renames
+
+Payload-sensitive matrix rows use exactly two tiers named `<op>_small` and `<op>_big`. Retired names map to these successors:
+
+| Retired row | Successor row |
+| --- | --- |
+| `small_write` | `fs_write_small` |
+| `big_read` | `fs_read_big` |
+| `readdir_large` | `readdir_small` |
+| `stream_copy_1m` | `stream_copy_big` |
+| `tcp_echo` | `tcp_echo_small` |
+| `tcp_throughput_64k` | `tcp_echo_big` |
+| `unix_echo_small` | `unix_echo_small` (kept, added `unix_echo_big`) |
+| `udp_echo_small` | `udp_echo_small` (kept, added `udp_echo_big`) |
+| `throughput_64k` | `pass_through_big` |
+| `spawn_stdout_256k_capture` | `spawn_stdout_capture_big` |
 
 ## Permissions Family
 

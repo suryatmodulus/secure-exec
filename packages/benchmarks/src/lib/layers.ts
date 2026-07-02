@@ -70,6 +70,7 @@ export interface BenchmarkOp {
 	family: string;
 	name: string;
 	nativeOp?: NativeOp;
+	nativeArgs?: string[];
 	nativeUnsupportedReason?: string;
 	wasmUnsupportedReason?: string;
 	fileLine: string;
@@ -360,6 +361,7 @@ export async function runWasmLayer(
 	nativeOp: NativeOp,
 	iters: number,
 	warmup: number,
+	extraArgs: string[] = [],
 ): Promise<number[] | undefined> {
 	if (!supportsWasmLayer(nativeOp)) return undefined;
 	if (!resolveNativeBaselineWasm()) return undefined;
@@ -376,6 +378,7 @@ export async function runWasmLayer(
 		String(warmup),
 		"--base-dir",
 		guestBaseDir,
+		...extraArgs,
 	]);
 	if (result.exitCode !== 0) {
 		throw new Error(`wasm native-baseline ${nativeOp} exited ${result.exitCode}\n${result.stderr}`);
@@ -411,7 +414,7 @@ export async function runOpHostLayers(
 	warmup: number,
 ): Promise<OpHostSamples> {
 	const native = op.nativeOp
-		? await runNativeLayerMeasured(op.nativeOp, iters, warmup)
+		? await runNativeLayerMeasured(op.nativeOp, iters, warmup, op.nativeArgs)
 		: undefined;
 	const node = op.runNode
 		? { samples: await op.runNode(iters, warmup) }
@@ -448,7 +451,7 @@ export async function runOpVmLayers(
 	const wasm =
 		op.nativeOp && !op.wasmUnsupportedReason
 			? await measureOptionalWithSidecarPeak(sampler, () =>
-					runWasmLayer(vm, op.nativeOp!, iters, warmup),
+					runWasmLayer(vm, op.nativeOp!, iters, warmup, op.nativeArgs),
 				)
 			: undefined;
 	return {

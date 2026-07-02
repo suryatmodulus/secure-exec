@@ -167,7 +167,7 @@ async function main(): Promise<void> {
 			...fuzz.refuted,
 			{
 				family: "net",
-				op: "udp_echo",
+				op: "udp_echo_small",
 				reason: "guest UDP datagrams are unsupported in the current kernel-backed V8 bridge",
 				evidence: "ERR_NOT_IMPLEMENTED: external UDP datagrams are not yet supported by the kernel-backed V8 bridge",
 			},
@@ -410,7 +410,7 @@ function criticGaps(
 	for (const required of [
 		"process/fanout_spawn_8",
 		"process/wait_reap_storm_8",
-		"fs/readdir_large",
+		"fs/readdir_small",
 		"dns/resolve_concurrent_4",
 		"pipes/backpressure_chunks",
 		"control/cpu_loop",
@@ -418,7 +418,7 @@ function criticGaps(
 		if (!covered.has(required)) gaps.push(`missing fixed op ${required}`);
 	}
 	gaps.push(
-		"unsupported fixed op net/udp_echo: guest dgram send returns ERR_NOT_IMPLEMENTED for external UDP datagrams",
+		"unsupported fixed op net/udp_echo_small: guest dgram send returns ERR_NOT_IMPLEMENTED for external UDP datagrams",
 	);
 	if (!fuzz.findings.some((finding) => finding.op === "fanout-stdout-storm")) {
 		gaps.push("fuzz did not confirm the non-P2 stdout fanout slow path");

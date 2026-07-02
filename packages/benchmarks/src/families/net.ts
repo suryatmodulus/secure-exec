@@ -15,6 +15,7 @@ const TLS_LOOPBACK_CERT = readFileSync(
 const TLS_LOOPBACK_BODY = "hello-loopback-tls";
 const EXTERNAL_HTTP_BODY = "external-host-http-ok";
 const EXTERNAL_TCP_PAYLOAD = "external-tcp-echo";
+const UDP_BIG_BYTES = 60 * 1024;
 
 async function closeServer(server: http.Server | net.Server): Promise<void> {
 	await new Promise<void>((resolve, reject) => {
@@ -287,15 +288,17 @@ try {
 `;
 }
 
-export const netFamily: BenchmarkOp[] = [
-	{
+function udpEchoOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
 		family: "net",
-		name: "udp_echo_small",
+		name,
 		nativeOp: "udp_echo",
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
 		fileLine: "crates/sidecar/src/execution.rs:2712",
-		reproducer: "node:dgram udp4 socket sends hello to its own loopback address inside VM",
+		reproducer: `node:dgram udp4 socket sends one ${sizeBytes} byte datagram to its own loopback address inside VM`,
 		program: `async () => {
   const dgram = await import("node:dgram");
+  const payload = Buffer.alloc(${sizeBytes}, 7);
   const createSocket = dgram.createSocket ?? dgram.default?.createSocket;
   if (typeof createSocket !== "function") throw new Error("dgram.createSocket is not a function");
   await new Promise((resolve, reject) => {
@@ -305,32 +308,46 @@ export const netFamily: BenchmarkOp[] = [
       reject(error);
     });
     socket.on("message", (message) => {
-      socket.close(() => message.toString("utf8") === "hello" ? resolve() : reject(new Error("bad udp echo")));
+      socket.close(() => message.equals(payload) ? resolve() : reject(new Error("bad udp echo: " + message.length)));
     });
     socket.bind(0, "127.0.0.1", () => {
       const address = socket.address();
-      socket.send(Buffer.from("hello"), address.port, "127.0.0.1");
+      socket.send(payload, address.port, "127.0.0.1");
     });
   });
 }`,
-	},
-	{
+	};
+}
+
+function unixEchoOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
 		family: "net",
-		name: "unix_echo_small",
-		nativeOp: "tcp_echo",
+		name,
+		// Phase 2 should add a Unix-socket native op; TCP echo is the closest
+		// existing native baseline for the same payload shape.
+		nativeOp: sizeBytes > 16 ? "tcp_throughput" : "tcp_echo",
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
 		fileLine: "crates/sidecar/src/execution.rs:2237",
-		reproducer: "Unix-domain socket echo one small payload inside VM",
+		reproducer: `Unix-domain socket echo one ${sizeBytes} byte payload inside VM`,
 		program: `async () => {
   const fs = await import("node:fs");
   const net = await import("node:net");
   const os = await import("node:os");
   const path = await import("node:path");
+  const payload = Buffer.alloc(${sizeBytes}, 7);
   const sock = path.join(
     os.tmpdir(),
     "fuzz-perf-unix-echo-" + process.pid + "-" + Math.random().toString(16).slice(2) + ".sock",
   );
   await new Promise((resolve, reject) => {
-    const server = net.createServer((socket) => socket.on("data", (data) => socket.end(data)));
+    const server = net.createServer((socket) => {
+      const chunks = [];
+      socket.on("data", (data) => {
+        chunks.push(data);
+        const got = Buffer.concat(chunks);
+        if (got.length >= payload.length) socket.end(got);
+      });
+    });
     const cleanup = () => {
       try { fs.unlinkSync(sock); } catch {}
     };
@@ -344,17 +361,62 @@ export const netFamily: BenchmarkOp[] = [
       client.on("data", (data) => chunks.push(data));
       client.on("error", reject);
       client.on("close", () => {
-        const got = Buffer.concat(chunks).toString("utf8");
+        const got = Buffer.concat(chunks);
         server.close(() => {
           cleanup();
-          got === "hello" ? resolve() : reject(new Error("bad unix echo"));
+          got.equals(payload) ? resolve() : reject(new Error("bad unix echo: " + got.length));
         });
       });
-      client.write("hello");
+      client.write(payload);
     });
   });
 }`,
-	},
+	};
+}
+
+function tcpEchoOp(name: string, sizeBytes: number, nativeOp: "tcp_echo" | "tcp_throughput"): BenchmarkOp {
+	return {
+		family: "net",
+		name,
+		nativeOp,
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
+		fileLine: "crates/kernel/src/socket_table.rs:1413",
+		reproducer: `localhost TCP echo of one ${sizeBytes} byte payload inside VM`,
+		program: `async () => {
+  const net = await import("node:net");
+  const payload = Buffer.alloc(${sizeBytes}, 7);
+  await new Promise((resolve, reject) => {
+    const server = net.createServer((socket) => {
+      const chunks = [];
+      socket.on("data", (d) => {
+        chunks.push(d);
+        const got = Buffer.concat(chunks);
+        if (got.length >= payload.length) socket.end(got);
+      });
+    });
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      const socket = net.connect(port, "127.0.0.1");
+      const chunks = [];
+      socket.on("data", (d) => chunks.push(d));
+      socket.on("error", reject);
+      socket.on("close", () => {
+        const got = Buffer.concat(chunks);
+        server.close(() => got.equals(payload) ? resolve() : reject(new Error("short echo: " + got.length)));
+      });
+      socket.write(payload);
+    });
+  });
+}`,
+	};
+}
+
+export const netFamily: BenchmarkOp[] = [
+	udpEchoOp("udp_echo_small", 16),
+	udpEchoOp("udp_echo_big", UDP_BIG_BYTES),
+	unixEchoOp("unix_echo_small", 16),
+	unixEchoOp("unix_echo_big", 64 * 1024),
 	{
 		family: "net",
 		name: "http_loopback_get",
@@ -513,31 +575,7 @@ export const netFamily: BenchmarkOp[] = [
   });
 }`,
 	},
-	{
-		family: "net",
-		name: "tcp_echo",
-		nativeOp: "tcp_echo",
-		fileLine: "crates/kernel/src/socket_table.rs:1413",
-		reproducer: "localhost TCP echo one small payload inside VM",
-		program: `async () => {
-  const net = await import("node:net");
-  await new Promise((resolve, reject) => {
-    const server = net.createServer((socket) => socket.on("data", (d) => socket.end(d)));
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const port = server.address().port;
-      const socket = net.connect(port, "127.0.0.1");
-      let data = "";
-      socket.on("data", (d) => data += d.toString("utf8"));
-      socket.on("error", reject);
-      socket.on("close", () => {
-        server.close(() => data === "hello" ? resolve() : reject(new Error(data)));
-      });
-      socket.write("hello");
-    });
-	  });
-}`,
-	},
+	tcpEchoOp("tcp_echo_small", 16, "tcp_echo"),
 	{
 		family: "net",
 		name: "tcp_external_echo",
@@ -590,34 +628,9 @@ export const netFamily: BenchmarkOp[] = [
   });
 }`,
 	},
+	tcpEchoOp("tcp_echo_big", 64 * 1024, "tcp_throughput"),
 	{
-		family: "net",
-		name: "tcp_throughput_64k",
-		nativeOp: "tcp_throughput",
-		fileLine: "crates/kernel/src/socket_table.rs:1413",
-		reproducer: "localhost TCP echo of one 64KiB payload inside VM",
-		program: `async () => {
-  const net = await import("node:net");
-  const payload = Buffer.alloc(64 * 1024, 7);
-  await new Promise((resolve, reject) => {
-    const server = net.createServer((socket) => socket.on("data", (d) => socket.end(d)));
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const port = server.address().port;
-      const socket = net.connect(port, "127.0.0.1");
-      const chunks = [];
-      socket.on("data", (d) => chunks.push(d));
-      socket.on("error", reject);
-      socket.on("close", () => {
-        const got = Buffer.concat(chunks);
-        server.close(() => got.length === payload.length ? resolve() : reject(new Error("short echo")));
-      });
-      socket.write(payload);
-    });
-  });
-}`,
-	},
-	{
+		// Measures write count/cadence, not payload-size scaling; keep the count suffix.
 		family: "net",
 		name: "tcp_tiny_writes_16",
 		nativeOp: "tcp_tiny_writes",

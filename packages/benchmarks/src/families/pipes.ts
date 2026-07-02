@@ -1,45 +1,35 @@
 import type { BenchmarkOp } from "../lib/layers.js";
 
-export const pipesFamily: BenchmarkOp[] = [
-	{
+function passThroughOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
 		family: "pipes",
-		name: "pass_through_small",
-		nativeOp: "pipe_echo",
+		name,
+		nativeOp: sizeBytes > 16 ? "pipe_throughput" : "pipe_echo",
+		nativeArgs: sizeBytes > 16 ? ["--size-bytes", String(sizeBytes)] : undefined,
 		fileLine: "crates/v8-runtime/src/host_call.rs:276",
-		reproducer: "node PassThrough write/read small payload inside VM",
+		reproducer: `node PassThrough write/read one ${sizeBytes} byte payload inside VM`,
 		program: `async () => {
   const { PassThrough } = await import("node:stream");
-  await new Promise((resolve, reject) => {
-    const stream = new PassThrough();
-    let out = "";
-    stream.on("data", (d) => out += d.toString("utf8"));
-    stream.on("end", () => out === "hello" ? resolve() : reject(new Error(out)));
-    stream.end("hello");
-  });
-}`,
-	},
-	{
-		family: "pipes",
-		name: "throughput_64k",
-		nativeOp: "pipe_throughput",
-		fileLine: "crates/v8-runtime/src/host_call.rs:276",
-		reproducer: "node PassThrough write/read one 64KiB payload inside VM",
-		program: `async () => {
-  const { PassThrough } = await import("node:stream");
-  const payload = Buffer.alloc(64 * 1024, 9);
+  const payload = Buffer.alloc(${sizeBytes}, 9);
   await new Promise((resolve, reject) => {
     const stream = new PassThrough();
     const chunks = [];
     stream.on("data", (d) => chunks.push(d));
     stream.on("end", () => {
       const got = Buffer.concat(chunks);
-      got.length === payload.length ? resolve() : reject(new Error("short pipe"));
+      got.equals(payload) ? resolve() : reject(new Error("bad pipe: " + got.length));
     });
     stream.end(payload);
   });
 }`,
-	},
+	};
+}
+
+export const pipesFamily: BenchmarkOp[] = [
+	passThroughOp("pass_through_small", 16),
+	passThroughOp("pass_through_big", 64 * 1024),
 	{
+		// Measures backpressure shape and chunk count, not payload-size scaling.
 		family: "pipes",
 		name: "backpressure_chunks",
 		nativeOp: "pipe_backpressure",

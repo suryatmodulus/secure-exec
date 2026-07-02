@@ -1,5 +1,92 @@
 import type { BenchmarkOp } from "../lib/layers.js";
 
+function fsWriteOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
+		family: "fs",
+		name,
+		nativeOp: "fs_write",
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
+		fileLine: "crates/kernel/src/kernel.rs:1930",
+		reproducer: `node fs.writeFileSync('/tmp/fuzz-perf-write.txt', ${sizeBytes} byte payload)`,
+		program: `async (i) => {
+  const fs = await import("node:fs");
+  fs.writeFileSync("/tmp/fuzz-perf-write.txt", Buffer.alloc(${sizeBytes}, i & 255));
+}`,
+	};
+}
+
+function fsReadOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
+		family: "fs",
+		name,
+		nativeOp: "fs_read",
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
+		fileLine: "crates/kernel/src/mount_table.rs:814",
+		reproducer: `node fs.readFileSync('/tmp/fuzz-perf-read-${sizeBytes}.bin')`,
+		program: `async () => {
+  const fs = await import("node:fs");
+  const path = "/tmp/fuzz-perf-read-${sizeBytes}.bin";
+  if (!fs.existsSync(path)) fs.writeFileSync(path, Buffer.alloc(${sizeBytes}, 7));
+  const data = fs.readFileSync(path);
+  if (data.length !== ${sizeBytes}) throw new Error("bad read: " + data.length);
+}`,
+	};
+}
+
+function readdirOp(name: string, entryCount: number): BenchmarkOp {
+	return {
+		family: "fs",
+		name,
+		nativeOp: "fs_readdir",
+		nativeArgs: ["--entry-count", String(entryCount)],
+		fileLine: "crates/kernel/src/mount_table.rs:814",
+		reproducer: `readdirSync over a ${entryCount}-entry VM directory`,
+		setup: `async () => {
+  const fs = await import("node:fs");
+  const dir = "/tmp/fuzz-perf-readdir-${entryCount}";
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+  for (let i = 0; i < ${entryCount}; i++) {
+    const path = dir + "/" + i + ".txt";
+    if (!fs.existsSync(path)) fs.writeFileSync(path, "hi");
+  }
+}`,
+		program: `async () => {
+  const fs = await import("node:fs");
+  const dir = "/tmp/fuzz-perf-readdir-${entryCount}";
+  const entries = fs.readdirSync(dir);
+  if (entries.length < ${entryCount}) throw new Error("short readdir: " + entries.length);
+}`,
+	};
+}
+
+function streamCopyOp(name: string, sizeBytes: number): BenchmarkOp {
+	return {
+		family: "fs",
+		name,
+		// Phase 2 should add a native stream-copy op; fs_read is the closest current
+		// native/wasm stand-in for the payload size.
+		nativeOp: "fs_read",
+		nativeArgs: ["--size-bytes", String(sizeBytes)],
+		fileLine: "crates/kernel/src/mount_table.rs:814",
+		reproducer: `stream pipeline copies one ${sizeBytes} byte file inside VM`,
+		setup: `async () => {
+  const fs = await import("node:fs");
+  const src = "/tmp/fuzz-perf-stream-copy-src-${sizeBytes}.bin";
+  if (!fs.existsSync(src)) fs.writeFileSync(src, Buffer.alloc(${sizeBytes}, 7));
+}`,
+		program: `async (i) => {
+  const fs = await import("node:fs");
+  const { pipeline } = await import("node:stream/promises");
+  const src = "/tmp/fuzz-perf-stream-copy-src-${sizeBytes}.bin";
+  const dst = "/tmp/fuzz-perf-stream-copy-dst-${sizeBytes}-" + i + ".bin";
+  await pipeline(fs.createReadStream(src), fs.createWriteStream(dst));
+  const stat = fs.statSync(dst);
+  fs.unlinkSync(dst);
+  if (stat.size !== ${sizeBytes}) throw new Error("bad stream copy: " + stat.size);
+}`,
+	};
+}
+
 export const fsFamily: BenchmarkOp[] = [
 	{
 		family: "fs",
@@ -28,31 +115,10 @@ export const fsFamily: BenchmarkOp[] = [
   fs.statSync(path);
 }`,
 	},
-	{
-		family: "fs",
-		name: "small_write",
-		nativeOp: "fs_write",
-		fileLine: "crates/kernel/src/kernel.rs:1930",
-		reproducer: "node fs.writeFileSync('/tmp/fuzz-perf-write.txt', payload)",
-		program: `async (i) => {
-  const fs = await import("node:fs");
-  fs.writeFileSync("/tmp/fuzz-perf-write.txt", "hello-" + i);
-}`,
-	},
-	{
-		family: "fs",
-		name: "big_read",
-		nativeOp: "fs_read",
-		fileLine: "crates/kernel/src/mount_table.rs:814",
-		reproducer: "node fs.readFileSync('/tmp/fuzz-perf-read.bin')",
-		program: `async () => {
-  const fs = await import("node:fs");
-  const path = "/tmp/fuzz-perf-read.bin";
-  if (!fs.existsSync(path)) fs.writeFileSync(path, Buffer.alloc(64 * 1024, 7));
-  const data = fs.readFileSync(path);
-  if (data.length !== 64 * 1024) throw new Error("bad read");
-}`,
-	},
+	fsWriteOp("fs_write_small", 4 * 1024),
+	fsWriteOp("fs_write_big", 1024 * 1024),
+	fsReadOp("fs_read_small", 4 * 1024),
+	fsReadOp("fs_read_big", 1024 * 1024),
 	{
 		family: "fs",
 		name: "mkdir_rmdir",
@@ -81,28 +147,8 @@ export const fsFamily: BenchmarkOp[] = [
   fs.unlinkSync(to);
 }`,
 	},
-	{
-		family: "fs",
-		name: "readdir_large",
-		nativeOp: "fs_readdir",
-		fileLine: "crates/kernel/src/mount_table.rs:814",
-		reproducer: "readdirSync over a 32-entry VM directory",
-		setup: `async () => {
-  const fs = await import("node:fs");
-  const dir = "/tmp/fuzz-perf-readdir";
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-  for (let i = 0; i < 32; i++) {
-    const path = dir + "/" + i + ".txt";
-    if (!fs.existsSync(path)) fs.writeFileSync(path, "hi");
-  }
-}`,
-		program: `async () => {
-  const fs = await import("node:fs");
-  const dir = "/tmp/fuzz-perf-readdir";
-  const entries = fs.readdirSync(dir);
-  if (entries.length < 32) throw new Error("short readdir");
-}`,
-	},
+	readdirOp("readdir_small", 32),
+	readdirOp("readdir_big", 1000),
 	{
 		family: "fs",
 		name: "fsync_small",
@@ -136,26 +182,6 @@ export const fsFamily: BenchmarkOp[] = [
   }
 }`,
 	},
-	{
-		family: "fs",
-		name: "stream_copy_1m",
-		nativeOp: "fs_read",
-		fileLine: "crates/kernel/src/mount_table.rs:814",
-		reproducer: "stream pipeline copies one 1MiB file inside VM",
-		setup: `async () => {
-  const fs = await import("node:fs");
-  const src = "/tmp/fuzz-perf-stream-copy-src.bin";
-  if (!fs.existsSync(src)) fs.writeFileSync(src, Buffer.alloc(1024 * 1024, 7));
-}`,
-		program: `async (i) => {
-  const fs = await import("node:fs");
-  const { pipeline } = await import("node:stream/promises");
-  const src = "/tmp/fuzz-perf-stream-copy-src.bin";
-  const dst = "/tmp/fuzz-perf-stream-copy-dst-" + i + ".bin";
-  await pipeline(fs.createReadStream(src), fs.createWriteStream(dst));
-  const stat = fs.statSync(dst);
-  fs.unlinkSync(dst);
-  if (stat.size !== 1024 * 1024) throw new Error("bad stream copy");
-}`,
-	},
+	streamCopyOp("stream_copy_small", 64 * 1024),
+	streamCopyOp("stream_copy_big", 1024 * 1024),
 ];

@@ -23,9 +23,9 @@ type CostAxis =
 	| "concurrency";
 type CompletionSemantics = "client_close" | "listener_close_after_accept";
 type BroadEquivalent =
-	| "tcp_echo"
+	| "tcp_echo_small"
 	| "tcp_tiny_writes_16"
-	| "tcp_throughput_64k"
+	| "tcp_echo_big"
 	| "tcp_concurrent_4"
 	| "tcp_connect_close";
 type PayloadKind = "buffer" | "string";
@@ -149,7 +149,7 @@ function defaultRows(): NetTcpRow[] {
 			writeCadence: "burstSameTick",
 			costAxis: "broad",
 			completionSemantics: "client_close",
-			broadMatrixEquivalent: "tcp_echo",
+			broadMatrixEquivalent: "tcp_echo_small",
 		},
 		{
 			id: "echo_1x5_string",
@@ -162,7 +162,7 @@ function defaultRows(): NetTcpRow[] {
 			costAxis: "payload_copy",
 			compareAgainst: "echo_1x5",
 			completionSemantics: "client_close",
-			broadMatrixEquivalent: "tcp_echo",
+			broadMatrixEquivalent: "tcp_echo_small",
 			payloadKind: "string",
 		},
 		{
@@ -199,7 +199,7 @@ function defaultRows(): NetTcpRow[] {
 			costAxis: "broad",
 			compareAgainst: "echo_1x1",
 			completionSemantics: "client_close",
-			broadMatrixEquivalent: "tcp_throughput_64k",
+			broadMatrixEquivalent: "tcp_echo_big",
 		},
 		{
 			id: "echo_1x256k",

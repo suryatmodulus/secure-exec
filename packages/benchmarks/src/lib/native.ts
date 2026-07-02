@@ -52,11 +52,12 @@ export function runNativeLayer(
 	op: NativeOp,
 	iters: number,
 	warmup: number,
+	extraArgs: string[] = [],
 ): number[] {
 	const bin = resolveNativeBaselineBin();
 	const stdout = execFileSync(
 		bin,
-		["--op", op, "--iters", String(iters), "--warmup", String(warmup)],
+		["--op", op, "--iters", String(iters), "--warmup", String(warmup), ...extraArgs],
 		{ encoding: "utf8", maxBuffer: 128 * 1024 * 1024 },
 	);
 	return parseNativeSamples(stdout);
@@ -71,9 +72,10 @@ export async function runNativeLayerMeasured(
 	op: NativeOp,
 	iters: number,
 	warmup: number,
+	extraArgs: string[] = [],
 ): Promise<NativeLayerMeasurement> {
 	const bin = resolveNativeBaselineBin();
-	const args = ["--op", op, "--iters", String(iters), "--warmup", String(warmup)];
+	const args = ["--op", op, "--iters", String(iters), "--warmup", String(warmup), ...extraArgs];
 	const timed =
 		hostPeakMemorySupportReason() === undefined
 			? await runCommandWithMaxRss(bin, args)
