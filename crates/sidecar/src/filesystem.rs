@@ -1058,6 +1058,7 @@ fn fs_sync_request_marks_host_write_dirty(
         }
         "fs.write"
         | "fs.writeSync"
+        | "fs.writevSync"
         | "fs.writeFileSync"
         | "fs.promises.writeFile"
         | "fs.mkdirSync"
@@ -1255,6 +1256,81 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 record_fs_sync_subphase(request.method.as_str(), "mirror_shadow", phase_start);
             }
             Ok(json!(written))
+        }
+        "fs.writevSync" => {
+            let phase_start = Instant::now();
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem writev fd")?;
+            let contents = request.raw_bytes_args.get(&1).ok_or_else(|| {
+                SidecarError::InvalidState(String::from(
+                    "filesystem writev requires raw byte payload",
+                ))
+            })?;
+            let position = javascript_sync_rpc_arg_u64_optional(
+                &request.args,
+                2,
+                "filesystem writev position",
+            )?;
+            let buffers = decode_javascript_writev_raw_payload(contents)?;
+            record_fs_sync_subphase(request.method.as_str(), "parse", phase_start);
+
+            let mut total_written = 0usize;
+            if let Some(mapped) = process.mapped_host_fd_mut(fd) {
+                record_fs_sync_subphase(request.method.as_str(), "mapped_fd_match", phase_start);
+                let mut next_position = position;
+                for buffer in buffers {
+                    let written = write_all_mapped_host_fd(mapped, fd, buffer, next_position)?;
+                    total_written = total_written.saturating_add(written);
+                    if let Some(position) = &mut next_position {
+                        *position = position.saturating_add(written as u64);
+                    }
+                }
+                return Ok(json!(total_written));
+            }
+            record_fs_sync_subphase(request.method.as_str(), "mapped_fd_none", phase_start);
+
+            let surfaces_stdio =
+                position.is_none() && kernel_fd_surfaces_stdio_event(kernel, kernel_pid, fd)?;
+            let mut next_position = position;
+            let mut combined_stdio = Vec::new();
+            for buffer in buffers {
+                let mut offset = 0usize;
+                while offset < buffer.len() {
+                    let slice = &buffer[offset..];
+                    let written = match next_position {
+                        Some(position) => kernel
+                            .fd_pwrite(EXECUTION_DRIVER_NAME, kernel_pid, fd, slice, position)
+                            .map_err(kernel_error)?,
+                        None => kernel
+                            .fd_write(EXECUTION_DRIVER_NAME, kernel_pid, fd, slice)
+                            .map_err(kernel_error)?,
+                    };
+                    if written == 0 {
+                        return Err(SidecarError::Execution(format!(
+                            "EIO: filesystem writev made no progress on fd {fd}"
+                        )));
+                    }
+                    offset += written;
+                    total_written = total_written.saturating_add(written);
+                    if let Some(position) = &mut next_position {
+                        *position = position.saturating_add(written as u64);
+                    }
+                }
+                if surfaces_stdio {
+                    combined_stdio.extend_from_slice(buffer);
+                }
+            }
+            record_fs_sync_subphase(request.method.as_str(), "kernel_fd_write", phase_start);
+            if surfaces_stdio && !combined_stdio.is_empty() {
+                let event = if fd == 1 {
+                    ActiveExecutionEvent::Stdout(combined_stdio)
+                } else {
+                    ActiveExecutionEvent::Stderr(combined_stdio)
+                };
+                process.queue_pending_execution_event(event)?;
+            } else {
+                mirror_kernel_fd_contents_to_process_shadow(kernel, process, kernel_pid, fd)?;
+            }
+            Ok(json!(total_written))
         }
         "fs.close" | "fs.closeSync" => {
             let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem close fd")?;
@@ -1474,92 +1550,8 @@ pub(crate) fn service_javascript_fs_sync_rpc(
             let path =
                 javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem readdir path")?;
             let path = path.as_str();
-            if let Some(MappedRuntimeHostAccess::Writable(mapped_host)) =
-                mapped_runtime_host_path(process, path, false)
-            {
-                materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
-                let directory = open_mapped_runtime_beneath(
-                    &mapped_host,
-                    "fs.readdir",
-                    OFlag::O_DIRECTORY | OFlag::O_RDONLY,
-                    Mode::empty(),
-                )?;
-                // Return each entry's directory-ness alongside its name so the guest's
-                // `readdirSync({withFileTypes:true})` does not issue one cross-thread
-                // stat RPC per entry. We already openat2 each child to validate it
-                // stays beneath the mount, so the type probe is one extra in-process
-                // fstat on the same fd — cheap relative to a per-entry RPC round-trip.
-                // metadata() follows symlinks, matching the prior statSync semantics.
-                let mut typed: BTreeMap<String, bool> = BTreeMap::new();
-                let readdir_path = directory.handle.readdir_path().map_err(|error| {
-                    SidecarError::Io(format!(
-                        "failed to resolve mapped guest directory {} -> {}: {error}",
-                        path,
-                        directory.host_path.display()
-                    ))
-                })?;
-                for entry in fs::read_dir(readdir_path).map_err(|error| {
-                    SidecarError::Io(format!(
-                        "failed to read mapped guest directory {} -> {}: {error}",
-                        path,
-                        directory.host_path.display()
-                    ))
-                })? {
-                    let Ok(entry) = entry else { continue };
-                    let Ok(name) = entry.file_name().into_string() else {
-                        continue;
-                    };
-                    let child = MappedRuntimeHostPath {
-                        guest_path: normalize_path(&format!(
-                            "{}/{}",
-                            path.trim_end_matches('/'),
-                            name
-                        )),
-                        host_root: mapped_host.host_root.clone(),
-                        host_path: directory.host_path.join(entry.file_name()),
-                    };
-                    let Ok(opened) = open_mapped_runtime_beneath(
-                        &child,
-                        "fs.readdir entry",
-                        O_PATH_ANCHOR,
-                        Mode::empty(),
-                    ) else {
-                        continue;
-                    };
-                    let is_dir = fs::metadata(opened.handle.proc_path())
-                        .map(|meta| meta.is_dir())
-                        .unwrap_or(false);
-                    typed.insert(name, is_dir);
-                }
-                match kernel.read_dir_with_types_for_process(
-                    EXECUTION_DRIVER_NAME,
-                    kernel_pid,
-                    path,
-                ) {
-                    Ok(entries) => {
-                        for entry in entries {
-                            typed.entry(entry.name).or_insert(entry.is_directory);
-                        }
-                    }
-                    Err(error) if matches!(error.code(), "ENOENT" | "ENOTDIR") => {}
-                    Err(error) => return Err(kernel_error(error)),
-                }
-                for name in mapped_runtime_child_mount_basenames(process, path) {
-                    typed.entry(name).or_insert(true);
-                }
-                return Ok(javascript_sync_rpc_readdir_typed_value(typed));
-            }
-            kernel
-                .read_dir_with_types_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
-                .map(|entries| {
-                    javascript_sync_rpc_readdir_typed_value(
-                        entries
-                            .into_iter()
-                            .map(|entry| (entry.name, entry.is_directory))
-                            .collect(),
-                    )
-                })
-                .map_err(kernel_error)
+            service_javascript_fs_readdir_entries(kernel, process, kernel_pid, path)
+                .map(javascript_sync_rpc_readdir_typed_value)
         }
         "fs.mkdirSync" | "fs.promises.mkdir" => {
             let path =
@@ -3438,6 +3430,71 @@ fn write_mapped_host_fd(
     Ok(json!(written))
 }
 
+fn write_all_mapped_host_fd(
+    mapped: &mut crate::state::ActiveMappedHostFd,
+    fd: u32,
+    contents: &[u8],
+    position: Option<u64>,
+) -> Result<usize, SidecarError> {
+    let mut total = 0usize;
+    while total < contents.len() {
+        let write_position = position.map(|offset| offset.saturating_add(total as u64));
+        let written = match write_position {
+            Some(offset) => mapped.file.write_at(&contents[total..], offset),
+            None => mapped.file.write(&contents[total..]),
+        }
+        .map_err(|error| {
+            SidecarError::Io(format!(
+                "failed to write mapped guest fd {fd} -> {}: {error}",
+                mapped.path.display()
+            ))
+        })?;
+        if written == 0 {
+            return Err(SidecarError::Execution(format!(
+                "EIO: filesystem write made no progress on mapped fd {fd}"
+            )));
+        }
+        total = total.saturating_add(written);
+    }
+    Ok(total)
+}
+
+fn read_le_u32(payload: &[u8], offset: &mut usize, label: &str) -> Result<u32, SidecarError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| SidecarError::InvalidState(format!("filesystem {label} offset overflow")))?;
+    let bytes = payload.get(*offset..end).ok_or_else(|| {
+        SidecarError::InvalidState(format!("truncated filesystem {label} payload"))
+    })?;
+    *offset = end;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("slice length checked"),
+    ))
+}
+
+fn decode_javascript_writev_raw_payload(payload: &[u8]) -> Result<Vec<&[u8]>, SidecarError> {
+    let mut offset = 0usize;
+    let count = read_le_u32(payload, &mut offset, "writev count")? as usize;
+    let mut buffers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_le_u32(payload, &mut offset, "writev buffer length")? as usize;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            SidecarError::InvalidState(String::from("filesystem writev payload length overflow"))
+        })?;
+        let buffer = payload.get(offset..end).ok_or_else(|| {
+            SidecarError::InvalidState(String::from("truncated filesystem writev payload"))
+        })?;
+        buffers.push(buffer);
+        offset = end;
+    }
+    if offset != payload.len() {
+        return Err(SidecarError::InvalidState(String::from(
+            "filesystem writev payload has trailing bytes",
+        )));
+    }
+    Ok(buffers)
+}
+
 fn rename_mapped_host_path(
     source: &str,
     source_host: Option<MappedRuntimeHostAccess>,
@@ -3546,6 +3603,146 @@ fn remove_existing_mapped_host_destination(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn mapped_readdir_entry_is_directory(
+    mapped_host: &MappedRuntimeHostPath,
+    directory: &MappedRuntimeOpenedPath,
+    guest_dir_path: &str,
+    entry: &fs::DirEntry,
+    name: &str,
+) -> Option<bool> {
+    let file_type = entry.file_type().ok()?;
+    if !file_type.is_symlink() {
+        return Some(file_type.is_dir());
+    }
+
+    let child = MappedRuntimeHostPath {
+        guest_path: normalize_path(&format!(
+            "{}/{}",
+            guest_dir_path.trim_end_matches('/'),
+            name
+        )),
+        host_root: mapped_host.host_root.clone(),
+        host_path: directory.host_path.join(entry.file_name()),
+    };
+    let opened =
+        open_mapped_runtime_beneath(&child, "fs.readdir entry", O_PATH_ANCHOR, Mode::empty())
+            .ok()?;
+    fs::metadata(opened.handle.proc_path())
+        .map(|metadata| metadata.is_dir())
+        .ok()
+}
+
+pub(crate) fn service_javascript_fs_readdir_entries(
+    kernel: &mut SidecarKernel,
+    process: &ActiveProcess,
+    kernel_pid: u32,
+    path: &str,
+) -> Result<BTreeMap<String, bool>, SidecarError> {
+    if let Some(MappedRuntimeHostAccess::Writable(mapped_host)) =
+        mapped_runtime_host_path(process, path, false)
+    {
+        let mut typed: BTreeMap<String, bool> = BTreeMap::new();
+        match open_mapped_runtime_beneath(
+            &mapped_host,
+            "fs.readdir",
+            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            Ok(directory) => {
+                let readdir_path = directory.handle.readdir_path().map_err(|error| {
+                    SidecarError::Io(format!(
+                        "failed to resolve mapped guest directory {} -> {}: {error}",
+                        path,
+                        directory.host_path.display()
+                    ))
+                })?;
+                for entry in fs::read_dir(readdir_path).map_err(|error| {
+                    SidecarError::Io(format!(
+                        "failed to read mapped guest directory {} -> {}: {error}",
+                        path,
+                        directory.host_path.display()
+                    ))
+                })? {
+                    let Ok(entry) = entry else { continue };
+                    let Ok(name) = entry.file_name().into_string() else {
+                        continue;
+                    };
+                    if let Some(is_dir) = mapped_readdir_entry_is_directory(
+                        &mapped_host,
+                        &directory,
+                        path,
+                        &entry,
+                        &name,
+                    ) {
+                        typed.insert(name, is_dir);
+                    }
+                }
+            }
+            Err(_)
+                if matches!(
+                    fs::symlink_metadata(&mapped_host.host_path),
+                    Err(ref metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        match kernel.read_dir_with_types_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path) {
+            Ok(entries) => {
+                for entry in entries {
+                    typed.entry(entry.name).or_insert(entry.is_directory);
+                }
+            }
+            Err(error) if matches!(error.code(), "ENOENT" | "ENOTDIR") => {}
+            Err(error) => return Err(kernel_error(error)),
+        }
+        for name in mapped_runtime_child_mount_basenames(process, path) {
+            typed.entry(name).or_insert(true);
+        }
+        return Ok(typed);
+    }
+
+    kernel
+        .read_dir_with_types_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.name, entry.is_directory))
+                .collect()
+        })
+        .map_err(kernel_error)
+}
+
+pub(crate) fn service_javascript_fs_readdir_raw_sync_rpc(
+    kernel: &mut SidecarKernel,
+    process: &ActiveProcess,
+    kernel_pid: u32,
+    request: &JavascriptSyncRpcRequest,
+) -> Result<Vec<u8>, SidecarError> {
+    let path = javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem readdir path")?;
+    let entries =
+        service_javascript_fs_readdir_entries(kernel, process, kernel_pid, path.as_str())?;
+    encode_javascript_readdir_raw_payload(entries)
+}
+
+fn encode_javascript_readdir_raw_payload(
+    entries: BTreeMap<String, bool>,
+) -> Result<Vec<u8>, SidecarError> {
+    let mut payload = Vec::new();
+    for (name, is_dir) in entries
+        .into_iter()
+        .filter(|(name, _)| name != "." && name != "..")
+    {
+        let name = name.into_bytes();
+        let name_len = u32::try_from(name.len()).map_err(|_| {
+            SidecarError::InvalidState(String::from("filesystem readdir entry name too long"))
+        })?;
+        payload.push(u8::from(is_dir));
+        payload.extend_from_slice(&name_len.to_le_bytes());
+        payload.extend_from_slice(&name);
+    }
+    Ok(payload)
 }
 
 /// Like `javascript_sync_rpc_readdir_value` but carries each entry's

@@ -616,6 +616,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Raw-byte host file-descriptor write bridge reference."
   },
   {
+    name: "_fsWritevRaw",
+    classification: "hardened",
+    rationale: "Raw-byte host file-descriptor vector write bridge reference."
+  },
+  {
     name: "fs.fstatSync",
     classification: "hardened",
     rationale: "Host file-descriptor stat bridge reference."

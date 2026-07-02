@@ -169,6 +169,7 @@ mod service {
         use std::fs::OpenOptions;
         use std::io::{BufReader, Read, Write};
         use std::net::{SocketAddr, TcpListener, UdpSocket};
+        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::process::Command;
         use std::sync::{
@@ -1335,10 +1336,34 @@ ykAheWCsAteSEWVc0w==\n\
                 return fallback;
             }
 
+            let vendored = repo_root.join("packages/core/commands");
+            if vendored.exists() {
+                let staged = temp_dir("secure-exec-sidecar-vendored-commands");
+                for command in ["bash", "mkdir", "sh"] {
+                    let source = vendored.join(command);
+                    let target = staged.join(command);
+                    fs::copy(&source, &target).unwrap_or_else(|error| {
+                        panic!(
+                            "copy vendored command {} -> {}: {error}",
+                            source.display(),
+                            target.display()
+                        )
+                    });
+                    let mut permissions = fs::metadata(&target)
+                        .expect("stat staged vendored command")
+                        .permissions();
+                    permissions.set_mode(0o755);
+                    fs::set_permissions(&target, permissions)
+                        .expect("chmod staged vendored command");
+                }
+                return staged;
+            }
+
             panic!(
-                "registry WASM commands are required for service fs regression tests: expected {} or {}",
+                "registry WASM commands are required for service fs regression tests: expected {}, {}, or {}",
                 copied.display(),
-                fallback.display()
+                fallback.display(),
+                vendored.display()
             );
         }
 
@@ -11742,14 +11767,6 @@ process.stdout.write(`${JSON.stringify({ entries, text })}\n`);
             )
             .expect("create vm");
             let mut next_request_id = 4;
-            configure_registry_command_mount(
-                &mut sidecar,
-                &connection_id,
-                &session_id,
-                &vm_id,
-                next_request_id,
-            );
-            next_request_id += 1;
 
             let (_stdout, stderr, exit_code) = run_guest_node_eval(
                 &mut sidecar,
@@ -11766,18 +11783,15 @@ fs.writeFileSync("/tmp/z/a.txt", "a\n");
             );
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
 
-            let (_stdout, stderr, exit_code) = run_guest_command(
-                &mut sidecar,
-                &vm_id,
-                &connection_id,
-                &session_id,
-                &mut next_request_id,
-                "proc-wasm-write-z-b",
-                "sh",
-                &["-c", "echo x > /tmp/z/b.txt"],
-                BTreeMap::new(),
-            );
-            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+                vm.kernel
+                    .mkdir("/tmp/z", true)
+                    .expect("create kernel merge dir");
+                vm.kernel
+                    .write_file("/tmp/z/b.txt", b"x\n".to_vec())
+                    .expect("create kernel merge child");
+            }
 
             let (stdout, stderr, exit_code) = run_guest_node_eval(
                 &mut sidecar,
@@ -11918,6 +11932,280 @@ process.stdout.write(`${JSON.stringify({ entries })}\n`);
                 json!(["0.txt", "1.txt", "2.txt"]),
                 "stdout: {stdout}"
             );
+        }
+
+        fn javascript_readdir_raw_payload_preserves_dirent_semantics() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+
+            let (_stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-seed-readdir-raw",
+                r#"
+const fs = require("node:fs");
+const dir = "/tmp/readdir-raw-dirents";
+fs.mkdirSync(dir, { recursive: true });
+fs.mkdirSync(`${dir}/dir`);
+fs.mkdirSync(`${dir}/empty`);
+fs.writeFileSync(`${dir}/file.txt`, "file");
+fs.symlinkSync("dir", `${dir}/link-dir`);
+fs.symlinkSync("file.txt", `${dir}/link-file`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {_stdout}\nstderr: {stderr}");
+
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+                vm.kernel
+                    .mkdir("/tmp/readdir-raw-dirents", true)
+                    .expect("create kernel merge dir");
+                vm.kernel
+                    .write_file("/tmp/readdir-raw-dirents/kernel.txt", b"kernel\n".to_vec())
+                    .expect("create kernel merge child");
+            }
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-read-readdir-raw",
+                r#"
+const fs = require("node:fs");
+const dir = "/tmp/readdir-raw-dirents";
+const typed = fs.readdirSync(dir, { withFileTypes: true })
+  .map((entry) => ({
+    name: entry.name,
+    isDirectory: entry.isDirectory(),
+    parentPath: entry.parentPath,
+    path: entry.path,
+  }))
+  .sort((a, b) => a.name.localeCompare(b.name));
+const plain = fs.readdirSync(dir).sort();
+const empty = fs.readdirSync(`${dir}/empty`);
+process.stdout.write(`${JSON.stringify({ plain, typed, empty })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(
+                payload["plain"],
+                json!([
+                    "dir",
+                    "empty",
+                    "file.txt",
+                    "kernel.txt",
+                    "link-dir",
+                    "link-file"
+                ]),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["empty"], json!([]), "stdout: {stdout}");
+            let typed = payload["typed"].as_array().expect("typed entries");
+            let by_name = |name: &str| {
+                typed
+                    .iter()
+                    .find(|entry| entry["name"] == json!(name))
+                    .unwrap_or_else(|| panic!("missing dirent {name}: {typed:?}"))
+            };
+            assert_eq!(by_name("dir")["isDirectory"], json!(true));
+            assert_eq!(by_name("empty")["isDirectory"], json!(true));
+            assert_eq!(by_name("file.txt")["isDirectory"], json!(false));
+            assert_eq!(by_name("kernel.txt")["isDirectory"], json!(false));
+            assert_eq!(by_name("link-dir")["isDirectory"], json!(true));
+            assert_eq!(by_name("link-file")["isDirectory"], json!(false));
+            for entry in typed {
+                assert_eq!(
+                    entry["parentPath"],
+                    json!("/tmp/readdir-raw-dirents"),
+                    "stdout: {stdout}"
+                );
+                assert_eq!(
+                    entry["path"],
+                    json!("/tmp/readdir-raw-dirents"),
+                    "stdout: {stdout}"
+                );
+            }
+        }
+
+        fn javascript_writev_raw_payload_preserves_stream_copy_order() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-writev-stream-copy",
+                r#"
+(async () => {
+  const fs = require("node:fs");
+  const chunkSize = 16 * 1024;
+  const chunkCount = 64;
+  const chunks = [];
+  for (let i = 0; i < chunkCount; i++) {
+    chunks.push(Buffer.alloc(chunkSize, i));
+  }
+  fs.writeFileSync("/tmp/writev-source.bin", Buffer.concat(chunks));
+
+  await new Promise((resolve, reject) => {
+    const reader = fs.createReadStream("/tmp/writev-source.bin", { highWaterMark: chunkSize });
+    const writer = fs.createWriteStream("/tmp/writev-dest.bin", { highWaterMark: chunkSize });
+    reader.on("data", (chunk) => {
+      if (!writer.write(chunk)) {
+        reader.pause();
+        writer.once("drain", () => reader.resume());
+      }
+    });
+    reader.on("error", reject);
+    writer.on("error", reject);
+    reader.on("end", () => writer.end());
+    writer.on("close", resolve);
+  });
+
+	  const copied = fs.readFileSync("/tmp/writev-dest.bin");
+	  const source = fs.readFileSync("/tmp/writev-source.bin");
+	  const makePattern = (size) => {
+	    const buffer = Buffer.alloc(size);
+	    for (let i = 0; i < buffer.length; i++) {
+	      buffer[i] = (i * 31 + 7) & 0xff;
+	    }
+	    return buffer;
+	  };
+	  const readStream = (path, options = {}) => new Promise((resolve, reject) => {
+	    const chunks = [];
+	    const sizes = [];
+	    const reader = fs.createReadStream(path, options);
+	    reader.on("data", (chunk) => {
+	      chunks.push(Buffer.from(chunk));
+	      sizes.push(chunk.length);
+	    });
+	    reader.on("error", reject);
+	    reader.on("end", () => resolve({ buffer: Buffer.concat(chunks), sizes }));
+	  });
+	
+	  const bigSource = makePattern(2 * 1024 * 1024 + 12345);
+	  fs.writeFileSync("/tmp/read-ahead-big.bin", bigSource);
+	  const bigRead = await readStream("/tmp/read-ahead-big.bin", { highWaterMark: 64 * 1024 });
+	  const partialTailSource = makePattern(1024 * 1024 + 17);
+	  fs.writeFileSync("/tmp/read-ahead-tail.bin", partialTailSource);
+	  const partialTailRead = await readStream("/tmp/read-ahead-tail.bin", { highWaterMark: 64 * 1024 });
+	  const rangeStart = 12345;
+	  const rangeEnd = 234567;
+	  const rangeRead = await readStream("/tmp/read-ahead-big.bin", {
+	    start: rangeStart,
+	    end: rangeEnd,
+	    highWaterMark: 7777,
+	  });
+	  const smallSource = makePattern(123);
+	  fs.writeFileSync("/tmp/read-ahead-small.bin", smallSource);
+	  const smallRead = await readStream("/tmp/read-ahead-small.bin", { highWaterMark: 64 * 1024 });
+	  const orderedFd = fs.openSync("/tmp/writev-ordered.txt", "w");
+	  const orderedBytes = fs.writevSync(orderedFd, [
+	    Buffer.from("aa"),
+	    Buffer.from("bb"),
+    Buffer.from("cc"),
+  ]);
+  fs.closeSync(orderedFd);
+
+  const closedFd = fs.openSync("/tmp/writev-closed.txt", "w");
+  fs.closeSync(closedFd);
+  let closedCode = null;
+  try {
+    fs.writevSync(closedFd, [Buffer.from("x")]);
+  } catch (error) {
+    closedCode = error.code;
+  }
+
+  process.stdout.write(`${JSON.stringify({
+    equal: copied.equals(source),
+    size: copied.length,
+	    first: copied[0],
+	    last: copied[copied.length - 1],
+	    bigEqual: bigRead.buffer.equals(bigSource),
+	    bigSize: bigRead.buffer.length,
+	    bigChunks: bigRead.sizes.length,
+	    bigLastChunk: bigRead.sizes[bigRead.sizes.length - 1],
+	    bigFullChunks: bigRead.sizes.slice(0, -1).every((size) => size === 64 * 1024),
+	    partialTailEqual: partialTailRead.buffer.equals(partialTailSource),
+	    partialTailLastChunk: partialTailRead.sizes[partialTailRead.sizes.length - 1],
+	    rangeEqual: rangeRead.buffer.equals(bigSource.subarray(rangeStart, rangeEnd + 1)),
+	    rangeSize: rangeRead.buffer.length,
+	    rangeMaxChunk: Math.max(...rangeRead.sizes),
+	    smallEqual: smallRead.buffer.equals(smallSource),
+	    smallChunks: smallRead.sizes,
+	    ordered: fs.readFileSync("/tmp/writev-ordered.txt", "utf8"),
+	    orderedBytes,
+	    closedCode,
+	  })}\n`);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : String(error));
+  process.exit(1);
+});
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(payload["equal"], json!(true), "stdout: {stdout}");
+            assert_eq!(payload["size"], json!(64 * 16 * 1024), "stdout: {stdout}");
+            assert_eq!(payload["first"], json!(0), "stdout: {stdout}");
+            assert_eq!(payload["last"], json!(63), "stdout: {stdout}");
+            assert_eq!(payload["bigEqual"], json!(true), "stdout: {stdout}");
+            assert_eq!(
+                payload["bigSize"],
+                json!(2 * 1024 * 1024 + 12345),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["bigChunks"], json!(33), "stdout: {stdout}");
+            assert_eq!(payload["bigLastChunk"], json!(12345), "stdout: {stdout}");
+            assert_eq!(payload["bigFullChunks"], json!(true), "stdout: {stdout}");
+            assert_eq!(payload["partialTailEqual"], json!(true), "stdout: {stdout}");
+            assert_eq!(
+                payload["partialTailLastChunk"],
+                json!(17),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["rangeEqual"], json!(true), "stdout: {stdout}");
+            assert_eq!(
+                payload["rangeSize"],
+                json!(234567 - 12345 + 1),
+                "stdout: {stdout}"
+            );
+            assert_eq!(payload["rangeMaxChunk"], json!(7777), "stdout: {stdout}");
+            assert_eq!(payload["smallEqual"], json!(true), "stdout: {stdout}");
+            assert_eq!(payload["smallChunks"], json!([123]), "stdout: {stdout}");
+            assert_eq!(payload["ordered"], json!("aabbcc"), "stdout: {stdout}");
+            assert_eq!(payload["orderedBytes"], json!(6), "stdout: {stdout}");
+            assert_eq!(payload["closedCode"], json!("EBADF"), "stdout: {stdout}");
         }
 
         fn javascript_imports_guest_written_modules_after_miss_work() {
@@ -19916,6 +20204,16 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn javascript_readdir_raw_payload_preserves_dirent_semantics_regression() {
+            run_isolated_service_test("javascript-readdir-raw-dirent-semantics");
+        }
+
+        #[test]
+        fn javascript_writev_raw_payload_preserves_stream_copy_order_regression() {
+            run_isolated_service_test("javascript-writev-stream-copy-order");
+        }
+
+        #[test]
         fn aab_wasm_command_timeout_is_enforced_by_sidecar_poll_path() {
             run_isolated_service_test("wasm-command-timeout");
         }
@@ -20029,6 +20327,12 @@ console.log(JSON.stringify({
                 }
                 "mapped-unlink-kernel-backed-no-resurrect" => {
                     javascript_mapped_unlink_of_kernel_backed_file_does_not_resurrect();
+                }
+                "javascript-readdir-raw-dirent-semantics" => {
+                    javascript_readdir_raw_payload_preserves_dirent_semantics();
+                }
+                "javascript-writev-stream-copy-order" => {
+                    javascript_writev_raw_payload_preserves_stream_copy_order();
                 }
                 "wasm-command-timeout" => {
                     wasm_command_timeout_is_enforced_by_sidecar_poll_path();

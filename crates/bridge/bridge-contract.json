@@ -145,6 +145,7 @@
 				"_fsReadRaw",
 				"fs.writeSync",
 				"_fsWriteRaw",
+				"_fsWritevRaw",
 				"fs.fstatSync",
 				"fs.futimesSync"
 			]
@@ -1078,6 +1079,10 @@
 		},
 		"_fsWriteRaw": {
 			"method": "fs.writeSync",
+			"translateArgs": false
+		},
+		"_fsWritevRaw": {
+			"method": "fs.writevSync",
 			"translateArgs": false
 		}
 	}

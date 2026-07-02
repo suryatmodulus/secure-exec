@@ -125,6 +125,7 @@ const browserUnsupportedContractGlobals = new Set([
 	"_fsReadRaw",
 	"_fsWriteFileBinaryRaw",
 	"_fsWriteRaw",
+	"_fsWritevRaw",
 	"_kernelIsattyRaw",
 	"_kernelTtySizeRaw",
 	"_kernelPollRaw",

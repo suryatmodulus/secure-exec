@@ -1760,27 +1760,15 @@ var WriteStream = class {
             }
           } else {
             const pathStr = typeof this.path === "string" ? this.path : this.path instanceof import_buffer.Buffer ? this.path.toString() : null;
-            if (!pathStr) {
-              if (this.fd !== null && this.fd >= 0) {
-                for (const chunk of this._chunks) {
-                  const bytesWritten = fs.writeSync(
-                    this.fd,
-                    chunk,
-                    0,
-                    chunk.byteLength,
-                    this._position
-                  );
-                  if (typeof this._position === "number") {
-                    this._position += bytesWritten;
-                  }
-                }
-                if (this.autoClose) {
-                  await this._closeUnderlying();
-                }
-              } else {
-                throw createFsError("EBADF", "EBADF: bad file descriptor", "write");
+            if (this.fd !== null && this.fd >= 0) {
+              const bytesWritten = fs.writevSync(this.fd, this._chunks, this._position);
+              if (typeof this._position === "number") {
+                this._position += bytesWritten;
               }
-            } else {
+              if (this.autoClose) {
+                await this._closeUnderlying();
+              }
+            } else if (pathStr) {
               const chunks = this._chunks.map((chunk) => import_buffer.Buffer.from(chunk));
               if (typeof this._position === "number") {
                 const existing = fs.readFileSync(pathStr);
@@ -1805,6 +1793,8 @@ var WriteStream = class {
               if (this.autoClose && this.fd !== null && this.fd >= 0) {
                 await this._closeUnderlying();
               }
+            } else {
+              throw createFsError("EBADF", "EBADF: bad file descriptor", "write");
             }
           }
           this.emit("finish");
@@ -2228,6 +2218,7 @@ var _fdRead = createBridgeSyncFacade("fs.readSync");
 var _fsReadRaw = createBridgeSyncFacade("_fsReadRaw");
 var _fdWrite = createBridgeSyncFacade("fs.writeSync");
 var _fsWriteRaw = createBridgeSyncFacade("_fsWriteRaw");
+var _fsWritevRaw = createBridgeSyncFacade("_fsWritevRaw");
 var _fdFstat = createBridgeSyncFacade("fs.fstatSync");
 var _fdFtruncate = createBridgeSyncFacade("fs.ftruncateSync");
 var _fdFsync = createBridgeSyncFacade("fs.fsyncSync");
@@ -2288,6 +2279,32 @@ function normalizeReaddirEntries(entries, dirPath, withFileTypes) {
     }
     return new Dirent(entry.name, entry.isDirectory, dirPath);
   });
+}
+function decodeRawReaddirEntries(entries, dirPath, withFileTypes) {
+  if (!(entries instanceof Uint8Array)) {
+    return normalizeReaddirEntries(entries, dirPath, withFileTypes);
+  }
+  const decoded = [];
+  let offset = 0;
+  while (offset < entries.byteLength) {
+    if (offset + 5 > entries.byteLength) {
+      throw new Error("Invalid raw readdir payload");
+    }
+    const kind = entries[offset++];
+    const nameLength = entries[offset] | entries[offset + 1] << 8 | entries[offset + 2] << 16 | entries[offset + 3] << 24;
+    offset += 4;
+    if (nameLength < 0 || offset + nameLength > entries.byteLength) {
+      throw new Error("Invalid raw readdir entry");
+    }
+    const name = import_buffer.Buffer.from(
+      entries.buffer,
+      entries.byteOffset + offset,
+      nameLength
+    ).toString("utf8");
+    offset += nameLength;
+    decoded.push(withFileTypes ? new Dirent(name, kind === 1, dirPath) : name);
+  }
+  return decoded;
 }
 async function fsReadFileAsync(path, options) {
   validateEncodingOption(options);
@@ -2502,6 +2519,27 @@ async function fsLutimesAsync(path, atime, mtime) {
     normalizeFsTimeSpec(mtime, "mtime")
   ]);
 }
+function encodeWritevRawPayload(buffers) {
+  let totalBytes = 4;
+  for (const buffer of buffers) {
+    if (buffer.byteLength > 4294967295) {
+      throw createOutOfRangeError("buffer.byteLength", "<= 4294967295", buffer.byteLength);
+    }
+    totalBytes += 4 + buffer.byteLength;
+  }
+  const payload = new Uint8Array(totalBytes);
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  view.setUint32(0, buffers.length, true);
+  let offset = 4;
+  for (const buffer of buffers) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    view.setUint32(offset, bytes.byteLength, true);
+    offset += 4;
+    payload.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  return payload;
+}
 var fs = {
   // Constants
   constants: {
@@ -2639,9 +2677,9 @@ var fs = {
     validateEncodingOption(options);
     const rawPath = normalizePathLike(path);
     const pathStr = rawPath;
-    let entriesJson;
+    let entries;
     try {
-      entriesJson = _fs.readDir.applySyncPromise(void 0, [pathStr]);
+      entries = _fs.readDir.applySyncPromise(void 0, [pathStr]);
     } catch (err) {
       if (bridgeErrorCode(err) === "ENOENT") {
         throw createFsError(
@@ -2653,8 +2691,10 @@ var fs = {
       }
       throw err;
     }
-    const entries = decodeBridgeJson(entriesJson);
-    return normalizeReaddirEntries(entries, rawPath, options?.withFileTypes);
+    if (entries instanceof Uint8Array) {
+      return decodeRawReaddirEntries(entries, rawPath, options?.withFileTypes);
+    }
+    return normalizeReaddirEntries(decodeBridgeJson(entries), rawPath, options?.withFileTypes);
   },
   mkdirSync(path, options) {
     const rawPath = normalizePathLike(path);
@@ -3548,11 +3588,18 @@ var fs = {
       } catch (e) {
         queueMicrotask(() => callback(e));
       }
+    } else {
+      return Promise.resolve(fs.writevSync(normalizedFd, normalizedBuffers, normalizedPosition));
     }
   },
   writevSync(fd, buffers, position) {
     const normalizedFd = normalizeFdInteger(fd);
     const normalizedBuffers = normalizeIoVectorBuffers(buffers);
+    if (hasBridgeSyncFn("_fsWritevRaw")) {
+      const normalizedPosition = normalizeOptionalPosition(position);
+      const payload = encodeWritevRawPayload(normalizedBuffers);
+      return _fsWritevRaw.applySyncPromise(void 0, [normalizedFd, payload, normalizedPosition]);
+    }
     let nextPosition = normalizeOptionalPosition(position);
     let totalBytesWritten = 0;
     for (const buffer of normalizedBuffers) {

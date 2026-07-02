@@ -3359,6 +3359,7 @@ fn spawn_v8_event_bridge(
                     let mut raw_bytes_args = HashMap::new();
                     if sidecar_method == "net.write"
                         || sidecar_method == "fs.writeSync"
+                        || sidecar_method == "fs.writevSync"
                         || sidecar_method == "fs.writeFileSync"
                     {
                         if let Ok(Some(bytes)) = v8_runtime::cbor_payload_raw_byte_arg(&payload, 1)
