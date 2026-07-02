@@ -1147,8 +1147,12 @@ where
         vm_id: &str,
         reason: DisposeReason,
     ) -> Result<Vec<EventFrame>, SidecarError> {
-        blocking_dispatch_runtime()
-            .block_on(self.dispose_vm_internal(connection_id, session_id, vm_id, reason))
+        blocking_dispatch_runtime().block_on(self.dispose_vm_internal(
+            connection_id,
+            session_id,
+            vm_id,
+            reason,
+        ))
     }
 
     pub async fn dispatch(
@@ -1185,7 +1189,9 @@ where
             RequestRoute::GuestFilesystemCall(payload) => {
                 self.guest_filesystem_call(&request, payload).await
             }
-            RequestRoute::GuestKernelCall(payload) => self.guest_kernel_call(&request, payload).await,
+            RequestRoute::GuestKernelCall(payload) => {
+                self.guest_kernel_call(&request, payload).await
+            }
             RequestRoute::SnapshotRootFilesystem(payload) => {
                 self.snapshot_root_filesystem(&request, payload).await
             }

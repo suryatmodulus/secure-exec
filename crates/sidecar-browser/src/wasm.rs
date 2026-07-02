@@ -4,22 +4,21 @@ use crate::{
     BrowserWorkerOsConfig, BrowserWorkerProcessConfig, BrowserWorkerSpawnRequest,
 };
 use base64::Engine;
-use js_sys::{Error as JsError, Function, JSON, Reflect, Uint8Array};
+use js_sys::{Error as JsError, Function, Reflect, Uint8Array, JSON};
 use secure_exec_bridge::{
     BridgeTypes, ChmodRequest, ClockBridge, ClockRequest, CommandPermissionRequest,
     CreateDirRequest, CreateJavascriptContextRequest, CreateWasmContextRequest, DiagnosticRecord,
     DirectoryEntry, EnvironmentAccess, EnvironmentPermissionRequest, EventBridge, ExecutionBridge,
-    ExecutionEvent, ExecutionExited, ExecutionHandleRequest, ExecutionSignal,
-    ExecutionSignalState, FileKind, FileMetadata, FilesystemAccess, FilesystemBridge,
-    FilesystemPermissionRequest, FilesystemSnapshot, FlushFilesystemStateRequest,
-    GuestContextHandle, GuestKernelCall, GuestRuntime, KillExecutionRequest, LifecycleEventRecord,
-    LoadFilesystemStateRequest, LogLevel, LogRecord, NetworkAccess, NetworkPermissionRequest,
-    OutputChunk, PathRequest, PermissionBridge, PermissionDecision, PermissionVerdict,
-    PersistenceBridge, PollExecutionEventRequest, RandomBridge, RandomBytesRequest, ReadDirRequest,
-    ReadFileRequest, RenameRequest, ScheduleTimerRequest, ScheduledTimer,
-    SignalDispositionAction, SignalHandlerRegistration, StartExecutionRequest, StartedExecution,
-    StructuredEventRecord, SymlinkRequest, TruncateRequest, WriteExecutionStdinRequest,
-    WriteFileRequest,
+    ExecutionEvent, ExecutionExited, ExecutionHandleRequest, ExecutionSignal, ExecutionSignalState,
+    FileKind, FileMetadata, FilesystemAccess, FilesystemBridge, FilesystemPermissionRequest,
+    FilesystemSnapshot, FlushFilesystemStateRequest, GuestContextHandle, GuestKernelCall,
+    GuestRuntime, KillExecutionRequest, LifecycleEventRecord, LoadFilesystemStateRequest, LogLevel,
+    LogRecord, NetworkAccess, NetworkPermissionRequest, OutputChunk, PathRequest, PermissionBridge,
+    PermissionDecision, PermissionVerdict, PersistenceBridge, PollExecutionEventRequest,
+    RandomBridge, RandomBytesRequest, ReadDirRequest, ReadFileRequest, RenameRequest,
+    ScheduleTimerRequest, ScheduledTimer, SignalDispositionAction, SignalHandlerRegistration,
+    StartExecutionRequest, StartedExecution, StructuredEventRecord, SymlinkRequest,
+    TruncateRequest, WriteExecutionStdinRequest, WriteFileRequest,
 };
 use secure_exec_sidecar_protocol::wire::WasmPermissionTier;
 use serde_json::{json, Value};
@@ -107,7 +106,9 @@ impl BrowserJsBridge {
         let function = Reflect::get(host, &JsValue::from_str(method))
             .map_err(format_js_error)?
             .dyn_into::<Function>()
-            .map_err(|_| format!("browser sidecar host bridge method {method} is not a function"))?;
+            .map_err(|_| {
+                format!("browser sidecar host bridge method {method} is not a function")
+            })?;
         let request = serde_json::to_string(&request)
             .map_err(|error| format!("serialize {method} request: {error}"))?;
         function
@@ -150,7 +151,9 @@ fn format_js_error(error: JsValue) -> String {
     {
         return message;
     }
-    error.as_string().unwrap_or_else(|| String::from("JavaScript error"))
+    error
+        .as_string()
+        .unwrap_or_else(|| String::from("JavaScript error"))
 }
 
 fn js_value_to_json(value: JsValue) -> Result<Value, String> {
@@ -240,7 +243,11 @@ fn directory_entries_from_json(value: Value) -> Result<Vec<DirectoryEntry>, Stri
 }
 
 fn permission_decision_from_json(value: Value) -> Result<PermissionDecision, String> {
-    let verdict = match value.get("verdict").and_then(Value::as_str).unwrap_or("deny") {
+    let verdict = match value
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("deny")
+    {
         "allow" => PermissionVerdict::Allow,
         "deny" => PermissionVerdict::Deny,
         "prompt" => PermissionVerdict::Prompt,
@@ -397,8 +404,12 @@ fn execution_event_from_json(value: Value) -> Result<Option<ExecutionEvent>, Str
         return Ok(None);
     }
     match value.get("type").and_then(Value::as_str).unwrap_or("") {
-        "stdout" => Ok(Some(ExecutionEvent::Stdout(output_chunk_from_json(&value)?))),
-        "stderr" => Ok(Some(ExecutionEvent::Stderr(output_chunk_from_json(&value)?))),
+        "stdout" => Ok(Some(ExecutionEvent::Stdout(output_chunk_from_json(
+            &value,
+        )?))),
+        "stderr" => Ok(Some(ExecutionEvent::Stderr(output_chunk_from_json(
+            &value,
+        )?))),
         "exited" => Ok(Some(ExecutionEvent::Exited(ExecutionExited {
             vm_id: get_string(&value, "vmId")?,
             execution_id: get_string(&value, "executionId")?,
@@ -483,7 +494,10 @@ impl BridgeTypes for BrowserJsBridge {
 
 impl FilesystemBridge for BrowserJsBridge {
     fn read_file(&mut self, request: ReadFileRequest) -> Result<Vec<u8>, Self::Error> {
-        self.call_bytes("readFile", json!({ "vmId": request.vm_id, "path": request.path }))
+        self.call_bytes(
+            "readFile",
+            json!({ "vmId": request.vm_id, "path": request.path }),
+        )
     }
 
     fn write_file(&mut self, request: WriteFileRequest) -> Result<(), Self::Error> {
@@ -550,7 +564,10 @@ impl FilesystemBridge for BrowserJsBridge {
     }
 
     fn read_link(&mut self, request: PathRequest) -> Result<String, Self::Error> {
-        get_string(&self.call_json("readLink", path_request(request))?, "targetPath")
+        get_string(
+            &self.call_json("readLink", path_request(request))?,
+            "targetPath",
+        )
     }
 
     fn chmod(&mut self, request: ChmodRequest) -> Result<(), Self::Error> {
@@ -640,10 +657,7 @@ impl PersistenceBridge for BrowserJsBridge {
         &mut self,
         request: LoadFilesystemStateRequest,
     ) -> Result<Option<FilesystemSnapshot>, Self::Error> {
-        let value = self.call_json(
-            "loadFilesystemState",
-            json!({ "vmId": request.vm_id }),
-        )?;
+        let value = self.call_json("loadFilesystemState", json!({ "vmId": request.vm_id }))?;
         if value.is_null() {
             return Ok(None);
         }

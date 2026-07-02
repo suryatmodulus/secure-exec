@@ -2,8 +2,8 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroI32;
 use std::ffi::c_void;
+use std::num::NonZeroI32;
 use std::time::Instant;
 
 // ── Module-load read/compile split (opt-in via AGENTOS_MODULE_TRACE=1) ──
@@ -106,10 +106,7 @@ pub fn inject_globals(
     // its initialization (whatwg-url/webidl-conversions uses it).
 }
 
-pub fn install_high_resolution_time_global(
-    scope: &mut v8::HandleScope,
-    origin: *const Instant,
-) {
+pub fn install_high_resolution_time_global(scope: &mut v8::HandleScope, origin: *const Instant) {
     let context = scope.get_current_context();
     let global = context.global(scope);
     let external = v8::External::new(scope, origin as *mut c_void);
@@ -3609,7 +3606,11 @@ export const file = new File([], "empty.txt");
                 "1700000000000"
             );
             assert_eq!(
-                eval(&mut isolate, &context, "_processConfig.high_resolution_time"),
+                eval(
+                    &mut isolate,
+                    &context,
+                    "_processConfig.high_resolution_time"
+                ),
                 "true"
             );
             assert_eq!(

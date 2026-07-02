@@ -1066,10 +1066,10 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map(|fd| json!(fd))
                 .map_err(|error| kernel_path_error("fs.open", path, error))
         }
-        "fs.read" | "fs.readSync" => service_javascript_fs_read_sync_rpc(
-            kernel, process, kernel_pid, request,
-        )
-        .map(|bytes| javascript_sync_rpc_bytes_value(&bytes)),
+        "fs.read" | "fs.readSync" => {
+            service_javascript_fs_read_sync_rpc(kernel, process, kernel_pid, request)
+                .map(|bytes| javascript_sync_rpc_bytes_value(&bytes))
+        }
         "fs.write" | "fs.writeSync" => {
             let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem write fd")?;
             let contents = if let Some(bytes) = request.raw_bytes_args.get(&1) {

@@ -36,8 +36,8 @@ use secure_exec_sidecar_core::{
 use secure_exec_sidecar_protocol::protocol::{
     FindBoundUdpRequest, FindListenerRequest, GuestFilesystemCallRequest,
     GuestFilesystemResultResponse, GuestKernelCallRequest, GuestKernelResultResponse,
-    ProjectedModuleDescriptor, RegisterHostCallbacksRequest,
-    RootFilesystemEntry, SignalDispositionAction as ProtocolSignalDispositionAction,
+    ProjectedModuleDescriptor, RegisterHostCallbacksRequest, RootFilesystemEntry,
+    SignalDispositionAction as ProtocolSignalDispositionAction,
     SignalHandlerRegistration as ProtocolSignalHandlerRegistration, SocketStateEntry,
     WasmPermissionTier,
 };
@@ -1821,7 +1821,6 @@ fn is_unspecified_socket_host(host: &str) -> bool {
 fn is_loopback_socket_host(host: &str) -> bool {
     host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
 }
-
 
 impl<B> BrowserExtensionHost for BrowserSidecar<B>
 where

@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -3717,12 +3717,15 @@ impl LocalBridgeState {
             return;
         };
 
-        TimerWheel::get().schedule(delay_ms, TimerAction::StreamEvent {
-            session,
-            timer_id,
-            generation,
-            timers,
-        });
+        TimerWheel::get().schedule(
+            delay_ms,
+            TimerAction::StreamEvent {
+                session,
+                timer_id,
+                generation,
+                timers,
+            },
+        );
     }
 
     fn clear_kernel_timer(&self, timer_id: u64) {
@@ -3746,13 +3749,16 @@ impl LocalBridgeState {
         let generation = 0;
         let timers = self.timers.clone();
 
-        TimerWheel::get().schedule(delay_ms, TimerAction::BridgeResponse {
-            session,
-            call_id,
-            timer_id,
-            generation,
-            timers,
-        });
+        TimerWheel::get().schedule(
+            delay_ms,
+            TimerAction::BridgeResponse {
+                session,
+                call_id,
+                timer_id,
+                generation,
+                timers,
+            },
+        );
     }
 
     fn has_module_reader(&self) -> bool {

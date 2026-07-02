@@ -247,7 +247,9 @@ pub fn permissions_policy_config_from_wire(
             .process
             .map(legacy_pattern_permission_scope_config),
         env: permissions.env.map(legacy_pattern_permission_scope_config),
-        binding: permissions.binding.map(legacy_pattern_permission_scope_config),
+        binding: permissions
+            .binding
+            .map(legacy_pattern_permission_scope_config),
     }
 }
 

@@ -4,11 +4,10 @@ use secure_exec_sidecar_protocol::protocol::{
     CreateLayerRequest, CreateOverlayRequest, CreateVmRequest, DisposeVmRequest, ExecuteRequest,
     ExportSnapshotRequest, ExtEnvelope, FindBoundUdpRequest, FindListenerRequest,
     GetProcessSnapshotRequest, GetResourceSnapshotRequest, GetSignalStateRequest,
-    GetZombieTimerCountRequest,
-    GuestFilesystemCallRequest, GuestKernelCallRequest, ImportSnapshotRequest, KillProcessRequest,
-    LinkPackageRequest, OpenSessionRequest, OwnershipScope, RegisterHostCallbacksRequest,
-    RequestFrame, RequestPayload, ResizePtyRequest, SealLayerRequest, SnapshotRootFilesystemRequest,
-    VmFetchRequest, WriteStdinRequest,
+    GetZombieTimerCountRequest, GuestFilesystemCallRequest, GuestKernelCallRequest,
+    ImportSnapshotRequest, KillProcessRequest, LinkPackageRequest, OpenSessionRequest,
+    OwnershipScope, RegisterHostCallbacksRequest, RequestFrame, RequestPayload, ResizePtyRequest,
+    SealLayerRequest, SnapshotRootFilesystemRequest, VmFetchRequest, WriteStdinRequest,
 };
 use secure_exec_sidecar_protocol::wire as generated_wire;
 

@@ -486,7 +486,7 @@ fn run_node_fanout_phases() -> Vec<(&'static str, u128)> {
             Command::new("node")
                 .args(["-e", "process.exit(0)"])
                 .spawn()
-            .expect("spawn node failed"),
+                .expect("spawn node failed"),
         );
     }
     let spawn_ns = elapsed_ns(spawn_start);

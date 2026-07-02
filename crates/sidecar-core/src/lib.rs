@@ -30,9 +30,8 @@ pub use diagnostics::{
 pub use frames::{
     authenticated_response, bound_udp_snapshot_response, event, layer_created_response,
     layer_sealed_response, listener_snapshot_response, overlay_created_response,
-    package_linked_response,
-    process_exited_event, process_killed_response, process_output_event, process_snapshot_response,
-    process_started_response, reject, respond, response_with_ownership,
+    package_linked_response, process_exited_event, process_killed_response, process_output_event,
+    process_snapshot_response, process_started_response, reject, respond, response_with_ownership,
     root_filesystem_bootstrapped_response, root_filesystem_snapshot_response,
     session_opened_response, signal_state_response, snapshot_exported_response,
     snapshot_imported_response, stdin_closed_response, stdin_written_response,

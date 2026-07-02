@@ -64,4 +64,3 @@ pub(crate) fn discover_command_guest_paths(kernel: &mut SidecarKernel) -> BTreeM
 
     command_guest_paths
 }
-

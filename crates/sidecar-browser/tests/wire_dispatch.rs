@@ -596,7 +596,8 @@ fn browser_wire_dispatcher_handles_lifecycle_and_execution_frames() {
             .poll_event_bytes()
             .expect("poll event")
             .expect("event should be encoded");
-        let ProtocolFrame::EventFrame(event) = codec.decode_message(&event).expect("decode event") else {
+        let ProtocolFrame::EventFrame(event) = codec.decode_message(&event).expect("decode event")
+        else {
             panic!("expected event frame");
         };
         if let secure_exec_sidecar_protocol::wire::EventPayload::ProcessOutputEvent(output) =
@@ -622,7 +623,8 @@ fn browser_wire_dispatcher_handles_lifecycle_and_execution_frames() {
             .poll_event_bytes()
             .expect("poll guest request event")
             .expect("guest request event should be encoded");
-        let ProtocolFrame::EventFrame(event) = codec.decode_message(&event).expect("decode event") else {
+        let ProtocolFrame::EventFrame(event) = codec.decode_message(&event).expect("decode event")
+        else {
             panic!("expected event frame");
         };
         if let secure_exec_sidecar_protocol::wire::EventPayload::StructuredEvent(event) =

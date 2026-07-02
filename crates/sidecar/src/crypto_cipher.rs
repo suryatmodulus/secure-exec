@@ -149,15 +149,15 @@ impl AesCtrStream {
         }
         let invalid = |_| CipherError::new("Invalid key/IV length for AES-CTR");
         Ok(match bits {
-            AesBits::A128 => {
-                AesCtrStream::A128(ctr::Ctr128BE::<Aes128>::new_from_slices(key, iv).map_err(invalid)?)
-            }
-            AesBits::A192 => {
-                AesCtrStream::A192(ctr::Ctr128BE::<Aes192>::new_from_slices(key, iv).map_err(invalid)?)
-            }
-            AesBits::A256 => {
-                AesCtrStream::A256(ctr::Ctr128BE::<Aes256>::new_from_slices(key, iv).map_err(invalid)?)
-            }
+            AesBits::A128 => AesCtrStream::A128(
+                ctr::Ctr128BE::<Aes128>::new_from_slices(key, iv).map_err(invalid)?,
+            ),
+            AesBits::A192 => AesCtrStream::A192(
+                ctr::Ctr128BE::<Aes192>::new_from_slices(key, iv).map_err(invalid)?,
+            ),
+            AesBits::A256 => AesCtrStream::A256(
+                ctr::Ctr128BE::<Aes256>::new_from_slices(key, iv).map_err(invalid)?,
+            ),
         })
     }
 
@@ -388,12 +388,14 @@ fn cbc_finalize(mut state: CbcState) -> Result<Vec<u8>> {
 fn strip_pkcs7(block: &[u8]) -> Result<Vec<u8>> {
     let pad = *block
         .last()
-        .ok_or_else(|| CipherError::new("empty block during unpad"))?
-        as usize;
+        .ok_or_else(|| CipherError::new("empty block during unpad"))? as usize;
     if pad == 0 || pad > AES_BLOCK_LEN || pad > block.len() {
         return Err(CipherError::new("bad decrypt (invalid PKCS#7 padding)"));
     }
-    if block[block.len() - pad..].iter().any(|&byte| byte as usize != pad) {
+    if block[block.len() - pad..]
+        .iter()
+        .any(|&byte| byte as usize != pad)
+    {
         return Err(CipherError::new("bad decrypt (invalid PKCS#7 padding)"));
     }
     Ok(block[..block.len() - pad].to_vec())
@@ -402,15 +404,15 @@ fn strip_pkcs7(block: &[u8]) -> Result<Vec<u8>> {
 fn gcm_cipher(bits: AesBits, key: &[u8]) -> Result<GcmAead> {
     let invalid = |_| CipherError::new("Invalid key length for AES-GCM");
     Ok(match bits {
-        AesBits::A128 => {
-            GcmAead::A128(Box::new(AesGcm::<Aes128, U12>::new_from_slice(key).map_err(invalid)?))
-        }
-        AesBits::A192 => {
-            GcmAead::A192(Box::new(AesGcm::<Aes192, U12>::new_from_slice(key).map_err(invalid)?))
-        }
-        AesBits::A256 => {
-            GcmAead::A256(Box::new(AesGcm::<Aes256, U12>::new_from_slice(key).map_err(invalid)?))
-        }
+        AesBits::A128 => GcmAead::A128(Box::new(
+            AesGcm::<Aes128, U12>::new_from_slice(key).map_err(invalid)?,
+        )),
+        AesBits::A192 => GcmAead::A192(Box::new(
+            AesGcm::<Aes192, U12>::new_from_slice(key).map_err(invalid)?,
+        )),
+        AesBits::A256 => GcmAead::A256(Box::new(
+            AesGcm::<Aes256, U12>::new_from_slice(key).map_err(invalid)?,
+        )),
     })
 }
 
@@ -421,12 +423,7 @@ enum GcmAead {
 }
 
 impl GcmAead {
-    fn encrypt_detached(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        buffer: &mut Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    fn encrypt_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut Vec<u8>) -> Result<Vec<u8>> {
         let nonce = GenericArray::from_slice(nonce);
         let tag = match self {
             GcmAead::A128(c) => c.encrypt_in_place_detached(nonce, aad, buffer),
@@ -502,7 +499,8 @@ mod tests {
         plaintext: &[u8],
     ) -> (Vec<u8>, Option<Vec<u8>>) {
         let mut session =
-            StreamCipherSession::new(algorithm, key, Some(iv), false, true, None, None, 16).unwrap();
+            StreamCipherSession::new(algorithm, key, Some(iv), false, true, None, None, 16)
+                .unwrap();
         let mut out = session.update(plaintext).unwrap();
         let fin = session.finalize().unwrap();
         out.extend_from_slice(&fin.data);
@@ -600,9 +598,17 @@ mod tests {
         let (ciphertext, tag) = encrypt_all("aes-256-gcm", &key, &iv, b"payload");
         let mut tag = tag.unwrap();
         tag[0] ^= 0xff;
-        let mut session =
-            StreamCipherSession::new("aes-256-gcm", &key, Some(&iv), true, true, None, Some(&tag), 16)
-                .unwrap();
+        let mut session = StreamCipherSession::new(
+            "aes-256-gcm",
+            &key,
+            Some(&iv),
+            true,
+            true,
+            None,
+            Some(&tag),
+            16,
+        )
+        .unwrap();
         session.update(&ciphertext).unwrap();
         assert!(session.finalize().is_err());
     }
