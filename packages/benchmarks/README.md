@@ -47,6 +47,7 @@ Run one matrix family:
 
 ```bash
 BENCH_FAMILIES=fs pnpm --dir packages/benchmarks bench:matrix
+BENCH_FAMILIES=modules pnpm --dir packages/benchmarks bench:matrix
 BENCH_FAMILIES=ecosystem pnpm --dir packages/benchmarks bench:matrix
 ```
 
@@ -125,6 +126,19 @@ Rows:
 - **`tcp_concurrent_4`**: four concurrent TCP loopback clients connect to one server.
 - **`tcp_throughput_64k`**: TCP loopback echo of one 64 KiB payload.
 - **`tcp_tiny_writes_16`**: TCP loopback echo using sixteen one-byte writes.
+
+## Modules Family
+
+`BENCH_FAMILIES=modules pnpm --dir packages/benchmarks bench:matrix` runs JavaScript module-resolution and import-heavy rows through the host Node and guest VM lanes. Native and WASM lanes are unsupported because module resolution is a JS-runtime surface.
+
+These rows cap the default matrix sample budget at five measured iterations plus one warmup so each row still loads 100 unique files per iteration without making debug-sidecar runs impractical.
+
+Rows:
+
+- **`require_100_small`**: stages 100 unique tiny CommonJS files per warmup/measured iteration, then requires that iteration's directory and verifies the exported-value sum.
+- **`import_100_small_esm`**: stages 100 unique tiny ESM files per warmup/measured iteration, then dynamic-imports that iteration's directory and verifies the exported-value sum.
+- **`import_npm_package`**: dynamic-imports `zod@4.3.6` from the workspace `node_modules` tree mounted read-only in the guest. The inspected static ESM graph from `index.js` contains 76 transitive module files. The benchmark uses one fresh Node process per measured iteration so the whole graph reloads instead of only cache-busting the entry URL.
+- **`import_fresh_file`**: moved from `fs/module_import_fresh`; writes a unique `.mjs` file, dynamic-imports it, verifies the exported value, and unlinks it.
 
 ## Ecosystem Family
 

@@ -101,6 +101,9 @@ function causeFor(family: string, op: string): string {
 	if (family === "fs") {
 		return "single sync filesystem bridge/VFS round trip floor on tiny filesystem operations";
 	}
+	if (family === "modules") {
+		return "module resolution, source loading, and import cache behavior in the guest JavaScript runtime";
+	}
 	if (family === "pipes") {
 		return "stdio pipe bytes cross synchronous bridge boundaries";
 	}

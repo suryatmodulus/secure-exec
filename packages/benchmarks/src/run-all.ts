@@ -259,18 +259,20 @@ async function runOneOp(
 	baseVmOptions: BenchVmOptions,
 	sharedVm: BenchVm | undefined,
 ): Promise<LatencyResult> {
+	const iterations = Math.min(ITERATIONS, op.maxIterations ?? ITERATIONS);
+	const warmup = Math.min(WARMUP, op.maxWarmup ?? WARMUP);
 	if ("runHostCmd" in op) {
 		if (op.skipReason) return skippedCommandOpResult(op);
-		const hostCmd = await runCommandHostLayer(op, ITERATIONS, WARMUP);
+		const hostCmd = await runCommandHostLayer(op, iterations, warmup);
 		const vmCmd = await withOpVm(op, baseVmOptions, sharedVm, (vm) =>
-			runCommandVmLayer(op, vm, ITERATIONS, WARMUP),
+			runCommandVmLayer(op, vm, iterations, warmup),
 		);
 		return buildCommandOpResult(op, hostCmd, vmCmd);
 	}
 
-	const hostSamples = await runOpHostLayers(op, ITERATIONS, WARMUP);
+	const hostSamples = await runOpHostLayers(op, iterations, warmup);
 	const vmSamples = await withOpVm(op, baseVmOptions, sharedVm, (vm, context) =>
-		runOpVmLayers(op, vm, ITERATIONS, WARMUP, context),
+		runOpVmLayers(op, vm, iterations, warmup, context),
 	);
 	return buildOpResult(op, hostSamples, vmSamples);
 }

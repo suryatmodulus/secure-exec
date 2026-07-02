@@ -83,6 +83,8 @@ export interface BenchmarkOp {
 		warmup: number,
 		context?: unknown,
 	) => Promise<number[]>;
+	maxIterations?: number;
+	maxWarmup?: number;
 	prepareVm?: () => Promise<{
 		options?: BenchVmOptions;
 		context?: unknown;
@@ -97,6 +99,8 @@ export interface CommandBenchmarkOp {
 	fileLine: string;
 	reproducer: string;
 	skipReason?: string;
+	maxIterations?: number;
+	maxWarmup?: number;
 	runHostCmd: (iters: number, warmup: number) => Promise<number[]> | number[];
 	runVmCmd: (
 		vm: BenchVm,

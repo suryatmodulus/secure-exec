@@ -1,15 +1,5 @@
 import type { BenchmarkOp } from "../lib/layers.js";
 
-/**
- * Filesystem differential ops.
- *
- * Requested but not shipped:
- *   - module_import_fresh: guest dynamic import cannot resolve a freshly written
- *     file, even when written beside the running benchmark module. Verbatim
- *     smoke error: `Cannot resolve module 'file:///tmp/fuzz-perf-import-1-0-929830bf8caa7.mjs'
- *     (imported from '/tmp/fuzz-perf-fs-module_import_fresh.mjs'): not found.`
- */
-
 export const fsFamily: BenchmarkOp[] = [
 	{
 		family: "fs",
@@ -47,23 +37,6 @@ export const fsFamily: BenchmarkOp[] = [
 		program: `async (i) => {
   const fs = await import("node:fs");
   fs.writeFileSync("/tmp/fuzz-perf-write.txt", "hello-" + i);
-}`,
-	},
-	{
-		family: "fs",
-		name: "module_import_fresh",
-		nativeUnsupportedReason: "dynamic import of guest-written JavaScript module",
-		wasmUnsupportedReason: "dynamic import of guest-written JavaScript module",
-		fileLine: "crates/execution/src/javascript.rs:3939",
-		reproducer: "write a unique /tmp .mjs file, dynamic-import it, and verify the exported value",
-		program: `async (i) => {
-  const fs = await import("node:fs");
-  const value = "fresh-" + process.pid + "-" + i;
-  const path = "/tmp/fuzz-perf-import-" + process.pid + "-" + i + ".mjs";
-  fs.writeFileSync(path, "export const value = " + JSON.stringify(value) + ";\\n");
-  const mod = await import("file://" + path);
-  if (mod.value !== value) throw new Error("bad fresh import");
-  fs.unlinkSync(path);
 }`,
 	},
 	{
