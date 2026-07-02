@@ -60,6 +60,8 @@ BENCH_FAMILIES=net BENCH_OP_FILTER=tls_loopback_get pnpm --dir packages/benchmar
 
 The latency matrix gives each guest-backed benchmark op a dedicated sidecar and VM by default. Host-only lanes (`native`, `node`, and `hostCmd`) run before that VM is created; guest-backed lanes (`guest`, `wasm`, and `vmCmd`) run inside the op's VM, which is disposed before the next op.
 
+Each row also reports peak memory where the lane can be measured. Guest-backed lanes (`guest`, `wasm`, and `vmCmd`) use Linux `/proc/<sidecarPid>/clear_refs=5`, then subtract baseline `VmRSS` from post-lane `VmHWM` so the value is above the prewarmed-sidecar baseline. Native and default host Node lanes spawn the measured child directly and sample `/proc/<pid>/status` `VmHWM`, minus a startup no-op baseline (`native-baseline cpu_loop --iters 1 --warmup 0` and `node -e ""`), floored to one page. Non-Linux runs print one reason and render memory columns as `-`.
+
 Warmup contract:
 
 - **Guest Node prewarm**: `prewarmBenchVm(vm, op)` runs one trivial guest Node program to force isolate creation, bridge snapshot load, and first-exec paths before timed sampling.

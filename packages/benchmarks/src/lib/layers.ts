@@ -11,7 +11,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { NativeOp } from "./native.js";
-import { runNativeLayer } from "./native.js";
+import { runNativeLayerMeasured } from "./native.js";
+import {
+	NODE_MEMORY_PROVENANCE,
+	SidecarPeakMemorySampler,
+	hostPeakMemorySupportReason,
+	pageSizeBytes,
+	runCommandWithMaxRss,
+	type LaneMemory,
+} from "./memory.js";
 import { nowMs, round, stats, type Stats } from "./perf-utils.js";
 import type { BenchVm, BenchVmOptions } from "./vm.js";
 
@@ -44,11 +52,18 @@ export interface LayerSamples {
 	wasm?: number[];
 }
 
+export interface LayerSampleSet {
+	samples: number[];
+	memory?: LaneMemory;
+}
+
+export type LayerStatsEntry = Stats & Partial<LaneMemory>;
+
 export interface LayerStats {
-	native?: Stats;
-	node: Stats;
-	guest: Stats;
-	wasm?: Stats;
+	native?: LayerStatsEntry;
+	node: LayerStatsEntry;
+	guest: LayerStatsEntry;
+	wasm?: LayerStatsEntry;
 }
 
 export interface BenchmarkOp {
@@ -105,6 +120,7 @@ export interface OpResult {
 		emulation: number;
 		total?: number;
 		wasm?: number;
+		mem?: number;
 	};
 }
 
@@ -116,11 +132,12 @@ export interface CommandOpResult {
 	skipped?: true;
 	skipReason?: string;
 	layers: {
-		hostCmd?: Stats;
-		vmCmd?: Stats;
+		hostCmd?: LayerStatsEntry;
+		vmCmd?: LayerStatsEntry;
 	};
 	tax: {
 		command?: number;
+		mem?: number;
 	};
 }
 
@@ -209,6 +226,50 @@ export function runNodeProgram(
 			maxBuffer: 128 * 1024 * 1024,
 		});
 		return JSON.parse(stdout).samples;
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+export async function runNodeProgramMeasured(
+	source: string,
+	iters: number,
+	warmup: number,
+): Promise<LayerSampleSet> {
+	const dir = mkdtempSync(join(tmpdir(), "secure-exec-fuzz-perf-node-"));
+	const file = join(dir, "bench.mjs");
+	try {
+		writeFileSync(file, source);
+		const env = {
+			...process.env,
+			BENCH_ITERATIONS: String(iters),
+			BENCH_WARMUP: String(warmup),
+		};
+		const timed =
+			hostPeakMemorySupportReason() === undefined
+				? await runCommandWithMaxRss("node", [file], {
+						env,
+						maxBuffer: 128 * 1024 * 1024,
+					})
+				: undefined;
+		const stdout =
+			timed?.stdout ??
+			execFileSync("node", [file], {
+				encoding: "utf8",
+				env,
+				maxBuffer: 128 * 1024 * 1024,
+			});
+		return {
+			samples: JSON.parse(stdout).samples,
+			...(timed
+				? {
+						memory: {
+							memBytes: await subtractNodeStartupBaseline(timed.maxRssBytes),
+							memProvenance: NODE_MEMORY_PROVENANCE,
+						},
+					}
+				: {}),
+		};
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -331,13 +392,13 @@ export async function runWasmLayer(
 }
 
 export interface OpHostSamples {
-	native?: number[];
-	node: number[];
+	native?: LayerSampleSet;
+	node: LayerSampleSet;
 }
 
 export interface OpVmSamples {
-	guest: number[];
-	wasm?: number[];
+	guest: LayerSampleSet;
+	wasm?: LayerSampleSet;
 }
 
 export async function runOpHostLayers(
@@ -345,10 +406,16 @@ export async function runOpHostLayers(
 	iters: number,
 	warmup: number,
 ): Promise<OpHostSamples> {
-	const native = op.nativeOp ? runNativeLayer(op.nativeOp, iters, warmup) : undefined;
+	const native = op.nativeOp
+		? await runNativeLayerMeasured(op.nativeOp, iters, warmup)
+		: undefined;
 	const node = op.runNode
-		? await op.runNode(iters, warmup)
-		: runNodeProgram(timedProgram(op.program ?? "() => {}", op.setup), iters, warmup);
+		? { samples: await op.runNode(iters, warmup) }
+		: await runNodeProgramMeasured(
+				timedProgram(op.program ?? "() => {}", op.setup),
+				iters,
+				warmup,
+			);
 	return {
 		...(native ? { native } : {}),
 		node,
@@ -362,18 +429,23 @@ export async function runOpVmLayers(
 	warmup: number,
 	context?: unknown,
 ): Promise<OpVmSamples> {
-	const guest = op.runGuest
-		? await op.runGuest(vm, iters, warmup, context)
-		: await runGuestProgram(
-				vm,
-				timedProgram(op.program ?? "() => {}", op.setup),
-				iters,
-				warmup,
-				`${op.family}-${op.name}`,
-			);
+	const sampler = SidecarPeakMemorySampler.forVm(vm);
+	const guest = await measureWithSidecarPeak(sampler, () =>
+		op.runGuest
+			? op.runGuest(vm, iters, warmup, context)
+			: runGuestProgram(
+					vm,
+					timedProgram(op.program ?? "() => {}", op.setup),
+					iters,
+					warmup,
+					`${op.family}-${op.name}`,
+				),
+	);
 	const wasm =
 		op.nativeOp && !op.wasmUnsupportedReason
-			? await runWasmLayer(vm, op.nativeOp, iters, warmup)
+			? await measureOptionalWithSidecarPeak(sampler, () =>
+					runWasmLayer(vm, op.nativeOp!, iters, warmup),
+				)
 			: undefined;
 	return {
 		guest,
@@ -387,10 +459,10 @@ export function buildOpResult(
 	vmSamples: OpVmSamples,
 ): OpResult {
 	const layers = {
-		...(hostSamples.native ? { native: stats(hostSamples.native) } : {}),
-		node: stats(hostSamples.node),
-		guest: stats(vmSamples.guest),
-		...(vmSamples.wasm ? { wasm: stats(vmSamples.wasm) } : {}),
+		...(hostSamples.native ? { native: statsWithMemory(hostSamples.native) } : {}),
+		node: statsWithMemory(hostSamples.node),
+		guest: statsWithMemory(vmSamples.guest),
+		...(vmSamples.wasm ? { wasm: statsWithMemory(vmSamples.wasm) } : {}),
 	};
 	return {
 		family: op.family,
@@ -408,6 +480,9 @@ export function buildOpResult(
 			...(layers.native ? { total: round(layers.guest.p50 / layers.native.p50) } : {}),
 			...(layers.wasm && layers.native
 				? { wasm: round(layers.wasm.p50 / layers.native.p50) }
+				: {}),
+			...(layers.guest.memBytes !== undefined && layers.native?.memBytes !== undefined
+				? { mem: round(layers.guest.memBytes / layers.native.memBytes) }
 				: {}),
 		},
 	};
@@ -430,8 +505,8 @@ export async function runCommandHostLayer(
 	op: CommandBenchmarkOp,
 	iters: number,
 	warmup: number,
-): Promise<Stats> {
-	return stats(await op.runHostCmd(iters, warmup));
+): Promise<LayerStatsEntry> {
+	return statsWithMemory({ samples: await op.runHostCmd(iters, warmup) });
 }
 
 export async function runCommandVmLayer(
@@ -439,14 +514,18 @@ export async function runCommandVmLayer(
 	vm: BenchVm,
 	iters: number,
 	warmup: number,
-): Promise<Stats> {
-	return stats(await op.runVmCmd(vm, iters, warmup));
+): Promise<LayerStatsEntry> {
+	const sampler = SidecarPeakMemorySampler.forVm(vm);
+	const measured = await measureWithSidecarPeak(sampler, () =>
+		op.runVmCmd(vm, iters, warmup),
+	);
+	return statsWithMemory(measured);
 }
 
 export function buildCommandOpResult(
 	op: CommandBenchmarkOp,
-	hostCmd: Stats,
-	vmCmd: Stats,
+	hostCmd: LayerStatsEntry,
+	vmCmd: LayerStatsEntry,
 ): CommandOpResult {
 	return {
 		family: op.family,
@@ -456,6 +535,64 @@ export function buildCommandOpResult(
 		layers: { hostCmd, vmCmd },
 		tax: {
 			command: round(vmCmd.p50 / hostCmd.p50),
+			...(vmCmd.memBytes !== undefined && hostCmd.memBytes !== undefined
+				? { mem: round(vmCmd.memBytes / hostCmd.memBytes) }
+				: {}),
 		},
+	};
+}
+
+let nodeStartupMaxRssBytes: number | undefined;
+
+export async function primeNodeMemoryBaseline(): Promise<number | undefined> {
+	if (hostPeakMemorySupportReason()) return undefined;
+	if (nodeStartupMaxRssBytes !== undefined) return nodeStartupMaxRssBytes;
+	nodeStartupMaxRssBytes = (
+		await runCommandWithMaxRss("node", ["-e", ""], {
+			maxBuffer: 128 * 1024 * 1024,
+		})
+	).maxRssBytes;
+	return nodeStartupMaxRssBytes;
+}
+
+async function subtractNodeStartupBaseline(opMaxRssBytes: number): Promise<number> {
+	const baseline = (await primeNodeMemoryBaseline()) ?? 0;
+	return Math.max(opMaxRssBytes - baseline, pageSizeBytes());
+}
+
+async function measureWithSidecarPeak<T extends number[] | undefined>(
+	sampler: SidecarPeakMemorySampler | undefined,
+	fn: () => Promise<T> | T,
+): Promise<LayerSampleSet> {
+	if (!sampler) {
+		return { samples: (await fn()) ?? [] };
+	}
+	const measured = await sampler.measure(fn);
+	return {
+		samples: measured.value ?? [],
+		...(measured.memory ? { memory: measured.memory } : {}),
+	};
+}
+
+async function measureOptionalWithSidecarPeak(
+	sampler: SidecarPeakMemorySampler | undefined,
+	fn: () => Promise<number[] | undefined>,
+): Promise<LayerSampleSet | undefined> {
+	if (!sampler) {
+		const samples = await fn();
+		return samples ? { samples } : undefined;
+	}
+	const measured = await sampler.measure(fn);
+	if (!measured.value) return undefined;
+	return {
+		samples: measured.value,
+		...(measured.memory ? { memory: measured.memory } : {}),
+	};
+}
+
+function statsWithMemory(sampleSet: LayerSampleSet): LayerStatsEntry {
+	return {
+		...stats(sampleSet.samples),
+		...(sampleSet.memory ? sampleSet.memory : {}),
 	};
 }

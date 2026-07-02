@@ -289,9 +289,21 @@ export function formatSidecarProvenance(
 }
 
 function sidecarPidFromRuntime(runtime: NodeRuntime): number | null {
-	const pid = (runtime as unknown as {
-		kernel?: { client?: { child?: { pid?: number } } };
-	}).kernel?.client?.child?.pid;
+	const kernel = (runtime as unknown as {
+		kernel?: {
+			client?: {
+				child?: { pid?: number };
+				protocolClient?: {
+					child?: { pid?: number };
+					sidecarProcess?: { child?: { pid?: number } };
+				};
+			};
+		};
+	}).kernel;
+	const pid =
+		kernel?.client?.child?.pid ??
+		kernel?.client?.protocolClient?.child?.pid ??
+		kernel?.client?.protocolClient?.sidecarProcess?.child?.pid;
 	return typeof pid === "number" ? pid : null;
 }
 

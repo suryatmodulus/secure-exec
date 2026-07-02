@@ -54,6 +54,7 @@ Every bound that protects a shared resource — memory/heap, CPU/wall-clock, fd/
 ## Benchmarks
 
 - **Purpose:** `packages/benchmarks` owns the differential matrix for the runtime surface. It compares four lanes: native (host Rust `crates/native-baseline`), node (host Node.js), vm-js (guest V8 Node emulation), and vm-wasm (`native-baseline` compiled to `wasm32-wasip1` and run in the VM). `guest/node` is JS-emulation tax, `wasm/native` is WASM-runtime tax, and `node/native` is Node's own cost.
+- **Memory columns:** matrix rows carry `mem`/`memTax` columns, with guest-backed lanes measured above the prewarmed-sidecar baseline.
 - **Ecosystem family:** `BENCH_FAMILIES=ecosystem` is command-pair only: `hostCmd` (host binary) vs `vmCmd` (VM WASM command), with `tax.command = vmCmd/hostCmd`.
 - **Layout:** matrix families and the lane engine live in `packages/benchmarks/src`; Rust op implementations live in `crates/native-baseline` and build for both host and wasm. Run one family with `BENCH_FAMILIES=fs pnpm --dir packages/benchmarks bench:matrix` or through `bash packages/benchmarks/run-benchmarks.sh`; results land in `packages/benchmarks/results/`.
 - **Verify work:** every op must verify its payload or side effect, so a fast-but-broken path fails instead of passing.

@@ -11,10 +11,12 @@ import {
 	skippedCommandOpResult,
 	supportsWasmLayer,
 	wasmLayerOptions,
+	primeNodeMemoryBaseline,
 	type BenchmarkOp,
 	type CommandBenchmarkOp,
 	type LatencyResult,
 } from "./lib/layers.js";
+import { primeNativeMemoryBaseline } from "./lib/native.js";
 import {
 	createBenchVm,
 	formatSidecarProvenance,
@@ -27,6 +29,12 @@ import {
 } from "./lib/vm.js";
 import { findingsFromLatency, refutedFromLatency, writeJson } from "./lib/report.js";
 import { getHardware, printTable } from "./lib/perf-utils.js";
+import {
+	SidecarPeakMemorySampler,
+	formatBytes,
+	hostPeakMemorySupportReason,
+	procPeakMemorySupportReason,
+} from "./lib/memory.js";
 import { runFuzz } from "./fuzz/run.js";
 import { runLeakSuite } from "./leak.js";
 import { runFootprint } from "./footprint.js";
@@ -87,6 +95,8 @@ export async function runLatencyMatrix(): Promise<LatencyMatrixRun> {
 		const filteredOps = OP_FILTER
 			? ops.filter((op) => OP_FILTER.includes(op.name) || OP_FILTER.includes(`${op.family}/${op.name}`))
 			: ops;
+		await primeMemoryBaselines(filteredOps);
+		await runIdleVmMemorySelfCheck(baseVmOptions);
 		for (const op of filteredOps) {
 			console.error(`latency ${op.family}/${op.name}`);
 			if (!("runHostCmd" in op) && op.nativeOp && supportsWasmLayer(op.nativeOp)) {
@@ -175,6 +185,13 @@ async function main(): Promise<void> {
 			"hostCmd p50",
 			"vmCmd p50",
 			"vm/host",
+			"native mem",
+			"node mem",
+			"guest mem",
+			"wasm mem",
+			"hostCmd mem",
+			"vmCmd mem",
+			"memTax",
 		],
 		latency.map((result) => {
 			if (isLayerOpResult(result)) {
@@ -194,6 +211,13 @@ async function main(): Promise<void> {
 					"-",
 					"-",
 					"-",
+					formatBytes(result.layers.native?.memBytes),
+					formatBytes(result.layers.node.memBytes),
+					formatBytes(result.layers.guest.memBytes),
+					formatBytes(result.layers.wasm?.memBytes),
+					"-",
+					"-",
+					result.tax.mem ?? "-",
 				];
 			}
 			return [
@@ -206,6 +230,13 @@ async function main(): Promise<void> {
 				result.layers.hostCmd ? `${result.layers.hostCmd.p50}ms` : "-",
 				result.layers.vmCmd ? `${result.layers.vmCmd.p50}ms` : "-",
 				result.tax.command ?? result.skipReason ?? "-",
+				"-",
+				"-",
+				"-",
+				"-",
+				formatBytes(result.layers.hostCmd?.memBytes),
+				formatBytes(result.layers.vmCmd?.memBytes),
+				result.tax.mem ?? "-",
 			];
 		}),
 	);
@@ -284,6 +315,60 @@ function mergeBenchVmOptions(
 			...(extra.loopbackExemptPorts ?? []),
 		],
 	};
+}
+
+async function primeMemoryBaselines(
+	ops: Array<BenchmarkOp | CommandBenchmarkOp>,
+): Promise<void> {
+	const hostReason = hostPeakMemorySupportReason();
+	if (hostReason) {
+		console.error(`host memory columns disabled: ${hostReason}`);
+	} else {
+		if (ops.some((op) => !("runHostCmd" in op) && op.nativeOp)) {
+			const nativeBaseline = await primeNativeMemoryBaseline();
+			console.error(`native memory startup baseline: ${formatBytes(nativeBaseline)}`);
+		}
+		if (ops.some((op) => !("runHostCmd" in op) && !op.runNode)) {
+			const nodeBaseline = await primeNodeMemoryBaseline();
+			console.error(`node memory startup baseline: ${formatBytes(nodeBaseline)}`);
+		}
+	}
+
+	const procReason = procPeakMemorySupportReason();
+	if (procReason) {
+		console.error(`guest/vm memory columns disabled: ${procReason}`);
+	}
+}
+
+async function runIdleVmMemorySelfCheck(
+	baseVmOptions: BenchVmOptions,
+): Promise<void> {
+	const reason = procPeakMemorySupportReason();
+	if (reason) {
+		console.error(`idle prewarmed VM memory self-check skipped: ${reason}`);
+		return;
+	}
+	const vm = await createBenchVm(baseVmOptions);
+	try {
+		await prewarmBenchVm(vm, {
+			family: "self_check",
+			name: "idle_prewarmed_vm",
+			fileLine: "packages/benchmarks/src/run-all.ts",
+			reproducer: "prewarm VM, clear_refs=5, wait 2s, read VmHWM - baseline VmRSS",
+		});
+		const sampler = SidecarPeakMemorySampler.forVm(vm);
+		if (!sampler) {
+			console.error("idle prewarmed VM memory self-check skipped: sidecar pid unavailable");
+			return;
+		}
+		const memory = await sampler.measureIdle(2_000);
+		const warning = memory.memBytes > 2 * 1024 * 1024 ? " WARN >2MiB" : "";
+		console.error(
+			`idle prewarmed VM op memory self-check: ${formatBytes(memory.memBytes)} (${memory.memBytes} bytes)${warning}`,
+		);
+	} finally {
+		await vm.dispose();
+	}
 }
 
 function criticGaps(
