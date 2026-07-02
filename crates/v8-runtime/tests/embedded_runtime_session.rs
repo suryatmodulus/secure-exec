@@ -64,6 +64,7 @@ fn dispatch_execute(
             userland_code: String::new(),
             high_resolution_time: false,
             user_code: user_code.to_owned(),
+            wasm_module_bytes: None,
         },
     })
 }

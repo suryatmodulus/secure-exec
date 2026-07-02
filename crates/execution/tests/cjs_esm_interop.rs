@@ -84,6 +84,7 @@ fn run_guest_result(
             argv: vec![String::from(entrypoint)],
             env,
             cwd: fixture.root().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");

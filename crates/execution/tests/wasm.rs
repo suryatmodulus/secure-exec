@@ -952,22 +952,30 @@ fn wasm_snapshot_runner_block_round_trips_twice() {
         context.context_id.clone(),
         temp.path(),
         Vec::new(),
-        BTreeMap::new(),
+        BTreeMap::from([(String::from("AGENTOS_WASM_WARMUP_DEBUG"), String::from("1"))]),
         WasmPermissionTier::Full,
     );
     assert_eq!(first_exit, 0, "stderr={first_stderr}");
     assert_eq!(first_stdout, "hello\n");
+    assert!(
+        !first_stderr.contains("decodeBase64ToUint8Array"),
+        "raw module bytes path should not base64-decode: {first_stderr}"
+    );
 
     let (second_stdout, second_stderr, second_exit) = run_wasm_execution(
         &mut engine,
         context.context_id,
         temp.path(),
         Vec::new(),
-        BTreeMap::new(),
+        BTreeMap::from([(String::from("AGENTOS_WASM_WARMUP_DEBUG"), String::from("1"))]),
         WasmPermissionTier::Full,
     );
     assert_eq!(second_exit, 0, "stderr={second_stderr}");
     assert_eq!(second_stdout, "hello\n");
+    assert!(
+        !second_stderr.contains("decodeBase64ToUint8Array"),
+        "raw module bytes path should not base64-decode: {second_stderr}"
+    );
 }
 
 fn phase_calls(path: &Path, stage: &str) -> u64 {
@@ -1117,15 +1125,19 @@ fn wasm_snapshot_runner_off_fallback_matches_inline() {
         context.context_id,
         temp.path(),
         Vec::new(),
-        BTreeMap::new(),
+        BTreeMap::from([(String::from("AGENTOS_WASM_WARMUP_DEBUG"), String::from("1"))]),
         WasmPermissionTier::Full,
     );
 
     assert_eq!(exit_code, 0, "stderr={stderr}");
     assert_eq!(stdout, "hello\n");
+    assert!(
+        !stderr.contains("decodeBase64ToUint8Array"),
+        "raw module bytes path should not base64-decode: {stderr}"
+    );
 }
 
-fn wasm_module_base64_cache_invalidates_when_file_changes() {
+fn wasm_module_bytes_cache_invalidates_when_file_changes() {
     assert_node_available();
     let _mode = EnvVarGuard::set_value("AGENTOS_WASM_SNAPSHOT_RUNNER", "block");
 
@@ -2742,7 +2754,7 @@ fn wasm_suite() {
     wasm_snapshot_runner_warm_worker_pool_disabled_falls_back();
     wasm_snapshot_runner_warm_hint_mismatch_falls_back();
     wasm_snapshot_runner_off_fallback_matches_inline();
-    wasm_module_base64_cache_invalidates_when_file_changes();
+    wasm_module_bytes_cache_invalidates_when_file_changes();
     wasm_execution_supports_fd_fdstat_set_flags();
     wasm_execution_ignores_guest_overrides_for_internal_node_env();
     wasm_execution_freezes_wasi_clock_time();

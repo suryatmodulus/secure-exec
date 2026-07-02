@@ -135,20 +135,20 @@ fn run_snapshot_script(
     scope: &mut v8::HandleScope,
     code: &str,
     label: &str,
-    eager: bool,
+    eager_compile: bool,
 ) -> Result<(), String> {
     let try_catch = &mut v8::TryCatch::new(scope);
     let source = match v8::String::new(try_catch, code) {
         Some(source) => source,
         None => return Err(format!("failed to create V8 string for {label}")),
     };
-    // NOTE(perf, measured 2026-07-02): EagerCompile was a wash while isolate
-    // creation stayed on the per-exec critical path: user_code_execute dropped
-    // 8.9ms -> 7.9ms on the wasm-runner floor, but the fatter blob made
-    // isolate_new 4.0ms -> 7.4ms per exec. Warm workers now prepay snapshot
-    // deserialization off-path, so only userland-bearing snapshots opt into
-    // eager compilation to cut user_code_execute.
-    let script = if eager {
+    // NOTE(perf, measured 2026-07-02): EagerCompile moves cost into the snapshot
+    // blob: user_code_execute dropped 8.9ms -> 7.9ms on the wasm-runner floor,
+    // but isolate_new rose 4.0ms -> 7.4ms when isolate creation was still
+    // per-exec. Parked warm workers now prepay snapshot deserialization off-path,
+    // so only the userland script opts into eager compilation; bridge code and
+    // userland prep stay lazy.
+    let script = if eager_compile {
         let resource_name = v8::String::new(try_catch, label).unwrap();
         let origin = v8::ScriptOrigin::new(
             try_catch,

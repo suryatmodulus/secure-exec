@@ -1159,6 +1159,21 @@ fn defer_session_command_before_slot(
     false
 }
 
+#[cfg(not(test))]
+fn install_wasm_module_bytes_global<'s>(scope: &mut v8::HandleScope<'s>, bytes: &[u8]) -> bool {
+    let global = scope.get_current_context().global(scope);
+    let Some(name) = v8::String::new(scope, "__agentOSWasmModuleBytes") else {
+        return false;
+    };
+    let len = bytes.len();
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_bytes(bytes.to_vec());
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store.make_shared());
+    let Some(bytes_value) = v8::Uint8Array::new(scope, array_buffer, 0, len) else {
+        return false;
+    };
+    global.set(scope, name.into(), bytes_value.into()).is_some()
+}
+
 /// Session thread: acquires a concurrency slot, defers V8 isolate creation
 /// to first Execute (when bridge code is known for snapshot lookup), and
 /// processes commands until shutdown.
@@ -1345,6 +1360,7 @@ fn session_thread(
                     userland_code,
                     high_resolution_time,
                     user_code,
+                    wasm_module_bytes,
                 } => {
                     // `userland_code` is consumed only by the non-test snapshot
                     // path below; keep it bound (without a warning) under `test`.
@@ -1352,6 +1368,8 @@ fn session_thread(
                     let _ = &userland_code;
                     #[cfg(test)]
                     let _ = high_resolution_time;
+                    #[cfg(test)]
+                    let _ = &wasm_module_bytes;
                     #[cfg(not(test))]
                     {
                         let session_id = session_id.clone();
@@ -1601,6 +1619,32 @@ fn session_thread(
                                         message: e.message,
                                         stack: e.stack,
                                         code: e.code.unwrap_or_default(),
+                                    }),
+                                };
+                                send_event_with_generation(
+                                    &event_tx,
+                                    output_generation,
+                                    result_frame,
+                                );
+                                continue;
+                            }
+                        }
+
+                        if let Some(wasm_module_bytes) = wasm_module_bytes.as_ref() {
+                            let scope = &mut v8::HandleScope::new(iso);
+                            let ctx = v8::Local::new(scope, &exec_context);
+                            let scope = &mut v8::ContextScope::new(scope, ctx);
+                            if !install_wasm_module_bytes_global(scope, wasm_module_bytes) {
+                                let result_frame = RuntimeEvent::ExecutionResult {
+                                    session_id,
+                                    exit_code: 1,
+                                    exports: None,
+                                    error: Some(ExecutionErrorBin {
+                                        error_type: "Error".into(),
+                                        message: "failed to install __agentOSWasmModuleBytes"
+                                            .into(),
+                                        stack: String::new(),
+                                        code: String::new(),
                                     }),
                                 };
                                 send_event_with_generation(

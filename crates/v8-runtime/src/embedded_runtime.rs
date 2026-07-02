@@ -305,6 +305,7 @@ impl EmbeddedV8SessionHandle {
         userland_code: String,
         high_resolution_time: bool,
         user_code: String,
+        wasm_module_bytes: Option<Arc<Vec<u8>>>,
     ) -> io::Result<()> {
         validate_execute_mode(mode)?;
         self.runtime.dispatch(RuntimeCommand::SendToSession {
@@ -317,6 +318,7 @@ impl EmbeddedV8SessionHandle {
                 userland_code,
                 high_resolution_time,
                 user_code,
+                wasm_module_bytes,
             },
         })
     }

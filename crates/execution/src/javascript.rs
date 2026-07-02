@@ -531,6 +531,9 @@ pub struct StartJavascriptExecutionRequest {
     /// still go through the normal require() wrapper so Node-style globals such
     /// as __filename and __dirname are initialized correctly.
     pub inline_code: Option<String>,
+    /// Optional raw WASM module bytes to expose to the runner isolate for this
+    /// execution.
+    pub wasm_module_bytes: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2397,6 +2400,7 @@ impl JavascriptExecutionEngine {
                 snapshot_userland_code,
                 request.guest_runtime.high_resolution_time,
                 user_code,
+                request.wasm_module_bytes.clone(),
             )
             .map_err(JavascriptExecutionError::Spawn)?;
         registration_guard.disarm();
@@ -7191,6 +7195,7 @@ mod tests {
                 v8_heap_limit_mb: Some(64),
                 sync_rpc_wait_timeout_ms: Some(2_000),
             },
+            wasm_module_bytes: None,
             inline_code: None,
         };
 
@@ -7216,6 +7221,7 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             cwd: std::path::PathBuf::from("/tmp"),
             limits: JavascriptExecutionLimits::default(),
+            wasm_module_bytes: None,
             inline_code: None,
         };
 
@@ -7560,6 +7566,7 @@ mod tests {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: std::path::PathBuf::from("/tmp"),
+            wasm_module_bytes: None,
             inline_code: None,
         };
 
@@ -7589,6 +7596,7 @@ mod tests {
                 argv: vec![String::from("./entry.mjs")],
                 env: BTreeMap::new(),
                 cwd: temp.path().to_path_buf(),
+                wasm_module_bytes: None,
                 inline_code: Some(String::from("globalThis.__agentOSDropCleanup = true;")),
             })
             .expect("start JavaScript execution");

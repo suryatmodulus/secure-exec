@@ -2538,6 +2538,7 @@ fn run_native_sample(
         argv: vec![String::from(scenario.entrypoint)],
         env: scenario_env(workspace, scenario),
         cwd: workspace.root.clone(),
+        wasm_module_bytes: None,
         inline_code: None,
     })?;
     let startup_ms = startup_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -2665,6 +2666,7 @@ fn measure_transport_rtt(
             String::from("1"),
         )]),
         cwd: workspace.root.clone(),
+        wasm_module_bytes: None,
         inline_code: None,
     })?;
 

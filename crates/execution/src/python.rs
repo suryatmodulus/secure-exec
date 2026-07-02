@@ -1075,6 +1075,7 @@ fn start_python_javascript_execution(
             // Forward the guest-runtime identity so the runner's shim sets
             // process.* from typed config rather than env.
             guest_runtime: request.guest_runtime.clone(),
+            wasm_module_bytes: None,
             inline_code: Some(inline_code),
         })
         .map_err(map_javascript_error)

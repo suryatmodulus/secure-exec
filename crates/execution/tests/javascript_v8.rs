@@ -773,6 +773,7 @@ fn javascript_execution_uses_v8_runtime_without_spawning_guest_node_binary() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from("globalThis.__secureExecRanInV8 = true;")),
         })
         .expect("start JavaScript execution");
@@ -836,6 +837,7 @@ fn javascript_execution_virtual_os_identity_comes_from_guest_runtime_not_env() {
                 ),
             ]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import os from "node:os";
@@ -892,6 +894,7 @@ fn javascript_execution_virtualizes_process_metadata_for_inline_v8_code() {
                 ),
             ]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 if (process.argv[1] !== "/root/entry.mjs") throw new Error(`argv=${process.argv[1]}`);
@@ -929,6 +932,7 @@ fn javascript_execution_process_kill_rejects_invalid_pid_in_guest_js() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 try {
@@ -982,6 +986,7 @@ fn javascript_execution_preserves_binary_process_stdio_writes() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 process.stdout.write(Buffer.from([0x00, 0xbc, 0xff, 0x41]));
@@ -1015,6 +1020,7 @@ fn javascript_execution_intl_number_format_does_not_require_host_icu() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const formatter = new Intl.NumberFormat("en", {
@@ -1058,6 +1064,7 @@ fn javascript_execution_to_locale_date_string_does_not_crash_embedded_v8() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const formatted = new Date(Date.UTC(2020, 0, 15)).toLocaleDateString("en-GB", {
@@ -1112,6 +1119,7 @@ fn javascript_execution_stream_consumers_text_reads_live_stdin() {
                 String::from("1"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { text } from "node:stream/consumers";
@@ -1159,6 +1167,7 @@ fn javascript_execution_process_stdin_async_iterator_finishes_with_live_stdin() 
                 String::from("1"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 let body = "";
@@ -1207,6 +1216,7 @@ fn javascript_execution_process_exit_from_live_stdin_listener_exits_without_wait
                 String::from("1"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 process.stdin.setEncoding("utf8");
@@ -1273,6 +1283,7 @@ fn javascript_execution_process_exit_ignores_live_interval_handles() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 process.stdout.write("before exit\n");
@@ -1329,6 +1340,7 @@ fn javascript_execution_process_exit_bypasses_promise_catch_handlers() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 Promise.resolve()
@@ -1374,6 +1386,7 @@ fn javascript_execution_live_stdin_replays_end_after_late_listener_registration(
                 String::from("1"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 setTimeout(() => {
@@ -1425,6 +1438,7 @@ fn javascript_execution_file_url_to_path_accepts_guest_absolute_paths() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { fileURLToPath } from "node:url";
@@ -1468,6 +1482,7 @@ fn javascript_execution_imports_node_events_without_hanging() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { EventEmitter, once } from "node:events";
@@ -1512,6 +1527,7 @@ fn javascript_execution_imports_node_process_without_hanging() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import process from "node:process";
@@ -1555,6 +1571,7 @@ fn javascript_execution_imports_node_fs_promises_without_hanging() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import fs from "node:fs/promises";
@@ -1597,6 +1614,7 @@ fn javascript_execution_imports_node_perf_hooks_without_hanging() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { performance } from "node:perf_hooks";
@@ -1654,6 +1672,7 @@ fn javascript_execution_high_resolution_time_opt_in_enables_sub_ms_hrtime() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 if (typeof __secureExecHrNowUs !== "function") {
@@ -1701,6 +1720,7 @@ fn javascript_execution_high_resolution_time_default_off_keeps_coarse_clock() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 if (typeof __secureExecHrNowUs !== "undefined") {
@@ -1741,6 +1761,7 @@ fn javascript_execution_exposes_compatibility_shims_and_denies_escape_builtins()
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { createRequire } from "node:module";
@@ -1844,6 +1865,7 @@ console.log(JSON.stringify({
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -1876,6 +1898,7 @@ fn javascript_execution_provides_async_hooks_and_diagnostics_channel_stubs() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { createRequire } from "node:module";
@@ -2020,6 +2043,7 @@ if (JSON.stringify(searchPaths) !== JSON.stringify(expectedPaths)) {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { createRequire } from "node:module";
@@ -2093,6 +2117,7 @@ fn javascript_execution_rejects_native_node_addons() {
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 let rejected = false;
@@ -2146,6 +2171,7 @@ fs.statSync("/workspace/note.txt");
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -2226,6 +2252,7 @@ if (summary.rinfo.address !== "127.0.0.1" || summary.rinfo.port !== 7) {
                 String::from("[\"dgram\"]"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -2355,6 +2382,7 @@ fn javascript_execution_strips_hashbang_from_module_entrypoints() {
             argv: vec![String::from("./index.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -2432,6 +2460,7 @@ fn javascript_execution_resolves_pnpm_store_dependencies_from_symlinked_entrypoi
             argv: vec![String::from("/root/node_modules/pkg/dist/index.js")],
             env: BTreeMap::from([(String::from("AGENTOS_GUEST_PATH_MAPPINGS"), guest_mappings)]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -2510,6 +2539,7 @@ fn javascript_execution_resolves_dependencies_from_package_specific_symlink_moun
             argv: vec![String::from("/root/node_modules/pkg/dist/index.js")],
             env: BTreeMap::from([(String::from("AGENTOS_GUEST_PATH_MAPPINGS"), guest_mappings)]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -2557,6 +2587,7 @@ fn javascript_execution_v8_timer_callbacks_fire_and_clear_correctly() {
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 (async () => {
@@ -2678,6 +2709,7 @@ fn javascript_execution_v8_timer_callbacks_fire_and_clear_correctly() {
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 setImmediate(() => {
@@ -2727,6 +2759,7 @@ fn javascript_execution_v8_readline_polyfill_emits_lines() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { EventEmitter } from "node:events";
@@ -2774,6 +2807,7 @@ fn javascript_execution_v8_builtin_wrappers_expose_common_named_exports() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 import { spawn, spawnSync } from "node:child_process";
@@ -2982,6 +3016,7 @@ console.log(JSON.stringify({
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -3020,6 +3055,7 @@ fn javascript_execution_v8_web_stream_globals_support_basic_io() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const writes = [];
@@ -3078,6 +3114,7 @@ fn javascript_execution_v8_text_codec_streams_support_pipe_through() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const {
@@ -3167,6 +3204,7 @@ fn javascript_execution_v8_abort_controller_dispatches_abort() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const controller = new AbortController();
@@ -3207,6 +3245,7 @@ fn javascript_execution_v8_request_accepts_abort_signal() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const controller = new AbortController();
@@ -3249,6 +3288,7 @@ fn javascript_execution_v8_abort_signal_static_helpers_work() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 if (typeof AbortSignal.timeout !== "function") {
@@ -3319,6 +3359,7 @@ fn javascript_execution_v8_schedule_timer_bridge_resolves() {
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 (async () => {
@@ -3363,6 +3404,7 @@ fn javascript_execution_v8_kernel_poll_bridge_requests_multiple_fds() {
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const result = globalThis._kernelPollRaw.applySyncPromise(undefined, [[
@@ -3444,6 +3486,7 @@ fn javascript_execution_v8_crypto_random_sources_use_local_secure_bridge() {
             argv: vec![String::from("./entry.js")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const first = new Uint8Array(32);
@@ -3520,6 +3563,7 @@ fn javascript_execution_v8_load_polyfill_returns_runtime_module_expressions() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const pathExpr = _loadPolyfill.applySyncPromise(undefined, ["path"]);
@@ -3659,6 +3703,7 @@ if (lifecycle.join(",") !== "write,finish,destroy") {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -3720,6 +3765,7 @@ if (!(file instanceof bufferModule.Blob)) {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -3778,6 +3824,7 @@ new tty.WriteStream(1);
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -3825,6 +3872,7 @@ if (typeof sqlite.StatementSync !== "function") {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -3891,6 +3939,7 @@ try {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -3987,6 +4036,7 @@ if (!resolved.endsWith("/entry.cjs")) {
             argv: vec![String::from("./entry.cjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -4082,6 +4132,7 @@ if (!resolved.endsWith("/entry.cjs")) {
             argv: vec![String::from("./entry.cjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(source),
         })
         .expect("start JavaScript execution");
@@ -4122,6 +4173,7 @@ console.log(
             argv: vec![String::from("./entry.cjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(source),
         })
         .expect("start JavaScript execution");
@@ -4187,6 +4239,7 @@ console.log(JSON.stringify(dep));
             argv: vec![String::from("./entry.cjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -4242,6 +4295,7 @@ for (const [name, module] of Object.entries({ http, https })) {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -4297,6 +4351,7 @@ if (isWritable(socket)) {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -4349,6 +4404,7 @@ fn javascript_execution_v8_event_channel_backpressures_instead_of_destroying_ses
             // Inline code avoids host-serviced module-resolution RPCs, so the
             // guest runs autonomously and fills the event channel during the
             // no-drain window below without the host's involvement.
+            wasm_module_bytes: None,
             inline_code: Some(format!(
                 "for (let i = 0; i < {LINE_COUNT}; i++) {{ console.log('LINE:' + i); }}\n"
             )),
@@ -4494,6 +4550,7 @@ console.log("ORDER_OK:" + trace);
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -4605,6 +4662,7 @@ console.log(JSON.stringify({ href, value: module.default.value }));
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start JavaScript execution");
@@ -4642,6 +4700,7 @@ fn javascript_execution_v8_wasm_instantiate_streaming_never_hangs() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const bytes = new Uint8Array([
@@ -4704,6 +4763,7 @@ fn javascript_execution_v8_structured_clone_rebinds_to_sandbox_realm() {
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 const source = new Uint8Array([1, 2, 3, 4]);
@@ -4845,6 +4905,7 @@ fn run_js_runtime_guest(
             argv: vec![String::from("./entry.mjs")],
             env,
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(inline_code.to_owned()),
         })
         .expect("start JavaScript execution");
@@ -5015,6 +5076,7 @@ fn js_runtime_module_resolution_relative_allows_local_denies_bare() {
                 ("AGENTOS_JS_BUILTIN_ALLOWLIST", "[]"),
             ]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
                 const local = await import("./local.mjs");
@@ -5088,6 +5150,7 @@ fn js_runtime_browser_loads_cjs_npm_package() {
                 ("AGENTOS_JS_BUILTIN_ALLOWLIST", "[]"),
             ]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
                 const pkg = await import("demo-pkg");
@@ -5166,6 +5229,7 @@ fn javascript_infinite_loop_is_terminated_by_cpu_watchdog() {
                 String::from("750"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from("while (true) {}\n")),
             limits: Default::default(),
             guest_runtime: Default::default(),
@@ -5249,6 +5313,7 @@ fn javascript_awaiting_guest_is_not_killed_by_cpu_budget() {
                 String::from("300"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 "await new Promise((resolve) => setTimeout(resolve, 1500));\n\
                  console.log('awaited-ok');\n",
@@ -5333,6 +5398,7 @@ fn javascript_default_cpu_budget_allows_short_cpu_work() {
             // ~600ms busy loop: long enough to have tripped the old 30s default's
             // removal is irrelevant, but short enough to always finish; importantly
             // it self-terminates so the test never hangs.
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 "const end = Date.now() + 600;\n\
                  let n = 0;\n\
@@ -5430,6 +5496,7 @@ fn javascript_awaiting_guest_is_terminated_by_wall_clock_backstop() {
                 String::from("300"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 "await new Promise((resolve) => setTimeout(resolve, 1500));\n\
                  console.log('awaited-ok');\n",
@@ -5525,6 +5592,7 @@ fn javascript_cpu_budget_only_does_not_impose_wall_clock_limit() {
                 String::from("300"),
             )]),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 "await new Promise((resolve) => setTimeout(resolve, 1200));\n\
                  console.log('cpu-only-ok');\n",
@@ -5611,6 +5679,7 @@ fn javascript_no_time_limit_when_neither_env_set() {
             cwd: temp.path().to_path_buf(),
             // Awaits ~1.2s, then exits cleanly. Self-terminating so the test cannot
             // hang even if (incorrectly) no limit were enforced.
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 "await new Promise((resolve) => setTimeout(resolve, 1200));\n\
                  console.log('no-limit-ok');\n",
@@ -5703,6 +5772,7 @@ fn javascript_heap_allocation_bomb_is_capped_by_oom_guard() {
             // `AGENTOS_V8_HEAP_LIMIT_MB` env knob).
             env: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
+            wasm_module_bytes: None,
             inline_code: Some(String::from(
                 r#"
 // Grow unbounded; with a 32MB heap cap the OOM guard must terminate the isolate

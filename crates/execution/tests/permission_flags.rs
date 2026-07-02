@@ -104,6 +104,7 @@ fn node_permission_flags_allow_workers_for_internal_javascript_loader_runtime() 
             argv: vec![String::from("./entry.mjs")],
             env: BTreeMap::new(),
             cwd: js_cwd.clone(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start javascript execution without workers")
@@ -123,6 +124,7 @@ fn node_permission_flags_allow_workers_for_internal_javascript_loader_runtime() 
                 String::from("[\"worker_threads\"]"),
             )]),
             cwd: js_cwd,
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start javascript execution with workers")
@@ -181,6 +183,7 @@ fn node_permission_flags_only_propagate_nested_child_capabilities_when_parent_ex
             argv: vec![String::from("./entry.mjs")],
             env: nested_env("0", "0"),
             cwd: js_cwd.clone(),
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start nested javascript execution without inherited permissions")
@@ -197,6 +200,7 @@ fn node_permission_flags_only_propagate_nested_child_capabilities_when_parent_ex
             argv: vec![String::from("./entry.mjs")],
             env: nested_env("1", "1"),
             cwd: js_cwd,
+            wasm_module_bytes: None,
             inline_code: None,
         })
         .expect("start nested javascript execution with inherited permissions")

@@ -94,7 +94,7 @@ const WASM_SYNC_READ_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const WASM_INLINE_RUNNER_ENTRYPOINT: &str = "./__agentos_wasm_runner__.mjs";
 const WASM_SNAPSHOT_RUNNER_ENV: &str = "AGENTOS_WASM_SNAPSHOT_RUNNER";
 const WASM_RUNNER_NO_CACHE_ENV: &str = "AGENTOS_WASM_RUNNER_NO_CACHE";
-const WASM_MODULE_BASE64_CACHE_CAPACITY: usize = 64;
+const WASM_MODULE_BYTES_CACHE_CAPACITY: usize = 64;
 const NODE_WASI_MODULE_SOURCE: &str = include_str!("../assets/runners/wasi-module.js");
 const WASM_SIDECAR_ROUTED_FS_SYNC_METHODS: &[&str] = &[
     "fs.accessSync",
@@ -2206,6 +2206,7 @@ fn start_wasm_javascript_execution(
     request: &StartWasmExecutionRequest,
     options: WasmJavascriptExecutionOptions<'_>,
 ) -> Result<JavascriptExecution, WasmExecutionError> {
+    let wasm_module_bytes = cached_wasm_module_bytes(&resolved_module.resolved_path)?;
     let internal_env = build_wasm_internal_env(
         resolved_module,
         request,
@@ -2221,7 +2222,6 @@ fn start_wasm_javascript_execution(
             env.extend(
                 internal_env
                     .iter()
-                    .filter(|(key, _)| key.as_str() != "AGENTOS_WASM_MODULE_BASE64")
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
             build_wasm_runner_module_source(import_cache, &internal_env, options.warmup_metrics)?
@@ -2276,7 +2276,6 @@ fn start_wasm_javascript_execution(
                 env.extend(
                     internal_env
                         .iter()
-                        .filter(|(key, _)| key.as_str() != "AGENTOS_WASM_MODULE_BASE64")
                         .map(|(key, value)| (key.clone(), value.clone())),
                 );
                 build_wasm_runner_module_source(
@@ -2308,67 +2307,63 @@ fn start_wasm_javascript_execution(
             // process.* from typed config rather than env.
             guest_runtime,
             inline_code: Some(inline_code),
+            wasm_module_bytes: Some(wasm_module_bytes),
         })
         .map_err(map_javascript_error)
 }
 
-struct WasmModuleBase64Cache {
-    entries: HashMap<PathBuf, (String, Arc<String>)>,
+struct WasmModuleBytesCache {
+    entries: HashMap<PathBuf, (String, Arc<Vec<u8>>)>,
 }
 
-fn wasm_module_base64_cache() -> &'static Mutex<WasmModuleBase64Cache> {
-    static CACHE: OnceLock<Mutex<WasmModuleBase64Cache>> = OnceLock::new();
+fn wasm_module_bytes_cache() -> &'static Mutex<WasmModuleBytesCache> {
+    static CACHE: OnceLock<Mutex<WasmModuleBytesCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        Mutex::new(WasmModuleBase64Cache {
+        Mutex::new(WasmModuleBytesCache {
             entries: HashMap::new(),
         })
     })
 }
 
-fn cached_wasm_module_base64(path: &Path) -> Result<Arc<String>, WasmExecutionError> {
+fn cached_wasm_module_bytes(path: &Path) -> Result<Arc<Vec<u8>>, WasmExecutionError> {
     let current_fingerprint = file_fingerprint(path);
     {
-        let cache = wasm_module_base64_cache()
+        let cache = wasm_module_bytes_cache()
             .lock()
-            .expect("wasm module base64 cache lock poisoned");
-        if let Some((fingerprint, encoded)) = cache.entries.get(path) {
+            .expect("wasm module bytes cache lock poisoned");
+        if let Some((fingerprint, bytes)) = cache.entries.get(path) {
             if fingerprint == &current_fingerprint {
-                return Ok(Arc::clone(encoded));
+                return Ok(Arc::clone(bytes));
             }
         }
     }
 
-    let module_bytes = fs::read(path).map_err(WasmExecutionError::PrepareWarmPath)?;
-    let encoded = Arc::new(v8_runtime::base64_encode_pub(&module_bytes));
+    let module_bytes = Arc::new(fs::read(path).map_err(WasmExecutionError::PrepareWarmPath)?);
     let fingerprint = file_fingerprint(path);
-    let mut cache = wasm_module_base64_cache()
+    let mut cache = wasm_module_bytes_cache()
         .lock()
-        .expect("wasm module base64 cache lock poisoned");
-    if !cache.entries.contains_key(path) && cache.entries.len() >= WASM_MODULE_BASE64_CACHE_CAPACITY
+        .expect("wasm module bytes cache lock poisoned");
+    if !cache.entries.contains_key(path) && cache.entries.len() >= WASM_MODULE_BYTES_CACHE_CAPACITY
     {
         if let Some(evicted_path) = cache.entries.keys().next().cloned() {
             cache.entries.remove(&evicted_path);
             tracing::warn!(
                 path = %evicted_path.display(),
-                "evicting cached wasm module base64 entry"
+                "evicting cached wasm module bytes entry"
             );
         }
     }
     cache
         .entries
-        .insert(path.to_path_buf(), (fingerprint, Arc::clone(&encoded)));
-    let cumulative_bytes: usize = cache
-        .entries
-        .values()
-        .map(|(_, encoded)| encoded.len())
-        .sum();
+        .insert(path.to_path_buf(), (fingerprint, Arc::clone(&module_bytes)));
+    let cumulative_bytes: usize = cache.entries.values().map(|(_, bytes)| bytes.len()).sum();
     tracing::debug!(
         path = %path.display(),
-        encoded_bytes = encoded.len(),
+        raw_bytes = module_bytes.len(),
         cumulative_bytes,
-        "cached wasm module base64 entry"
+        "cached wasm module bytes entry"
     );
-    Ok(encoded)
+    Ok(module_bytes)
 }
 
 fn build_wasm_internal_env(
@@ -2394,11 +2389,6 @@ fn build_wasm_internal_env(
     internal_env.insert(
         String::from("AGENTOS_FORWARD_KERNEL_STDIN_RPC"),
         String::from("1"),
-    );
-    let module_base64 = cached_wasm_module_base64(&resolved_module.resolved_path)?;
-    internal_env.insert(
-        String::from("AGENTOS_WASM_MODULE_BASE64"),
-        module_base64.as_ref().clone(),
     );
     internal_env.insert(
         WASM_GUEST_ARGV_ENV.to_string(),

@@ -1,5 +1,6 @@
 use crate::ipc_binary::{BinaryFrame, ExecutionErrorBin};
 use std::io;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WarmSessionHint {
@@ -82,6 +83,7 @@ pub enum SessionMessage {
         userland_code: String,
         high_resolution_time: bool,
         user_code: String,
+        wasm_module_bytes: Option<Arc<Vec<u8>>>,
     },
     BridgeResponse(BridgeResponse),
     StreamEvent(StreamEvent),
@@ -191,6 +193,7 @@ impl TryFrom<BinaryFrame> for RuntimeCommand {
                         userland_code,
                         high_resolution_time,
                         user_code,
+                        wasm_module_bytes: None,
                     },
                 })
             }

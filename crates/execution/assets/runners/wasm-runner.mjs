@@ -687,8 +687,11 @@ function readKernelStdinChunk(maxBytes) {
   }
 }
 
+const rawModuleBytes = globalThis.__agentOSWasmModuleBytes;
 const moduleSource =
-  typeof moduleBase64 === 'string' && moduleBase64.length > 0
+  rawModuleBytes instanceof Uint8Array
+    ? Buffer.from(rawModuleBytes.buffer, rawModuleBytes.byteOffset, rawModuleBytes.byteLength)
+    : typeof moduleBase64 === 'string' && moduleBase64.length > 0
     ? moduleBase64
     : fsModule.readFileSync(resolveModulePath(modulePath));
 const moduleBytes =
