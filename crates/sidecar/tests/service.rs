@@ -912,6 +912,7 @@ ykAheWCsAteSEWVc0w==\n\
                     cwd,
                     limits: Default::default(),
                     inline_code: Some(String::from("")),
+                    wasm_module_bytes: None,
                 })
                 .expect("start javascript execution");
             ActiveExecution::Javascript(execution)
@@ -1319,6 +1320,141 @@ ykAheWCsAteSEWVc0w==\n\
             created_vm_id(response)
         }
 
+        fn registry_command_root() -> PathBuf {
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .expect("canonicalize repo root");
+            let copied = repo_root.join("registry/software/coreutils/wasm");
+            if copied.exists() {
+                return copied;
+            }
+
+            let fallback = repo_root.join("registry/native/target/wasm32-wasip1/release/commands");
+            if fallback.exists() {
+                return fallback;
+            }
+
+            panic!(
+                "registry WASM commands are required for service fs regression tests: expected {} or {}",
+                copied.display(),
+                fallback.display()
+            );
+        }
+
+        fn configure_registry_command_mount(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            connection_id: &str,
+            session_id: &str,
+            vm_id: &str,
+            request_id: secure_exec_sidecar::protocol::RequestId,
+        ) {
+            let command_root = registry_command_root();
+            sidecar
+                .dispatch_blocking(request(
+                    request_id,
+                    OwnershipScope::vm(connection_id, session_id, vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: vec![MountDescriptor {
+                            guest_path: String::from("/__secure_exec/commands/0"),
+                            read_only: true,
+                            plugin: MountPluginDescriptor {
+                                id: String::from("host_dir"),
+                                config: json!({
+                                    "hostPath": command_root,
+                                    "readOnly": true,
+                                })
+                                .to_string(),
+                            },
+                        }],
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: std::collections::HashMap::new(),
+                        loopback_exempt_ports: Vec::new(),
+                        packages: Vec::new(),
+                        packages_mount_at: String::new(),
+                    }),
+                ))
+                .expect("configure registry command mount");
+        }
+
+        fn run_guest_command(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            connection_id: &str,
+            session_id: &str,
+            next_request_id: &mut secure_exec_sidecar::protocol::RequestId,
+            process_id: &str,
+            command: &str,
+            args: &[&str],
+            env: BTreeMap<String, String>,
+        ) -> (String, String, Option<i32>) {
+            let request_id = *next_request_id;
+            *next_request_id += 1;
+            let response = sidecar
+                .dispatch_blocking(request(
+                    request_id,
+                    OwnershipScope::vm(connection_id, session_id, vm_id),
+                    RequestPayload::Execute(crate::protocol::ExecuteRequest {
+                        process_id: process_id.to_owned(),
+                        command: Some(command.to_owned()),
+                        runtime: None,
+                        entrypoint: None,
+                        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                        env: env.into_iter().collect(),
+                        cwd: None,
+                        wasm_permission_tier: None,
+                    }),
+                ))
+                .expect("dispatch guest command");
+
+            match response.response.payload {
+                ResponsePayload::ProcessStarted(response) => {
+                    assert_eq!(response.process_id, process_id);
+                }
+                other => panic!("unexpected execute response: {other:?}"),
+            }
+
+            drain_process_output(sidecar, vm_id, process_id)
+        }
+
+        fn run_guest_node_eval(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            connection_id: &str,
+            session_id: &str,
+            next_request_id: &mut secure_exec_sidecar::protocol::RequestId,
+            process_id: &str,
+            source: &str,
+        ) -> (String, String, Option<i32>) {
+            run_guest_command(
+                sidecar,
+                vm_id,
+                connection_id,
+                session_id,
+                next_request_id,
+                process_id,
+                "node",
+                &["-e", source],
+                BTreeMap::from([(
+                    String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
+                    String::from("[\"buffer\",\"console\",\"fs\",\"path\"]"),
+                )]),
+            )
+        }
+
+        fn stdout_json(stdout: &str) -> Value {
+            let line = stdout
+                .lines()
+                .rev()
+                .find(|line| line.trim_start().starts_with('{'))
+                .unwrap_or_else(|| panic!("stdout did not contain a JSON object line: {stdout:?}"));
+            serde_json::from_str(line).expect("parse stdout JSON")
+        }
+
         fn run_isolated_service_test(test_name: &str) {
             let current_exe = std::env::current_exe().expect("current service test binary path");
             let status = Command::new(&current_exe)
@@ -1659,6 +1795,7 @@ ykAheWCsAteSEWVc0w==\n\
                     env: env.clone(),
                     cwd: cwd.to_path_buf(),
                     inline_code: None,
+                    wasm_module_bytes: None,
                 })
                 .expect("start fake javascript execution");
 
@@ -2326,6 +2463,7 @@ ykAheWCsAteSEWVc0w==\n\
                     env: BTreeMap::new(),
                     cwd: cwd.to_path_buf(),
                     inline_code: None,
+                    wasm_module_bytes: None,
                 })
                 .expect("start fake javascript execution");
 
@@ -5226,6 +5364,7 @@ ykAheWCsAteSEWVc0w==\n\
                     )]),
                     cwd: cwd.clone(),
                     inline_code: None,
+                    wasm_module_bytes: None,
                 })
                 .expect("start fake javascript execution");
             let kernel_handle = {
@@ -5390,6 +5529,7 @@ ykAheWCsAteSEWVc0w==\n\
                     env: BTreeMap::new(),
                     cwd: cwd.clone(),
                     inline_code: None,
+                    wasm_module_bytes: None,
                 })
                 .expect("start fake javascript execution");
             let kernel_handle = {
@@ -10866,6 +11006,7 @@ await new Promise(() => {});
                     )]),
                     cwd: cwd.clone(),
                     inline_code: None,
+                    wasm_module_bytes: None,
                 })
                 .expect("start fake javascript execution");
 
@@ -11232,6 +11373,7 @@ console.log(
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -11462,6 +11604,322 @@ console.log(
             );
         }
 
+        fn javascript_mapped_shadow_readdir_sees_wasm_created_directory() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+            configure_registry_command_mount(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                next_request_id,
+            );
+            next_request_id += 1;
+
+            let (_stdout, stderr, exit_code) = run_guest_command(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-wasm-mkdir-x",
+                "mkdir",
+                &["/tmp/x"],
+                BTreeMap::new(),
+            );
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+            let client_entries = sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("vm")
+                .kernel
+                .read_dir("/tmp")
+                .expect("client readdir /tmp");
+            assert!(
+                client_entries.iter().any(|entry| entry == "x"),
+                "kernel /tmp entries should include x: {client_entries:?}"
+            );
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-read-x",
+                r#"
+const fs = require("node:fs");
+const entries = fs.readdirSync("/tmp/x");
+const isDirectory = fs.statSync("/tmp/x").isDirectory();
+process.stdout.write(`${JSON.stringify({ entries, isDirectory })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(payload["entries"], json!([]), "stdout: {stdout}");
+            assert_eq!(payload["isDirectory"], json!(true), "stdout: {stdout}");
+        }
+
+        fn javascript_mapped_shadow_readdir_merges_wasm_created_children() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+            configure_registry_command_mount(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                next_request_id,
+            );
+            next_request_id += 1;
+
+            let (_stdout, stderr, exit_code) = run_guest_command(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-wasm-write-y",
+                "sh",
+                &["-c", "mkdir -p /tmp/y && echo hi > /tmp/y/f.txt"],
+                BTreeMap::new(),
+            );
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-read-y",
+                r#"
+const fs = require("node:fs");
+const entries = fs.readdirSync("/tmp/y").sort();
+const text = fs.readFileSync("/tmp/y/f.txt", "utf8");
+process.stdout.write(`${JSON.stringify({ entries, text })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(payload["entries"], json!(["f.txt"]), "stdout: {stdout}");
+            assert_eq!(payload["text"], json!("hi\n"), "stdout: {stdout}");
+        }
+
+        fn javascript_mapped_shadow_readdir_unions_shadow_and_kernel_children() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+            configure_registry_command_mount(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                next_request_id,
+            );
+            next_request_id += 1;
+
+            let (_stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-write-z-a",
+                r#"
+const fs = require("node:fs");
+fs.mkdirSync("/tmp/z", { recursive: true });
+fs.writeFileSync("/tmp/z/a.txt", "a\n");
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+            let (_stdout, stderr, exit_code) = run_guest_command(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-wasm-write-z-b",
+                "sh",
+                &["-c", "echo x > /tmp/z/b.txt"],
+                BTreeMap::new(),
+            );
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-read-z",
+                r#"
+const fs = require("node:fs");
+const entries = fs.readdirSync("/tmp/z").sort();
+process.stdout.write(`${JSON.stringify({ entries })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(
+                payload["entries"],
+                json!(["a.txt", "b.txt"]),
+                "stdout: {stdout}"
+            );
+        }
+
+        // A kernel-backed file (created by a wasm command) unlinked from JS must
+        // stay deleted in the SAME process's merged readdir view and for later
+        // processes — the mapped unlink now mirrors the removal into the kernel,
+        // otherwise the readdir kernel-merge would resurrect it.
+        fn javascript_mapped_unlink_of_kernel_backed_file_does_not_resurrect() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+            configure_registry_command_mount(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                next_request_id,
+            );
+            next_request_id += 1;
+
+            let (_stdout, stderr, exit_code) = run_guest_command(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-wasm-write-w",
+                "sh",
+                &["-c", "mkdir -p /tmp/w && echo hi > /tmp/w/gone.txt"],
+                BTreeMap::new(),
+            );
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-unlink-w",
+                r#"
+const fs = require("node:fs");
+fs.unlinkSync("/tmp/w/gone.txt");
+const entries = fs.readdirSync("/tmp/w").sort();
+process.stdout.write(`${JSON.stringify({ entries })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(payload["entries"], json!([]), "stdout: {stdout}");
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-recheck-w",
+                r#"
+const fs = require("node:fs");
+const entries = fs.readdirSync("/tmp/w").sort();
+process.stdout.write(`${JSON.stringify({ entries })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(payload["entries"], json!([]), "stdout: {stdout}");
+        }
+
+        fn javascript_mapped_shadow_readdir_sees_same_process_shadow_directory() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let mut next_request_id = 4;
+
+            let (stdout, stderr, exit_code) = run_guest_node_eval(
+                &mut sidecar,
+                &vm_id,
+                &connection_id,
+                &session_id,
+                &mut next_request_id,
+                "proc-js-readdir-own-shadow-dir",
+                r#"
+const fs = require("node:fs");
+const dir = "/tmp/fuzz-perf-readdir-32";
+if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+for (let i = 0; i < 3; i++) {
+  const path = `${dir}/${i}.txt`;
+  if (!fs.existsSync(path)) fs.writeFileSync(path, "hi");
+}
+const entries = fs.readdirSync(dir).sort();
+process.stdout.write(`${JSON.stringify({ entries })}\n`);
+"#,
+            );
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            let payload = stdout_json(&stdout);
+            assert_eq!(
+                payload["entries"],
+                json!(["0.txt", "1.txt", "2.txt"]),
+                "stdout: {stdout}"
+            );
+        }
+
         fn javascript_imports_guest_written_modules_after_miss_work() {
             assert_node_available();
 
@@ -11623,6 +12081,7 @@ await new Promise(() => {});
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -13614,6 +14073,7 @@ console.log(JSON.stringify({ lookup, resolve4 }));
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -13806,6 +14266,7 @@ process.exit(0);
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -14507,6 +14968,7 @@ process.exit(0);
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -18082,6 +18544,7 @@ console.log(`BODY:${{body}}`);
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -18753,6 +19216,7 @@ console.log(JSON.stringify({
                 )]),
                 cwd: cwd.clone(),
                 inline_code: None,
+                wasm_module_bytes: None,
             })
             .expect("start fake javascript execution");
 
@@ -18967,6 +19431,7 @@ console.log(JSON.stringify({
                     )]),
                     cwd: cwd.clone(),
                     inline_code: None,
+                    wasm_module_bytes: None,
                 })
                 .expect("start nested SIGCHLD javascript execution");
 
@@ -19426,6 +19891,31 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn javascript_mapped_shadow_readdir_sees_wasm_created_directory_regression() {
+            run_isolated_service_test("mapped-shadow-readdir-wasm-directory");
+        }
+
+        #[test]
+        fn javascript_mapped_shadow_readdir_merges_wasm_created_children_regression() {
+            run_isolated_service_test("mapped-shadow-readdir-wasm-children");
+        }
+
+        #[test]
+        fn javascript_mapped_shadow_readdir_unions_shadow_and_kernel_children_regression() {
+            run_isolated_service_test("mapped-shadow-readdir-shadow-kernel-union");
+        }
+
+        #[test]
+        fn javascript_mapped_shadow_readdir_sees_same_process_shadow_directory_regression() {
+            run_isolated_service_test("mapped-shadow-readdir-same-process-shadow");
+        }
+
+        #[test]
+        fn javascript_mapped_unlink_kernel_backed_no_resurrect_regression() {
+            run_isolated_service_test("mapped-unlink-kernel-backed-no-resurrect");
+        }
+
+        #[test]
         fn aab_wasm_command_timeout_is_enforced_by_sidecar_poll_path() {
             run_isolated_service_test("wasm-command-timeout");
         }
@@ -19524,6 +20014,21 @@ console.log(JSON.stringify({
                 }
                 "javascript-import-fresh" => {
                     javascript_imports_guest_written_modules_after_miss_work();
+                }
+                "mapped-shadow-readdir-wasm-directory" => {
+                    javascript_mapped_shadow_readdir_sees_wasm_created_directory();
+                }
+                "mapped-shadow-readdir-wasm-children" => {
+                    javascript_mapped_shadow_readdir_merges_wasm_created_children();
+                }
+                "mapped-shadow-readdir-shadow-kernel-union" => {
+                    javascript_mapped_shadow_readdir_unions_shadow_and_kernel_children();
+                }
+                "mapped-shadow-readdir-same-process-shadow" => {
+                    javascript_mapped_shadow_readdir_sees_same_process_shadow_directory();
+                }
+                "mapped-unlink-kernel-backed-no-resurrect" => {
+                    javascript_mapped_unlink_of_kernel_backed_file_does_not_resurrect();
                 }
                 "wasm-command-timeout" => {
                     wasm_command_timeout_is_enforced_by_sidecar_poll_path();

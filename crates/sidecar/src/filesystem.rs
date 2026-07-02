@@ -1477,6 +1477,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
             if let Some(MappedRuntimeHostAccess::Writable(mapped_host)) =
                 mapped_runtime_host_path(process, path, false)
             {
+                materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
                 let directory = open_mapped_runtime_beneath(
                     &mapped_host,
                     "fs.readdir",
@@ -1529,6 +1530,19 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                         .map(|meta| meta.is_dir())
                         .unwrap_or(false);
                     typed.insert(name, is_dir);
+                }
+                match kernel.read_dir_with_types_for_process(
+                    EXECUTION_DRIVER_NAME,
+                    kernel_pid,
+                    path,
+                ) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            typed.entry(entry.name).or_insert(entry.is_directory);
+                        }
+                    }
+                    Err(error) if matches!(error.code(), "ENOENT" | "ENOTDIR") => {}
+                    Err(error) => return Err(kernel_error(error)),
                 }
                 for name in mapped_runtime_child_mount_basenames(process, path) {
                     typed.entry(name).or_insert(true);
@@ -1721,6 +1735,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 javascript_sync_rpc_path_arg(process, &request.args, 0, "filesystem exists path")?;
             let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
+                materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
                 let exists = match open_mapped_runtime_beneath(
                     &mapped_host,
                     "fs.exists",
@@ -1746,6 +1761,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
             )?;
             let path = path.as_str();
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
+                materialize_mapped_host_path_from_kernel(kernel, kernel_pid, path, &mapped_host)?;
                 let target = read_mapped_runtime_link(&mapped_host, path, "fs.readlink")?;
                 return Ok(Value::String(target.to_string_lossy().into_owned()));
             }
@@ -1836,15 +1852,22 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
                     let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.rmdir")?;
                     let host_path = parent.host_path.join(&parent.child_name);
-                    return mapped_child_remove_dir(&parent)
-                        .map(|()| Value::Null)
-                        .map_err(|error| {
-                            SidecarError::Io(format!(
-                                "failed to remove mapped guest directory {} -> {}: {error}",
-                                path,
-                                host_path.display()
-                            ))
-                        });
+                    mapped_child_remove_dir(&parent).map_err(|error| {
+                        SidecarError::Io(format!(
+                            "failed to remove mapped guest directory {} -> {}: {error}",
+                            path,
+                            host_path.display()
+                        ))
+                    })?;
+                    // Mirror the deletion into the kernel for the same reason as
+                    // fs.unlink below: readdir/stat merge kernel state, so a
+                    // kernel-backed directory would otherwise resurrect.
+                    if let Err(error) = kernel.remove_dir(path) {
+                        if error.code() != "ENOENT" {
+                            return Err(kernel_error(error));
+                        }
+                    }
+                    return Ok(Value::Null);
                 }
                 Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
                     return Err(read_only_mapped_runtime_host_path_error(path));
@@ -1864,15 +1887,24 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
                     let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.unlink")?;
                     let host_path = parent.host_path.join(&parent.child_name);
-                    return mapped_child_remove_file(&parent)
-                        .map(|()| Value::Null)
-                        .map_err(|error| {
-                            SidecarError::Io(format!(
-                                "failed to remove mapped guest file {} -> {}: {error}",
-                                path,
-                                host_path.display()
-                            ))
-                        });
+                    mapped_child_remove_file(&parent).map_err(|error| {
+                        SidecarError::Io(format!(
+                            "failed to remove mapped guest file {} -> {}: {error}",
+                            path,
+                            host_path.display()
+                        ))
+                    })?;
+                    // The shadow cannot express deletions, and readdir/stat now
+                    // merge kernel state into the mapped view — without a kernel
+                    // removal a kernel-backed file (e.g. created by a wasm
+                    // command) would resurrect in the very listing that follows
+                    // the unlink. Best-effort: absent kernel entries are fine.
+                    if let Err(error) = kernel.remove_file(path) {
+                        if error.code() != "ENOENT" {
+                            return Err(kernel_error(error));
+                        }
+                    }
+                    return Ok(Value::Null);
                 }
                 Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
                     return Err(read_only_mapped_runtime_host_path_error(path));
