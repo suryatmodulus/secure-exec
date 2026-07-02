@@ -179,7 +179,6 @@ impl V8RuntimeHost {
                         eprintln!(
                             "secure-exec-v8-runtime: wasm runner snapshot warm failed: {error}"
                         );
-                        return;
                     }
                 });
         });
@@ -262,6 +261,7 @@ impl V8SessionHandle {
 
     /// Execute bridge code + user code in this V8 session without routing through
     /// the legacy binary frame encode/decode path.
+    #[allow(clippy::too_many_arguments)] // mirrors the CreateSession frame
     pub fn execute(
         &self,
         mode: u8,

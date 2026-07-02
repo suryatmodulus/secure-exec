@@ -1406,6 +1406,7 @@ ykAheWCsAteSEWVc0w==\n\
                 .expect("configure registry command mount");
         }
 
+        #[allow(clippy::too_many_arguments)] // test helper mirroring the exec surface
         fn run_guest_command(
             sidecar: &mut NativeSidecar<RecordingBridge>,
             vm_id: &str,
@@ -17356,7 +17357,7 @@ console.log(JSON.stringify(summary));
             let cwd = temp_dir("secure-exec-sidecar-js-http-external-cwd");
             write_fixture(
                 &cwd.join("entry.mjs"),
-                &format!(
+                format!(
                     r#"
 import http from "node:http";
 

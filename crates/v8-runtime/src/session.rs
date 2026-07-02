@@ -282,6 +282,8 @@ impl WarmWorkerPool {
             });
     }
 
+    // Internal pool-refill plumbing; args mirror the parked-worker construction.
+    #[allow(clippy::too_many_arguments)]
     fn refill_until(
         &self,
         snapshot_cache: Arc<SnapshotCache>,
@@ -749,6 +751,9 @@ impl SessionManager {
         Ok(())
     }
 
+    // The Err variant intentionally carries the whole SessionAssignment back to
+    // the caller for the fallback spawn path — it is moved, not copied.
+    #[allow(clippy::result_large_err)]
     fn claim_warm_worker(
         &self,
         warm_hint: Option<&WarmSessionHint>,

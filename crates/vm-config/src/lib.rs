@@ -131,10 +131,6 @@ pub struct JsRuntimeConfig {
     pub snapshot_userland_code: Option<String>,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 impl JsRuntimeConfig {
     fn validate(&self) -> Result<(), VmConfigError> {
         if let Some(allowed) = &self.allowed_builtins {

@@ -5919,7 +5919,7 @@ where
         process_id: &str,
         request: PythonVfsRpcRequest,
     ) -> Result<(), SidecarError> {
-        if self.vms.get(vm_id).is_none() {
+        if !self.vms.contains_key(vm_id) {
             return Ok(());
         }
         let response = self.python_socket_op(vm_id, process_id, &request);
@@ -15866,13 +15866,13 @@ pub(crate) fn mark_execute_exit_event_queued(vm_id: &str, process_id: &str) {
     let queued = EXECUTE_EXIT_EVENT_QUEUED.get_or_init(|| Mutex::new(BTreeMap::new()));
     if let Ok(mut queued) = queued.lock() {
         let key = execute_phase_key(vm_id, process_id);
-        if !queued.contains_key(&key) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = queued.entry(key) {
             record_execute_response_to_exit_milestone(
                 "execute_response_to_exit_event_queued",
                 vm_id,
                 process_id,
             );
-            queued.insert(key, Instant::now());
+            entry.insert(Instant::now());
         }
     }
 }
@@ -18475,10 +18475,10 @@ fn javascript_crypto_call_ecdh_session(
                 })?,
                 "ECDH private key",
             )?;
-            let mut ctx = BigNumContext::new().map_err(javascript_crypto_openssl_error)?;
+            let ctx = BigNumContext::new().map_err(javascript_crypto_openssl_error)?;
             let mut public_key = EcPoint::new(&group).map_err(javascript_crypto_openssl_error)?;
             public_key
-                .mul_generator(&group, &private_key, &mut ctx)
+                .mul_generator(&group, &private_key, &ctx)
                 .map_err(javascript_crypto_openssl_error)?;
             session.key_pair = Some(
                 EcKey::from_private_components(&group, &private_key, &public_key)

@@ -88,11 +88,7 @@ pub(crate) fn record_sync_bridge_host_phase(method: &str, stage: &str, elapsed: 
             let Some((method, stage)) = key.split_once(':') else {
                 continue;
             };
-            let avg_us = if value.calls == 0 {
-                0
-            } else {
-                value.total_us / value.calls
-            };
+            let avg_us = value.total_us.checked_div(value.calls).unwrap_or(0);
             lines.push_str(&format!(
                 "method={method} stage={stage} calls={} total_us={} avg_us={} max_us={}\n",
                 value.calls, value.total_us, avg_us, value.max_us

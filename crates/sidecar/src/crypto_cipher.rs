@@ -206,6 +206,7 @@ pub(crate) struct StreamCipherSession {
 impl StreamCipherSession {
     /// Construct a cipher session. `pad` controls PKCS#7 auto-padding for CBC
     /// (Node's `setAutoPadding`). `aad`/`auth_tag` apply to AEAD (GCM) modes.
+    #[allow(clippy::too_many_arguments)] // mirrors Node's createCipheriv surface
     pub(crate) fn new(
         algorithm: &str,
         key: &[u8],
@@ -423,7 +424,7 @@ enum GcmAead {
 }
 
 impl GcmAead {
-    fn encrypt_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut Vec<u8>) -> Result<Vec<u8>> {
+    fn encrypt_detached(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> Result<Vec<u8>> {
         let nonce = GenericArray::from_slice(nonce);
         let tag = match self {
             GcmAead::A128(c) => c.encrypt_in_place_detached(nonce, aad, buffer),
@@ -438,7 +439,7 @@ impl GcmAead {
         &self,
         nonce: &[u8],
         aad: &[u8],
-        buffer: &mut Vec<u8>,
+        buffer: &mut [u8],
         tag: &[u8],
     ) -> Result<()> {
         let nonce = GenericArray::from_slice(nonce);

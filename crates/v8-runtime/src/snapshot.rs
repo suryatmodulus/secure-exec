@@ -715,8 +715,7 @@ impl SnapshotCache {
         }
 
         // Phase 2: create snapshot without holding the cache lock
-        let creation_result =
-            create_snapshot_inner(bridge_code, userland_code).map(|blob| Arc::new(blob));
+        let creation_result = create_snapshot_inner(bridge_code, userland_code).map(Arc::new);
 
         // Phase 3: short lock — insert result, notify waiters, clean up
         {

@@ -1976,6 +1976,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // browser_worker_identity below is shared with the worker shim
 mod tests {
     use super::*;
     use secure_exec_bridge::{

@@ -873,7 +873,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             let umask = self.processes.get_umask(pid)?;
             let mode = mode.unwrap_or(0o777);
             for created_path in &created_paths {
-                self.apply_creation_mode(&created_path, mode, umask)?;
+                self.apply_creation_mode(created_path, mode, umask)?;
             }
         }
         self.update_filesystem_usage_cache_for_inode_creates(created_paths.len());

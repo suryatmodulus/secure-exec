@@ -490,13 +490,11 @@ fn extension_interrupt_response(
 ) -> Option<ExtensionInterruptDispatch> {
     match frame {
         ProtocolFrame::RequestFrame(request) => {
-            let Some(interrupt) = generated_wire_blocking_extension_interrupt(
+            let interrupt = generated_wire_blocking_extension_interrupt(
                 active_request,
                 &blocking_request.namespace,
                 request,
-            ) else {
-                return None;
-            };
+            )?;
             let interrupt = blocking_request.extension.interrupt_blocking_request(
                 &blocking_request.payload,
                 match interrupt {

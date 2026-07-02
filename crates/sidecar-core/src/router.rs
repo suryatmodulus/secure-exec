@@ -21,6 +21,9 @@ pub enum RequestDispatchMode {
     Async,
 }
 
+// Request payload variants intentionally vary widely in size (small acks next
+// to bulky create/exec payloads); boxing is a wire-adjacent refactor.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum RequestRoute {
     Authenticate(AuthenticateRequest),

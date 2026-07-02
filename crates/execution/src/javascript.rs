@@ -218,11 +218,7 @@ fn record_sync_bridge_phase(method: &str, stage: &str, elapsed: Duration) {
             let Some((method, stage)) = key.split_once(':') else {
                 continue;
             };
-            let avg_us = if value.calls == 0 {
-                0
-            } else {
-                value.total_us / value.calls
-            };
+            let avg_us = value.total_us.checked_div(value.calls).unwrap_or(0);
             lines.push_str(&format!(
                 "method={method} stage={stage} calls={} total_us={} avg_us={} max_us={}\n",
                 value.calls, value.total_us, avg_us, value.max_us
@@ -922,7 +918,7 @@ impl TimerWheel {
         state.next_seq = state.next_seq.wrapping_add(1);
         state.heap.push(Reverse((deadline, seq)));
         state.entries.insert(seq, action);
-        if old_earliest.map_or(true, |old| deadline < old) {
+        if old_earliest.is_none_or(|old| deadline < old) {
             self.ready.notify_one();
         }
     }

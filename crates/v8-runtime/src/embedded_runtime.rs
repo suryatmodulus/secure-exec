@@ -296,6 +296,8 @@ pub struct EmbeddedV8SessionHandle {
 }
 
 impl EmbeddedV8SessionHandle {
+    // In-process runtime protocol call; the arg list mirrors the Execute frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &self,
         mode: u8,

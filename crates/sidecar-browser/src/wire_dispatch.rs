@@ -1049,15 +1049,12 @@ where
 
     fn pump_execution_events(&mut self) {
         for vm_id in self.active_vms.iter().cloned().collect::<Vec<_>>() {
-            loop {
-                let event = match self
-                    .sidecar
+            while let Ok(Some(event)) =
+                self.sidecar
                     .poll_execution_event(PollExecutionEventRequest {
                         vm_id: vm_id.clone(),
-                    }) {
-                    Ok(Some(event)) => event,
-                    Ok(None) | Err(_) => break,
-                };
+                    })
+            {
                 if let Some(frame) = self.execution_event_to_frame(event) {
                     self.pending_events.push_back(frame);
                 }
