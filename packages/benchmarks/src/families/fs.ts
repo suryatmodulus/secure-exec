@@ -63,9 +63,7 @@ function streamCopyOp(name: string, sizeBytes: number): BenchmarkOp {
 	return {
 		family: "fs",
 		name,
-		// Phase 2 should add a native stream-copy op; fs_read is the closest current
-		// native/wasm stand-in for the payload size.
-		nativeOp: "fs_read",
+		nativeOp: "stream_copy",
 		nativeArgs: ["--size-bytes", String(sizeBytes)],
 		fileLine: "crates/kernel/src/mount_table.rs:814",
 		reproducer: `stream pipeline copies one ${sizeBytes} byte file inside VM`,
@@ -166,7 +164,7 @@ export const fsFamily: BenchmarkOp[] = [
 	{
 		family: "fs",
 		name: "fs_promises_stat_x32",
-		nativeOp: "fs_stat",
+		nativeOp: "fs_stat_x32",
 		fileLine: "crates/kernel/src/kernel.rs:1950",
 		reproducer: "32 sequential fs.promises.stat calls on one VM file",
 		setup: `async () => {

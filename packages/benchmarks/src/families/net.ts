@@ -289,12 +289,13 @@ try {
 }
 
 function udpEchoOp(name: string, sizeBytes: number): BenchmarkOp {
-	return {
-		family: "net",
-		name,
-		nativeOp: "udp_echo",
-		nativeArgs: ["--size-bytes", String(sizeBytes)],
-		fileLine: "crates/sidecar/src/execution.rs:2712",
+		return {
+			family: "net",
+			name,
+			nativeOp: "udp_echo",
+			nativeArgs: ["--size-bytes", String(sizeBytes)],
+			wasmUnsupportedReason: "UDP sockets are not supported in the native-baseline wasm lane",
+			fileLine: "crates/sidecar/src/execution.rs:2712",
 		reproducer: `node:dgram udp4 socket sends one ${sizeBytes} byte datagram to its own loopback address inside VM`,
 		program: `async () => {
   const dgram = await import("node:dgram");
@@ -320,14 +321,13 @@ function udpEchoOp(name: string, sizeBytes: number): BenchmarkOp {
 }
 
 function unixEchoOp(name: string, sizeBytes: number): BenchmarkOp {
-	return {
-		family: "net",
-		name,
-		// Phase 2 should add a Unix-socket native op; TCP echo is the closest
-		// existing native baseline for the same payload shape.
-		nativeOp: sizeBytes > 16 ? "tcp_throughput" : "tcp_echo",
-		nativeArgs: ["--size-bytes", String(sizeBytes)],
-		fileLine: "crates/sidecar/src/execution.rs:2237",
+		return {
+			family: "net",
+			name,
+			nativeOp: "unix_echo",
+			nativeArgs: ["--size-bytes", String(sizeBytes)],
+			wasmUnsupportedReason: "Unix-domain sockets are not supported in the native-baseline wasm lane",
+			fileLine: "crates/sidecar/src/execution.rs:2237",
 		reproducer: `Unix-domain socket echo one ${sizeBytes} byte payload inside VM`,
 		program: `async () => {
   const fs = await import("node:fs");
@@ -375,12 +375,13 @@ function unixEchoOp(name: string, sizeBytes: number): BenchmarkOp {
 }
 
 function tcpEchoOp(name: string, sizeBytes: number, nativeOp: "tcp_echo" | "tcp_throughput"): BenchmarkOp {
-	return {
-		family: "net",
-		name,
-		nativeOp,
-		nativeArgs: ["--size-bytes", String(sizeBytes)],
-		fileLine: "crates/kernel/src/socket_table.rs:1413",
+		return {
+			family: "net",
+			name,
+			nativeOp,
+			nativeArgs: ["--size-bytes", String(sizeBytes)],
+			wasmUnsupportedReason: "TCP sockets are not supported in the native-baseline wasm lane",
+			fileLine: "crates/kernel/src/socket_table.rs:1413",
 		reproducer: `localhost TCP echo of one ${sizeBytes} byte payload inside VM`,
 		program: `async () => {
   const net = await import("node:net");
@@ -417,11 +418,12 @@ export const netFamily: BenchmarkOp[] = [
 	udpEchoOp("udp_echo_big", UDP_BIG_BYTES),
 	unixEchoOp("unix_echo_small", 16),
 	unixEchoOp("unix_echo_big", 64 * 1024),
-	{
-		family: "net",
-		name: "http_loopback_get",
-		nativeOp: "tcp_echo",
-		fileLine: "crates/execution/src/node_import_cache.rs:4750",
+		{
+			family: "net",
+			name: "http_loopback_get",
+			nativeOp: "http_loopback_get",
+			wasmUnsupportedReason: "TCP HTTP loopback is not supported in the native-baseline wasm lane",
+			fileLine: "crates/execution/src/node_import_cache.rs:4750",
 		reproducer: "node:http loopback GET inside VM",
 		program: `async () => {
   const http = await import("node:http");
@@ -446,11 +448,11 @@ export const netFamily: BenchmarkOp[] = [
 	  });
 	}`,
 	},
-	{
-		family: "net",
-		name: "http_external_get",
-		nativeOp: "tcp_echo",
-		wasmUnsupportedReason: "host-side benchmark listener requires Node harness networking",
+		{
+			family: "net",
+			name: "http_external_get",
+			nativeUnsupportedReason: "external-loopback row depends on a Node harness listener, no native-baseline analogue",
+			wasmUnsupportedReason: "host-side benchmark listener requires Node harness networking",
 		fileLine: "crates/sidecar/src/execution.rs:13919",
 		reproducer: "node:http GET from guest to a host-side loopback-exempt HTTP server",
 		runNode: (iters, warmup) =>
@@ -472,11 +474,11 @@ export const netFamily: BenchmarkOp[] = [
 				"net-http-external-get",
 			),
 	},
-	{
-		family: "net",
-		name: "http2_loopback_get",
-		nativeUnsupportedReason: "no native HTTP/2-loopback pair yet — Phase 2 backlog",
-		wasmUnsupportedReason: "HTTP/2 unsupported in wasm baseline",
+		{
+			family: "net",
+			name: "http2_loopback_get",
+			nativeUnsupportedReason: "HTTP/2 is a JS-runtime protocol surface in this matrix",
+			wasmUnsupportedReason: "HTTP/2 unsupported in wasm baseline",
 		fileLine: "packages/build-tools/bridge-src/builtins/http2.ts:1472",
 		reproducer: "node:http2 h2c loopback GET inside VM",
 		program: `async () => {
@@ -516,11 +518,12 @@ export const netFamily: BenchmarkOp[] = [
   });
 }`,
 	},
-	{
-		family: "net",
-		name: "fetch_loopback_get",
-		nativeOp: "tcp_echo",
-		fileLine: "crates/execution/src/node_import_cache.rs:4750",
+		{
+			family: "net",
+			name: "fetch_loopback_get",
+			nativeUnsupportedReason: "fetch is a JS-runtime undici surface",
+			wasmUnsupportedReason: "fetch is a JS-runtime undici surface",
+			fileLine: "crates/execution/src/node_import_cache.rs:4750",
 		reproducer: "global fetch loopback GET inside VM",
 		program: `async () => {
   if (typeof fetch !== "function") throw new Error("fetch is not defined");
@@ -543,22 +546,23 @@ export const netFamily: BenchmarkOp[] = [
   });
 }`,
 	},
-	{
-		family: "net",
-		name: "tls_loopback_get",
-		nativeUnsupportedReason: "no native TLS-loopback pair yet — Phase 2 backlog",
-		wasmUnsupportedReason: "TLS unsupported in wasm baseline",
+		{
+			family: "net",
+			name: "tls_loopback_get",
+			nativeUnsupportedReason: "TLS is a JS-runtime protocol surface in this matrix",
+			wasmUnsupportedReason: "TLS unsupported in wasm baseline",
 		fileLine: "crates/sidecar/src/execution.rs:13532",
 		reproducer: "persistent node:https loopback server; each iteration opens a fresh https.get connection inside VM",
 		runNode: (iters, warmup) => runNodeProgram(tlsLoopbackGetProgram(), iters, warmup),
 		runGuest: (vm, iters, warmup) =>
 			runGuestProgram(vm, tlsLoopbackGetProgram(), iters, warmup, "net-tls-loopback-get"),
 	},
-	{
-		family: "net",
-		name: "tcp_connect_close",
-		nativeOp: "tcp_connect",
-		fileLine: "crates/kernel/src/socket_table.rs:382",
+		{
+			family: "net",
+			name: "tcp_connect_close",
+			nativeOp: "tcp_connect",
+			wasmUnsupportedReason: "TCP sockets are not supported in the native-baseline wasm lane",
+			fileLine: "crates/kernel/src/socket_table.rs:382",
 		reproducer: "node net.createServer(); net.connect(port).end() inside VM",
 		program: `async () => {
   const net = await import("node:net");
@@ -576,10 +580,10 @@ export const netFamily: BenchmarkOp[] = [
 }`,
 	},
 	tcpEchoOp("tcp_echo_small", 16, "tcp_echo"),
-	{
-		family: "net",
-		name: "tcp_external_echo",
-		nativeOp: "tcp_echo",
+		{
+			family: "net",
+			name: "tcp_external_echo",
+			nativeOp: "tcp_echo",
 		wasmUnsupportedReason: "host-side benchmark listener requires Node harness networking",
 		fileLine: "crates/sidecar/src/execution.rs:13919",
 		reproducer: "guest net.connect to a host-side loopback-exempt TCP echo server, one 16-byte echo",
@@ -602,11 +606,12 @@ export const netFamily: BenchmarkOp[] = [
 				"net-tcp-external-echo",
 			),
 	},
-	{
-		family: "net",
-		name: "tcp_concurrent_4",
-		nativeOp: "tcp_concurrent",
-		fileLine: "crates/kernel/src/socket_table.rs:382",
+		{
+			family: "net",
+			name: "tcp_concurrent_4",
+			nativeOp: "tcp_concurrent",
+			wasmUnsupportedReason: "TCP sockets are not supported in the native-baseline wasm lane",
+			fileLine: "crates/kernel/src/socket_table.rs:382",
 		reproducer: "four concurrent localhost TCP clients connect to one VM server",
 		program: `async () => {
   const net = await import("node:net");
@@ -631,10 +636,11 @@ export const netFamily: BenchmarkOp[] = [
 	tcpEchoOp("tcp_echo_big", 64 * 1024, "tcp_throughput"),
 	{
 		// Measures write count/cadence, not payload-size scaling; keep the count suffix.
-		family: "net",
-		name: "tcp_tiny_writes_16",
-		nativeOp: "tcp_tiny_writes",
-		fileLine: "crates/kernel/src/socket_table.rs:1335",
+			family: "net",
+			name: "tcp_tiny_writes_16",
+			nativeOp: "tcp_tiny_writes",
+			wasmUnsupportedReason: "TCP sockets are not supported in the native-baseline wasm lane",
+			fileLine: "crates/kernel/src/socket_table.rs:1335",
 		reproducer: "localhost TCP echo using sixteen one-byte writes inside VM",
 		program: `async () => {
   const net = await import("node:net");

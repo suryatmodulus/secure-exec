@@ -38,6 +38,9 @@ jobs:
           cargo build --release -p native-baseline
           cargo build --release -p native-baseline --target wasm32-wasip1
 
+      - name: Check native benchmark op wiring
+        run: pnpm --dir packages/benchmarks bench:check
+
       - name: Run quick benchmark gate
         env:
           SECURE_EXEC_SIDECAR_BIN: ${{ github.workspace }}/target/release/secure-exec-sidecar
@@ -70,6 +73,9 @@ jobs:
           cargo build --release -p secure-exec-sidecar
           cargo build --release -p native-baseline
           cargo build --release -p native-baseline --target wasm32-wasip1
+
+      - name: Check native benchmark op wiring
+        run: pnpm --dir packages/benchmarks bench:check
 
       - name: Run full benchmark matrix
         env:

@@ -22,21 +22,19 @@
 //! Usage: native-baseline --op spawn_exit|exec_capture --iters N --warmup W
 
 use std::fs::File;
-#[cfg(not(target_family = "wasm"))]
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(not(target_family = "wasm"))]
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(all(unix, not(target_family = "wasm")))]
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::process::{Command, Stdio};
 #[cfg(not(target_family = "wasm"))]
 use std::thread;
-use std::time::Instant;
 #[cfg(target_family = "wasm")]
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -48,19 +46,26 @@ enum Op {
     NodeExit,
     NodeFanout,
     NodeReapStorm,
+    NodeStdinRoundtrip,
     PipeChain,
     FsStat,
+    FsStatX32,
     FsWrite,
     FsRead,
+    StreamCopy,
     FsOpenClose,
     FsMkdirRmdir,
     FsRename,
     FsReaddir,
     FsFsync,
     DnsLookup,
+    DnsLookupX2,
     DnsConcurrent,
     TcpConnect,
     TcpEcho,
+    UnixConnect,
+    UnixEcho,
+    HttpLoopbackGet,
     TcpConcurrent,
     TcpThroughput,
     TcpTinyWrites,
@@ -68,14 +73,63 @@ enum Op {
     PipeEcho,
     PipeThroughput,
     PipeBackpressure,
+    StdioWriteSync,
     CpuLoop,
+    SleepTimer,
+    YieldLoop,
     AllocFree,
 }
 
 struct BenchConfig {
     size_bytes: Option<usize>,
     entry_count: Option<usize>,
+    timer_count: Option<usize>,
+    sleep_ns: Option<u64>,
+    chunk_count: Option<usize>,
 }
+
+const OP_NAMES: &[&str] = &[
+    "spawn_exit",
+    "exec_capture",
+    "node_stdout_discard_2b",
+    "node_stdout_capture_2b",
+    "node_stdout_listener_only_2b",
+    "node_exit",
+    "node_fanout",
+    "node_reap_storm",
+    "node_stdin_roundtrip",
+    "pipe_chain",
+    "fs_stat",
+    "fs_stat_x32",
+    "fs_write",
+    "fs_read",
+    "stream_copy",
+    "fs_open_close",
+    "fs_mkdir_rmdir",
+    "fs_rename",
+    "fs_readdir",
+    "fs_fsync",
+    "dns_lookup",
+    "dns_lookup_x2",
+    "dns_concurrent",
+    "tcp_connect",
+    "tcp_echo",
+    "unix_connect",
+    "unix_echo",
+    "http_loopback_get",
+    "tcp_concurrent",
+    "tcp_throughput",
+    "tcp_tiny_writes",
+    "udp_echo",
+    "pipe_echo",
+    "pipe_throughput",
+    "pipe_backpressure",
+    "stdio_write_sync",
+    "cpu_loop",
+    "sleep_timer",
+    "yield_loop",
+    "alloc_free",
+];
 
 impl Op {
     #[cfg(target_family = "wasm")]
@@ -83,16 +137,111 @@ impl Op {
         matches!(
             self,
             Op::FsStat
+                | Op::FsStatX32
                 | Op::FsWrite
                 | Op::FsRead
+                | Op::StreamCopy
                 | Op::FsOpenClose
                 | Op::FsMkdirRmdir
                 | Op::FsRename
                 | Op::FsReaddir
                 | Op::FsFsync
                 | Op::CpuLoop
+                | Op::SleepTimer
+                | Op::YieldLoop
                 | Op::AllocFree
         )
+    }
+}
+
+fn parse_op(name: &str) -> Option<Op> {
+    Some(match name {
+        "spawn_exit" => Op::SpawnExit,
+        "exec_capture" => Op::ExecCapture,
+        "node_stdout_discard_2b" => Op::NodeStdoutDiscard2b,
+        "node_stdout_capture_2b" => Op::NodeStdoutCapture2b,
+        "node_stdout_listener_only_2b" => Op::NodeStdoutListenerOnly2b,
+        "node_exit" => Op::NodeExit,
+        "node_fanout" => Op::NodeFanout,
+        "node_reap_storm" => Op::NodeReapStorm,
+        "node_stdin_roundtrip" => Op::NodeStdinRoundtrip,
+        "pipe_chain" => Op::PipeChain,
+        "fs_stat" => Op::FsStat,
+        "fs_stat_x32" => Op::FsStatX32,
+        "fs_write" => Op::FsWrite,
+        "fs_read" => Op::FsRead,
+        "stream_copy" => Op::StreamCopy,
+        "fs_open_close" => Op::FsOpenClose,
+        "fs_mkdir_rmdir" => Op::FsMkdirRmdir,
+        "fs_rename" => Op::FsRename,
+        "fs_readdir" => Op::FsReaddir,
+        "fs_fsync" => Op::FsFsync,
+        "dns_lookup" => Op::DnsLookup,
+        "dns_lookup_x2" => Op::DnsLookupX2,
+        "dns_concurrent" => Op::DnsConcurrent,
+        "tcp_connect" => Op::TcpConnect,
+        "tcp_echo" => Op::TcpEcho,
+        "unix_connect" => Op::UnixConnect,
+        "unix_echo" => Op::UnixEcho,
+        "http_loopback_get" => Op::HttpLoopbackGet,
+        "tcp_concurrent" => Op::TcpConcurrent,
+        "tcp_throughput" => Op::TcpThroughput,
+        "tcp_tiny_writes" => Op::TcpTinyWrites,
+        "udp_echo" => Op::UdpEcho,
+        "pipe_echo" => Op::PipeEcho,
+        "pipe_throughput" => Op::PipeThroughput,
+        "pipe_backpressure" => Op::PipeBackpressure,
+        "stdio_write_sync" => Op::StdioWriteSync,
+        "cpu_loop" => Op::CpuLoop,
+        "sleep_timer" => Op::SleepTimer,
+        "yield_loop" => Op::YieldLoop,
+        "alloc_free" => Op::AllocFree,
+        _ => return None,
+    })
+}
+
+fn op_name(op: Op) -> &'static str {
+    match op {
+        Op::SpawnExit => "spawn_exit",
+        Op::ExecCapture => "exec_capture",
+        Op::NodeStdoutDiscard2b => "node_stdout_discard_2b",
+        Op::NodeStdoutCapture2b => "node_stdout_capture_2b",
+        Op::NodeStdoutListenerOnly2b => "node_stdout_listener_only_2b",
+        Op::NodeExit => "node_exit",
+        Op::NodeFanout => "node_fanout",
+        Op::NodeReapStorm => "node_reap_storm",
+        Op::NodeStdinRoundtrip => "node_stdin_roundtrip",
+        Op::PipeChain => "pipe_chain",
+        Op::FsStat => "fs_stat",
+        Op::FsStatX32 => "fs_stat_x32",
+        Op::FsWrite => "fs_write",
+        Op::FsRead => "fs_read",
+        Op::StreamCopy => "stream_copy",
+        Op::FsOpenClose => "fs_open_close",
+        Op::FsMkdirRmdir => "fs_mkdir_rmdir",
+        Op::FsRename => "fs_rename",
+        Op::FsReaddir => "fs_readdir",
+        Op::FsFsync => "fs_fsync",
+        Op::DnsLookup => "dns_lookup",
+        Op::DnsLookupX2 => "dns_lookup_x2",
+        Op::DnsConcurrent => "dns_concurrent",
+        Op::TcpConnect => "tcp_connect",
+        Op::TcpEcho => "tcp_echo",
+        Op::UnixConnect => "unix_connect",
+        Op::UnixEcho => "unix_echo",
+        Op::HttpLoopbackGet => "http_loopback_get",
+        Op::TcpConcurrent => "tcp_concurrent",
+        Op::TcpThroughput => "tcp_throughput",
+        Op::TcpTinyWrites => "tcp_tiny_writes",
+        Op::UdpEcho => "udp_echo",
+        Op::PipeEcho => "pipe_echo",
+        Op::PipeThroughput => "pipe_throughput",
+        Op::PipeBackpressure => "pipe_backpressure",
+        Op::StdioWriteSync => "stdio_write_sync",
+        Op::CpuLoop => "cpu_loop",
+        Op::SleepTimer => "sleep_timer",
+        Op::YieldLoop => "yield_loop",
+        Op::AllocFree => "alloc_free",
     }
 }
 
@@ -225,6 +374,34 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             }
         }
         #[cfg(not(target_family = "wasm"))]
+        Op::NodeStdinRoundtrip => {
+            let size_bytes = config.size_bytes.unwrap_or(4096);
+            let payload = vec![9_u8; size_bytes];
+            let mut child = Command::new("node")
+                .args([
+                    "-e",
+                    "process.stdin.on('data', (chunk) => process.stdout.write(chunk)); process.stdin.on('end', () => process.exit(0));",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn node failed");
+            child
+                .stdin
+                .take()
+                .expect("child stdin")
+                .write_all(&payload)
+                .expect("write child stdin");
+            let out = child.wait_with_output().expect("wait node child");
+            assert!(
+                out.status.success(),
+                "expected exit 0, got {:?}",
+                out.status
+            );
+            assert_eq!(out.stdout, payload, "stdin roundtrip mismatch");
+        }
+        #[cfg(not(target_family = "wasm"))]
         Op::PipeChain => {
             let out = Command::new("/bin/sh")
                 .args(["-c", "printf hello | cat | cat >/dev/null"])
@@ -237,6 +414,16 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             std::fs::write(&path, b"hi").expect("write stat fixture");
             let meta = std::fs::metadata(&path).expect("stat fixture");
             assert!(meta.len() >= 2);
+        }
+        Op::FsStatX32 => {
+            let path = base_dir.join("secure-exec-native-fs-stat-x32.txt");
+            if !path.exists() {
+                std::fs::write(&path, b"hi").expect("write stat fixture");
+            }
+            for _ in 0..32 {
+                let meta = std::fs::metadata(&path).expect("stat fixture");
+                assert!(meta.len() >= 2);
+            }
         }
         Op::FsWrite => {
             let path = base_dir.join("secure-exec-native-fs-write.txt");
@@ -257,6 +444,40 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             }
             let data = std::fs::read(path).expect("read fixture");
             assert_eq!(data.len(), size_bytes);
+        }
+        Op::StreamCopy => {
+            let size_bytes = config.size_bytes.unwrap_or(64 * 1024);
+            let src = base_dir.join(format!(
+                "secure-exec-native-stream-copy-src-{size_bytes}.bin"
+            ));
+            let dst = base_dir.join(format!(
+                "secure-exec-native-stream-copy-dst-{size_bytes}-{iter}.bin"
+            ));
+            let rewrite = std::fs::metadata(&src)
+                .map(|meta| meta.len() != size_bytes as u64)
+                .unwrap_or(true);
+            if rewrite {
+                std::fs::write(&src, vec![7_u8; size_bytes]).expect("write stream source");
+            }
+            let mut input = File::open(&src).expect("open stream source");
+            let mut output = File::create(&dst).expect("create stream destination");
+            let mut copied = 0_usize;
+            let mut buf = vec![0_u8; 16 * 1024];
+            loop {
+                let n = input.read(&mut buf).expect("read stream source");
+                if n == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buf[..n])
+                    .expect("write stream destination");
+                copied += n;
+            }
+            drop(output);
+            let meta = std::fs::metadata(&dst).expect("stat stream destination");
+            std::fs::remove_file(&dst).expect("remove stream destination");
+            assert_eq!(copied, size_bytes);
+            assert_eq!(meta.len(), size_bytes as u64);
         }
         Op::FsOpenClose => {
             let path = base_dir.join("secure-exec-native-fs-open-close.txt");
@@ -304,6 +525,16 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             assert!(!addrs.is_empty());
         }
         #[cfg(not(target_family = "wasm"))]
+        Op::DnsLookupX2 => {
+            for _ in 0..2 {
+                let addrs: Vec<_> = ("localhost", 80)
+                    .to_socket_addrs()
+                    .expect("resolve localhost")
+                    .collect();
+                assert!(!addrs.is_empty());
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
         Op::DnsConcurrent => {
             let threads: Vec<_> = (0..4)
                 .map(|_| {
@@ -348,6 +579,76 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
             stream.read_exact(&mut buf).expect("read client echo");
             assert_eq!(buf, payload);
             server.join().expect("join tcp server");
+        }
+        #[cfg(all(unix, not(target_family = "wasm")))]
+        Op::UnixConnect => {
+            let sock = base_dir.join(format!("secure-exec-native-unix-connect-{iter}.sock"));
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind unix listener");
+            let server = thread::spawn(move || {
+                let (_stream, _) = listener.accept().expect("accept unix connect");
+            });
+            let stream = UnixStream::connect(&sock).expect("connect unix listener");
+            drop(stream);
+            server.join().expect("join unix server");
+            let _ = std::fs::remove_file(&sock);
+        }
+        #[cfg(all(unix, not(target_family = "wasm")))]
+        Op::UnixEcho => {
+            let payload = vec![7_u8; config.size_bytes.unwrap_or(16)];
+            let sock = base_dir.join(format!("secure-exec-native-unix-echo-{iter}.sock"));
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind unix listener");
+            let expected_len = payload.len();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept unix echo");
+                let mut buf = vec![0_u8; expected_len];
+                stream.read_exact(&mut buf).expect("read unix echo");
+                stream.write_all(&buf).expect("write unix echo");
+            });
+            let mut stream = UnixStream::connect(&sock).expect("connect unix echo");
+            stream.write_all(&payload).expect("write client unix echo");
+            let mut buf = vec![0_u8; payload.len()];
+            stream.read_exact(&mut buf).expect("read client unix echo");
+            assert_eq!(buf, payload);
+            server.join().expect("join unix server");
+            let _ = std::fs::remove_file(&sock);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        Op::HttpLoopbackGet => {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind http listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept http");
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).expect("read http request");
+                    request.push(byte[0]);
+                }
+                assert!(
+                    request.starts_with(b"GET / HTTP/1.1\r\n"),
+                    "unexpected HTTP request"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .expect("write http response");
+            });
+            let mut stream = TcpStream::connect(addr).expect("connect http listener");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .expect("write http request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .expect("read http response");
+            assert!(
+                response.ends_with(b"\r\n\r\nok"),
+                "unexpected HTTP response body"
+            );
+            server.join().expect("join http server");
         }
         #[cfg(not(target_family = "wasm"))]
         Op::TcpConcurrent => {
@@ -457,12 +758,46 @@ fn run_once(op: Op, iter: usize, base_dir: &Path, config: &BenchConfig) {
                 assert!(out.status.success(), "pipe fallback failed: {out:?}");
             }
         }
+        Op::StdioWriteSync => {
+            let size_bytes = config.size_bytes.unwrap_or(64 * 1024);
+            let chunk_count = config.chunk_count.unwrap_or(8);
+            let payload = vec![7_u8; size_bytes];
+            #[cfg(not(target_family = "wasm"))]
+            let mut sink: Box<dyn Write> = Box::new(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/null")
+                    .expect("open /dev/null"),
+            );
+            #[cfg(target_family = "wasm")]
+            let mut sink: Box<dyn Write> = Box::new(std::io::sink());
+            for _ in 0..chunk_count {
+                sink.write_all(&payload).expect("write stdio payload");
+            }
+            sink.flush().expect("flush stdio payload");
+        }
         Op::CpuLoop => {
             let mut acc = 0_u64;
             for i in 0..2_000_000_u64 {
                 acc = acc.wrapping_add(i ^ (acc.rotate_left(7)));
             }
             std::hint::black_box(acc);
+        }
+        Op::SleepTimer => {
+            let count = config.timer_count.unwrap_or(50);
+            let sleep_ns = config.sleep_ns.unwrap_or(1_000_000);
+            let duration = Duration::from_nanos(sleep_ns);
+            for _ in 0..count {
+                std::thread::sleep(duration);
+            }
+        }
+        Op::YieldLoop => {
+            let count = config.timer_count.unwrap_or(1000);
+            for _ in 0..count {
+                // This is the closest native analogue to setImmediate cadence: it
+                // yields scheduler turn-taking, but it does not model JS task queues.
+                std::thread::yield_now();
+            }
         }
         Op::AllocFree => {
             let mut data = vec![0_u8; 4 * 1024 * 1024];
@@ -574,74 +909,22 @@ fn write_phase_json(op_name: &str, samples: &[(String, Vec<u128>)]) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let op = match arg_value(&args, "--op").as_deref() {
-        Some("spawn_exit") => Op::SpawnExit,
-        Some("exec_capture") => Op::ExecCapture,
-        Some("node_stdout_discard_2b") => Op::NodeStdoutDiscard2b,
-        Some("node_stdout_capture_2b") => Op::NodeStdoutCapture2b,
-        Some("node_stdout_listener_only_2b") => Op::NodeStdoutListenerOnly2b,
-        Some("node_exit") => Op::NodeExit,
-        Some("node_fanout") => Op::NodeFanout,
-        Some("node_reap_storm") => Op::NodeReapStorm,
-        Some("pipe_chain") => Op::PipeChain,
-        Some("fs_stat") => Op::FsStat,
-        Some("fs_write") => Op::FsWrite,
-        Some("fs_read") => Op::FsRead,
-        Some("fs_open_close") => Op::FsOpenClose,
-        Some("fs_mkdir_rmdir") => Op::FsMkdirRmdir,
-        Some("fs_rename") => Op::FsRename,
-        Some("fs_readdir") => Op::FsReaddir,
-        Some("fs_fsync") => Op::FsFsync,
-        Some("dns_lookup") => Op::DnsLookup,
-        Some("dns_concurrent") => Op::DnsConcurrent,
-        Some("tcp_connect") => Op::TcpConnect,
-        Some("tcp_echo") => Op::TcpEcho,
-        Some("tcp_concurrent") => Op::TcpConcurrent,
-        Some("tcp_throughput") => Op::TcpThroughput,
-        Some("tcp_tiny_writes") => Op::TcpTinyWrites,
-        Some("udp_echo") => Op::UdpEcho,
-        Some("pipe_echo") => Op::PipeEcho,
-        Some("pipe_throughput") => Op::PipeThroughput,
-        Some("pipe_backpressure") => Op::PipeBackpressure,
-        Some("cpu_loop") => Op::CpuLoop,
-        Some("alloc_free") => Op::AllocFree,
-        other => {
-            eprintln!("unknown --op {other:?}");
+    if args.iter().any(|arg| arg == "--list-ops") {
+        for name in OP_NAMES {
+            println!("{name}");
+        }
+        return;
+    }
+
+    let op_arg = arg_value(&args, "--op");
+    let op = match op_arg.as_deref().and_then(parse_op) {
+        Some(op) => op,
+        None => {
+            eprintln!("unknown --op {:?}", op_arg.as_deref());
             std::process::exit(2);
         }
     };
-    let op_name = match op {
-        Op::SpawnExit => "spawn_exit",
-        Op::ExecCapture => "exec_capture",
-        Op::NodeStdoutDiscard2b => "node_stdout_discard_2b",
-        Op::NodeStdoutCapture2b => "node_stdout_capture_2b",
-        Op::NodeStdoutListenerOnly2b => "node_stdout_listener_only_2b",
-        Op::NodeExit => "node_exit",
-        Op::NodeFanout => "node_fanout",
-        Op::NodeReapStorm => "node_reap_storm",
-        Op::PipeChain => "pipe_chain",
-        Op::FsStat => "fs_stat",
-        Op::FsWrite => "fs_write",
-        Op::FsRead => "fs_read",
-        Op::FsOpenClose => "fs_open_close",
-        Op::FsMkdirRmdir => "fs_mkdir_rmdir",
-        Op::FsRename => "fs_rename",
-        Op::FsReaddir => "fs_readdir",
-        Op::FsFsync => "fs_fsync",
-        Op::DnsLookup => "dns_lookup",
-        Op::DnsConcurrent => "dns_concurrent",
-        Op::TcpConnect => "tcp_connect",
-        Op::TcpEcho => "tcp_echo",
-        Op::TcpConcurrent => "tcp_concurrent",
-        Op::TcpThroughput => "tcp_throughput",
-        Op::TcpTinyWrites => "tcp_tiny_writes",
-        Op::UdpEcho => "udp_echo",
-        Op::PipeEcho => "pipe_echo",
-        Op::PipeThroughput => "pipe_throughput",
-        Op::PipeBackpressure => "pipe_backpressure",
-        Op::CpuLoop => "cpu_loop",
-        Op::AllocFree => "alloc_free",
-    };
+    let op_name = op_name(op);
     #[cfg(target_family = "wasm")]
     if !op.supported_on_wasm() {
         println!("{{\"unsupported\":true,\"op\":\"{op_name}\"}}");
@@ -665,6 +948,9 @@ fn main() {
     let config = BenchConfig {
         size_bytes: arg_value(&args, "--size-bytes").and_then(|s| s.parse().ok()),
         entry_count: arg_value(&args, "--entry-count").and_then(|s| s.parse().ok()),
+        timer_count: arg_value(&args, "--timer-count").and_then(|s| s.parse().ok()),
+        sleep_ns: arg_value(&args, "--sleep-ns").and_then(|s| s.parse().ok()),
+        chunk_count: arg_value(&args, "--chunk-count").and_then(|s| s.parse().ok()),
     };
     let phases = args.iter().any(|arg| arg == "--phases");
 

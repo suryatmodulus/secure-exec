@@ -3,18 +3,18 @@ import type { BenchmarkOp } from "../lib/layers.js";
 /**
  * Timer cadence differential ops.
  *
- * There is no native timer op in the Rust baseline, so these rows use
- * `cpu_loop`. The meaningful signal is guest-vs-host Node timer cadence,
- * especially for guest net polling that is paced with setTimeout
- * (secure-exec crates/execution/src/node_import_cache.rs:4750
- * scheduleSocketPoll).
+ * Native timer analogues are intentionally honest rather than exact:
+ * - setTimeout rows use std::thread::sleep cadence.
+ * - setImmediate uses scheduler yield cadence. That does not model JS task queues,
+ *   but it is closer than a CPU loop for measuring turn-taking overhead.
  */
 
 export const timersFamily: BenchmarkOp[] = [
 	{
 		family: "timers",
 		name: "settimeout_zero_x100",
-		nativeOp: "cpu_loop",
+		nativeOp: "sleep_timer",
+		nativeArgs: ["--timer-count", "100", "--sleep-ns", "0"],
 		fileLine: "crates/execution/src/node_import_cache.rs:4750",
 		reproducer: "100 chained setTimeout(0) awaits inside VM",
 		program: `async () => {
@@ -26,7 +26,8 @@ export const timersFamily: BenchmarkOp[] = [
 	{
 		family: "timers",
 		name: "settimeout_1ms_x50",
-		nativeOp: "cpu_loop",
+		nativeOp: "sleep_timer",
+		nativeArgs: ["--timer-count", "50", "--sleep-ns", "1000000"],
 		fileLine: "crates/execution/src/node_import_cache.rs:4750",
 		reproducer: "50 chained setTimeout(1) awaits inside VM",
 		program: `async () => {
@@ -38,7 +39,8 @@ export const timersFamily: BenchmarkOp[] = [
 	{
 		family: "timers",
 		name: "setimmediate_x1000",
-		nativeOp: "cpu_loop",
+		nativeOp: "yield_loop",
+		nativeArgs: ["--timer-count", "1000"],
 		fileLine: "crates/execution/src/node_import_cache.rs:4750",
 		reproducer: "1000 chained setImmediate awaits inside VM, falling back to setTimeout(0)",
 		program: `async () => {

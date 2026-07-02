@@ -32,14 +32,18 @@ const WASM_COMMAND_NAME = "native-baseline";
 const WASM_BASE_DIR = "/mnt/native-baseline-wasm";
 const WASM_SUPPORTED_OPS = new Set<NativeOp>([
 	"fs_stat",
+	"fs_stat_x32",
 	"fs_write",
 	"fs_read",
+	"stream_copy",
 	"fs_open_close",
 	"fs_mkdir_rmdir",
 	"fs_rename",
 	"fs_readdir",
 	"fs_fsync",
 	"cpu_loop",
+	"sleep_timer",
+	"yield_loop",
 	"alloc_free",
 ]);
 let wasmCommandDir: string | undefined;

@@ -6,6 +6,7 @@ function passThroughOp(name: string, sizeBytes: number): BenchmarkOp {
 		name,
 		nativeOp: sizeBytes > 16 ? "pipe_throughput" : "pipe_echo",
 		nativeArgs: sizeBytes > 16 ? ["--size-bytes", String(sizeBytes)] : undefined,
+		wasmUnsupportedReason: "pipe primitives are not supported in the native-baseline wasm lane",
 		fileLine: "crates/v8-runtime/src/host_call.rs:276",
 		reproducer: `node PassThrough write/read one ${sizeBytes} byte payload inside VM`,
 		program: `async () => {
@@ -33,6 +34,7 @@ export const pipesFamily: BenchmarkOp[] = [
 		family: "pipes",
 		name: "backpressure_chunks",
 		nativeOp: "pipe_backpressure",
+		wasmUnsupportedReason: "pipe primitives are not supported in the native-baseline wasm lane",
 		fileLine: "crates/v8-runtime/src/host_call.rs:276",
 		reproducer: "node PassThrough with a tiny highWaterMark and 64 one-byte writes",
 		program: `async () => {

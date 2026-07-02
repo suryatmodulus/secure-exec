@@ -38,7 +38,9 @@ export const perfFindingsFamily: BenchmarkOp[] = [
 		// as ~0). 8 x 64KiB per iter stays well under the 4096 event-buffer bound.
 		family: "perf-finding",
 		name: "stdio_writeSync_8x64k",
-		nativeOp: "pipe_throughput",
+		nativeOp: "stdio_write_sync",
+		nativeArgs: ["--size-bytes", String(64 * 1024), "--chunk-count", "8"],
+		wasmUnsupportedReason: "stdio fd writes are not supported in the native-baseline wasm lane",
 		fileLine: "crates/sidecar/src/filesystem.rs:1284",
 		reproducer: "8 synchronous fs.writeSync(2, 64KiB) inside VM (stdio buffer clone)",
 		program: `async () => {
@@ -54,7 +56,8 @@ export const perfFindingsFamily: BenchmarkOp[] = [
 		// (baseline ~30x guest/node) — the 10ms poll dominates a sub-ms host accept.
 		family: "perf-finding",
 		name: "unix_accept_latency",
-		nativeOp: "tcp_connect",
+		nativeOp: "unix_connect",
+		wasmUnsupportedReason: "Unix-domain sockets are not supported in the native-baseline wasm lane",
 		fileLine: "crates/sidecar/src/execution.rs:2213",
 		reproducer: "connect+close one Unix-domain socket inside VM (10ms accept poll)",
 		program: `async () => {
