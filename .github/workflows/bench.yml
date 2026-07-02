@@ -30,7 +30,10 @@ jobs:
         run: corepack enable
 
       - name: Install benchmark workspace dependencies
-        run: pnpm install --frozen-lockfile --filter "@secure-exec/benchmarks..."
+        run: pnpm install --frozen-lockfile --filter "@secure-exec/benchmarks..." --filter "@secure-exec/build-tools..."
+
+      - name: Build @secure-exec/core (bench ops import its dist)
+        run: pnpm --dir packages/core build
 
       - name: Build release benchmark binaries
         run: |
@@ -66,7 +69,15 @@ jobs:
         run: corepack enable
 
       - name: Install benchmark workspace dependencies
-        run: pnpm install --frozen-lockfile --filter "@secure-exec/benchmarks..."
+        run: pnpm install --frozen-lockfile --filter "@secure-exec/benchmarks..." --filter "@secure-exec/build-tools..."
+
+      - name: Build @secure-exec/core (bench ops import its dist)
+        run: pnpm --dir packages/core build
+
+      - name: Build guest WASM command binaries (VM boot + ecosystem rows)
+        run: |
+          make -C registry/native wasm
+          node packages/core/scripts/copy-wasm-commands.mjs
 
       - name: Build release benchmark binaries
         run: |
