@@ -3119,11 +3119,17 @@ fn spawn_v8_event_bridge(
                     let phase_start = Instant::now();
                     let request_args = translate_request_args_for_legacy(sidecar_method, &args);
                     let mut raw_bytes_args = HashMap::new();
-                    if sidecar_method == "net.write" {
+                    if sidecar_method == "net.write"
+                        || sidecar_method == "fs.writeSync"
+                        || sidecar_method == "fs.writeFileSync"
+                    {
                         if let Ok(Some(bytes)) = v8_runtime::cbor_payload_raw_byte_arg(&payload, 1)
                         {
                             raw_bytes_args.insert(1, bytes);
                         }
+                    }
+                    if method == "_fsReadRaw" {
+                        raw_bytes_args.insert(usize::MAX, Vec::new());
                     }
                     record_sync_bridge_phase(
                         &method,

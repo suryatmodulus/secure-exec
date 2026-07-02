@@ -4,7 +4,8 @@ use secure_exec_vm_config as vm_config;
 
 use crate::filesystem::{
     handle_python_vfs_rpc_request as filesystem_handle_python_vfs_rpc_request,
-    service_javascript_fs_sync_rpc, service_javascript_module_sync_rpc,
+    service_javascript_fs_read_sync_rpc, service_javascript_fs_sync_rpc,
+    service_javascript_module_sync_rpc,
 };
 use crate::protocol::{
     CloseStdinRequest, EventFrame, EventPayload, ExecuteRequest, FindBoundUdpRequest,
@@ -15082,6 +15083,11 @@ where
         resource_limits,
         network_counts,
     } = request;
+    if request.raw_bytes_args.contains_key(&usize::MAX) && request.method == "fs.readSync" {
+        let kernel_pid = process.kernel_pid;
+        let bytes = service_javascript_fs_read_sync_rpc(kernel, process, kernel_pid, request)?;
+        return Ok(JavascriptSyncRpcServiceResponse::Raw(bytes));
+    }
     let response = match request.method.as_str() {
         "__bench.noop" => Ok(Value::Null),
         "__bench.net_tcp_metrics_reset" => {

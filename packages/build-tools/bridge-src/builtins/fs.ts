@@ -1795,11 +1795,11 @@ var WriteStream = class {
                   chunk.copy(output, cursor);
                   cursor += chunk.length;
                 }
-                fs.writeFileSync(pathStr, output.toString(this._options?.encoding ?? "utf8"));
+                fs.writeFileSync(pathStr, output);
               } else {
                 fs.writeFileSync(
                   pathStr,
-                  import_buffer.Buffer.concat(chunks).toString(this._options?.encoding ?? "utf8")
+                  import_buffer.Buffer.concat(chunks)
                 );
               }
               if (this.autoClose && this.fd !== null && this.fd >= 0) {
@@ -2159,6 +2159,10 @@ function createBridgeSyncFacade(name) {
     }
   };
 }
+function hasBridgeSyncFn(name) {
+  const fn = getBridgeSyncFn(name);
+  return typeof fn === "function" || !!(fn && (typeof fn.applySync === "function" || typeof fn.applySyncPromise === "function"));
+}
 function createBridgeAsyncFacade(name) {
   return {
     apply(_thisArg, args) {
@@ -2178,6 +2182,7 @@ var _fs = {
   writeFile: createBridgeSyncFacade("_fsWriteFile"),
   readFileBinary: createBridgeSyncFacade("_fsReadFileBinary"),
   writeFileBinary: createBridgeSyncFacade("_fsWriteFileBinary"),
+  writeFileBinaryRaw: createBridgeSyncFacade("_fsWriteFileBinaryRaw"),
   readDir: createBridgeSyncFacade("_fsReadDir"),
   mkdir: createBridgeSyncFacade("_fsMkdir"),
   rmdir: createBridgeSyncFacade("_fsRmdir"),
@@ -2220,7 +2225,9 @@ var _fsAsync = {
 var _fdOpen = createBridgeSyncFacade("fs.openSync");
 var _fdClose = createBridgeSyncFacade("fs.closeSync");
 var _fdRead = createBridgeSyncFacade("fs.readSync");
+var _fsReadRaw = createBridgeSyncFacade("_fsReadRaw");
 var _fdWrite = createBridgeSyncFacade("fs.writeSync");
+var _fsWriteRaw = createBridgeSyncFacade("_fsWriteRaw");
 var _fdFstat = createBridgeSyncFacade("fs.fstatSync");
 var _fdFtruncate = createBridgeSyncFacade("fs.ftruncateSync");
 var _fdFsync = createBridgeSyncFacade("fs.fsyncSync");
@@ -2325,6 +2332,9 @@ async function fsWriteFileAsync(file, data, options) {
     }
     if (ArrayBuffer.isView(data)) {
       const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      if (hasBridgeSyncFn("_fsWriteFileBinaryRaw")) {
+        return _fs.writeFileBinaryRaw.applySyncPromise(void 0, [pathStr, uint8]);
+      }
       return await _fsAsync.writeFileBinary.apply(void 0, [pathStr, encodeBridgeBytes(uint8)]);
     }
     return await _fsAsync.writeFile.apply(void 0, [pathStr, String(data)]);
@@ -2595,6 +2605,9 @@ var fs = {
         return _fs.writeFile.applySyncPromise(void 0, [pathStr, data]);
       } else if (ArrayBuffer.isView(data)) {
         const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        if (hasBridgeSyncFn("_fsWriteFileBinaryRaw")) {
+          return _fs.writeFileBinaryRaw.applySyncPromise(void 0, [pathStr, uint8]);
+        }
         return _fs.writeFileBinary.applySyncPromise(void 0, [pathStr, encodeBridgeBytes(uint8)]);
       } else {
         return _fs.writeFile.applySyncPromise(void 0, [pathStr, String(data)]);
@@ -2872,24 +2885,28 @@ var fs = {
   },
   readSync(fd, buffer, offset, length, position) {
     const normalized = normalizeReadSyncArgs(buffer, offset, length, position);
-    let base64;
+    let bytes;
     try {
-      base64 = _fdRead.applySyncPromise(void 0, [fd, normalized.length, normalized.position ?? null]);
+      if (hasBridgeSyncFn("_fsReadRaw")) {
+        const rawBytes = _fsReadRaw.applySyncPromise(void 0, [fd, normalized.length, normalized.position ?? null]);
+        bytes = rawBytes instanceof Uint8Array ? rawBytes : import_buffer.Buffer.from(rawBytes);
+      } else {
+        const base64 = _fdRead.applySyncPromise(void 0, [fd, normalized.length, normalized.position ?? null]);
+        bytes = import_buffer.Buffer.from(base64, "base64");
+      }
     } catch (e) {
       const msg = e?.message ?? String(e);
       if (msg.includes("EBADF")) throw createFsError("EBADF", msg, "read");
       throw e;
     }
-    const bytes = import_buffer.Buffer.from(base64, "base64");
     const targetBuffer = new Uint8Array(
       normalized.buffer.buffer,
       normalized.buffer.byteOffset,
       normalized.buffer.byteLength
     );
-    for (let i = 0; i < bytes.length && i < normalized.length; i++) {
-      targetBuffer[normalized.offset + i] = bytes[i];
-    }
-    return bytes.length;
+    const bytesRead = Math.min(bytes.length, normalized.length);
+    targetBuffer.set(bytes.subarray(0, bytesRead), normalized.offset);
+    return bytesRead;
   },
   writeSync(fd, buffer, offsetOrPosition, lengthOrEncoding, position) {
     const normalized = normalizeWriteSyncArgs(buffer, offsetOrPosition, lengthOrEncoding, position);
@@ -2905,6 +2922,9 @@ var fs = {
     }
     const pos = normalized.position ?? null;
     try {
+      if (hasBridgeSyncFn("_fsWriteRaw")) {
+        return _fsWriteRaw.applySyncPromise(void 0, [fd, dataBytes, pos]);
+      }
       return _fdWrite.applySyncPromise(void 0, [fd, encodeBridgeBytes(dataBytes), pos]);
     } catch (e) {
       const msg = e?.message ?? String(e);
@@ -3489,26 +3509,12 @@ var fs = {
       );
       const cb = callback;
       try {
-        const bytesWritten = typeof normalized.buffer === "string" ? _fdWrite.applySyncPromise(
-          void 0,
-          [
-            fd,
-            encodeBridgeBytes(import_buffer.Buffer.from(normalized.buffer, normalized.encoding)),
-            normalized.position ?? null
-          ]
-        ) : _fdWrite.applySyncPromise(
-          void 0,
-          [
-            fd,
-            encodeBridgeBytes(import_buffer.Buffer.from(
-              new Uint8Array(
-                normalized.buffer.buffer,
-                normalized.buffer.byteOffset + normalized.offset,
-                normalized.length
-              )
-            )),
-            normalized.position ?? null
-          ]
+        const bytesWritten = fs.writeSync(
+          fd,
+          buffer,
+          offset,
+          length,
+          position
         );
         queueMicrotask(() => cb(null, bytesWritten));
       } catch (e) {

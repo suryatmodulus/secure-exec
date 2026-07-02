@@ -406,6 +406,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host filesystem bridge reference."
   },
   {
+    name: "_fsWriteFileBinaryRaw",
+    classification: "hardened",
+    rationale: "Raw-byte host filesystem binary write bridge reference."
+  },
+  {
     name: "_fsWriteFileBinaryAsync",
     classification: "hardened",
     rationale: "Host filesystem bridge reference."
@@ -591,9 +596,19 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host file-descriptor read bridge reference."
   },
   {
+    name: "_fsReadRaw",
+    classification: "hardened",
+    rationale: "Raw-byte host file-descriptor read bridge reference."
+  },
+  {
     name: "fs.writeSync",
     classification: "hardened",
     rationale: "Host file-descriptor write bridge reference."
+  },
+  {
+    name: "_fsWriteRaw",
+    classification: "hardened",
+    rationale: "Raw-byte host file-descriptor write bridge reference."
   },
   {
     name: "fs.fstatSync",

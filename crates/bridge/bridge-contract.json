@@ -122,6 +122,7 @@
 				"_fsWriteFile",
 				"_fsReadFileBinary",
 				"_fsWriteFileBinary",
+				"_fsWriteFileBinaryRaw",
 				"_fsReadDir",
 				"_fsMkdir",
 				"_fsRmdir",
@@ -141,7 +142,9 @@
 				"fs.openSync",
 				"fs.closeSync",
 				"fs.readSync",
+				"_fsReadRaw",
 				"fs.writeSync",
+				"_fsWriteRaw",
 				"fs.fstatSync",
 				"fs.futimesSync"
 			]
@@ -697,6 +700,10 @@
 			"method": "fs.writeFileSync",
 			"translateArgs": true
 		},
+		"_fsWriteFileBinaryRaw": {
+			"method": "fs.writeFileSync",
+			"translateArgs": false
+		},
 		"_fsWriteFileBinaryAsync": {
 			"method": "fs.promises.writeFile",
 			"translateArgs": true
@@ -1061,7 +1068,15 @@
 			"method": "fs.readSync",
 			"translateArgs": false
 		},
+		"_fsReadRaw": {
+			"method": "fs.readSync",
+			"translateArgs": false
+		},
 		"fs.writeSync": {
+			"method": "fs.writeSync",
+			"translateArgs": false
+		},
+		"_fsWriteRaw": {
 			"method": "fs.writeSync",
 			"translateArgs": false
 		}

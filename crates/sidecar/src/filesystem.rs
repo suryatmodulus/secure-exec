@@ -984,6 +984,38 @@ fn fs_sync_request_marks_host_write_dirty(
     })
 }
 
+pub(crate) fn service_javascript_fs_read_sync_rpc(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+    kernel_pid: u32,
+    request: &JavascriptSyncRpcRequest,
+) -> Result<Vec<u8>, SidecarError> {
+    let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem read fd")?;
+    let length = usize::try_from(javascript_sync_rpc_arg_u64(
+        &request.args,
+        1,
+        "filesystem read length",
+    )?)
+    .map_err(|_| {
+        SidecarError::InvalidState("filesystem read length must fit within usize".to_string())
+    })?;
+    let position =
+        javascript_sync_rpc_arg_u64_optional(&request.args, 2, "filesystem read position")?;
+    if let Some(mapped) = process.mapped_host_fd_mut(fd) {
+        let value = read_mapped_host_fd(mapped, fd, length, position)?;
+        return javascript_sync_rpc_bytes_arg(
+            std::slice::from_ref(&value),
+            0,
+            "filesystem mapped read response",
+        );
+    }
+    match position {
+        Some(offset) => kernel.fd_pread(EXECUTION_DRIVER_NAME, kernel_pid, fd, length, offset),
+        None => kernel.fd_read(EXECUTION_DRIVER_NAME, kernel_pid, fd, length),
+    }
+    .map_err(kernel_error)
+}
+
 pub(crate) fn service_javascript_fs_sync_rpc(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
@@ -1034,36 +1066,17 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 .map(|fd| json!(fd))
                 .map_err(|error| kernel_path_error("fs.open", path, error))
         }
-        "fs.read" | "fs.readSync" => {
-            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem read fd")?;
-            let length = usize::try_from(javascript_sync_rpc_arg_u64(
-                &request.args,
-                1,
-                "filesystem read length",
-            )?)
-            .map_err(|_| {
-                SidecarError::InvalidState(
-                    "filesystem read length must fit within usize".to_string(),
-                )
-            })?;
-            let position =
-                javascript_sync_rpc_arg_u64_optional(&request.args, 2, "filesystem read position")?;
-            if let Some(mapped) = process.mapped_host_fd_mut(fd) {
-                return read_mapped_host_fd(mapped, fd, length, position);
-            }
-            let bytes = match position {
-                Some(offset) => {
-                    kernel.fd_pread(EXECUTION_DRIVER_NAME, kernel_pid, fd, length, offset)
-                }
-                None => kernel.fd_read(EXECUTION_DRIVER_NAME, kernel_pid, fd, length),
-            }
-            .map_err(kernel_error)?;
-            Ok(javascript_sync_rpc_bytes_value(&bytes))
-        }
+        "fs.read" | "fs.readSync" => service_javascript_fs_read_sync_rpc(
+            kernel, process, kernel_pid, request,
+        )
+        .map(|bytes| javascript_sync_rpc_bytes_value(&bytes)),
         "fs.write" | "fs.writeSync" => {
             let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem write fd")?;
-            let contents =
-                javascript_sync_rpc_bytes_arg(&request.args, 1, "filesystem write contents")?;
+            let contents = if let Some(bytes) = request.raw_bytes_args.get(&1) {
+                bytes.clone()
+            } else {
+                javascript_sync_rpc_bytes_arg(&request.args, 1, "filesystem write contents")?
+            };
             let position = javascript_sync_rpc_arg_u64_optional(
                 &request.args,
                 2,
@@ -1226,8 +1239,11 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 "filesystem writeFile path",
             )?;
             let path = path.as_str();
-            let contents =
-                javascript_sync_rpc_bytes_arg(&request.args, 1, "filesystem writeFile contents")?;
+            let contents = if let Some(bytes) = request.raw_bytes_args.get(&1) {
+                bytes.clone()
+            } else {
+                javascript_sync_rpc_bytes_arg(&request.args, 1, "filesystem writeFile contents")?
+            };
             match mapped_runtime_host_path(process, path, true) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
                     let opened = open_mapped_runtime_beneath(
