@@ -58,6 +58,59 @@ Run one matrix op:
 BENCH_FAMILIES=net BENCH_OP_FILTER=tls_loopback_get pnpm --dir packages/benchmarks bench:matrix
 ```
 
+## Baseline And PR Gate
+
+The committed local baseline is `packages/benchmarks/results/baseline-local.json`. It is generated from the full 70-row latency matrix and records:
+
+- **Hardware**: `getHardware()` output for the canonical machine.
+- **Sidecar provenance**: binary path, inferred profile, mtime, and size.
+- **Engine defaults**: iterations, warmup, cold/shared-VM mode, and row count.
+- **Rows**: per-row lane p50 values and memory columns where available.
+
+Regenerate it only from a release sidecar on the canonical machine:
+
+```bash
+pnpm install --frozen-lockfile --filter "@secure-exec/benchmarks..."
+cargo build --release -p secure-exec-sidecar
+cargo build --release -p native-baseline
+cargo build --release -p native-baseline --target wasm32-wasip1
+SECURE_EXEC_SIDECAR_BIN="$PWD/target/release/secure-exec-sidecar" \
+	pnpm --dir packages/benchmarks bench:baseline
+```
+
+`bench:baseline` refuses debug sidecars and refuses filtered matrix runs. A complete baseline has `engine.rowCount = 70`.
+
+`pnpm --dir packages/benchmarks bench:gate` runs the deterministic PR subset with 9 measured iterations and 3 warmup iterations, then compares p50 against the baseline:
+
+- **Threshold**: fail when current p50 is greater than `2.0x` the baseline p50. Override with `BENCH_GATE_THRESHOLD`.
+- **Tiny-row floor**: rows with baseline p50 below `0.3ms` are ignored unless current p50 reaches at least `1ms`, so sub-millisecond timer noise does not flap the gate.
+- **Row override**: use `BENCH_GATE_ROWS=family/op[:lane],...` to run a smaller or different subset.
+- **Release-only**: the gate exits `2` if `SECURE_EXEC_SIDECAR_BIN` resolves to a debug sidecar.
+
+Gate rows:
+
+| Row | Lane | Why it is gated |
+| --- | --- | --- |
+| `fs/fs_write_small` | `guest` | Tiny sync write hot path, with the 1ms tiny-row floor. |
+| `fs/fs_write_big` | `guest` | Large write payload catches whole-buffer copy regressions. |
+| `fs/fs_read_small` | `guest` | Small read bridge/VFS floor. |
+| `fs/stat_storm` | `guest` | Metadata syscall hot path. |
+| `fs/readdir_small` | `guest` | Directory enumeration without the high variance of large listings. |
+| `net/tcp_connect_close` | `guest` | TCP socket lifecycle floor. |
+| `net/tcp_echo_small` | `guest` | Small TCP payload round trip. |
+| `net/http_loopback_get` | `guest` | HTTP over kernel sockets with a loopback server. |
+| `modules/import_fresh_file` | `guest` | Dynamic import and filesystem resolution. |
+| `modules/require_100_small` | `guest` | CommonJS resolver/cache behavior. |
+| `control/cpu_loop` | `wasm` | WASM runtime lane sanity check. |
+| `ecosystem/ls_100` | `vmCmd` | End-to-end WASM command tier. |
+
+The CI baseline is environment-specific because GitHub-hosted runner hardware differs from the canonical machine. In CI, `bench:gate` uses `packages/benchmarks/results/baseline-ci.json`. If it is missing, PR gates skip loudly. The nightly workflow runs the full matrix, writes a candidate `baseline-ci.json`, and uploads it as an artifact. Bootstrap is:
+
+1. Let the first nightly workflow finish.
+2. Download `baseline-ci.json` from the `nightly-benchmark-results` artifact.
+3. Commit it at `packages/benchmarks/results/baseline-ci.json`.
+4. Future PRs enforce the quick gate against that CI baseline.
+
 ### Latency Matrix VM Lifecycle
 
 The latency matrix gives each guest-backed benchmark op a dedicated sidecar and VM by default. Host-only lanes (`native`, `node`, and `hostCmd`) run before that VM is created; guest-backed lanes (`guest`, `wasm`, and `vmCmd`) run inside the op's VM, which is disposed before the next op.

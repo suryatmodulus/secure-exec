@@ -1,291 +1,260 @@
-/**
- * Baseline recording + regression-gate utilities for the JS-layer benchmarks.
- *
- * Strategy (chosen): a committed `baseline.json` in this directory holds the
- * "golden" numbers plus full metadata. A bench run records its own result JSON,
- * prints a delta table vs the baseline, and — when `--gate` is passed — exits
- * non-zero if a gated metric regresses beyond a *relative* tolerance. Baselines
- * are bumped explicitly with `--update-baseline` so the change is reviewed in a PR.
- *
- * Gate philosophy:
- *   - Gate on p50 (stable) of deterministic, llmock-backed metrics only.
- *   - Use *relative* thresholds (e.g. +12%), not absolute ms, so the gate tolerates
- *     hardware drift within a class.
- *   - Also gate hardware-independent ratios (e.g. the VM tax ratio), which survive
- *     cross-machine variance far better than absolute latencies.
- *   - Never gate on LLM-bound metrics (prompt latency) — those belong to a separate,
- *     informational real-API suite.
- */
+import { existsSync, readFileSync } from "node:fs";
+import { basename } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type { LatencyResult, LayerStatsEntry } from "./lib/layers.js";
+import { getHardware, round } from "./lib/perf-utils.js";
+import { writeJson } from "./lib/report.js";
+import {
+	formatPacificIso,
+	formatSidecarProvenance,
+	resolveBenchSidecarProvenance,
+	type SidecarBinaryProvenance,
+} from "./lib/vm.js";
 
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import os from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+export const LOCAL_BASELINE_PATH = fileURLToPath(
+	new URL("../results/baseline-local.json", import.meta.url),
+);
+export const CI_BASELINE_PATH = fileURLToPath(
+	new URL("../results/baseline-ci.json", import.meta.url),
+);
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = join(HERE, "..", "..", "..");
-export const BASELINE_PATH = join(HERE, "..", "results", "baseline.json");
+export type GateLane =
+	| "native"
+	| "node"
+	| "guest"
+	| "wasm"
+	| "hostCmd"
+	| "vmCmd";
 
-export interface PhaseStats {
-	mean: number;
-	p50: number;
-	p95: number;
-	p99: number;
-	min: number;
-	max: number;
-	stddev: number;
-}
-
-export interface BenchMetadata {
-	timestamp: string;
-	gitSha: string;
-	gitDirty: boolean;
-	hardware: {
-		cpu: string;
-		cores: number;
-		ram: string;
-		node: string;
-		os: string;
-		arch: string;
+export interface MatrixBaseline {
+	schemaVersion: 1;
+	kind: "local" | "ci";
+	generatedAt: string;
+	hardware: ReturnType<typeof getHardware>;
+	sidecar: SidecarBinaryProvenance;
+	engine: {
+		iterations: number;
+		warmup: number;
+		cold: boolean;
+		sharedVm: boolean;
+		rowCount: number;
 	};
-	/** Versions that move the numbers — recorded so a baseline is interpretable. */
-	deps: Record<string, string>;
-	llmock: boolean;
-	iterations: number;
-	warmup: number;
+	rows: MatrixBaselineRow[];
 }
 
-export interface BenchResult extends BenchMetadata {
-	benchmark: string;
-	/** lane -> metric -> stats (e.g. lanes.vm.sessionCreate.p50). */
-	lanes: Record<string, Record<string, PhaseStats>>;
-	/** Derived comparison metrics (e.g. vmTaxMs, vmTaxRatio). */
-	derived: Record<string, number>;
+export interface MatrixBaselineRow {
+	key: string;
+	family: string;
+	op: string;
+	lanes: Partial<Record<GateLane, BaselineLane>>;
+	tax: Record<string, number>;
+	skipped?: true;
+	skipReason?: string;
 }
 
-/** A single gate rule. `path` is "lane.metric.field" or "derived.key". */
-export interface GateRule {
-	path: string;
-	/** Relative tolerance, e.g. 0.12 = fail if current exceeds baseline by >12%. */
-	tolerance: number;
-	/**
-	 * Noise floor: a regression only counts if the *absolute* delta also exceeds
-	 * this. Prevents tiny-value metrics (e.g. a ~10ms vmCreate) from flaking the
-	 * gate on sub-millisecond jitter that looks large in percent terms.
-	 */
-	noiseFloor?: number;
-	/** Human label for the delta table. */
-	label?: string;
+export interface BaselineLane {
+	p50Ms: number;
+	memBytes?: number;
+	memProvenance?: string;
 }
 
-// ── stats ────────────────────────────────────────────────────────────
-
-export function round(n: number, decimals = 2): number {
-	const f = 10 ** decimals;
-	return Math.round(n * f) / f;
+export interface LatencyMatrixLike {
+	results?: LatencyResult[];
+	latency?: LatencyResult[];
+	sidecar: SidecarBinaryProvenance;
+	mode?: {
+		cold: boolean;
+		sharedVm: boolean;
+	};
+	matrixMode?: {
+		cold: boolean;
+		sharedVm: boolean;
+	};
 }
 
-function percentile(sorted: number[], p: number): number {
-	const idx = Math.ceil((p / 100) * sorted.length) - 1;
-	return sorted[Math.max(0, Math.min(sorted.length - 1, idx))];
+export function baselinePathForEnvironment(): string {
+	return process.env.GITHUB_ACTIONS === "true" ? CI_BASELINE_PATH : LOCAL_BASELINE_PATH;
 }
 
-export function stats(samples: number[]): PhaseStats {
-	const sorted = [...samples].sort((a, b) => a - b);
-	const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
-	const variance =
-		samples.reduce((a, b) => a + (b - mean) ** 2, 0) / samples.length;
+export function loadMatrixBaseline(path: string): MatrixBaseline | null {
+	if (!existsSync(path)) return null;
+	return JSON.parse(readFileSync(path, "utf8")) as MatrixBaseline;
+}
+
+export function rowKey(row: Pick<LatencyResult, "family" | "op">): string {
+	return `${row.family}/${row.op}`;
+}
+
+export function laneMetric(
+	row: Pick<MatrixBaselineRow, "lanes">,
+	lane: GateLane,
+): BaselineLane | undefined {
+	return row.lanes[lane];
+}
+
+export function createMatrixBaseline(
+	matrix: LatencyMatrixLike,
+	options: {
+		kind: "local" | "ci";
+		iterations: number;
+		warmup: number;
+	},
+): MatrixBaseline {
+	const latency = matrix.results ?? matrix.latency ?? [];
+	const mode = matrix.mode ?? matrix.matrixMode ?? { cold: false, sharedVm: false };
 	return {
-		mean: round(mean),
-		p50: round(percentile(sorted, 50)),
-		p95: round(percentile(sorted, 95)),
-		p99: round(percentile(sorted, 99)),
-		min: round(sorted[0]),
-		max: round(sorted[sorted.length - 1]),
-		stddev: round(Math.sqrt(variance)),
+		schemaVersion: 1,
+		kind: options.kind,
+		generatedAt: formatPacificIso(new Date()),
+		hardware: getHardware(),
+		sidecar: matrix.sidecar,
+		engine: {
+			iterations: options.iterations,
+			warmup: options.warmup,
+			cold: mode.cold,
+			sharedVm: mode.sharedVm,
+			rowCount: latency.length,
+		},
+		rows: latency.map(baselineRowFromLatency),
 	};
 }
 
-// ── metadata ─────────────────────────────────────────────────────────
+export function baselineRowFromLatency(result: LatencyResult): MatrixBaselineRow {
+	const lanes: MatrixBaselineRow["lanes"] = {};
+	for (const lane of ["native", "node", "guest", "wasm", "hostCmd", "vmCmd"] as const) {
+		const stats = (result.layers as Partial<Record<GateLane, LayerStatsEntry>>)[lane];
+		if (stats) lanes[lane] = baselineLane(stats);
+	}
+	return {
+		key: rowKey(result),
+		family: result.family,
+		op: result.op,
+		lanes,
+		tax: Object.fromEntries(
+			Object.entries(result.tax).filter((entry): entry is [string, number] =>
+				typeof entry[1] === "number",
+			),
+		),
+		...("skipped" in result && result.skipped ? { skipped: true as const } : {}),
+		...("skipReason" in result && result.skipReason
+			? { skipReason: result.skipReason }
+			: {}),
+	};
+}
 
-function safe<T>(fn: () => T, fallback: T): T {
-	try {
-		return fn();
-	} catch {
-		return fallback;
+export function printBaselineMetadata(baseline: MatrixBaseline, path: string): void {
+	console.log(
+		JSON.stringify(
+			{
+				path,
+				kind: baseline.kind,
+				generatedAt: baseline.generatedAt,
+				hardware: baseline.hardware,
+				sidecar: baseline.sidecar,
+				engine: baseline.engine,
+			},
+			null,
+			2,
+		),
+	);
+}
+
+function baselineLane(stats: LayerStatsEntry): BaselineLane {
+	return {
+		p50Ms: stats.p50,
+		...(stats.memBytes !== undefined ? { memBytes: stats.memBytes } : {}),
+		...(stats.memProvenance ? { memProvenance: stats.memProvenance } : {}),
+	};
+}
+
+function parseArgs(argv: string[]): {
+	kind: "local" | "ci";
+	output: string;
+	from?: string;
+} {
+	let kind: "local" | "ci" = "local";
+	let output: string | undefined;
+	let from: string | undefined;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--ci") {
+			kind = "ci";
+		} else if (arg === "--local") {
+			kind = "local";
+		} else if (arg === "--output") {
+			output = argv[++i];
+		} else if (arg === "--from") {
+			from = argv[++i];
+		} else {
+			throw new Error(`unknown ${basename(import.meta.url)} argument: ${arg}`);
+		}
+	}
+	return {
+		kind,
+		output: output ?? (kind === "ci" ? CI_BASELINE_PATH : LOCAL_BASELINE_PATH),
+		from,
+	};
+}
+
+async function loadOrRunMatrix(from: string | undefined): Promise<LatencyMatrixLike> {
+	if (from) {
+		return JSON.parse(readFileSync(from, "utf8")) as LatencyMatrixLike;
+	}
+	if (process.env.BENCH_FAMILIES || process.env.BENCH_OP_FILTER) {
+		throw new Error("baseline regeneration requires the full matrix; unset BENCH_FAMILIES and BENCH_OP_FILTER");
+	}
+	const sidecar = resolveBenchSidecarProvenance();
+	console.error(formatSidecarProvenance(sidecar));
+	if (sidecar.profile !== "release") {
+		throw new BaselineExitError(
+			2,
+			`refusing to regenerate baseline with ${sidecar.profile} sidecar; set SECURE_EXEC_SIDECAR_BIN to target/release/secure-exec-sidecar`,
+		);
+	}
+	const { runLatencyMatrix } = await import("./run-all.js");
+	return runLatencyMatrix();
+}
+
+class BaselineExitError extends Error {
+	constructor(
+		readonly code: number,
+		message: string,
+	) {
+		super(message);
 	}
 }
 
-function gitSha(): string {
-	// Works for both git and jj (colocated or standalone) checkouts.
-	const fromGit = safe(
-		() =>
-			execFileSync("git", ["rev-parse", "--short", "HEAD"], {
-				cwd: REPO_ROOT,
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "ignore"],
-			}).trim(),
-		"",
-	);
-	if (fromGit) return fromGit;
-	return safe(
-		() =>
-			execFileSync(
-				"jj",
-				["log", "-r", "@", "--no-graph", "-T", "commit_id.short()"],
-				{ cwd: REPO_ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-			).trim(),
-		"unknown",
-	);
-}
-
-function gitDirty(): boolean {
-	return safe(
-		() =>
-			execFileSync("git", ["status", "--porcelain"], {
-				cwd: REPO_ROOT,
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "ignore"],
-			}).trim().length > 0,
-		false,
-	);
-}
-
-/**
- * Best-effort read of an installed package version. Resolves the package's main
- * entry then walks up to its package.json — `require.resolve("<name>/package.json")`
- * fails when the package's `exports` map doesn't expose `./package.json`.
- */
-function pkgVersion(name: string): string {
-	return safe(() => {
-		const req = createRequire(join(REPO_ROOT, "package.json"));
-		let dir = dirname(req.resolve(name));
-		for (let i = 0; i < 8; i++) {
-			const candidate = join(dir, "package.json");
-			if (existsSync(candidate)) {
-				const pkg = JSON.parse(readFileSync(candidate, "utf8"));
-				if (pkg.name === name && pkg.version) return pkg.version;
-			}
-			const parent = dirname(dir);
-			if (parent === dir) break;
-			dir = parent;
-		}
-		return "unknown";
-	}, "absent");
-}
-
-export function collectMetadata(opts: {
-	iterations: number;
-	warmup: number;
-	llmock: boolean;
-}): BenchMetadata {
-	const cpus = os.cpus();
-	return {
-		timestamp: new Date().toISOString(),
-		gitSha: gitSha(),
-		gitDirty: gitDirty(),
-		hardware: {
-			cpu: cpus[0]?.model ?? "unknown",
-			cores: os.availableParallelism(),
-			ram: `${round(os.totalmem() / 1024 ** 3, 1)} GB`,
-			node: process.version,
-			os: `${os.type()} ${os.release()}`,
-			arch: os.arch(),
-		},
-		// These are the versions that swing the numbers — the published-binary vs
-		// source-build gap proved versions matter for interpreting a baseline.
-		deps: {
-			"@secure-exec/core": pkgVersion("@secure-exec/core"),
-			"@secure-exec/sidecar": pkgVersion("@secure-exec/sidecar"),
-		},
-		iterations: opts.iterations,
-		warmup: opts.warmup,
-		llmock: opts.llmock,
-	};
-}
-
-// ── baseline IO ──────────────────────────────────────────────────────
-
-export function loadBaseline(): BenchResult | null {
-	if (!existsSync(BASELINE_PATH)) return null;
-	return JSON.parse(readFileSync(BASELINE_PATH, "utf8")) as BenchResult;
-}
-
-export function writeBaseline(result: BenchResult): void {
-	writeFileSync(BASELINE_PATH, `${JSON.stringify(result, null, 2)}\n`);
-}
-
-// ── compare + gate ───────────────────────────────────────────────────
-
-function resolvePath(result: BenchResult, path: string): number | undefined {
-	const parts = path.split(".");
-	if (parts[0] === "derived") return result.derived[parts[1]];
-	const [lane, metric, field] = parts;
-	const s = result.lanes[lane]?.[metric];
-	return s ? (s[field as keyof PhaseStats] as number) : undefined;
-}
-
-export interface GateOutcome {
-	path: string;
-	label: string;
-	baseline: number | undefined;
-	current: number | undefined;
-	deltaPct: number | undefined;
-	tolerance: number;
-	regressed: boolean;
-}
-
-export function evaluateGate(
-	current: BenchResult,
-	baseline: BenchResult | null,
-	rules: GateRule[],
-): GateOutcome[] {
-	return rules.map((rule) => {
-		const cur = resolvePath(current, rule.path);
-		const base = baseline ? resolvePath(baseline, rule.path) : undefined;
-		const deltaPct =
-			base !== undefined && base !== 0 && cur !== undefined
-				? round(((cur - base) / base) * 100)
-				: undefined;
-		const absDelta =
-			base !== undefined && cur !== undefined ? cur - base : undefined;
-		const regressed =
-			deltaPct !== undefined &&
-			absDelta !== undefined &&
-			deltaPct > rule.tolerance * 100 &&
-			absDelta > (rule.noiseFloor ?? 0);
-		return {
-			path: rule.path,
-			label: rule.label ?? rule.path,
-			baseline: base,
-			current: cur,
-			deltaPct,
-			tolerance: rule.tolerance,
-			regressed,
-		};
+async function main(): Promise<void> {
+	const args = parseArgs(process.argv.slice(2));
+	const matrix = await loadOrRunMatrix(args.from);
+	if (matrix.sidecar.profile !== "release") {
+		throw new BaselineExitError(
+			2,
+			`refusing to write ${args.output} from ${matrix.sidecar.profile} sidecar provenance`,
+		);
+	}
+	const baseline = createMatrixBaseline(matrix, {
+		kind: args.kind,
+		iterations: Number(process.env.BENCH_ITERATIONS ?? 20),
+		warmup: Number(process.env.BENCH_WARMUP ?? 5),
 	});
+	if (baseline.engine.rowCount !== 70) {
+		throw new BaselineExitError(
+			2,
+			`refusing to write incomplete baseline: expected 70 matrix rows, got ${baseline.engine.rowCount}`,
+		);
+	}
+	writeJson(args.output, baseline);
+	printBaselineMetadata(baseline, args.output);
 }
 
-export function printDeltaTable(outcomes: GateOutcome[]): void {
-	const headers = ["metric", "baseline", "current", "delta%", "budget%", ""];
-	const rows = outcomes.map((o) => [
-		o.label,
-		o.baseline ?? "—",
-		o.current ?? "—",
-		o.deltaPct === undefined ? "—" : `${o.deltaPct > 0 ? "+" : ""}${o.deltaPct}`,
-		`±${round(o.tolerance * 100)}`,
-		o.baseline === undefined ? "NEW" : o.regressed ? "❌ REGRESSED" : "✓",
-	]);
-	const widths = headers.map((h, i) =>
-		Math.max(h.length, ...rows.map((r) => String(r[i]).length)),
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+	main().then(
+		() => process.exit(0),
+		(error) => {
+			const code = error instanceof BaselineExitError ? error.code : 1;
+			console.error(error instanceof Error ? error.message : error);
+			process.exit(code);
+		},
 	);
-	const fmt = (row: (string | number)[]) =>
-		row.map((c, i) => String(c).padStart(widths[i])).join(" | ");
-	console.error("");
-	console.error(fmt(headers));
-	console.error(widths.map((w) => "-".repeat(w)).join("-+-"));
-	for (const row of rows) console.error(fmt(row));
-	console.error("");
 }

@@ -62,6 +62,7 @@ Every bound that protects a shared resource — memory/heap, CPU/wall-clock, fd/
 - **Clock discipline:** guest clocks are 1ms-quantized by default for security. Bench VMs opt in to `jsRuntime.highResolutionTime`, or the op must amplify by call count.
 - **Unsupported cells:** unsupported lane/op cells are explicit and never silently dropped.
 - **Baselines:** regenerate baselines only on a canonical environment, with hardware and dependency metadata recorded.
+- **Bench gate:** `packages/benchmarks/results/baseline-local.json` is the canonical-machine baseline; `baseline-ci.json` is GitHub-runner-specific and bootstrapped from the nightly artifact before PR gates enforce it.
 - **Merge rule:** a perf fix whose row does not move gets reverted, matching the Performance section.
 - **Keep them current:** the benches are a maintained surface, not a one-off audit. New runtime surface (a syscall, a polyfill module, an executor capability, a registry command tier) needs a matrix op or focused lane in the same change or a filed follow-up; perf-relevant changes to existing surface must re-run the affected rows and update coverage when the shape changes (new lanes, renamed ops). If a bench stops compiling or a lane can no longer run, fix or explicitly skip it with a reason — never delete coverage silently.
 - **Agent OS boundary:** agent-os keeps product-surface benches only (session tax, ACP) and consumes this framework.

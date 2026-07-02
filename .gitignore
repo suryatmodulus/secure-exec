@@ -77,6 +77,8 @@ crates/execution/async-out.txt
 crates/sidecar/.tmp-sidecar-tests/
 packages/browser/.cache/
 packages/benchmarks/results/*
+!packages/benchmarks/results/baseline-local.json
+!packages/benchmarks/results/baseline-ci.json
 website/.astro/
 website/public/docs/
 

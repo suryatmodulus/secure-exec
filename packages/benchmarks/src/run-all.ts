@@ -45,6 +45,7 @@ import { runFuzz } from "./fuzz/run.js";
 import { runLeakSuite } from "./leak.js";
 import { runFootprint } from "./footprint.js";
 import { compareBaselineFile } from "./compare-baseline.js";
+import { pathToFileURL } from "node:url";
 
 const RESULTS_DIR = new URL("../results/", import.meta.url).pathname;
 const ITERATIONS = Number(process.env.BENCH_ITERATIONS ?? 20);
@@ -432,10 +433,12 @@ function criticGaps(
 	return gaps;
 }
 
-main().then(
-	() => process.exit(0),
-	(error) => {
-		console.error(error);
-		process.exit(1);
-	},
-);
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+	main().then(
+		() => process.exit(0),
+		(error) => {
+			console.error(error);
+			process.exit(1);
+		},
+	);
+}

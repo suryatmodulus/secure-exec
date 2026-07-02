@@ -8,7 +8,7 @@ function fsWriteOp(name: string, sizeBytes: number): BenchmarkOp {
 		nativeArgs: ["--size-bytes", String(sizeBytes)],
 		fileLine: "crates/kernel/src/kernel.rs:1930",
 		reproducer: `node fs.writeFileSync('/tmp/fuzz-perf-write.txt', ${sizeBytes} byte payload)`,
-		program: `async (i) => {
+	program: `async (i) => {
   const fs = await import("node:fs");
   fs.writeFileSync("/tmp/fuzz-perf-write.txt", Buffer.alloc(${sizeBytes}, i & 255));
 }`,
