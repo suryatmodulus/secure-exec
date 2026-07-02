@@ -879,6 +879,7 @@ ykAheWCsAteSEWVc0w==\n\
                 .expect("spawn javascript kernel process")
         }
 
+        #[allow(dead_code)]
         fn create_active_execution_for_tests() -> ActiveExecution {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
@@ -922,7 +923,7 @@ ykAheWCsAteSEWVc0w==\n\
                 kernel_handle.pid(),
                 kernel_handle,
                 GuestRuntimeKind::JavaScript,
-                create_active_execution_for_tests(),
+                ActiveExecution::Tool(ToolExecution::default()),
             )
         }
 
@@ -19377,7 +19378,7 @@ console.log(JSON.stringify({
 
         #[test]
         fn javascript_loopback_tls_https_get_buffers_handshake_pending_write() {
-            javascript_loopback_tls_https_get_buffers_handshake_pending_write_work();
+            run_isolated_service_test("loopback-tls-https-pending-write");
         }
 
         #[test]
@@ -19442,6 +19443,9 @@ console.log(JSON.stringify({
                 }
                 "vm-fetch-kernel-tcp-target-exit" => {
                     vm_fetch_kernel_tcp_target_exit_cleans_up_process_resources();
+                }
+                "loopback-tls-https-pending-write" => {
+                    javascript_loopback_tls_https_get_buffers_handshake_pending_write_work();
                 }
                 other => panic!("unknown isolated service test {other}"),
             }

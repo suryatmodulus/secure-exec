@@ -681,11 +681,7 @@ fn dispatch_runtime_command(
         } => snapshot_cache
             .get_or_create_with_userland(
                 &bridge_code,
-                if userland_code.is_empty() {
-                    None
-                } else {
-                    Some(userland_code.as_str())
-                },
+                (!userland_code.is_empty()).then_some(userland_code.as_str()),
             )
             .map(|_| ())
             .map_err(other_io_error),

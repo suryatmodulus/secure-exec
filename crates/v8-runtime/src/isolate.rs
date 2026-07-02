@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use crate::ipc::ExecutionError;
 use secure_exec_bridge::queue_tracker::{warn_limit_exhausted, TrackedLimit};
 
 static V8_INIT: Once = Once::new();
+static V8_ISOLATE_LIFECYCLE: Mutex<()> = Mutex::new(());
 const MAX_UNHANDLED_PROMISE_REJECTIONS: usize = 1024;
 
 #[repr(align(16))]
@@ -183,10 +184,29 @@ pub fn create_isolate(heap_limit_mb: Option<u32>) -> v8::OwnedIsolate {
     let mut params = v8::CreateParams::default();
     let limit_bytes = (limit as usize) * 1024 * 1024;
     params = params.heap_limits(0, limit_bytes);
-    let mut isolate = v8::Isolate::new(params);
+    let mut isolate = with_isolate_lifecycle_lock(|| v8::Isolate::new(params));
     configure_isolate(&mut isolate);
     install_heap_limit_guard(&mut isolate);
     isolate
+}
+
+/// Run V8 isolate create/drop work under a process-wide lifecycle lock.
+///
+/// rusty_v8 130.0.7 embeds a V8 13.0-era process-wide WebAssembly code pointer
+/// table. Isolate construction allocates wasm builtin handles from that table and
+/// isolate destruction frees them again, so create/drop must not overlap across
+/// session threads.
+pub fn with_isolate_lifecycle_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = V8_ISOLATE_LIFECYCLE
+        .lock()
+        .expect("V8 isolate lifecycle lock poisoned");
+    f()
+}
+
+pub fn drop_isolate(isolate: Option<v8::OwnedIsolate>) {
+    if let Some(isolate) = isolate {
+        with_isolate_lifecycle_lock(|| drop(isolate));
+    }
 }
 
 /// Create a new V8 context on the given isolate.

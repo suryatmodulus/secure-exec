@@ -1,6 +1,8 @@
 // V8 startup snapshots: fast isolate creation from pre-compiled bridge code
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -19,6 +21,33 @@ const MAX_V8_BRIDGE_CODE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_V8_USERLAND_CODE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const V8_BRIDGE_CODE_LIMIT_ERROR_CODE: &str = "ERR_V8_BRIDGE_CODE_LIMIT";
 pub(crate) const V8_USERLAND_CODE_LIMIT_ERROR_CODE: &str = "ERR_V8_USERLAND_CODE_LIMIT";
+
+const SNAPSHOT_HELPER_ENV: &str = "SECURE_EXEC_V8_SNAPSHOT_HELPER";
+const SNAPSHOT_HELPER_MAGIC: &[u8; 8] = b"SEV8SNP1";
+const SNAPSHOT_HELPER_OK: &[u8; 2] = b"OK";
+const SNAPSHOT_HELPER_ERR: &[u8; 3] = b"ERR";
+const SNAPSHOT_HELPER_NONE_LEN: u64 = u64::MAX;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[used]
+#[link_section = ".init_array"]
+static SNAPSHOT_HELPER_CTOR: extern "C" fn() = snapshot_helper_ctor;
+
+// Same pre-main hook on macOS: the darwin sidecar build ships this crate, and
+// without the constructor the helper child would fall through to the normal
+// main and the parent's snapshot request would fail.
+#[cfg(target_os = "macos")]
+#[used]
+#[link_section = "__DATA,__mod_init_func"]
+static SNAPSHOT_HELPER_CTOR: extern "C" fn() = snapshot_helper_ctor;
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+extern "C" fn snapshot_helper_ctor() {
+    if std::env::var_os(SNAPSHOT_HELPER_ENV).is_some() {
+        let code = run_snapshot_helper_from_stdio();
+        std::process::exit(code);
+    }
+}
 
 pub(crate) fn validate_bridge_code_size(bridge_code: &str) -> Result<(), String> {
     if bridge_code.len() > MAX_V8_BRIDGE_CODE_BYTES {
@@ -140,7 +169,7 @@ fn run_snapshot_script(scope: &mut v8::HandleScope, code: &str, label: &str) -> 
 ///
 /// Returns an error if the bridge code fails to compile or the resulting
 /// snapshot exceeds MAX_SNAPSHOT_BLOB_BYTES.
-pub fn create_snapshot(bridge_code: &str) -> Result<v8::StartupData, String> {
+pub fn create_snapshot(bridge_code: &str) -> Result<Vec<u8>, String> {
     create_snapshot_inner(bridge_code, None)
 }
 
@@ -159,14 +188,26 @@ pub fn create_snapshot(bridge_code: &str) -> Result<v8::StartupData, String> {
 pub fn create_snapshot_with_userland(
     bridge_code: &str,
     userland_code: &str,
-) -> Result<v8::StartupData, String> {
+) -> Result<Vec<u8>, String> {
     create_snapshot_inner(bridge_code, Some(userland_code))
 }
 
 fn create_snapshot_inner(
     bridge_code: &str,
     userland_code: Option<&str>,
-) -> Result<v8::StartupData, String> {
+) -> Result<Vec<u8>, String> {
+    validate_bridge_code_size(bridge_code)?;
+    if let Some(userland_code) = userland_code {
+        validate_userland_code_size(userland_code)?;
+    }
+
+    create_snapshot_in_subprocess(bridge_code, userland_code)
+}
+
+fn create_snapshot_inner_in_process(
+    bridge_code: &str,
+    userland_code: Option<&str>,
+) -> Result<Vec<u8>, String> {
     validate_bridge_code_size(bridge_code)?;
     if let Some(userland_code) = userland_code {
         validate_userland_code_size(userland_code)?;
@@ -174,55 +215,265 @@ fn create_snapshot_inner(
 
     init_v8_platform();
 
-    let mut isolate = v8::Isolate::snapshot_creator(Some(external_refs()), None);
-    let bridge_result = {
-        let scope = &mut v8::HandleScope::new(&mut isolate);
-        let context = v8::Context::new(scope, Default::default());
-        let scope = &mut v8::ContextScope::new(scope, context);
+    crate::isolate::with_isolate_lifecycle_lock(|| {
+        let mut isolate = v8::Isolate::snapshot_creator(Some(external_refs()), None);
+        let bridge_result = {
+            let scope = &mut v8::HandleScope::new(&mut isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
 
-        // Register stub bridge functions so the IIFE can reference them.
-        let sync_bridge_fns = sync_bridge_fns();
-        let async_bridge_fns = async_bridge_fns();
-        register_stub_bridge_fns(scope, sync_bridge_fns, async_bridge_fns);
+            // Register stub bridge functions so the IIFE can reference them.
+            let sync_bridge_fns = sync_bridge_fns();
+            let async_bridge_fns = async_bridge_fns();
+            register_stub_bridge_fns(scope, sync_bridge_fns, async_bridge_fns);
 
-        // Inject default config globals for bridge IIFE setup
-        inject_snapshot_defaults(scope);
+            // Inject default config globals for bridge IIFE setup
+            inject_snapshot_defaults(scope);
 
-        // Compile and run bridge code — context captures fully-initialized state.
-        // Then, if present, run the userland (agent-SDK) IIFE in the SAME context so
-        // its evaluated graph is captured alongside the bridge.
-        let result = (|| -> Result<(), String> {
-            run_snapshot_script(scope, bridge_code, "bridge code")?;
-            if let Some(userland_code) = userland_code {
-                // Some bridge-backed globals (e.g. `process.versions`) are lazy
-                // getters that dispatch a host bridge call on first access. During
-                // snapshot creation the bridge fns are stubs, so an agent SDK that
-                // reads them at module-init would fail. Freeze them to static values
-                // first; per-session config is still injected post-restore.
-                run_snapshot_script(scope, SNAPSHOT_USERLAND_PREP, "userland prep")?;
-                run_snapshot_script(scope, userland_code, "userland code")?;
-            }
-            Ok(())
-        })();
+            // Compile and run bridge code — context captures fully-initialized state.
+            // Then, if present, run the userland (agent-SDK) IIFE in the SAME context so
+            // its evaluated graph is captured alongside the bridge.
+            let result = (|| -> Result<(), String> {
+                run_snapshot_script(scope, bridge_code, "bridge code")?;
+                if let Some(userland_code) = userland_code {
+                    // Some bridge-backed globals (e.g. `process.versions`) are lazy
+                    // getters that dispatch a host bridge call on first access. During
+                    // snapshot creation the bridge fns are stubs, so an agent SDK that
+                    // reads them at module-init would fail. Freeze them to static values
+                    // first; per-session config is still injected post-restore.
+                    run_snapshot_script(scope, SNAPSHOT_USERLAND_PREP, "userland prep")?;
+                    run_snapshot_script(scope, userland_code, "userland code")?;
+                }
+                Ok(())
+            })();
 
-        scope.set_default_context(context);
-        result
-    };
-    let blob = isolate
-        .create_blob(v8::FunctionCodeHandling::Keep)
-        .ok_or_else(|| "V8 snapshot creation failed".to_string())?;
-    bridge_result?;
+            scope.set_default_context(context);
+            result
+        };
+        let blob = isolate
+            .create_blob(v8::FunctionCodeHandling::Keep)
+            .ok_or_else(|| "V8 snapshot creation failed".to_string())?;
+        bridge_result?;
 
-    // Reject oversized snapshots
-    if blob.len() > MAX_SNAPSHOT_BLOB_BYTES {
+        // Reject oversized snapshots
+        if blob.len() > MAX_SNAPSHOT_BLOB_BYTES {
+            return Err(format!(
+                "snapshot blob too large: {} bytes (max {})",
+                blob.len(),
+                MAX_SNAPSHOT_BLOB_BYTES
+            ));
+        }
+
+        Ok(blob.to_vec())
+    })
+}
+
+fn create_snapshot_in_subprocess(
+    bridge_code: &str,
+    userland_code: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let current_exe =
+        std::env::current_exe().map_err(|error| format!("snapshot helper path: {error}"))?;
+    let mut child = Command::new(current_exe)
+        .env(SNAPSHOT_HELPER_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("spawn snapshot helper: {error}"))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| String::from("snapshot helper stdin unavailable"))?;
+        write_snapshot_helper_request(&mut stdin, bridge_code, userland_code)?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for snapshot helper: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "snapshot blob too large: {} bytes (max {})",
-            blob.len(),
-            MAX_SNAPSHOT_BLOB_BYTES
+            "snapshot helper exited with status {}: {}",
+            output.status, stderr
         ));
     }
 
-    Ok(blob)
+    parse_snapshot_helper_response(&output.stdout, &output.stderr)
+}
+
+fn write_snapshot_helper_request(
+    writer: &mut impl Write,
+    bridge_code: &str,
+    userland_code: Option<&str>,
+) -> Result<(), String> {
+    writer
+        .write_all(SNAPSHOT_HELPER_MAGIC)
+        .map_err(|error| format!("write snapshot helper magic: {error}"))?;
+    write_u64(writer, bridge_code.len() as u64)?;
+    write_u64(
+        writer,
+        userland_code
+            .map(|code| code.len() as u64)
+            .unwrap_or(SNAPSHOT_HELPER_NONE_LEN),
+    )?;
+    writer
+        .write_all(bridge_code.as_bytes())
+        .map_err(|error| format!("write snapshot helper bridge code: {error}"))?;
+    if let Some(userland_code) = userland_code {
+        writer
+            .write_all(userland_code.as_bytes())
+            .map_err(|error| format!("write snapshot helper userland code: {error}"))?;
+    }
+    Ok(())
+}
+
+fn parse_snapshot_helper_response(stdout: &[u8], stderr: &[u8]) -> Result<Vec<u8>, String> {
+    if stdout.starts_with(SNAPSHOT_HELPER_OK) {
+        let payload = &stdout[SNAPSHOT_HELPER_OK.len()..];
+        let (len, rest) = read_u64_from_slice(payload)?;
+        let len = usize::try_from(len)
+            .map_err(|_| String::from("snapshot helper OK payload length overflows usize"))?;
+        if rest.len() != len {
+            return Err(format!(
+                "snapshot helper OK payload length mismatch: declared {}, got {}",
+                len,
+                rest.len()
+            ));
+        }
+        return Ok(rest.to_vec());
+    }
+
+    if stdout.starts_with(SNAPSHOT_HELPER_ERR) {
+        let payload = &stdout[SNAPSHOT_HELPER_ERR.len()..];
+        let (len, rest) = read_u64_from_slice(payload)?;
+        let len = usize::try_from(len)
+            .map_err(|_| String::from("snapshot helper error length overflows usize"))?;
+        if rest.len() != len {
+            return Err(format!(
+                "snapshot helper error length mismatch: declared {}, got {}",
+                len,
+                rest.len()
+            ));
+        }
+        let message = String::from_utf8_lossy(rest);
+        return Err(message.into_owned());
+    }
+
+    Err(format!(
+        "snapshot helper returned invalid response (stdout {} bytes, stderr: {})",
+        stdout.len(),
+        String::from_utf8_lossy(stderr)
+    ))
+}
+
+fn run_snapshot_helper_from_stdio() -> i32 {
+    let mut input = Vec::new();
+    if let Err(error) = std::io::stdin().read_to_end(&mut input) {
+        let _ = write_snapshot_helper_error(format!("read snapshot helper request: {error}"));
+        return 2;
+    }
+
+    let result = (|| -> Result<Vec<u8>, String> {
+        let (bridge_code, userland_code) = parse_snapshot_helper_request(&input)?;
+        create_snapshot_inner_in_process(&bridge_code, userland_code.as_deref())
+    })();
+
+    match result {
+        Ok(blob) => match write_snapshot_helper_ok(&blob) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("write snapshot helper response: {error}");
+                2
+            }
+        },
+        Err(error) => match write_snapshot_helper_error(error) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("write snapshot helper error response: {error}");
+                2
+            }
+        },
+    }
+}
+
+fn parse_snapshot_helper_request(input: &[u8]) -> Result<(String, Option<String>), String> {
+    let Some(rest) = input.strip_prefix(SNAPSHOT_HELPER_MAGIC) else {
+        return Err(String::from("snapshot helper request missing magic"));
+    };
+    let (bridge_len, rest) = read_u64_from_slice(rest)?;
+    let (userland_len, rest) = read_u64_from_slice(rest)?;
+    let bridge_len = usize::try_from(bridge_len)
+        .map_err(|_| String::from("snapshot helper bridge length overflows usize"))?;
+    if rest.len() < bridge_len {
+        return Err(format!(
+            "snapshot helper bridge length mismatch: declared {}, got {}",
+            bridge_len,
+            rest.len()
+        ));
+    }
+    let (bridge_bytes, rest) = rest.split_at(bridge_len);
+    let userland_code = if userland_len == SNAPSHOT_HELPER_NONE_LEN {
+        if !rest.is_empty() {
+            return Err(format!(
+                "snapshot helper request has {} trailing bytes after bridge-only payload",
+                rest.len()
+            ));
+        }
+        None
+    } else {
+        let userland_len = usize::try_from(userland_len)
+            .map_err(|_| String::from("snapshot helper userland length overflows usize"))?;
+        if rest.len() != userland_len {
+            return Err(format!(
+                "snapshot helper userland length mismatch: declared {}, got {}",
+                userland_len,
+                rest.len()
+            ));
+        }
+        Some(
+            String::from_utf8(rest.to_vec())
+                .map_err(|error| format!("snapshot helper userland is not UTF-8: {error}"))?,
+        )
+    };
+    let bridge_code = String::from_utf8(bridge_bytes.to_vec())
+        .map_err(|error| format!("snapshot helper bridge is not UTF-8: {error}"))?;
+    Ok((bridge_code, userland_code))
+}
+
+fn write_snapshot_helper_ok(blob: &[u8]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(SNAPSHOT_HELPER_OK)?;
+    write_u64_io(&mut stdout, blob.len() as u64)?;
+    stdout.write_all(blob)?;
+    stdout.flush()
+}
+
+fn write_snapshot_helper_error(message: String) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(SNAPSHOT_HELPER_ERR)?;
+    write_u64_io(&mut stdout, message.len() as u64)?;
+    stdout.write_all(message.as_bytes())?;
+    stdout.flush()
+}
+
+fn write_u64(writer: &mut impl Write, value: u64) -> Result<(), String> {
+    write_u64_io(writer, value).map_err(|error| format!("write snapshot helper length: {error}"))
+}
+
+fn write_u64_io(writer: &mut impl Write, value: u64) -> std::io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn read_u64_from_slice(input: &[u8]) -> Result<(u64, &[u8]), String> {
+    let bytes = input
+        .get(..8)
+        .ok_or_else(|| String::from("snapshot helper payload ended before u64"))?;
+    let mut value = [0_u8; 8];
+    value.copy_from_slice(bytes);
+    Ok((u64::from_le_bytes(value), &input[8..]))
 }
 
 /// Inject default config globals needed by the bridge IIFE during snapshot creation.
@@ -299,7 +550,7 @@ where
         .snapshot_blob(blob)
         .external_references(&**external_refs())
         .heap_limits(0, limit_bytes);
-    let mut isolate = v8::Isolate::new(params);
+    let mut isolate = crate::isolate::with_isolate_lifecycle_lock(|| v8::Isolate::new(params));
     crate::isolate::configure_isolate(&mut isolate);
     // Same OOM guard as the fresh-isolate path: terminate this isolate on heap
     // exhaustion instead of fatal-aborting the shared process (F-003).
@@ -409,8 +660,8 @@ impl SnapshotCache {
         }
 
         // Phase 2: create snapshot without holding the cache lock
-        let creation_result = create_snapshot_inner(bridge_code, userland_code)
-            .map(|startup_data| Arc::new(startup_data.to_vec()));
+        let creation_result =
+            create_snapshot_inner(bridge_code, userland_code).map(|blob| Arc::new(blob));
 
         // Phase 3: short lock — insert result, notify waiters, clean up
         {

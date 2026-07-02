@@ -556,6 +556,47 @@ fn assert_cpu_terminated_session_can_execute_again() -> io::Result<()> {
     Ok(())
 }
 
+fn assert_isolate_churn_recreates_embedded_sessions_without_segv() -> io::Result<()> {
+    let runtime = Arc::new(EmbeddedV8Runtime::new(Some(1))?);
+    let bridge_code = "(function() { globalThis.__churnBridgeReady = true; })();";
+
+    for _ in 0..32 {
+        let session_id = next_session_id();
+        let receiver = register_and_create_session(&runtime, &session_id)?;
+        dispatch_execute(
+            runtime.as_ref(),
+            &session_id,
+            0,
+            bridge_code,
+            "if (globalThis.__churnBridgeReady !== true) { throw new Error('missing bridge'); }",
+        )?;
+        assert_execution_ok(&receiver, &session_id);
+        runtime.dispatch(RuntimeCommand::DestroySession {
+            session_id: session_id.clone(),
+        })?;
+        runtime.unregister_session(&session_id);
+    }
+
+    let session_id = next_session_id();
+    let receiver = register_and_create_session(&runtime, &session_id)?;
+    dispatch_execute(
+        runtime.as_ref(),
+        &session_id,
+        0,
+        bridge_code,
+        "globalThis.__afterChurn = 42;",
+    )?;
+    assert_execution_ok(&receiver, &session_id);
+    runtime.dispatch(RuntimeCommand::DestroySession {
+        session_id: session_id.clone(),
+    })?;
+    runtime.unregister_session(&session_id);
+    wait_until("expected isolate churn sessions to drain", || {
+        runtime.session_count() == 0 && runtime.active_slot_count() == 0
+    });
+    Ok(())
+}
+
 #[test]
 fn embedded_runtime_session_consolidated_behaviors() -> io::Result<()> {
     // Keep the embedded-runtime coverage in one test process. V8 teardown across
@@ -569,5 +610,6 @@ fn embedded_runtime_session_consolidated_behaviors() -> io::Result<()> {
     assert_shared_runtime_handles_share_concurrency_quota()?;
     assert_terminate_interrupts_sync_bridge_wait()?;
     assert_cpu_terminated_session_can_execute_again()?;
+    assert_isolate_churn_recreates_embedded_sessions_without_segv()?;
     Ok(())
 }

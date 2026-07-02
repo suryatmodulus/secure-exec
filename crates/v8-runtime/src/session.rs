@@ -914,7 +914,7 @@ fn session_thread(
                             // outlive the isolate that created them.
                             reset_pending_promises(&mut pending);
                             drop(_v8_context.take());
-                            drop(v8_isolate.take());
+                            isolate::drop_isolate(v8_isolate.take());
                             from_snapshot = false;
                             isolate_bridge_code = None;
                             isolate_userland_code = None;
@@ -926,35 +926,39 @@ fn session_thread(
                             // The snapshot captures the bridge AND (when present) the
                             // agent-SDK userland bundle, keyed process-wide by both, so
                             // the SDK is evaluated once per sidecar and reused here.
-                            let userland_for_snapshot = if effective_userland_code.is_empty() {
-                                None
-                            } else {
-                                Some(effective_userland_code.as_str())
-                            };
-                            let mut iso = if !effective_bridge_code.is_empty() {
-                                match snapshot_cache.get_or_create_with_userland(
-                                    &effective_bridge_code,
-                                    userland_for_snapshot,
-                                ) {
-                                    Ok(blob) => {
-                                        from_snapshot = true;
-                                        snapshot::create_isolate_from_snapshot(
-                                            (*blob).clone(),
-                                            heap_limit_mb,
-                                        )
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "snapshot creation failed, falling back to fresh isolate: {}",
-                                            e
-                                        );
-                                        from_snapshot = false;
-                                        isolate::create_isolate(heap_limit_mb)
-                                    }
+                            let snapshot_blob = match snapshot_cache.get_or_create_with_userland(
+                                &effective_bridge_code,
+                                (!effective_userland_code.is_empty())
+                                    .then_some(effective_userland_code.as_str()),
+                            ) {
+                                Ok(blob) => Some(blob),
+                                Err(message) => {
+                                    // Snapshot creation runs in a helper subprocess; if
+                                    // that fails (unsupported platform, spawn failure),
+                                    // degrade to a fresh isolate that evaluates the
+                                    // bridge in-context rather than failing the session.
+                                    eprintln!(
+                                        "secure-exec-v8-runtime: snapshot creation failed, \
+                                         falling back to fresh isolate: {message}"
+                                    );
+                                    None
                                 }
-                            } else {
-                                from_snapshot = false;
-                                isolate::create_isolate(heap_limit_mb)
+                            };
+                            let mut iso = match snapshot_blob {
+                                Some(blob) => {
+                                    from_snapshot = true;
+                                    eprintln!(
+                                        "secure-exec-v8-runtime: restored session isolate from_snapshot=true"
+                                    );
+                                    snapshot::create_isolate_from_snapshot(
+                                        (*blob).clone(),
+                                        heap_limit_mb,
+                                    )
+                                }
+                                None => {
+                                    from_snapshot = false;
+                                    isolate::create_isolate(heap_limit_mb)
+                                }
                             };
                             iso.set_host_import_module_dynamically_callback(
                                 execution::dynamic_import_callback,
@@ -1541,7 +1545,7 @@ fn session_thread(
         // violating the V8 lifetime contract.
         reset_pending_promises(&mut pending);
         drop(_v8_context.take());
-        drop(v8_isolate.take());
+        isolate::drop_isolate(v8_isolate.take());
     }
 
     // Release concurrency slot
