@@ -158,6 +158,9 @@ if (!modulePath) {
 const moduleBase64 = process.env.AGENTOS_WASM_MODULE_BASE64;
 const __agentOSWasmPhaseDebug = process.env.AGENTOS_WASM_WARMUP_DEBUG === '1';
 const __agentOSWasmPhaseTimings = [];
+const __agentOSWasiSyscallPhasesEnabled = process.env.AGENTOS_WASI_SYSCALL_PHASES === '1';
+const __agentOSWasiSyscallMetrics = new Map();
+const __agentOSWasiSyncRpcMetrics = new Map();
 
 function __agentOSWasmNowNs() {
   return process.hrtime.bigint();
@@ -181,6 +184,133 @@ function __agentOSWasmMeasurePhase(name, run) {
   } finally {
     __agentOSWasmRecordPhase(name, startedNs);
   }
+}
+
+function __agentOSWasiMetricFor(map, key, factory) {
+  let metric = map.get(key);
+  if (!metric) {
+    metric = factory();
+    map.set(key, metric);
+  }
+  return metric;
+}
+
+function __agentOSWasiSyscallMetric(name) {
+  return __agentOSWasiMetricFor(__agentOSWasiSyscallMetrics, name, () => ({
+    name,
+    count: 0,
+    totalNs: 0n,
+    phases: new Map(),
+  }));
+}
+
+function __agentOSWasiRecordSyscall(name, startedNs) {
+  if (!__agentOSWasiSyscallPhasesEnabled) {
+    return;
+  }
+  const metric = __agentOSWasiSyscallMetric(name);
+  metric.count += 1;
+  metric.totalNs += __agentOSWasmNowNs() - startedNs;
+}
+
+function __agentOSWasiRecordPhase(syscallName, phaseName, startedNs) {
+  if (!__agentOSWasiSyscallPhasesEnabled) {
+    return;
+  }
+  const syscall = __agentOSWasiSyscallMetric(syscallName);
+  const phase = __agentOSWasiMetricFor(syscall.phases, phaseName, () => ({
+    name: phaseName,
+    count: 0,
+    totalNs: 0n,
+  }));
+  phase.count += 1;
+  phase.totalNs += __agentOSWasmNowNs() - startedNs;
+}
+
+function __agentOSWasiMeasurePhase(syscallName, phaseName, run) {
+  if (!__agentOSWasiSyscallPhasesEnabled) {
+    return run();
+  }
+  const startedNs = __agentOSWasmNowNs();
+  try {
+    return run();
+  } finally {
+    __agentOSWasiRecordPhase(syscallName, phaseName, startedNs);
+  }
+}
+
+function __agentOSWasiRecordSyncRpc(method, route, startedNs) {
+  if (!__agentOSWasiSyscallPhasesEnabled) {
+    return;
+  }
+  const key = `${route}:${method}`;
+  const metric = __agentOSWasiMetricFor(__agentOSWasiSyncRpcMetrics, key, () => ({
+    method,
+    route,
+    count: 0,
+    totalNs: 0n,
+  }));
+  metric.count += 1;
+  metric.totalNs += __agentOSWasmNowNs() - startedNs;
+}
+
+function __agentOSWasiNsToUs(ns) {
+  return Number(ns) / 1000;
+}
+
+function __agentOSWasiMetricSummary(metric) {
+  const totalUs = __agentOSWasiNsToUs(metric.totalNs);
+  return {
+    name: metric.name,
+    count: metric.count,
+    totalUs,
+    avgUs: metric.count > 0 ? totalUs / metric.count : 0,
+    phases: Array.from(metric.phases.values())
+      .map((phase) => {
+        const phaseTotalUs = __agentOSWasiNsToUs(phase.totalNs);
+        return {
+          name: phase.name,
+          count: phase.count,
+          totalUs: phaseTotalUs,
+          avgUs: phase.count > 0 ? phaseTotalUs / phase.count : 0,
+        };
+      })
+      .sort((left, right) => right.totalUs - left.totalUs),
+  };
+}
+
+function __agentOSWasiEmitSyscallPhaseMetrics() {
+  if (!__agentOSWasiSyscallPhasesEnabled || typeof process?.stderr?.write !== 'function') {
+    return;
+  }
+  try {
+    process.stderr.write(`__AGENTOS_WASI_SYSCALL_PHASE_METRICS__:${JSON.stringify({
+      modulePath,
+      syscalls: Array.from(__agentOSWasiSyscallMetrics.values())
+        .map(__agentOSWasiMetricSummary)
+        .sort((left, right) => right.totalUs - left.totalUs),
+      syncRpc: Array.from(__agentOSWasiSyncRpcMetrics.values())
+        .map((metric) => {
+          const totalUs = __agentOSWasiNsToUs(metric.totalNs);
+          return {
+            method: metric.method,
+            route: metric.route,
+            count: metric.count,
+            totalUs,
+            avgUs: metric.count > 0 ? totalUs / metric.count : 0,
+          };
+        })
+        .sort((left, right) => right.totalUs - left.totalUs),
+    })}\n`);
+  } catch {
+    // Diagnostics must never change command behavior.
+  }
+}
+
+if (__agentOSWasiSyscallPhasesEnabled && typeof process?.on === 'function') {
+  process.on('exit', () => {
+    __agentOSWasiEmitSyscallPhaseMetrics();
+  });
 }
 
 function __agentOSWasmEmitPhaseMetrics(reason, extra = {}) {
@@ -2450,7 +2580,12 @@ function callSyncRpc(method, args = []) {
     globalThis.__agentOSSyncRpc &&
     typeof globalThis.__agentOSSyncRpc.callSync === 'function'
   ) {
-    return globalThis.__agentOSSyncRpc.callSync(method, args);
+    const startedNs = __agentOSWasmNowNs();
+    try {
+      return globalThis.__agentOSSyncRpc.callSync(method, args);
+    } finally {
+      __agentOSWasiRecordSyncRpc(method, 'glue', startedNs);
+    }
   }
 
   if (!NODE_SYNC_RPC_ENABLE || NODE_SYNC_RPC_REQUEST_FD == null || NODE_SYNC_RPC_RESPONSE_FD == null) {
@@ -2459,25 +2594,30 @@ function callSyncRpc(method, args = []) {
     throw error;
   }
 
-  const payload = JSON.stringify({
-    id: nextSyncRpcId++,
-    method,
-    args: encodeSyncRpcValue(args),
-  });
-  writeSync(NODE_SYNC_RPC_REQUEST_FD, `${payload}\n`);
+  const startedNs = __agentOSWasmNowNs();
+  try {
+    const payload = JSON.stringify({
+      id: nextSyncRpcId++,
+      method,
+      args: encodeSyncRpcValue(args),
+    });
+    writeSync(NODE_SYNC_RPC_REQUEST_FD, `${payload}\n`);
 
-  const response = JSON.parse(readSyncRpcLine());
-  if (response?.ok) {
-    return decodeSyncRpcValue(response.result);
-  }
+    const response = JSON.parse(readSyncRpcLine());
+    if (response?.ok) {
+      return decodeSyncRpcValue(response.result);
+    }
 
-  const error = new Error(
-    response?.error?.message || `secure-exec WASM sync RPC ${method} failed`,
-  );
-  if (typeof response?.error?.code === 'string') {
-    error.code = response.error.code;
+    const error = new Error(
+      response?.error?.message || `secure-exec WASM sync RPC ${method} failed`,
+    );
+    if (typeof response?.error?.code === 'string') {
+      error.code = response.error.code;
+    }
+    throw error;
+  } finally {
+    __agentOSWasiRecordSyncRpc(method, 'pipe', startedNs);
   }
-  throw error;
 }
 
 const hostNetSockets = new Map();
@@ -4164,14 +4304,17 @@ if (delegatePathOpen) {
     fdflags,
     openedFdPtr,
   ) => {
-    if (
+    const workspaceReadOnlyDenied = __agentOSWasiMeasurePhase('path_open', 'readonly_policy', () =>
       isWorkspaceReadOnly() &&
       (hasMutationOpenFlags(oflags) || hasWriteRights(rightsBase))
-    ) {
+    );
+    if (workspaceReadOnlyDenied) {
       return denyReadOnlyMutation();
     }
 
-    const passthroughDirHandle = lookupFdHandle(fd);
+    const passthroughDirHandle = __agentOSWasiMeasurePhase('path_open', 'lookup_handle', () =>
+      lookupFdHandle(fd)
+    );
     if (passthroughDirHandle && passthroughDirHandle.kind !== 'passthrough') {
       return WASI_ERRNO_BADF;
     }
@@ -4183,23 +4326,30 @@ if (delegatePathOpen) {
       passthroughDirHandle?.kind === 'passthrough'
         ? passthroughDirHandle.targetFd
         : fd;
-    const guestPath = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
-    if (
+    const guestPath = __agentOSWasiMeasurePhase('path_open', 'path_resolution', () =>
+      resolvePathOpenGuestPath(fd, pathPtr, pathLen)
+    );
+    const guestReadOnlyDenied = __agentOSWasiMeasurePhase('path_open', 'readonly_policy', () =>
       guestPathIsReadOnly(guestPath) &&
       (hasMutationOpenFlags(oflags) || hasWriteRights(rightsBase))
-    ) {
+    );
+    if (guestReadOnlyDenied) {
       return denyReadOnlyMutation();
     }
     if (!SIDECAR_MANAGED_PROCESS && (Number(oflags) & WASI_OFLAGS_CREAT) !== 0) {
       try {
-        const syntheticResult = openGuestFileForPathOpen(
-          fd,
-          pathPtr,
-          pathLen,
-          oflags,
-          rightsBase,
-          fdflags,
-          openedFdPtr,
+        const syntheticResult = __agentOSWasiMeasurePhase(
+          'path_open',
+          'synthetic_open',
+          () => openGuestFileForPathOpen(
+            fd,
+            pathPtr,
+            pathLen,
+            oflags,
+            rightsBase,
+            fdflags,
+            openedFdPtr,
+          ),
         );
         if (syntheticResult != null) {
           return syntheticResult;
@@ -4209,16 +4359,20 @@ if (delegatePathOpen) {
       }
     }
 
-    let result = delegatePathOpen(
-      delegateDirFd,
-      dirflags,
-      pathPtr,
-      pathLen,
-      oflags,
-      rightsBase,
-      rightsInheriting,
-      fdflags,
-      openedFdPtr,
+    let result = __agentOSWasiMeasurePhase(
+      'path_open',
+      'delegate_call',
+      () => delegatePathOpen(
+        delegateDirFd,
+        dirflags,
+        pathPtr,
+        pathLen,
+        oflags,
+        rightsBase,
+        rightsInheriting,
+        fdflags,
+        openedFdPtr,
+      ),
     );
 
     if (
@@ -4227,27 +4381,37 @@ if (delegatePathOpen) {
       (Number(oflags) & WASI_OFLAGS_CREAT) !== 0
     ) {
       try {
-        precreatePathOpenTarget(fd, pathPtr, pathLen, oflags);
-        result = delegatePathOpen(
-          delegateDirFd,
-          dirflags,
-          pathPtr,
-          pathLen,
-          oflags,
-          rightsBase,
-          rightsInheriting,
-          fdflags,
-          openedFdPtr,
+        __agentOSWasiMeasurePhase('path_open', 'synthetic_precreate', () =>
+          precreatePathOpenTarget(fd, pathPtr, pathLen, oflags)
         );
-        if (result !== WASI_ERRNO_SUCCESS) {
-          const fallbackResult = openGuestFileForPathOpen(
-            fd,
+        result = __agentOSWasiMeasurePhase(
+          'path_open',
+          'delegate_call',
+          () => delegatePathOpen(
+            delegateDirFd,
+            dirflags,
             pathPtr,
             pathLen,
             oflags,
             rightsBase,
+            rightsInheriting,
             fdflags,
             openedFdPtr,
+          ),
+        );
+        if (result !== WASI_ERRNO_SUCCESS) {
+          const fallbackResult = __agentOSWasiMeasurePhase(
+            'path_open',
+            'synthetic_open',
+            () => openGuestFileForPathOpen(
+              fd,
+              pathPtr,
+              pathLen,
+              oflags,
+              rightsBase,
+              fdflags,
+              openedFdPtr,
+            ),
           );
           if (fallbackResult != null) {
             return fallbackResult;
@@ -4259,7 +4423,9 @@ if (delegatePathOpen) {
     }
 
     if (result === WASI_ERRNO_SUCCESS) {
-      return retainPathOpenDelegateFd(openedFdPtr, guestPath);
+      return __agentOSWasiMeasurePhase('path_open', 'fd_bookkeeping', () =>
+        retainPathOpenDelegateFd(openedFdPtr, guestPath)
+      );
     }
     return result;
   };
@@ -4403,11 +4569,13 @@ const KERNEL_POLLHUP = 0x0010;
 
 wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
   const numericFd = Number(fd) >>> 0;
-  const handle = lookupFdHandle(numericFd);
+  const handle = __agentOSWasiMeasurePhase('fd_read', 'lookup_handle', () =>
+    lookupFdHandle(numericFd)
+  );
 
   if (handle?.kind === 'pipe-read') {
     try {
-      const requestedLength = (() => {
+      const requestedLength = __agentOSWasiMeasurePhase('fd_read', 'iov_scan', () => {
         if (!(instanceMemory instanceof WebAssembly.Memory)) {
           return 0;
         }
@@ -4418,22 +4586,36 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
           total += view.getUint32(entryOffset + 4, true);
         }
         return total >>> 0;
-      })();
+      });
 
-      while (handle.pipe.chunks.length === 0) {
-        if (handle.pipe.writeHandleCount === 0 && handle.pipe.producers.size === 0) {
-          return writeGuestUint32(nreadPtr, 0);
-        }
+      const pipeClosed = __agentOSWasiMeasurePhase('fd_read', 'pipe_wait', () => {
+        while (handle.pipe.chunks.length === 0) {
+          if (handle.pipe.writeHandleCount === 0 && handle.pipe.producers.size === 0) {
+            return true;
+          }
 
-        const pumped = pumpPipeProducers(handle.pipe, 10);
-        if (!pumped) {
-          Atomics.wait(syntheticWaitArray, 0, 0, 10);
+          const pumped = pumpPipeProducers(handle.pipe, 10);
+          if (!pumped) {
+            Atomics.wait(syntheticWaitArray, 0, 0, 10);
+          }
         }
+        return false;
+      });
+      if (pipeClosed) {
+        return __agentOSWasiMeasurePhase('fd_read', 'result_marshal', () =>
+          writeGuestUint32(nreadPtr, 0)
+        );
       }
 
-      const chunk = dequeuePipeBytes(handle.pipe, requestedLength);
-      const written = writeBytesToGuestIovs(iovs, iovsLen, chunk);
-      return writeGuestUint32(nreadPtr, written);
+      const chunk = __agentOSWasiMeasurePhase('fd_read', 'host_io', () =>
+        dequeuePipeBytes(handle.pipe, requestedLength)
+      );
+      const written = __agentOSWasiMeasurePhase('fd_read', 'guest_iov_write', () =>
+        writeBytesToGuestIovs(iovs, iovsLen, chunk)
+      );
+      return __agentOSWasiMeasurePhase('fd_read', 'result_marshal', () =>
+        writeGuestUint32(nreadPtr, written)
+      );
     } catch {
       return WASI_ERRNO_FAULT;
     }
@@ -4441,7 +4623,7 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
 
   if (handle?.kind === 'guest-file') {
     try {
-      const requestedLength = (() => {
+      const requestedLength = __agentOSWasiMeasurePhase('fd_read', 'iov_scan', () => {
         if (!(instanceMemory instanceof WebAssembly.Memory)) {
           return 0;
         }
@@ -4452,18 +4634,24 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
           total += view.getUint32(entryOffset + 4, true);
         }
         return total >>> 0;
-      })();
+      });
       const buffer = Buffer.alloc(requestedLength);
-      const bytesRead = fsModule.readSync(
-        handle.targetFd,
-        buffer,
-        0,
-        requestedLength,
-        handle.position ?? 0,
+      const bytesRead = __agentOSWasiMeasurePhase('fd_read', 'host_io', () =>
+        fsModule.readSync(
+          handle.targetFd,
+          buffer,
+          0,
+          requestedLength,
+          handle.position ?? 0,
+        )
       );
       handle.position = (handle.position ?? 0) + bytesRead;
-      const written = writeBytesToGuestIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
-      return writeGuestUint32(nreadPtr, written);
+      const written = __agentOSWasiMeasurePhase('fd_read', 'guest_iov_write', () =>
+        writeBytesToGuestIovs(iovs, iovsLen, buffer.subarray(0, bytesRead))
+      );
+      return __agentOSWasiMeasurePhase('fd_read', 'result_marshal', () =>
+        writeGuestUint32(nreadPtr, written)
+      );
     } catch {
       return WASI_ERRNO_FAULT;
     }
@@ -4480,7 +4668,7 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
       process.env.AGENTOS_SANDBOX_ROOT.length > 0;
     if (sidecarManagedProcess || KERNEL_STDIO_SYNC_RPC) {
       try {
-        const requestedLength = (() => {
+        const requestedLength = __agentOSWasiMeasurePhase('fd_read', 'iov_scan', () => {
           if (!(instanceMemory instanceof WebAssembly.Memory)) {
             return 0;
           }
@@ -4491,13 +4679,21 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
             total += view.getUint32(entryOffset + 4, true);
           }
           return total >>> 0;
-        })();
-        const chunk = readKernelStdinChunk(requestedLength);
+        });
+        const chunk = __agentOSWasiMeasurePhase('fd_read', 'kernel_stdin_read', () =>
+          readKernelStdinChunk(requestedLength)
+        );
         if (!chunk || chunk.length === 0) {
-          return writeGuestUint32(nreadPtr, 0);
+          return __agentOSWasiMeasurePhase('fd_read', 'result_marshal', () =>
+            writeGuestUint32(nreadPtr, 0)
+          );
         }
-        const written = writeBytesToGuestIovs(iovs, iovsLen, chunk);
-        return writeGuestUint32(nreadPtr, written);
+        const written = __agentOSWasiMeasurePhase('fd_read', 'guest_iov_write', () =>
+          writeBytesToGuestIovs(iovs, iovsLen, chunk)
+        );
+        return __agentOSWasiMeasurePhase('fd_read', 'result_marshal', () =>
+          writeGuestUint32(nreadPtr, written)
+        );
       } catch {
         return WASI_ERRNO_FAULT;
       }
@@ -4510,7 +4706,9 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
 
   if (handle?.kind === 'passthrough') {
     return delegateManagedFdRead
-      ? delegateManagedFdRead(handle.targetFd, iovs, iovsLen, nreadPtr)
+      ? __agentOSWasiMeasurePhase('fd_read', 'delegate_call', () =>
+          delegateManagedFdRead(handle.targetFd, iovs, iovsLen, nreadPtr)
+        )
       : WASI_ERRNO_BADF;
   }
 
@@ -4519,7 +4717,9 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
   }
 
   return delegateManagedFdRead
-    ? delegateManagedFdRead(numericFd, iovs, iovsLen, nreadPtr)
+    ? __agentOSWasiMeasurePhase('fd_read', 'delegate_call', () =>
+        delegateManagedFdRead(numericFd, iovs, iovsLen, nreadPtr)
+      )
     : WASI_ERRNO_BADF;
 };
 
@@ -4681,7 +4881,9 @@ wasiImport.fd_tell = (fd, offsetPtr) => {
 };
 
 wasiImport.fd_fdstat_get = (fd, statPtr) => {
-  const handle = lookupFdHandle(fd);
+  const handle = __agentOSWasiMeasurePhase('fd_fdstat_get', 'lookup_handle', () =>
+    lookupFdHandle(fd)
+  );
   // Kernel-PTY stdio must report CHARACTER_DEVICE so guest is_terminal()/
   // isatty() see the TTY (the runner-process fds behind the delegate are
   // pipes). Resolve dup'd passthrough handles to their target fd first.
@@ -4690,42 +4892,54 @@ wasiImport.fd_fdstat_get = (fd, statPtr) => {
       handle?.kind === 'passthrough' ? Number(handle.targetFd) >>> 0 : Number(fd) >>> 0;
     if ((handle == null || handle.kind === 'passthrough') && stdioFd <= 2 &&
         stdioFdIsKernelTty(stdioFd)) {
-      return writeGuestFdstat(
-        statPtr,
-        WASI_FILETYPE_CHARACTER_DEVICE,
-        0,
-        WASI_RIGHT_FD_READ |
-          WASI_RIGHT_FD_WRITE |
-          WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
-          WASI_RIGHT_FD_FILESTAT_GET |
-          WASI_RIGHT_POLL_FD_READWRITE,
-        0n,
+      return __agentOSWasiMeasurePhase(
+        'fd_fdstat_get',
+        'marshal_fdstat',
+        () => writeGuestFdstat(
+          statPtr,
+          WASI_FILETYPE_CHARACTER_DEVICE,
+          0,
+          WASI_RIGHT_FD_READ |
+            WASI_RIGHT_FD_WRITE |
+            WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
+            WASI_RIGHT_FD_FILESTAT_GET |
+            WASI_RIGHT_POLL_FD_READWRITE,
+          0n,
+        ),
       );
     }
   }
   if (handle?.kind === 'pipe-read') {
-    return writeGuestFdstat(
-      statPtr,
-      WASI_FILETYPE_UNKNOWN,
-      0,
-      WASI_RIGHT_FD_READ |
-        WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
-        WASI_RIGHT_FD_FILESTAT_GET |
-        WASI_RIGHT_POLL_FD_READWRITE,
-      0n,
+    return __agentOSWasiMeasurePhase(
+      'fd_fdstat_get',
+      'marshal_fdstat',
+      () => writeGuestFdstat(
+        statPtr,
+        WASI_FILETYPE_UNKNOWN,
+        0,
+        WASI_RIGHT_FD_READ |
+          WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
+          WASI_RIGHT_FD_FILESTAT_GET |
+          WASI_RIGHT_POLL_FD_READWRITE,
+        0n,
+      ),
     );
   }
 
   if (handle?.kind === 'pipe-write') {
-    return writeGuestFdstat(
-      statPtr,
-      WASI_FILETYPE_UNKNOWN,
-      0,
-      WASI_RIGHT_FD_WRITE |
-        WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
-        WASI_RIGHT_FD_FILESTAT_GET |
-        WASI_RIGHT_POLL_FD_READWRITE,
-      0n,
+    return __agentOSWasiMeasurePhase(
+      'fd_fdstat_get',
+      'marshal_fdstat',
+      () => writeGuestFdstat(
+        statPtr,
+        WASI_FILETYPE_UNKNOWN,
+        0,
+        WASI_RIGHT_FD_WRITE |
+          WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
+          WASI_RIGHT_FD_FILESTAT_GET |
+          WASI_RIGHT_POLL_FD_READWRITE,
+        0n,
+      ),
     );
   }
 
@@ -4735,7 +4949,9 @@ wasiImport.fd_fdstat_get = (fd, statPtr) => {
 
   if (handle?.kind === 'passthrough') {
     return delegateManagedFdFdstatGet
-      ? delegateManagedFdFdstatGet(handle.targetFd, statPtr)
+      ? __agentOSWasiMeasurePhase('fd_fdstat_get', 'delegate_call', () =>
+          delegateManagedFdFdstatGet(handle.targetFd, statPtr)
+        )
       : WASI_ERRNO_BADF;
   }
 
@@ -4744,7 +4960,9 @@ wasiImport.fd_fdstat_get = (fd, statPtr) => {
   }
 
   return delegateManagedFdFdstatGet
-    ? delegateManagedFdFdstatGet(fd, statPtr)
+    ? __agentOSWasiMeasurePhase('fd_fdstat_get', 'delegate_call', () =>
+        delegateManagedFdFdstatGet(fd, statPtr)
+      )
     : WASI_ERRNO_BADF;
 };
 
@@ -4870,17 +5088,25 @@ wasiImport.fd_prestat_dir_name = (fd, pathPtr, pathLen) => {
 };
 
 wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
-  const handle = lookupFdHandle(fd);
+  const handle = __agentOSWasiMeasurePhase('fd_write', 'lookup_handle', () =>
+    lookupFdHandle(fd)
+  );
   const numericFd = Number(fd) >>> 0;
   if (handle?.kind === 'pipe-write') {
     try {
-      const bytes = collectGuestIovBytes(iovs, iovsLen);
+      const bytes = __agentOSWasiMeasurePhase('fd_write', 'guest_iov_collect', () =>
+        collectGuestIovBytes(iovs, iovsLen)
+      );
       if (bytes.length > 0 && !pipeHasReaders(handle.pipe)) {
         return WASI_ERRNO_PIPE;
       }
-      enqueuePipeBytes(handle.pipe, bytes);
-      flushPipeConsumers(handle.pipe);
-      return writeGuestUint32(nwrittenPtr, bytes.length);
+      __agentOSWasiMeasurePhase('fd_write', 'host_io', () => {
+        enqueuePipeBytes(handle.pipe, bytes);
+        flushPipeConsumers(handle.pipe);
+      });
+      return __agentOSWasiMeasurePhase('fd_write', 'result_marshal', () =>
+        writeGuestUint32(nwrittenPtr, bytes.length)
+      );
     } catch {
       return WASI_ERRNO_FAULT;
     }
@@ -4888,9 +5114,15 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
 
   if (handle?.kind === 'guest-file') {
     try {
-      const bytes = collectGuestIovBytes(iovs, iovsLen);
-      const written = writeBytesToGuestFileHandle(handle, bytes);
-      return writeGuestUint32(nwrittenPtr, written);
+      const bytes = __agentOSWasiMeasurePhase('fd_write', 'guest_iov_collect', () =>
+        collectGuestIovBytes(iovs, iovsLen)
+      );
+      const written = __agentOSWasiMeasurePhase('fd_write', 'host_io', () =>
+        writeBytesToGuestFileHandle(handle, bytes)
+      );
+      return __agentOSWasiMeasurePhase('fd_write', 'result_marshal', () =>
+        writeGuestUint32(nwrittenPtr, written)
+      );
     } catch {
       return WASI_ERRNO_FAULT;
     }
@@ -4901,7 +5133,9 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
       return WASI_ERRNO_ROFS;
     }
     return delegateManagedFdWrite
-      ? delegateManagedFdWrite(handle.targetFd, iovs, iovsLen, nwrittenPtr)
+      ? __agentOSWasiMeasurePhase('fd_write', 'delegate_call', () =>
+          delegateManagedFdWrite(handle.targetFd, iovs, iovsLen, nwrittenPtr)
+        )
       : WASI_ERRNO_BADF;
   }
 
@@ -4911,18 +5145,26 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
 
   if (numericFd === 1 || numericFd === 2) {
     try {
-      const bytes = collectGuestIovBytes(iovs, iovsLen);
+      const bytes = __agentOSWasiMeasurePhase('fd_write', 'guest_iov_collect', () =>
+        collectGuestIovBytes(iovs, iovsLen)
+      );
       const sidecarManagedProcess =
         typeof process?.env?.AGENTOS_SANDBOX_ROOT === 'string' &&
         process.env.AGENTOS_SANDBOX_ROOT.length > 0;
       if (sidecarManagedProcess || KERNEL_STDIO_SYNC_RPC) {
-        const written = Number(
-          callSyncRpc('__kernel_stdio_write', [numericFd, bytes]),
-        ) >>> 0;
-        return writeGuestUint32(nwrittenPtr, written);
+        const written = __agentOSWasiMeasurePhase('fd_write', 'sync_rpc', () =>
+          Number(callSyncRpc('__kernel_stdio_write', [numericFd, bytes])) >>> 0
+        );
+        return __agentOSWasiMeasurePhase('fd_write', 'result_marshal', () =>
+          writeGuestUint32(nwrittenPtr, written)
+        );
       }
-      (numericFd === 1 ? process.stdout : process.stderr).write(bytes);
-      return writeGuestUint32(nwrittenPtr, bytes.length);
+      __agentOSWasiMeasurePhase('fd_write', 'host_io', () =>
+        (numericFd === 1 ? process.stdout : process.stderr).write(bytes)
+      );
+      return __agentOSWasiMeasurePhase('fd_write', 'result_marshal', () =>
+        writeGuestUint32(nwrittenPtr, bytes.length)
+      );
     } catch {
       return WASI_ERRNO_FAULT;
     }
@@ -4933,7 +5175,9 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
   }
 
   return delegateManagedFdWrite
-    ? delegateManagedFdWrite(fd, iovs, iovsLen, nwrittenPtr)
+    ? __agentOSWasiMeasurePhase('fd_write', 'delegate_call', () =>
+        delegateManagedFdWrite(fd, iovs, iovsLen, nwrittenPtr)
+      )
     : WASI_ERRNO_BADF;
 };
 
@@ -4943,18 +5187,20 @@ wasiImport.fd_close = (fd) => {
     syntheticKind: syntheticFdEntries.get(Number(fd) >>> 0)?.kind ?? null,
     passthroughKind: passthroughHandles.get(Number(fd) >>> 0)?.kind ?? null,
   });
-  if (closeSyntheticFd(fd)) {
+  if (__agentOSWasiMeasurePhase('fd_close', 'synthetic_close', () => closeSyntheticFd(fd))) {
     traceHostProcess('fd-close-synthetic', { fd: Number(fd) >>> 0 });
     return WASI_ERRNO_SUCCESS;
   }
 
-  const handle = lookupFdHandle(fd);
+  const handle = __agentOSWasiMeasurePhase('fd_close', 'lookup_handle', () =>
+    lookupFdHandle(fd)
+  );
   if (handle?.kind === 'passthrough') {
     traceHostProcess('fd-close-passthrough', {
       fd: Number(fd) >>> 0,
       targetFd: handle.targetFd ?? null,
     });
-    closePassthroughFd(fd);
+    __agentOSWasiMeasurePhase('fd_close', 'fd_bookkeeping', () => closePassthroughFd(fd));
     return WASI_ERRNO_SUCCESS;
   }
 
@@ -4967,7 +5213,9 @@ wasiImport.fd_close = (fd) => {
   }
 
   if (delegateManagedFdRefCounts.has(Number(fd) >>> 0)) {
-    const shouldDelegateClose = releaseDelegateFd(fd);
+    const shouldDelegateClose = __agentOSWasiMeasurePhase('fd_close', 'fd_bookkeeping', () =>
+      releaseDelegateFd(fd)
+    );
     traceHostProcess('fd-close-delegate-tracked', {
       fd: Number(fd) >>> 0,
       shouldDelegateClose,
@@ -4980,7 +5228,11 @@ wasiImport.fd_close = (fd) => {
   }
 
   traceHostProcess('fd-close-delegate', { fd: Number(fd) >>> 0 });
-  return delegateManagedFdClose ? delegateManagedFdClose(fd) : WASI_ERRNO_BADF;
+  return delegateManagedFdClose
+    ? __agentOSWasiMeasurePhase('fd_close', 'delegate_call', () =>
+        delegateManagedFdClose(fd)
+      )
+    : WASI_ERRNO_BADF;
 };
 
 wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
@@ -5312,6 +5564,28 @@ const hostTtyImport = {
     return 0;
   },
 };
+
+function __agentOSWasiWrapImport(name, delegate) {
+  if (!__agentOSWasiSyscallPhasesEnabled || typeof delegate !== 'function') {
+    return delegate;
+  }
+  return (...args) => {
+    const startedNs = __agentOSWasmNowNs();
+    try {
+      return delegate(...args);
+    } finally {
+      __agentOSWasiRecordSyscall(name, startedNs);
+    }
+  };
+}
+
+if (__agentOSWasiSyscallPhasesEnabled) {
+  for (const [name, delegate] of Object.entries(wasiImport)) {
+    if (typeof delegate === 'function') {
+      wasiImport[name] = __agentOSWasiWrapImport(name, delegate.bind(wasiImport));
+    }
+  }
+}
 
 const instance = __agentOSWasmMeasurePhase('WebAssembly.Instance', () => new WebAssembly.Instance(module, {
   wasi_snapshot_preview1: wasiImport,
