@@ -235,9 +235,17 @@ Rows:
 Rows:
 
 - **`ls_100`**: `ls -1` over a 100-file directory.
-- **`grep_1m`**: `grep -c needle` over a ~1 MiB fixture with a known count.
-- **`git_init_commit`**: `git init && git add . && git commit`, skipped unless `registry/software/git/wasm` exists locally.
 - **`sh_pipeline`**: `sh -c "ls -1 | grep -c ."` over the 100-file directory.
+- **`cd_tmp_pwd`**: `sh -c "cd /tmp && pwd"` with `/tmp` verification.
+- **`echo_hello`**: `echo` emits a known line.
+- **`cat_small` / `cat_big`**: `cat` emits exact 4 KiB and 1 MiB fixture contents.
+- **`grep_small` / `grep_big`**: `grep -l needle` over 32-file and 1000-file fixtures with known match counts.
+- **`sed_substitution`**: `sed` replaces every known token in a fixture.
+- **`find_1000`**: `find` walks a 1000-file tree and verifies the file count.
+- **`tar_small` / `tar_big`**: `tar` creates, extracts, diffs a sentinel file, and lists 32-file and 128-file archives.
+- **`gzip_small` / `gzip_big`**: `gzip` compresses/decompresses 4 KiB and 64 KiB fixtures, then diffs the round trip.
+- **`jq_extract`**: `jq` extracts a known JSON field.
+- **`git_init_commit`**: `git init && git add . && git commit`, then verifies `rev-parse HEAD`.
 
 Run only the cold-start matrix:
 
