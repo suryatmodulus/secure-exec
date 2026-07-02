@@ -45,9 +45,9 @@ test("Rust crate publish order satisfies internal dependencies", () => {
 	assertBefore("secure-exec-build-support", "secure-exec-execution");
 	assertBefore("secure-exec-bridge", "secure-exec-kernel");
 	assertBefore("secure-exec-bridge", "secure-exec-v8-runtime");
-	assertBefore("vfs", "secure-exec-kernel");
-	assertBefore("vfs", "secure-exec-vfs");
-	assertBefore("vfs", "secure-exec-sidecar-core");
+	assertBefore("secure-exec-vfs-core", "secure-exec-kernel");
+	assertBefore("secure-exec-vfs-core", "secure-exec-vfs");
+	assertBefore("secure-exec-vfs-core", "secure-exec-sidecar-core");
 	assertBefore("secure-exec-kernel", "secure-exec-sidecar-core");
 	assertBefore("secure-exec-vm-config", "secure-exec-sidecar-core");
 	assertBefore("secure-exec-sidecar-core", "secure-exec-sidecar");
@@ -83,7 +83,7 @@ test("discovers the publishable Rust crate subset from a secure-exec-only worksp
 		for (const [member, name] of [
 			["crates/bridge", "secure-exec-bridge"],
 			["crates/build-support", "secure-exec-build-support"],
-			["crates/vfs", "vfs"],
+			["crates/vfs", "secure-exec-vfs-core"],
 			["crates/kernel", "secure-exec-kernel"],
 			["crates/vm-config", "secure-exec-vm-config"],
 			["crates/sidecar-core", "secure-exec-sidecar-core"],
@@ -99,7 +99,7 @@ test("discovers the publishable Rust crate subset from a secure-exec-only worksp
 		assert.deepEqual(discoverRustCrates(root), [
 			"secure-exec-build-support",
 			"secure-exec-bridge",
-			"vfs",
+			"secure-exec-vfs-core",
 			"secure-exec-kernel",
 			"secure-exec-vm-config",
 			"secure-exec-sidecar-core",
