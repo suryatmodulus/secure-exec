@@ -45,6 +45,7 @@ export type {
 	HostToolExample,
 	VirtualDirEntry,
 } from "./test-runtime.js";
+export { resolveNodeRuntimeSidecarBinary } from "./test-runtime.js";
 
 export type NodeRuntimeBootTimingPhase =
 	| KernelBootTiming["phase"]

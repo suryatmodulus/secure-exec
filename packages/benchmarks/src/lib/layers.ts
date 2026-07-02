@@ -66,7 +66,13 @@ export interface BenchmarkOp {
 		vm: BenchVm,
 		iters: number,
 		warmup: number,
+		context?: unknown,
 	) => Promise<number[]>;
+	prepareVm?: () => Promise<{
+		options?: BenchVmOptions;
+		context?: unknown;
+		cleanup?: () => Promise<void> | void;
+	}>;
 	program?: string;
 }
 
@@ -130,6 +136,19 @@ export function isLayerOpResult(result: LatencyResult): result is OpResult {
 
 export function supportsWasmLayer(op: NativeOp): boolean {
 	return WASM_SUPPORTED_OPS.has(op);
+}
+
+export function hasNativeBaselineWasm(): boolean {
+	return Boolean(resolveNativeBaselineWasm());
+}
+
+export function opSupportsWasmLayer(op: BenchmarkOp): boolean {
+	return Boolean(
+		op.nativeOp &&
+			!op.wasmUnsupportedReason &&
+			supportsWasmLayer(op.nativeOp) &&
+			hasNativeBaselineWasm(),
+	);
 }
 
 export function wasmLayerOptions(): BenchVmOptions | undefined {
@@ -311,18 +330,40 @@ export async function runWasmLayer(
 	return parsed.samples.map((ns) => ns / 1e6);
 }
 
-export async function runOp(
+export interface OpHostSamples {
+	native?: number[];
+	node: number[];
+}
+
+export interface OpVmSamples {
+	guest: number[];
+	wasm?: number[];
+}
+
+export async function runOpHostLayers(
 	op: BenchmarkOp,
-	vm: BenchVm,
 	iters: number,
 	warmup: number,
-): Promise<OpResult> {
+): Promise<OpHostSamples> {
 	const native = op.nativeOp ? runNativeLayer(op.nativeOp, iters, warmup) : undefined;
 	const node = op.runNode
 		? await op.runNode(iters, warmup)
 		: runNodeProgram(timedProgram(op.program ?? "() => {}", op.setup), iters, warmup);
+	return {
+		...(native ? { native } : {}),
+		node,
+	};
+}
+
+export async function runOpVmLayers(
+	op: BenchmarkOp,
+	vm: BenchVm,
+	iters: number,
+	warmup: number,
+	context?: unknown,
+): Promise<OpVmSamples> {
 	const guest = op.runGuest
-		? await op.runGuest(vm, iters, warmup)
+		? await op.runGuest(vm, iters, warmup, context)
 		: await runGuestProgram(
 				vm,
 				timedProgram(op.program ?? "() => {}", op.setup),
@@ -334,11 +375,22 @@ export async function runOp(
 		op.nativeOp && !op.wasmUnsupportedReason
 			? await runWasmLayer(vm, op.nativeOp, iters, warmup)
 			: undefined;
+	return {
+		guest,
+		...(wasm ? { wasm } : {}),
+	};
+}
+
+export function buildOpResult(
+	op: BenchmarkOp,
+	hostSamples: OpHostSamples,
+	vmSamples: OpVmSamples,
+): OpResult {
 	const layers = {
-		...(native ? { native: stats(native) } : {}),
-		node: stats(node),
-		guest: stats(guest),
-		...(wasm ? { wasm: stats(wasm) } : {}),
+		...(hostSamples.native ? { native: stats(hostSamples.native) } : {}),
+		node: stats(hostSamples.node),
+		guest: stats(vmSamples.guest),
+		...(vmSamples.wasm ? { wasm: stats(vmSamples.wasm) } : {}),
 	};
 	return {
 		family: op.family,
@@ -361,26 +413,41 @@ export async function runOp(
 	};
 }
 
-export async function runCommandOp(
+export function skippedCommandOpResult(op: CommandBenchmarkOp): CommandOpResult {
+	return {
+		family: op.family,
+		op: op.name,
+		fileLine: op.fileLine,
+		reproducer: op.reproducer,
+		skipped: true,
+		skipReason: op.skipReason,
+		layers: {},
+		tax: {},
+	};
+}
+
+export async function runCommandHostLayer(
+	op: CommandBenchmarkOp,
+	iters: number,
+	warmup: number,
+): Promise<Stats> {
+	return stats(await op.runHostCmd(iters, warmup));
+}
+
+export async function runCommandVmLayer(
 	op: CommandBenchmarkOp,
 	vm: BenchVm,
 	iters: number,
 	warmup: number,
-): Promise<CommandOpResult> {
-	if (op.skipReason) {
-		return {
-			family: op.family,
-			op: op.name,
-			fileLine: op.fileLine,
-			reproducer: op.reproducer,
-			skipped: true,
-			skipReason: op.skipReason,
-			layers: {},
-			tax: {},
-		};
-	}
-	const hostCmd = stats(await op.runHostCmd(iters, warmup));
-	const vmCmd = stats(await op.runVmCmd(vm, iters, warmup));
+): Promise<Stats> {
+	return stats(await op.runVmCmd(vm, iters, warmup));
+}
+
+export function buildCommandOpResult(
+	op: CommandBenchmarkOp,
+	hostCmd: Stats,
+	vmCmd: Stats,
+): CommandOpResult {
 	return {
 		family: op.family,
 		op: op.name,

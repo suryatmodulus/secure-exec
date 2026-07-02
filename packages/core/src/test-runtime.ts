@@ -1995,6 +1995,10 @@ function ensureNativeSidecarBinary(): string {
 	return ensuredSidecarBinary;
 }
 
+export function resolveNodeRuntimeSidecarBinary(): string {
+	return ensureNativeSidecarBinary();
+}
+
 function createBootstrapEntries(commandNames: string[]): RootFilesystemEntry[] {
 	const entries: RootFilesystemEntry[] = [
 		{

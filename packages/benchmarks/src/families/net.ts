@@ -3,7 +3,6 @@ import net from "node:net";
 import { readFileSync } from "node:fs";
 import type { BenchmarkOp } from "../lib/layers.js";
 import { runGuestProgram, runNodeProgram } from "../lib/layers.js";
-import { createBenchVm } from "../lib/vm.js";
 
 const TLS_LOOPBACK_KEY = readFileSync(
 	new URL("../../fixtures/tls-loopback-key.pem", import.meta.url),
@@ -60,21 +59,6 @@ async function listenTcpExternalServer(): Promise<{ port: number; server: net.Se
 		throw new Error("tcp external server did not bind to a TCP port");
 	}
 	return { port: address.port, server };
-}
-
-async function runExternalGuestProgram(
-	port: number,
-	source: string,
-	iters: number,
-	warmup: number,
-	name: string,
-): Promise<number[]> {
-	const vm = await createBenchVm({ loopbackExemptPorts: [port] });
-	try {
-		return await runGuestProgram(vm, source, iters, warmup, name);
-	} finally {
-		await vm.dispose();
-	}
 }
 
 async function withHttpExternalServer<T>(
@@ -409,15 +393,21 @@ export const netFamily: BenchmarkOp[] = [
 		reproducer: "node:http GET from guest to a host-side loopback-exempt HTTP server",
 		runNode: (iters, warmup) =>
 			withHttpExternalServer((port) => runHttpExternalClient(port, iters, warmup)),
-		runGuest: (_vm, iters, warmup) =>
-			withHttpExternalServer((port) =>
-				runExternalGuestProgram(
-					port,
-					httpExternalGetProgram(port),
-					iters,
-					warmup,
-					"net-http-external-get",
-				),
+		prepareVm: async () => {
+			const { port, server } = await listenHttpExternalServer();
+			return {
+				options: { loopbackExemptPorts: [port] },
+				context: port,
+				cleanup: () => closeServer(server),
+			};
+		},
+		runGuest: (vm, iters, warmup, context) =>
+			runGuestProgram(
+				vm,
+				httpExternalGetProgram(assertPortContext(context, "http_external_get")),
+				iters,
+				warmup,
+				"net-http-external-get",
 			),
 	},
 	{
@@ -557,15 +547,21 @@ export const netFamily: BenchmarkOp[] = [
 		reproducer: "guest net.connect to a host-side loopback-exempt TCP echo server, one 16-byte echo",
 		runNode: (iters, warmup) =>
 			withTcpExternalServer((port) => runTcpExternalClient(port, iters, warmup)),
-		runGuest: (_vm, iters, warmup) =>
-			withTcpExternalServer((port) =>
-				runExternalGuestProgram(
-					port,
-					tcpExternalEchoProgram(port),
-					iters,
-					warmup,
-					"net-tcp-external-echo",
-				),
+		prepareVm: async () => {
+			const { port, server } = await listenTcpExternalServer();
+			return {
+				options: { loopbackExemptPorts: [port] },
+				context: port,
+				cleanup: () => closeServer(server),
+			};
+		},
+		runGuest: (vm, iters, warmup, context) =>
+			runGuestProgram(
+				vm,
+				tcpExternalEchoProgram(assertPortContext(context, "tcp_external_echo")),
+				iters,
+				warmup,
+				"net-tcp-external-echo",
 			),
 	},
 	{
@@ -654,3 +650,10 @@ export const netFamily: BenchmarkOp[] = [
 }`,
 	},
 ];
+
+function assertPortContext(context: unknown, op: string): number {
+	if (typeof context !== "number") {
+		throw new Error(`${op} missing prepared loopback port`);
+	}
+	return context;
+}

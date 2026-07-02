@@ -1,5 +1,7 @@
+import { statSync } from "node:fs";
 import {
 	NodeRuntime,
+	resolveNodeRuntimeSidecarBinary,
 	resolveNodeRuntimeCommandsDir,
 	SidecarProcess,
 	type HostDirectoryMount,
@@ -8,6 +10,11 @@ import {
 	type SidecarSpawnOptions,
 	type VirtualDirEntry,
 } from "@secure-exec/core";
+import { hasNativeBaselineWasm, supportsWasmLayer } from "./layers.js";
+import type { BenchmarkOp, CommandBenchmarkOp } from "./layers.js";
+
+const NATIVE_BASELINE_WASM_COMMAND = "native-baseline";
+const NATIVE_BASELINE_WASM_PREWARM_DIR = "/mnt/native-baseline-wasm/prewarm";
 
 export interface BenchVmOptions {
 	commandsDir?: string;
@@ -84,6 +91,14 @@ export interface BenchVm {
 	getResourceSnapshot(): Promise<NodeRuntimeResourceSnapshot>;
 	dispose(): Promise<void>;
 	sidecarPid(): number | null;
+}
+
+export interface SidecarBinaryProvenance {
+	path: string;
+	profile: "debug" | "release" | "unknown";
+	mtimeMs: number;
+	mtimeIso: string;
+	sizeBytes: number;
 }
 
 export async function createBenchVm(options: BenchVmOptions = {}): Promise<BenchVm> {
@@ -199,12 +214,78 @@ export async function createBenchVm(options: BenchVmOptions = {}): Promise<Bench
 	};
 }
 
+/**
+ * Prewarms a benchmark VM before timed sampling:
+ * 1. run trivial guest Node code to force isolate/bridge/first-exec setup;
+ * 2. for native-baseline WASM lanes, run a one-iteration cpu_loop command;
+ * 3. for command ops, run one discarded VM-command sample so that command WASM
+ *    compilation is outside the measured sample set.
+ */
+export async function prewarmBenchVm(
+	vm: BenchVm,
+	op: BenchmarkOp | CommandBenchmarkOp,
+): Promise<void> {
+	const nodeResult = await vm.spawnNodeCapture(["-e", ""]);
+	if (nodeResult.exitCode !== 0) {
+		throw new Error(`guest node prewarm exited ${nodeResult.exitCode}\n${nodeResult.stderr}`);
+	}
+
+	if (
+		!("runHostCmd" in op) &&
+		op.nativeOp &&
+		!op.wasmUnsupportedReason &&
+		supportsWasmLayer(op.nativeOp) &&
+		hasNativeBaselineWasm()
+	) {
+		const wasmResult = await vm.execWasmCommand(NATIVE_BASELINE_WASM_COMMAND, [
+			"--op",
+			"cpu_loop",
+			"--iters",
+			"1",
+			"--warmup",
+			"0",
+			"--base-dir",
+			NATIVE_BASELINE_WASM_PREWARM_DIR,
+		]);
+		if (wasmResult.exitCode !== 0) {
+			throw new Error(
+				`native-baseline wasm prewarm exited ${wasmResult.exitCode}\n${wasmResult.stderr}`,
+			);
+		}
+	}
+
+	if ("runHostCmd" in op && !op.skipReason) {
+		await op.runVmCmd(vm, 1, 0);
+	}
+}
+
 export function createBenchSidecar(options: SidecarSpawnOptions = {}): SidecarProcess {
-	return SidecarProcess.spawn(options);
+	return SidecarProcess.spawn({
+		...options,
+		command: options.command ?? resolveNodeRuntimeSidecarBinary(),
+	});
 }
 
 export function resolveBenchCommandsDir(explicit?: string): string {
 	return resolveNodeRuntimeCommandsDir(explicit);
+}
+
+export function resolveBenchSidecarProvenance(): SidecarBinaryProvenance {
+	const path = resolveNodeRuntimeSidecarBinary();
+	const stat = statSync(path);
+	return {
+		path,
+		profile: inferSidecarProfile(path),
+		mtimeMs: stat.mtimeMs,
+		mtimeIso: formatPacificIso(stat.mtime),
+		sizeBytes: stat.size,
+	};
+}
+
+export function formatSidecarProvenance(
+	provenance: SidecarBinaryProvenance,
+): string {
+	return `Sidecar binary: ${provenance.path} (${provenance.profile}, mtime ${provenance.mtimeIso}, size ${provenance.sizeBytes} bytes)`;
 }
 
 function sidecarPidFromRuntime(runtime: NodeRuntime): number | null {
@@ -212,4 +293,37 @@ function sidecarPidFromRuntime(runtime: NodeRuntime): number | null {
 		kernel?: { client?: { child?: { pid?: number } } };
 	}).kernel?.client?.child?.pid;
 	return typeof pid === "number" ? pid : null;
+}
+
+function inferSidecarProfile(path: string): "debug" | "release" | "unknown" {
+	if (path.includes("/release/")) return "release";
+	if (path.includes("/debug/")) return "debug";
+	return "unknown";
+}
+
+export function formatPacificIso(date: Date): string {
+	const formatter = new Intl.DateTimeFormat("en-CA", {
+		timeZone: "America/Los_Angeles",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		fractionalSecondDigits: 3,
+		hourCycle: "h23",
+		timeZoneName: "shortOffset",
+	});
+	const parts = new Map(
+		formatter.formatToParts(date).map((part) => [part.type, part.value]),
+	);
+	return `${parts.get("year")}-${parts.get("month")}-${parts.get("day")}T${parts.get("hour")}:${parts.get("minute")}:${parts.get("second")}.${parts.get("fractionalSecond")}${isoOffset(parts.get("timeZoneName") ?? "GMT")}`;
+}
+
+function isoOffset(shortOffset: string): string {
+	if (shortOffset === "GMT" || shortOffset === "UTC") return "Z";
+	const match = /^GMT([+-])(\d{1,2})(?::(\d{2}))?$/.exec(shortOffset);
+	if (!match) return shortOffset;
+	const [, sign, hours, minutes = "00"] = match;
+	return `${sign}${hours.padStart(2, "0")}:${minutes}`;
 }

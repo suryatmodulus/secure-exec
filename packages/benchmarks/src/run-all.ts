@@ -1,14 +1,30 @@
 import { allOps } from "./families/index.js";
 import { ecosystemWasmCommandDirs } from "./families/ecosystem.js";
 import {
+	buildCommandOpResult,
+	buildOpResult,
 	isLayerOpResult,
-	runOp,
-	runCommandOp,
+	runCommandHostLayer,
+	runCommandVmLayer,
+	runOpHostLayers,
+	runOpVmLayers,
+	skippedCommandOpResult,
 	supportsWasmLayer,
 	wasmLayerOptions,
+	type BenchmarkOp,
+	type CommandBenchmarkOp,
 	type LatencyResult,
 } from "./lib/layers.js";
-import { createBenchVm } from "./lib/vm.js";
+import {
+	createBenchVm,
+	formatSidecarProvenance,
+	formatPacificIso,
+	prewarmBenchVm,
+	resolveBenchSidecarProvenance,
+	type BenchVm,
+	type BenchVmOptions,
+	type SidecarBinaryProvenance,
+} from "./lib/vm.js";
 import { findingsFromLatency, refutedFromLatency, writeJson } from "./lib/report.js";
 import { getHardware, printTable } from "./lib/perf-utils.js";
 import { runFuzz } from "./fuzz/run.js";
@@ -27,20 +43,42 @@ const OP_FILTER = process.env.BENCH_OP_FILTER
 	?.split(",")
 	.map((op) => op.trim())
 	.filter(Boolean);
+const COLD_MODE = process.env.BENCH_COLD === "1";
+const SHARED_VM_MODE = process.env.BENCH_SHARED_VM === "1";
 
-export async function runLatencyMatrix(): Promise<LatencyResult[]> {
+interface LatencyMatrixRun {
+	results: LatencyResult[];
+	sidecar: SidecarBinaryProvenance;
+	wallTimeMs: number;
+	mode: {
+		cold: boolean;
+		sharedVm: boolean;
+	};
+}
+
+export async function runLatencyMatrix(): Promise<LatencyMatrixRun> {
+	const start = process.hrtime.bigint();
+	const sidecar = resolveBenchSidecarProvenance();
+	console.error(formatSidecarProvenance(sidecar));
+	if (COLD_MODE) {
+		console.error("BENCH_COLD=1: VM prewarm is disabled; samples include first-use VM costs.");
+	}
+	if (SHARED_VM_MODE) {
+		console.error("BENCH_SHARED_VM=1: reusing a VM where op-specific VM options are not required.");
+	}
 	const wasmOptions = wasmLayerOptions();
 	if (!wasmOptions) {
 		console.error("vm-wasm lane disabled: native-baseline wasm artifact was not found");
 	}
 	const commandDirs = ecosystemWasmCommandDirs();
-	const vm = await createBenchVm({
-		...(wasmOptions ?? {}),
+	const baseVmOptions = mergeBenchVmOptions({}, {
+		mounts: wasmOptions?.mounts,
 		wasmCommandDirs: [
 			...(wasmOptions?.wasmCommandDirs ?? []),
 			...commandDirs,
 		],
 	});
+	const sharedVm = SHARED_VM_MODE ? await createBenchVm(baseVmOptions) : undefined;
 	try {
 		const results: LatencyResult[] = [];
 		const ops = FAMILY_FILTER
@@ -54,20 +92,25 @@ export async function runLatencyMatrix(): Promise<LatencyResult[]> {
 			if (!("runHostCmd" in op) && op.nativeOp && supportsWasmLayer(op.nativeOp)) {
 				console.error("  wasm lane: guest JS measured first, wasm native-baseline after");
 			}
-			results.push(
-				"runHostCmd" in op
-					? await runCommandOp(op, vm, ITERATIONS, WARMUP)
-					: await runOp(op, vm, ITERATIONS, WARMUP),
-			);
+			results.push(await runOneOp(op, baseVmOptions, sharedVm));
 		}
-		return results;
+		return {
+			results,
+			sidecar,
+			wallTimeMs: Number(process.hrtime.bigint() - start) / 1e6,
+			mode: {
+				cold: COLD_MODE,
+				sharedVm: SHARED_VM_MODE,
+			},
+		};
 	} finally {
-		await vm.dispose();
+		await sharedVm?.dispose();
 	}
 }
 
 async function main(): Promise<void> {
-	const latency = await runLatencyMatrix();
+	const matrix = await runLatencyMatrix();
+	const latency = matrix.results;
 	const layerLatency = latency.filter(isLayerOpResult);
 	const findings = findingsFromLatency(layerLatency);
 	const refuted = refutedFromLatency(layerLatency);
@@ -80,8 +123,11 @@ async function main(): Promise<void> {
 		? { findings: [], components: [] }
 		: await runFootprint();
 	const findingsJson = {
-		generatedAt: new Date().toISOString(),
+		generatedAt: formatPacificIso(new Date()),
 		hardware: getHardware(),
+		sidecar: matrix.sidecar,
+		matrixMode: matrix.mode,
+		wallTimeMs: matrix.wallTimeMs,
 		iterations: ITERATIONS,
 		warmup: WARMUP,
 		resourceSnapshotStubbed,
@@ -107,7 +153,12 @@ async function main(): Promise<void> {
 		],
 		critic_gaps: criticGaps(latency, fuzz, leak, footprint),
 	};
-	writeJson(`${RESULTS_DIR}/latency-matrix.json`, { latency });
+	writeJson(`${RESULTS_DIR}/latency-matrix.json`, {
+		sidecar: matrix.sidecar,
+		matrixMode: matrix.mode,
+		wallTimeMs: matrix.wallTimeMs,
+		latency,
+	});
 	writeJson(`${RESULTS_DIR}/findings.json`, findingsJson);
 	const baselinePath = `${RESULTS_DIR}/baseline/findings-baseline.json`;
 	const diff = compareBaselineFile(`${RESULTS_DIR}/findings.json`, baselinePath);
@@ -170,6 +221,69 @@ async function main(): Promise<void> {
 		]),
 	);
 	console.log(JSON.stringify(findingsJson, null, 2));
+}
+
+async function runOneOp(
+	op: BenchmarkOp | CommandBenchmarkOp,
+	baseVmOptions: BenchVmOptions,
+	sharedVm: BenchVm | undefined,
+): Promise<LatencyResult> {
+	if ("runHostCmd" in op) {
+		if (op.skipReason) return skippedCommandOpResult(op);
+		const hostCmd = await runCommandHostLayer(op, ITERATIONS, WARMUP);
+		const vmCmd = await withOpVm(op, baseVmOptions, sharedVm, (vm) =>
+			runCommandVmLayer(op, vm, ITERATIONS, WARMUP),
+		);
+		return buildCommandOpResult(op, hostCmd, vmCmd);
+	}
+
+	const hostSamples = await runOpHostLayers(op, ITERATIONS, WARMUP);
+	const vmSamples = await withOpVm(op, baseVmOptions, sharedVm, (vm, context) =>
+		runOpVmLayers(op, vm, ITERATIONS, WARMUP, context),
+	);
+	return buildOpResult(op, hostSamples, vmSamples);
+}
+
+async function withOpVm<T>(
+	op: BenchmarkOp | CommandBenchmarkOp,
+	baseVmOptions: BenchVmOptions,
+	sharedVm: BenchVm | undefined,
+	callback: (vm: BenchVm, context?: unknown) => Promise<T>,
+): Promise<T> {
+	const prepared = "prepareVm" in op && op.prepareVm ? await op.prepareVm() : undefined;
+	const options = mergeBenchVmOptions(baseVmOptions, prepared?.options ?? {});
+	const canUseSharedVm = sharedVm && !prepared?.options;
+	const vm = canUseSharedVm ? sharedVm : await createBenchVm(options);
+	try {
+		if (!COLD_MODE) {
+			await prewarmBenchVm(vm, op);
+		}
+		return await callback(vm, prepared?.context);
+	} finally {
+		if (!canUseSharedVm) {
+			await vm.dispose();
+		}
+		await prepared?.cleanup?.();
+	}
+}
+
+function mergeBenchVmOptions(
+	base: BenchVmOptions,
+	extra: BenchVmOptions,
+): BenchVmOptions {
+	return {
+		...base,
+		...extra,
+		mounts: [...(base.mounts ?? []), ...(extra.mounts ?? [])],
+		wasmCommandDirs: [
+			...(base.wasmCommandDirs ?? []),
+			...(extra.wasmCommandDirs ?? []),
+		],
+		loopbackExemptPorts: [
+			...(base.loopbackExemptPorts ?? []),
+			...(extra.loopbackExemptPorts ?? []),
+		],
+	};
 }
 
 function criticGaps(

@@ -56,6 +56,31 @@ Run one matrix op:
 BENCH_FAMILIES=net BENCH_OP_FILTER=tls_loopback_get pnpm --dir packages/benchmarks bench:matrix
 ```
 
+### Latency Matrix VM Lifecycle
+
+The latency matrix gives each guest-backed benchmark op a dedicated sidecar and VM by default. Host-only lanes (`native`, `node`, and `hostCmd`) run before that VM is created; guest-backed lanes (`guest`, `wasm`, and `vmCmd`) run inside the op's VM, which is disposed before the next op.
+
+Warmup contract:
+
+- **Guest Node prewarm**: `prewarmBenchVm(vm, op)` runs one trivial guest Node program to force isolate creation, bridge snapshot load, and first-exec paths before timed sampling.
+- **Native-baseline WASM prewarm**: when an op has a supported `vm-wasm` lane, the helper runs `native-baseline --op cpu_loop --iters 1 --warmup 0` once so module compilation is outside the measured samples.
+- **Command WASM prewarm**: command ops run one discarded VM-command sample (`iters=1`, `warmup=0`) so command module compilation is outside the measured samples.
+- **Op warmup**: `BENCH_WARMUP` still runs inside each op and is discarded from the reported stats.
+
+Useful latency-matrix knobs:
+
+```text
+BENCH_COLD=1        Skip the VM prewarm contract above. Cold-start lanes remain the canonical cold measurements.
+BENCH_SHARED_VM=1   Reuse a VM where op-specific VM options are not required. Default is per-op VM isolation.
+```
+
+Each matrix JSON records the sidecar binary used for the run:
+
+- **`sidecar.path`**: `NodeRuntime`-resolved sidecar binary path, including `SECURE_EXEC_SIDECAR_BIN` overrides and local checkout fallbacks.
+- **`sidecar.profile`**: inferred from the binary path (`debug`, `release`, or `unknown`).
+- **`sidecar.mtimeMs` / `sidecar.mtimeIso`**: sidecar binary modification time.
+- **`sidecar.sizeBytes`**: sidecar binary size in bytes.
+
 ## Focused Lanes
 
 Focused lanes live under `src/focused/` and preserve the legacy CLI flags, env vars, JSON shape, and stderr tables from the Agent OS benchmark scripts. They use `src/lib/vm.ts` over `NodeRuntime`.
