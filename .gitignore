@@ -76,6 +76,7 @@ crates/execution/.agent-os-pyodide-cache/
 crates/execution/async-out.txt
 crates/sidecar/.tmp-sidecar-tests/
 packages/browser/.cache/
+packages/benchmarks/results/*
 website/.astro/
 website/public/docs/
 

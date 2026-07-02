@@ -28,6 +28,7 @@ import type {
 	KernelBootTiming,
 	Permissions,
 } from "./test-runtime.js";
+import type { JsRuntimeConfig } from "./generated/JsRuntimeConfig.js";
 import type { SidecarProcess } from "./sidecar-process.js";
 import {
 	createInMemoryFileSystem,
@@ -151,6 +152,12 @@ export interface NodeRuntimeCreateOptions {
 	 * `@secure-exec/core` package (published installs).
 	 */
 	commandsDir?: string;
+	/**
+	 * Additional directories of wasm32-wasip1 commands to register in the VM.
+	 * Intended for low-level tooling and benchmark harnesses; normal callers use
+	 * the bundled shell/coreutils command directory resolved by `commandsDir`.
+	 */
+	wasmCommandDirs?: string[];
 	/**
 	 * Existing native sidecar process to use for this runtime. Omit this to use
 	 * the default shared sidecar behavior. When provided, the runtime owns only
@@ -279,6 +286,13 @@ export interface NodeRuntimeCreateOptions {
 	 * ```
 	 */
 	loopbackExemptPorts?: number[];
+	/**
+	 * Low-level guest JavaScript runtime configuration. Most callers should leave
+	 * this unset. Benchmarks may opt in to `highResolutionTime`, which disables
+	 * the default 1ms timer quantization and should not be enabled for untrusted
+	 * workloads.
+	 */
+	jsRuntime?: Partial<JsRuntimeConfig>;
 }
 
 /** A host directory projected into the VM's virtual filesystem. */
@@ -464,6 +478,31 @@ export interface NodeRuntimeProcess {
 	readonly exitCode: number | null;
 }
 
+export interface NodeRuntimeResourceSnapshot {
+	runningProcesses: number;
+	exitedProcesses: number;
+	fdTables: number;
+	openFds: number;
+	pipes: number;
+	pipeBufferedBytes: number;
+	ptys: number;
+	ptyBufferedInputBytes: number;
+	ptyBufferedOutputBytes: number;
+	sockets: number;
+	socketListeners: number;
+	socketConnections: number;
+	socketBufferedBytes: number;
+	socketDatagramQueueLen: number;
+	queueSnapshots: Array<{
+		name: string;
+		category: string;
+		depth: number;
+		highWater: number;
+		capacity: number;
+		fillPercent: number;
+	}>;
+}
+
 export interface NodeRuntimeResidentRunnerExecOptions {
 	/** Abort the guest eval after this many milliseconds. */
 	timeout?: number;
@@ -602,6 +641,7 @@ export class NodeRuntime {
 			sidecar: options.sidecar,
 			onBootTiming: (timing) => options.onBootTiming?.(timing),
 			loopbackExemptPorts: options.loopbackExemptPorts,
+			jsRuntime: options.jsRuntime,
 		});
 
 		try {
@@ -611,7 +651,11 @@ export class NodeRuntime {
 			// `sh` nothing can be spawned, including the guest `node` program we
 			// run here and any child the guest spawns via node:child_process.
 			await measureBootTiming("runtime_mount_wasm", options.onBootTiming, () =>
-				kernel.mount(createWasmVmRuntime({ commandDirs: [commandsDir] })),
+				kernel.mount(
+					createWasmVmRuntime({
+						commandDirs: [commandsDir, ...(options.wasmCommandDirs ?? [])],
+					}),
+				),
 			);
 			await measureBootTiming("runtime_mount_node", options.onBootTiming, () =>
 				kernel.mount(createNodeRuntime()),
@@ -797,6 +841,90 @@ export class NodeRuntime {
 				return proc.exitCode;
 			},
 		};
+	}
+
+	/**
+	 * Start an arbitrary guest command and return a live handle. This is the
+	 * command-level companion to {@link spawn}, used by benchmark harnesses that
+	 * need to measure kernel process spawning directly instead of running a source
+	 * string through the ergonomic Node wrapper.
+	 */
+	spawnCommand(
+		command: string,
+		args: string[] = [],
+		options: NodeRuntimeSpawnOptions = {},
+	): NodeRuntimeProcess {
+		const proc = this.kernel.spawn(command, args, {
+			env: options.env,
+			cwd: options.cwd,
+			onStdout: options.onStdout,
+			onStderr: options.onStderr,
+			streamStdin: true,
+		});
+		return {
+			pid: proc.pid,
+			writeStdin(data) {
+				proc.writeStdin(data);
+			},
+			closeStdin() {
+				proc.closeStdin();
+			},
+			kill(signal) {
+				proc.kill(toSignalNumber(signal));
+			},
+			wait() {
+				return proc.wait();
+			},
+			get exitCode() {
+				return proc.exitCode;
+			},
+		};
+	}
+
+	/**
+	 * Run an arbitrary guest command to completion and capture stdout/stderr.
+	 * Unlike {@link exec}, this does not write a JavaScript source file first.
+	 */
+	async execCommand(
+		command: string,
+		args: string[] = [],
+		options: NodeRuntimeExecOptions = {},
+	): Promise<NodeRuntimeExecResult> {
+		const stdoutChunks: Uint8Array[] = [];
+		const stderrChunks: Uint8Array[] = [];
+		const proc = this.spawnCommand(command, args, {
+			env: options.env,
+			cwd: options.cwd,
+			onStdout: (chunk) => {
+				stdoutChunks.push(chunk);
+				options.onStdout?.(chunk);
+			},
+			onStderr: (chunk) => {
+				stderrChunks.push(chunk);
+				options.onStderr?.(chunk);
+			},
+		});
+		if (options.stdin !== undefined) {
+			proc.writeStdin(options.stdin);
+		}
+		proc.closeStdin();
+
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		if (options.timeout !== undefined) {
+			timer = setTimeout(() => proc.kill("SIGKILL"), options.timeout);
+		}
+		try {
+			const exitCode = await proc.wait();
+			return {
+				stdout: decodeChunks(stdoutChunks),
+				stderr: decodeChunks(stderrChunks),
+				exitCode,
+			};
+		} finally {
+			if (timer !== undefined) {
+				clearTimeout(timer);
+			}
+		}
 	}
 
 	/**
@@ -1000,6 +1128,10 @@ export class NodeRuntime {
 	/** Read a file from the VM's virtual filesystem as raw bytes. */
 	async readFile(filePath: string): Promise<Uint8Array> {
 		return this.kernel.readFile(filePath);
+	}
+
+	async getResourceSnapshot(): Promise<NodeRuntimeResourceSnapshot> {
+		return this.kernel.getResourceSnapshot();
 	}
 
 	/** Tear down the VM and release the sidecar. */

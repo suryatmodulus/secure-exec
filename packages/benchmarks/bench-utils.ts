@@ -7,10 +7,10 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import {
 	NodeRuntime,
-	Sidecar,
+	SidecarProcess,
 	type NodeRuntimeBootTiming,
 	type NodeRuntimeCreateOptions,
-} from "secure-exec";
+} from "@secure-exec/core";
 
 function numList(envVar: string, fallback: number[]): number[] {
 	const raw = process.env[envVar];
@@ -72,8 +72,8 @@ export async function createBenchRuntime(
 	return NodeRuntime.create(options);
 }
 
-export function createBenchSidecar(): Sidecar {
-	return Sidecar.spawn();
+export function createBenchSidecar(): SidecarProcess {
+	return SidecarProcess.spawn();
 }
 
 export function percentile(sorted: number[], p: number): number {

@@ -71,6 +71,16 @@ const nodeModulesMountSchema = z
 	})
 	.strict();
 
+const jsRuntimeSchema = z
+	.object({
+		platform: z.enum(["node", "browser", "neutral", "bare"]).optional(),
+		moduleResolution: z.enum(["node", "relative", "none"]).optional(),
+		allowedBuiltins: stringArray.optional(),
+		highResolutionTime: z.boolean().optional(),
+		snapshotUserlandCode: z.string().optional(),
+	})
+	.strict();
+
 const bindingExampleSchema = z
 	.object({
 		description: z.string(),
@@ -110,6 +120,7 @@ export const nodeRuntimeCreateOptionsSchema = z
 		cwd: z.string().optional(),
 		permissions: nodeRuntimePermissionsSchema.optional(),
 		commandsDir: z.string().optional(),
+		wasmCommandDirs: stringArray.optional(),
 		sidecar: z
 			.custom((value: unknown) => typeof value === "object" && value !== null, {
 				message: "Expected SidecarProcess object",
@@ -130,6 +141,7 @@ export const nodeRuntimeCreateOptionsSchema = z
 		loopbackExemptPorts: z
 			.array(z.number().int().min(0).max(65535))
 			.optional(),
+		jsRuntime: jsRuntimeSchema.optional(),
 	})
 	.strict() as z.ZodType<NodeRuntimeCreateOptions>;
 

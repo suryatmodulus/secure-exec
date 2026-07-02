@@ -349,9 +349,9 @@ importers:
 
   packages/benchmarks:
     dependencies:
-      secure-exec:
+      '@secure-exec/core':
         specifier: workspace:*
-        version: link:../secure-exec
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

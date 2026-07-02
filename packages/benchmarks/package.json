@@ -5,10 +5,12 @@
 	"scripts": {
 		"bench": "./run-benchmarks.sh",
 		"bench:coldstart": "tsx coldstart.bench.ts",
-		"bench:memory": "node --expose-gc --import tsx/esm memory.bench.ts"
+		"bench:memory": "node --expose-gc --import tsx/esm memory.bench.ts",
+		"bench:matrix": "tsx src/run-all.ts",
+		"check-types": "pnpm --dir ../core build && tsc --noEmit"
 	},
 	"dependencies": {
-		"secure-exec": "workspace:*"
+		"@secure-exec/core": "workspace:*"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.2",

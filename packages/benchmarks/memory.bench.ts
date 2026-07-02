@@ -15,7 +15,7 @@
  *     node --expose-gc --import tsx/esm memory.bench.ts
  */
 
-import type { NodeRuntime } from "secure-exec";
+import type { NodeRuntime } from "@secure-exec/core";
 import {
 	BATCH_SIZES,
 	createBenchRuntime,

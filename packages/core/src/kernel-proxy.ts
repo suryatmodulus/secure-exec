@@ -23,6 +23,7 @@ import type {
 	SidecarProcess,
 	SidecarMountDescriptor,
 	SidecarProcessSnapshotEntry,
+	SidecarResourceSnapshot,
 	SidecarSignalHandlerRegistration,
 	SidecarSocketStateEntry,
 } from "./sidecar-process.js";
@@ -1286,6 +1287,10 @@ export class NativeSidecarKernelProxy {
 
 	snapshotProcesses(): ProcessInfo[] {
 		return this.buildProcessSnapshot();
+	}
+
+	getResourceSnapshot(): Promise<SidecarResourceSnapshot> {
+		return this.client.getResourceSnapshot(this.session, this.vm);
 	}
 
 	findListener(request: {

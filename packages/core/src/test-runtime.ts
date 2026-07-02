@@ -22,6 +22,7 @@ import {
 import { resolvePublishedSidecarBinary } from "./binary.js";
 import { findCargoBinary, resolveCargoBinary } from "./cargo.js";
 import type { PermissionsPolicy } from "./generated/PermissionsPolicy.js";
+import type { JsRuntimeConfig } from "./generated/JsRuntimeConfig.js";
 
 export const AF_INET = 2;
 export const AF_UNIX = 1;
@@ -480,6 +481,30 @@ export interface Kernel extends KernelInterface {
 		body?: string;
 	}): Promise<string>;
 	registerHostTools(tools: Record<string, BindingDefinition>): Promise<void>;
+	getResourceSnapshot(): Promise<{
+		runningProcesses: number;
+		exitedProcesses: number;
+		fdTables: number;
+		openFds: number;
+		pipes: number;
+		pipeBufferedBytes: number;
+		ptys: number;
+		ptyBufferedInputBytes: number;
+		ptyBufferedOutputBytes: number;
+		sockets: number;
+		socketListeners: number;
+		socketConnections: number;
+		socketBufferedBytes: number;
+		socketDatagramQueueLen: number;
+		queueSnapshots: Array<{
+			name: string;
+			category: string;
+			depth: number;
+			highWater: number;
+			capacity: number;
+			fillPercent: number;
+		}>;
+	}>;
 	readonly commands: ReadonlyMap<string, string>;
 	readonly processes: ReadonlyMap<number, ProcessInfo>;
 	readonly env: Record<string, string>;
@@ -2529,6 +2554,7 @@ class NativeKernel implements Kernel {
 			onBootTiming?: (timing: KernelBootTiming) => void;
 			hostNetworkAdapter?: unknown;
 			loopbackExemptPorts?: number[];
+			jsRuntime?: Partial<JsRuntimeConfig>;
 			mounts?: Array<{
 				path: string;
 				fs: VirtualFileSystem;
@@ -2582,6 +2608,16 @@ class NativeKernel implements Kernel {
 
 	get zombieTimerCount(): number {
 		return this.proxy?.zombieTimerCount ?? 0;
+	}
+
+	async getResourceSnapshot() {
+		if (!this.proxy) {
+			await this.ensureReady();
+		}
+		if (!this.proxy) {
+			throw new Error("kernel is not ready");
+		}
+		return this.proxy.getResourceSnapshot();
 	}
 
 	async mount(driver: KernelRuntimeDriver): Promise<void> {
@@ -3042,6 +3078,9 @@ class NativeKernel implements Kernel {
 					rootFilesystem,
 					...(bootstrapPermissions ? { permissions: bootstrapPermissions } : {}),
 					loopbackExemptPorts: this.loopbackExemptPorts,
+					...(this.options.jsRuntime
+						? { jsRuntime: this.options.jsRuntime as JsRuntimeConfig }
+						: {}),
 				},
 			}),
 		);
@@ -3163,6 +3202,7 @@ export function createKernel(options: {
 	maxProcesses?: number;
 	hostNetworkAdapter?: unknown;
 	loopbackExemptPorts?: number[];
+	jsRuntime?: Partial<JsRuntimeConfig>;
 	logger?: unknown;
 	mounts?: Array<{ path: string; fs: VirtualFileSystem; readOnly?: boolean }>;
 	syncFilesystemOnDispose?: boolean;
