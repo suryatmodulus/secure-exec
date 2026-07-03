@@ -1020,5 +1020,11 @@
 		"path": "packages/core/src/sidecar-process.ts",
 		"class": "policy-deferred",
 		"rationale": "Client-side event buffer default for spawned sidecar processes; callers can override sidecar process options."
+	},
+	{
+		"name": "WASM_MODULE_BYTES_CACHE_CAPACITY",
+		"path": "crates/execution/src/wasm.rs",
+		"class": "invariant",
+		"rationale": "Host-side LRU entry cap for cached wasm module bytes; process-wide cache sizing, not per-VM policy."
 	}
 ]
