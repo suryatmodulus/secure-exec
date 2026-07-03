@@ -280,7 +280,15 @@ fn mount_operations_emit_security_audit_events() {
         .expect("unmount workspace");
 
     let events = structured_events(&sidecar);
-    let mounted = find_event(&events, "security.mount.mounted");
+    // VM creation auto-mounts /opt/agentos (package projection) first; find
+    // the audit event for THIS test's explicit /workspace mount.
+    let mounted = events
+        .iter()
+        .find(|event| {
+            event.name == "security.mount.mounted"
+                && event.fields.get("guest_path").map(String::as_str) == Some("/workspace")
+        })
+        .expect("missing /workspace mount audit event");
     assert_eq!(mounted.vm_id, vm_id);
     assert_eq!(mounted.fields["guest_path"], "/workspace");
     assert_eq!(mounted.fields["plugin_id"], "memory");
@@ -289,8 +297,11 @@ fn mount_operations_emit_security_audit_events() {
 
     let unmounted = events
         .iter()
-        .rfind(|event| event.name == "security.mount.unmounted")
-        .expect("missing unmount audit event");
+        .rfind(|event| {
+            event.name == "security.mount.unmounted"
+                && event.fields.get("guest_path").map(String::as_str) == Some("/workspace")
+        })
+        .expect("missing /workspace unmount audit event");
     assert_eq!(unmounted.vm_id, vm_id);
     assert_eq!(unmounted.fields["guest_path"], "/workspace");
     assert_eq!(unmounted.fields["plugin_id"], "memory");

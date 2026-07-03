@@ -1078,9 +1078,12 @@ fn browser_sidecar_preserves_default_deny_kernel_permissions() {
         .write_file("vm-browser", "/workspace/denied.txt", b"denied".to_vec())
         .expect_err("default permissions should deny filesystem writes");
 
+    // Under default deny-all the write's parent-directory resolution is the
+    // first denied operation, so the error reports the read denial on the
+    // parent; the write itself never proceeds.
     assert_eq!(
         error.to_string(),
-        "EACCES: permission denied, write '/workspace/denied.txt'"
+        "EACCES: permission denied, read '/workspace'"
     );
 }
 
