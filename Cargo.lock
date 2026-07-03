@@ -2190,7 +2190,7 @@ dependencies = [
 
 [[package]]
 name = "native-baseline"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 
 [[package]]
 name = "ndk-context"
@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-bridge"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2980,11 +2980,11 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-build-support"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 
 [[package]]
 name = "secure-exec-client"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "futures",
  "parking_lot",
@@ -2997,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-execution"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-kernel"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-sidecar"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-sidecar-browser"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
@@ -3102,7 +3102,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-sidecar-core"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "base64 0.22.1",
  "secure-exec-bridge",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-sidecar-protocol"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "rivet-vbare-compiler",
  "secure-exec-vm-config",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-v8-runtime"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "ciborium",
  "crossbeam-channel",
@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-vfs"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-vfs-core"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "secure-exec-vm-config"
-version = "0.3.0-rc.1"
+version = "0.3.4-rc.1"
 dependencies = [
  "serde",
  "serde_json",
