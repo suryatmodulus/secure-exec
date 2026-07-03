@@ -1106,6 +1106,7 @@ console.log(JSON.stringify({ formatted }));
     );
 }
 
+#[allow(dead_code)] // quarantined: see the live-stdin/tty harness note above
 fn javascript_execution_stream_consumers_text_reads_live_stdin() {
     let temp = tempdir().expect("create temp dir");
     let mut engine = JavascriptExecutionEngine::default();
@@ -1154,6 +1155,7 @@ console.log(JSON.stringify({ body }));
     assert_eq!(output, json!({ "body": "alpha\nbeta\n" }));
 }
 
+#[allow(dead_code)] // quarantined: see the live-stdin/tty harness note above
 fn javascript_execution_process_stdin_async_iterator_finishes_with_live_stdin() {
     let temp = tempdir().expect("create temp dir");
     let mut engine = JavascriptExecutionEngine::default();
@@ -1203,6 +1205,7 @@ console.log(JSON.stringify({ body }));
     assert_eq!(output, json!({ "body": "{\"request_id\":\"init1\"}\n" }));
 }
 
+#[allow(dead_code)] // quarantined: see the live-stdin/tty harness note above
 fn javascript_execution_process_exit_from_live_stdin_listener_exits_without_waiting_for_eof() {
     let temp = tempdir().expect("create temp dir");
     let mut engine = JavascriptExecutionEngine::default();
@@ -1373,6 +1376,7 @@ Promise.resolve()
     assert!(!stdout.contains("catch handler ran"), "stdout:\n{stdout}");
 }
 
+#[allow(dead_code)] // quarantined: see the live-stdin/tty harness note above
 fn javascript_execution_live_stdin_replays_end_after_late_listener_registration() {
     let temp = tempdir().expect("create temp dir");
     let mut engine = JavascriptExecutionEngine::default();
@@ -3784,6 +3788,7 @@ if (!(file instanceof bufferModule.Blob)) {
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
 }
 
+#[allow(dead_code)] // quarantined: see the live-stdin/tty harness note above
 fn javascript_execution_v8_tty_module_is_backed_by_live_process() {
     let temp = tempdir().expect("create temp dir");
     write_fixture(

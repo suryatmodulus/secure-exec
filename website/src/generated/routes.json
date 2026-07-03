@@ -44,30 +44,6 @@
       "title": "Secure Exec vs Container Sandbox",
       "description": "When to use a container sandbox versus Secure Exec for running untrusted code."
     },
-    "/docs/docs/sdks/rust": {
-      "title": "Rust SDK",
-      "description": "Install the Secure Exec Rust client and find its generated docs.rs reference."
-    },
-    "/docs/docs/sdks/typescript": {
-      "title": "TypeScript SDK",
-      "description": "Install the Secure Exec TypeScript SDK and find its generated API reference."
-    },
-    "/docs/docs/use-cases/ai-agent-code-exec": {
-      "title": "AI Agent Code Exec",
-      "description": "Give AI agents a secure code-execution tool that runs untrusted code in a sandbox and returns structured results."
-    },
-    "/docs/docs/use-cases/code-mode": {
-      "title": "Code Mode (MCP)",
-      "description": "Give AI agents a single code-execution tool instead of individual MCP tools. The LLM writes code that chains binding calls, executed safely in Secure Exec."
-    },
-    "/docs/docs/use-cases/dev-servers": {
-      "title": "Dev Servers",
-      "description": "Run user-provided server-style code (HTTP servers, request handlers) inside a secure isolate."
-    },
-    "/docs/docs/use-cases/plugin-systems": {
-      "title": "Plugin Systems",
-      "description": "Run user-authored plugins in isolation with explicit permissions."
-    },
     "/docs/docs/features/bindings": {
       "title": "Bindings",
       "description": "Give sandboxed guest code a narrow, curated set of host-backed capabilities."
@@ -115,6 +91,30 @@
     "/docs/docs/features/typescript": {
       "title": "TypeScript",
       "description": "Compiling and type-checking TypeScript inside the sandbox."
+    },
+    "/docs/docs/sdks/rust": {
+      "title": "Rust SDK",
+      "description": "Install the Secure Exec Rust client and find its generated docs.rs reference."
+    },
+    "/docs/docs/sdks/typescript": {
+      "title": "TypeScript SDK",
+      "description": "Install the Secure Exec TypeScript SDK and find its generated API reference."
+    },
+    "/docs/docs/use-cases/ai-agent-code-exec": {
+      "title": "AI Agent Code Exec",
+      "description": "Give AI agents a secure code-execution tool that runs untrusted code in a sandbox and returns structured results."
+    },
+    "/docs/docs/use-cases/code-mode": {
+      "title": "Code Mode (MCP)",
+      "description": "Give AI agents a single code-execution tool instead of individual MCP tools. The LLM writes code that chains binding calls, executed safely in Secure Exec."
+    },
+    "/docs/docs/use-cases/dev-servers": {
+      "title": "Dev Servers",
+      "description": "Run user-provided server-style code (HTTP servers, request handlers) inside a secure isolate."
+    },
+    "/docs/docs/use-cases/plugin-systems": {
+      "title": "Plugin Systems",
+      "description": "Run user-authored plugins in isolation with explicit permissions."
     }
   }
 }
