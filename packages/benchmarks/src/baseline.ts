@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { allOps } from "./families/index.js";
 import type { LatencyResult, LayerStatsEntry } from "./lib/layers.js";
 import { getHardware, round } from "./lib/perf-utils.js";
 import { writeJson } from "./lib/report.js";
@@ -242,10 +243,12 @@ async function main(): Promise<void> {
 		iterations: Number(process.env.BENCH_ITERATIONS ?? 20),
 		warmup: Number(process.env.BENCH_WARMUP ?? 5),
 	});
-	if (baseline.engine.rowCount !== 70) {
+	// One matrix row per registered op; derive from the registry so the check
+	// tracks new families instead of going stale on a hardcoded count.
+	if (baseline.engine.rowCount !== allOps.length) {
 		throw new BaselineExitError(
 			2,
-			`refusing to write incomplete baseline: expected 70 matrix rows, got ${baseline.engine.rowCount}`,
+			`refusing to write incomplete baseline: expected ${allOps.length} matrix rows, got ${baseline.engine.rowCount}`,
 		);
 	}
 	writeJson(args.output, baseline);
