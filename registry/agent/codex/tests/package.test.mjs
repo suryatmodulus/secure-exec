@@ -13,7 +13,8 @@ test("codex package does not advertise an ACP adapter until the real agent is wi
 	);
 
 	assert.equal(manifest.bin, undefined);
-	assert.equal(codex.name, "codex");
-	assert.equal(typeof codex.dir, "string");
+	// The package now re-exports the @agentos-software/codex-cli toolchain
+	// package descriptor ({ packageDir }) instead of a bespoke shape.
+	assert.equal(typeof codex.packageDir, "string");
 	assert.equal(codex.agent, undefined);
 });
