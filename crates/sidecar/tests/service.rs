@@ -12874,8 +12874,6 @@ await new Promise(() => {});
                 }
             }
 
-
-
             let content = {
                 let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                 (0..10)

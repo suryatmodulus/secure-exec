@@ -82,23 +82,47 @@ function collectImportSpecifiers(source) {
 	return specifiers;
 }
 
-function checkPackageManifest(root, relPath, violations) {
+// A package DEFINED in this repo cannot be a boundary violation even if its
+// name matches the agent-os pattern (e.g. @rivet-dev/agentos-toolchain, the
+// registry build toolchain owned here); the rule guards against depending on
+// the agent-os repo's products.
+function collectLocalPackageNames(root, dir, names) {
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			collectLocalPackageNames(root, path, names);
+			continue;
+		}
+		if (!entry.isFile() || entry.name !== 'package.json') continue;
+		try {
+			const manifest = readJson(path);
+			if (typeof manifest.name === 'string') {
+				names.add(manifest.name);
+			}
+		} catch {
+			// Unparseable manifests are reported by other checks.
+		}
+	}
+}
+
+function checkPackageManifest(root, relPath, violations, localNames) {
 	const manifest = readJson(join(root, relPath));
 	for (const section of dependencySections) {
 		const dependencies = manifest[section];
 		if (!dependencies || typeof dependencies !== 'object') continue;
 		for (const name of Object.keys(dependencies)) {
-			if (agentOSPackagePattern.test(name)) {
+			if (agentOSPackagePattern.test(name) && !localNames.has(name)) {
 				violations.push(`${relPath} ${section} references ${name}`);
 			}
 		}
 	}
 }
 
-function checkSourceFile(root, relPath, violations) {
+function checkSourceFile(root, relPath, violations, localNames) {
 	const source = readFileSync(join(root, relPath), 'utf8');
 	for (const specifier of collectImportSpecifiers(source)) {
-		if (agentOSPackagePattern.test(specifier)) {
+		if (agentOSPackagePattern.test(specifier) && !localNames.has(specifier)) {
 			violations.push(`${relPath} imports ${specifier}`);
 		}
 	}
@@ -114,18 +138,18 @@ function checkPatternFile(root, relPath, patterns, violations) {
 	}
 }
 
-function walk(root, dir, violations) {
+function walk(root, dir, violations, localNames) {
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
 		if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
 		const path = join(dir, entry.name);
 		const relPath = relative(root, path);
 		if (entry.isDirectory()) {
-			walk(root, path, violations);
+			walk(root, path, violations, localNames);
 			continue;
 		}
 		if (!entry.isFile() || shouldSkipFile(relPath)) continue;
 		if (entry.name === 'package.json') {
-			checkPackageManifest(root, relPath, violations);
+			checkPackageManifest(root, relPath, violations, localNames);
 			continue;
 		}
 		if (entry.name === 'Cargo.toml') {
@@ -137,7 +161,7 @@ function walk(root, dir, violations) {
 			continue;
 		}
 		if (sourceExtensions.has(extname(entry.name))) {
-			checkSourceFile(root, relPath, violations);
+			checkSourceFile(root, relPath, violations, localNames);
 		}
 	}
 }
@@ -148,7 +172,9 @@ export function auditSecureExecBoundary(options = {}) {
 	if (!existsSync(root)) {
 		return { root, ok: false, violations: [`${root} does not exist`] };
 	}
-	walk(root, root, violations);
+	const localNames = new Set();
+	collectLocalPackageNames(root, root, localNames);
+	walk(root, root, violations, localNames);
 	violations.sort();
 	return { root, ok: violations.length === 0, violations };
 }
