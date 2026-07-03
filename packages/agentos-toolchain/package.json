@@ -5,7 +5,7 @@
   "type": "module",
   "license": "Apache-2.0",
   "bin": {
-    "agentos-toolchain": "./dist/cli.js"
+    "agentos-toolchain": "./bin/agentos-toolchain.mjs"
   },
   "exports": {
     ".": {
@@ -16,6 +16,7 @@
     }
   },
   "files": [
+    "bin",
     "dist",
     "package.json",
     "README.md"
