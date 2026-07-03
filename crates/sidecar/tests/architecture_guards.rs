@@ -283,6 +283,10 @@ const FS_ALLOW: &[&str] = &[
     "crates/v8-runtime/src/execution.rs",
     "crates/v8-runtime/src/host_call.rs",
     "crates/v8-runtime/src/snapshot.rs",
+    // Session-phase perf recorder writes to an operator-provided file path
+    // (AGENTOS_V8_SESSION_PHASES_FILE). Host-only diagnostics, same class as
+    // execution.rs/host_call.rs above.
+    "crates/v8-runtime/src/session.rs",
 ];
 
 /// net: host network access.
@@ -323,7 +327,13 @@ const NET_ALLOW: &[&str] = &[
 /// Sanctioned surface: only the client transport, which spawns secure-exec's
 /// own sidecar helper binary. Guest "process" spawns go through the kernel
 /// `CommandDriver` registry and never reach `Command::new`.
-const PROCESS_ALLOW: &[&str] = &["crates/secure-exec-client/src/transport.rs"];
+const PROCESS_ALLOW: &[&str] = &[
+    "crates/secure-exec-client/src/transport.rs",
+    // V8 snapshot builder re-execs secure-exec's OWN binary as a helper
+    // (SNAPSHOT_HELPER_ENV) so snapshot creation runs in a clean process.
+    // Host-side bootstrap only; no guest-controlled input picks the program.
+    "crates/v8-runtime/src/snapshot.rs",
+];
 
 /// env: process-environment reads.
 ///
@@ -355,6 +365,17 @@ const ENV_ALLOW: &[&str] = &[
     // Browser sidecar reads a test-only vm.fetch timeout override (bucket 1:
     // process-wide test/debug knob, native-only); not VM policy.
     "crates/sidecar-browser/src/service.rs",
+    // Warm-isolate pool sizing knob (AGENTOS_V8_WARM_ISOLATES), read at
+    // executor init from operator env. Not guest-reachable.
+    "crates/execution/src/v8_host.rs",
+    // Wasm runner mode/cache knobs (AGENTOS_WASM_SNAPSHOT_RUNNER,
+    // AGENTOS_WASM_RUNNER_NO_CACHE) + warm-pool sizing, read at executor init
+    // from operator env. Not guest-reachable. (wasm.rs is already a sanctioned
+    // FS asset-loading boundary above.)
+    "crates/execution/src/wasm.rs",
+    // Session-phase perf diagnostics toggles (AGENTOS_V8_SESSION_PHASES*),
+    // read from operator env. Not guest-reachable.
+    "crates/v8-runtime/src/session.rs",
 ];
 
 fn fs_class() -> BannedClass {
