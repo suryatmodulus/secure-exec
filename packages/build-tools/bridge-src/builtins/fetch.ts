@@ -1,4 +1,4 @@
-import { createSecureExecUndiciDispatcher, undiciFetch } from "./undici.js";
+import { getSecureExecUndiciDispatcher, undiciFetch } from "./undici.js";
 import { exposeCustomGlobal } from "../global-exposure.js";
 import { undiciHeadersModule, undiciRequestModule, undiciResponseModule } from "../prelude.js";
 import { isFlatHeaderList, onUpgradeSocketEnd } from "./http.js";
@@ -106,7 +106,11 @@ async function fetch(input, options = {}) {
   if (handleId) {
     _registerHandle?.(handleId, `fetch ${requestLabel}`);
   }
-  const fetchDispatcher = normalizedOptions.dispatcher == null && typeof createSecureExecUndiciDispatcher === "function" ? createSecureExecUndiciDispatcher() : null;
+  // Shared bounded dispatcher (see undici.ts): keepalive pooling across fetch()
+  // calls. Per-call dispatchers (the 4f470c61 workaround for pooled clients
+  // going stale against released sockets) are no longer needed now that
+  // host->guest socket event push keeps pooled connections live.
+  const fetchDispatcher = normalizedOptions.dispatcher == null && typeof getSecureExecUndiciDispatcher === "function" ? getSecureExecUndiciDispatcher() : null;
   try {
     return await undiciFetch(
       resolvedInput,

@@ -1115,7 +1115,11 @@ fn handle_late_session_message(
             event_type,
             payload,
         }) => {
-            if event_type == "timer" {
+            // Timer and socket-readiness events are wake hints, not data; both
+            // race execution completion by design (edge-triggered readiness can
+            // fire as the guest finishes) and carry nothing to lose, so drop
+            // them silently instead of warning.
+            if event_type == "timer" || event_type == "net_socket" {
                 return;
             }
             send_late_message_warning(
