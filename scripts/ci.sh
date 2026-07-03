@@ -33,6 +33,10 @@ run_step pnpm --dir scripts/publish run check-types
 run_step pnpm --dir scripts/publish test
 run_step cargo fmt --check
 run_step cargo clippy --workspace --all-targets -- -D warnings
+# Service fs/shell regression tests stage guest WASM command binaries
+# (registry/native or packages/core/commands) and fail hard when missing.
+run_step make -C registry/native wasm
+run_step node packages/core/scripts/copy-wasm-commands.mjs
 run_step env CARGO_INCREMENTAL=0 cargo test --workspace -- --test-threads=1
 
 if [[ "${CI_FORK_PULL_REQUEST:-0}" == "1" ]]; then
