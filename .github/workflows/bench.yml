@@ -14,7 +14,7 @@ jobs:
     name: Bench gate
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +34,11 @@ jobs:
 
       - name: Build @secure-exec/core (bench ops import its dist)
         run: pnpm --dir packages/core build
+
+      - name: Build guest WASM command binaries (ls_100 vmCmd row)
+        run: |
+          make -C registry/native wasm
+          node packages/core/scripts/copy-wasm-commands.mjs
 
       - name: Build release benchmark binaries
         run: |
