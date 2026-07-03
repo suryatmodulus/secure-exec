@@ -9810,6 +9810,10 @@ fn sync_process_host_writes_to_kernel(
     Ok(())
 }
 
+fn host_sync_root_is_filesystem_root(host_root: &Path) -> bool {
+    normalize_host_path(host_root) == Path::new("/")
+}
+
 fn sync_host_directory_tree_to_kernel(
     vm: &mut VmState,
     host_root: &Path,
@@ -9817,6 +9821,14 @@ fn sync_host_directory_tree_to_kernel(
 ) -> Result<(), SidecarError> {
     let normalized_host_root = normalize_host_path(host_root);
     let normalized_guest_root = normalize_path(guest_root);
+    if host_sync_root_is_filesystem_root(host_root) {
+        // A process tracked with host cwd "/" would pull the entire host
+        // filesystem into the kernel VFS (until the size/inode caps fire).
+        // No sanctioned flow shadows the host root wholesale; host access is
+        // scoped through mounts.
+        tracing::warn!("skipping host shadow sync rooted at the host filesystem root");
+        return Ok(());
+    }
     let mut synced_file_times = BTreeMap::new();
     sync_host_directory_tree_to_kernel_inner(
         vm,
