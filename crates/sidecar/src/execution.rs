@@ -9837,6 +9837,16 @@ fn sync_host_directory_tree_to_kernel_inner(
     let entries = match fs::read_dir(current_host_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Host dirs the sidecar user cannot read (e.g. root-owned
+            // /lost+found under a host-root mount) are skipped rather than
+            // failing the whole shadow sync; the guest just won't see them.
+            tracing::warn!(
+                path = %current_host_dir.display(),
+                "skipping unreadable host shadow directory"
+            );
+            return Ok(());
+        }
         Err(error) => {
             return Err(SidecarError::Io(format!(
                 "failed to read host shadow directory {}: {error}",
@@ -9976,6 +9986,19 @@ fn sync_host_directory_tree_to_kernel_inner(
                 // temp files). Skipping matches native semantics; failing
                 // here would poison EVERY subsequent fs op on the VM.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                // Same tolerance for entries the sidecar user cannot read
+                // (root-owned files under a host-root mount): skip them
+                // rather than poisoning the whole sync.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(libc::EPERM) =>
+                {
+                    tracing::warn!(
+                        path = %host_path.display(),
+                        "skipping unreadable host shadow file"
+                    );
+                    continue;
+                }
                 Err(error) => {
                     return Err(SidecarError::Io(format!(
                         "failed to read host shadow file {}: {error}",
