@@ -177,6 +177,10 @@ function parseArgs(argv: string[]): {
 	let from: string | undefined;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
+		if (arg === "--") {
+			// pnpm run forwards the `--` separator itself; ignore it.
+			continue;
+		}
 		if (arg === "--ci") {
 			kind = "ci";
 		} else if (arg === "--local") {
