@@ -4591,8 +4591,10 @@ mod tests {
     fn wasm_runner_bootstrap_reports_dot_preopen_to_wasi() {
         let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
 
-        assert!(bootstrap.contains("const cwdMount = guestCwd || '/workspace';"));
-        assert!(bootstrap.contains("preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);"));
+        // The dot preopen must resolve through the guest cwd, never surface as a
+        // literal "." (restructured into _currentGuestCwd/_descriptorPreopenName
+        // by the wasi-shim stat-path rework).
+        assert!(bootstrap.contains("_currentGuestCwd()"));
         assert!(!bootstrap.contains("preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);"));
         assert!(bootstrap.contains("_descriptorPreopenName(entry)"));
         assert!(bootstrap.contains(
