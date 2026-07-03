@@ -4391,8 +4391,12 @@ if (delegatePathOpen) {
       ),
     );
 
+    // Precreate-and-retry exists for creatable targets the delegate reports
+    // as missing (e.g. `>>` append redirect targets). Only retry on NOENT:
+    // retrying on permission errors would mask the real errno and attempt to
+    // create a file the kernel just denied.
     if (
-      result !== WASI_ERRNO_SUCCESS &&
+      result === WASI_ERRNO_NOENT &&
       mayCreateTarget
     ) {
       try {
