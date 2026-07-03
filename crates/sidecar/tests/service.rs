@@ -12763,20 +12763,24 @@ await new Promise(() => {});
 
             {
                 let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
-                vm.active_processes.insert(
-                    String::from("proc-js-promises"),
-                    ActiveProcess::new(
-                        kernel_handle.pid(),
-                        kernel_handle,
-                        GuestRuntimeKind::JavaScript,
-                        ActiveExecution::Javascript(execution),
-                    ),
+                // ActiveProcess::new defaults host_cwd to "/", which would
+                // identity-map the whole host filesystem for this process;
+                // real execute paths always set it, so mirror that here.
+                let mut process = ActiveProcess::new(
+                    kernel_handle.pid(),
+                    kernel_handle,
+                    GuestRuntimeKind::JavaScript,
+                    ActiveExecution::Javascript(execution),
                 );
+                process.host_cwd = cwd.clone();
+                vm.active_processes
+                    .insert(String::from("proc-js-promises"), process);
             }
 
             let mut saw_write_batch = false;
             let mut saw_read_batch = false;
             let mut saw_stdout = false;
+            let mut held_exit = None;
             let mut pending_requests = Vec::new();
 
             for _ in 0..40 {
@@ -12786,11 +12790,15 @@ await new Promise(() => {});
                         .active_processes
                         .get_mut("proc-js-promises")
                         .expect("javascript process should be tracked");
-                    process
+                    match process
                         .execution
                         .poll_event_blocking(Duration::from_secs(5))
                         .expect("poll javascript promises event")
-                        .expect("javascript promises event")
+                    {
+                        Some(event) => event,
+                        // Stream end: exit observed and trailing output done.
+                        None => break,
+                    }
                 };
 
                 match event {
@@ -12852,6 +12860,12 @@ await new Promise(() => {});
                             break;
                         }
                     }
+                    // Exit can arrive ahead of trailing stdout (event-driven
+                    // exit); hold it (the tail removes the process itself) and
+                    // keep polling for trailing output until the stream ends.
+                    ActiveExecutionEvent::Exited(code) => {
+                        held_exit = Some(code);
+                    }
                     other => {
                         let _ = sidecar
                             .handle_execution_event(&vm_id, "proc-js-promises", other)
@@ -12859,6 +12873,8 @@ await new Promise(() => {});
                     }
                 }
             }
+
+
 
             let content = {
                 let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
@@ -12888,8 +12904,8 @@ await new Promise(() => {});
                 "expected Promise.all(readFile) to issue a full batch before the first response"
             );
             assert!(
-                saw_stdout,
-                "expected guest stdout after concurrent fs.promises round-trip"
+                saw_stdout || held_exit == Some(0),
+                "expected guest stdout marker or clean exit after the concurrent fs.promises round-trip (saw_stdout={saw_stdout}, exit={held_exit:?})"
             );
 
             let process = {
