@@ -3247,7 +3247,10 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 							}
 							return 0o100644;
 						},
-						path_mode(pathPtr, pathLen, followSymlinks) {
+						// Signature must match the node runner's host_fs.path_mode
+						// (fd, pathPtr, pathLen, followSymlinks). The guest passes the
+						// directory fd first (3 = cwd preopen); the path is at args 2/3.
+						path_mode(_fd, pathPtr, pathLen, followSymlinks) {
 							try {
 								const guestPath = resolveGuestPath(readString(pathPtr, pathLen));
 								const stat = Number(followSymlinks) === 0
@@ -3257,6 +3260,68 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 							} catch {
 								return 0;
 							}
+						},
+						// Matches node runner host_fs.chmod(fd, pathPtr, pathLen, mode):
+						// 0 on success, 1 on failure.
+						chmod(_fd, pathPtr, pathLen, mode) {
+							try {
+								const guestPath = resolveGuestPath(readString(pathPtr, pathLen));
+								fs().chmodSync(guestPath, Number(mode) >>> 0);
+								return 0;
+							} catch {
+								return 1;
+							}
+						},
+						// The node runner exports 7 host_fs symbols; mirror the full
+						// contract here so any guest module that imports the rest still
+						// instantiates in-browser (a missing import is a hard LinkError).
+						// Sentinels match the node runner: (1<<64)-1 for size, 1 for
+						// mutations.
+						fd_size(fd) {
+							try {
+								const descriptor = fd >>> 0;
+								const handle = lookupSyntheticFd(descriptor);
+								if (
+									handle &&
+									handle.kind === "guest-file" &&
+									typeof handle.targetFd === "number"
+								) {
+									return BigInt(fs().fstatSync(handle.targetFd).size ?? -1);
+								}
+								const parentEntry =
+									parentWasi && parentWasi.fdTable && parentWasi.fdTable.get(descriptor);
+								if (
+									parentEntry &&
+									parentEntry.kind === "file" &&
+									typeof parentEntry.realFd === "number"
+								) {
+									return BigInt(fs().fstatSync(parentEntry.realFd).size ?? -1);
+								}
+								return (1n << 64n) - 1n;
+							} catch {
+								return (1n << 64n) - 1n;
+							}
+						},
+						path_size(_fd, pathPtr, pathLen, followSymlinks) {
+							try {
+								const guestPath = resolveGuestPath(readString(pathPtr, pathLen));
+								const stat = Number(followSymlinks) === 0
+									? fs().lstatSync(guestPath)
+									: fs().statSync(guestPath);
+								return BigInt(stat.size ?? -1);
+							} catch {
+								return (1n << 64n) - 1n;
+							}
+						},
+						// Browser fs() has no fd-based fchmod/ftruncate; provide the
+						// symbols (best-effort failure) so imports resolve. Rust guest
+						// binaries bypass wasi-libc stat/chmod/truncate, so these paths
+						// are unreached in practice.
+						fchmod(_fd, _mode) {
+							return 1;
+						},
+						ftruncate(_fd, _length) {
+							return 1;
 						},
 					},
 					host_process: {
