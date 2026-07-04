@@ -1203,19 +1203,16 @@ function write12(bc: bare.ByteCursor, x: readonly ProjectedCommand[]): void {
 }
 
 export type PackageLinkedResponse = {
-    readonly commands: readonly string[]
     readonly projectedCommands: readonly ProjectedCommand[]
 }
 
 export function readPackageLinkedResponse(bc: bare.ByteCursor): PackageLinkedResponse {
     return {
-        commands: read6(bc),
         projectedCommands: read12(bc),
     }
 }
 
 export function writePackageLinkedResponse(bc: bare.ByteCursor, x: PackageLinkedResponse): void {
-    write6(bc, x.commands)
     write12(bc, x.projectedCommands)
 }
 

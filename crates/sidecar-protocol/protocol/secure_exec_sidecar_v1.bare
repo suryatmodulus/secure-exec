@@ -227,7 +227,6 @@ type ProjectedCommand struct {
 }
 
 type PackageLinkedResponse struct {
-  commands: list<str>
   projectedCommands: list<ProjectedCommand>
 }
 

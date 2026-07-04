@@ -95,7 +95,6 @@ export type LiveResponsePayload =
 	  }
 	| {
 			type: "package_linked";
-			commands: string[];
 			projected_commands: LiveProjectedCommand[];
 	  }
 	| {
@@ -271,7 +270,6 @@ export function fromGeneratedResponsePayload(
 		case "PackageLinkedResponse":
 			return {
 				type: "package_linked",
-				commands: [...payload.val.commands],
 				projected_commands: payload.val.projectedCommands.map(
 					(command) => ({
 						name: command.name,

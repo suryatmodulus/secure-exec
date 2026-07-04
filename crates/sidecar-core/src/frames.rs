@@ -168,13 +168,11 @@ pub fn vm_configured_response(
 
 pub fn package_linked_response(
     request: &RequestFrame,
-    commands: Vec<String>,
     projected_commands: Vec<ProjectedCommand>,
 ) -> ResponseFrame {
     respond(
         request,
         ResponsePayload::PackageLinked(PackageLinkedResponse {
-            commands,
             projected_commands,
         }),
     )

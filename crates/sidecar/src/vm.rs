@@ -613,7 +613,7 @@ where
             .collect();
 
         Ok(DispatchResult {
-            response: package_linked_response(request, commands, projected_commands),
+            response: package_linked_response(request, projected_commands),
             events: Vec::new(),
         })
     }
