@@ -355,27 +355,6 @@ where
             },
         );
 
-        // Pre-warm the agent-SDK snapshot (when the trusted client supplied one via
-        // jsRuntime.snapshotUserlandCode) so the FIRST session is already warm — the
-        // one-per-sidecar build happens here at VM create, off the session-create
-        // critical path. The V8 platform is already initialized on the main thread at
-        // startup (ensure_runtime_initialized), so building on this worker thread is
-        // safe. Best-effort: on failure the runtime falls back to the lazy build.
-        if let Some(userland) = create_config
-            .js_runtime
-            .as_ref()
-            .and_then(|cfg| cfg.snapshot_userland_code.clone())
-        {
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(error) =
-                    secure_exec_execution::v8_host::pre_warm_agent_snapshot(&userland)
-                {
-                    eprintln!("agent snapshot pre-warm failed: {error}");
-                }
-            })
-            .await;
-        }
-
         let events = vec![
             self.vm_lifecycle_event(
                 &connection_id,
@@ -463,6 +442,7 @@ where
             let _ = fs::remove_dir_all(&old);
         }
         let package_descriptors = package_descriptors_from_wire(&payload.packages)?;
+        let snapshot_userland_code = resolve_agent_snapshot_bundle(&package_descriptors)?;
         let (packages_staging_root, packages_mount) =
             build_packages_projection(&vm_id, &package_descriptors, &payload.packages_mount_at)?;
         vm.packages_staging_root = Some(packages_staging_root);
@@ -523,12 +503,15 @@ where
                 command_permissions: payload.command_permissions.clone().into_iter().collect(),
                 // jsRuntime is create-time only; preserve what create_vm stored.
                 js_runtime: vm.configuration.js_runtime.clone(),
+                snapshot_userland_code: snapshot_userland_code.clone(),
                 loopback_exempt_ports: payload.loopback_exempt_ports.clone(),
             };
             Ok(())
         });
         match reconfigure_result {
-            Ok(()) => bridge.set_vm_permissions(&vm_id, &configured_permissions)?,
+            Ok(()) => {
+                bridge.set_vm_permissions(&vm_id, &configured_permissions)?;
+            }
             Err(error) => {
                 match bridge.restore_vm_permissions_fail_closed(
                     &vm_id,
@@ -549,13 +532,31 @@ where
             }
         }
 
-        tracing::info!(target: "secure_exec_sidecar::perf", phase = "configure_vm", elapsed_ms = __t.elapsed().as_millis() as u64, applied_mounts = effective_mounts.len() as u64, "vm phase");
+        let applied_mounts = effective_mounts.len() as u32;
+        let configured_software = payload.software.len() as u32;
         let projected_commands = projected_commands_from_guest_paths(&vm.command_guest_paths);
+        let _ = vm;
+        // Pre-warm the agent-SDK snapshot when a configured package opts in with
+        // `agent.snapshot`. The sidecar reads the bundle from the host package dir
+        // it already projects, so the first session is warm without shipping the
+        // source over the client wire.
+        if let Some(userland) = snapshot_userland_code {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    secure_exec_execution::v8_host::pre_warm_agent_snapshot(&userland)
+                {
+                    eprintln!("agent snapshot pre-warm failed: {error}");
+                }
+            })
+            .await;
+        }
+
+        tracing::info!(target: "secure_exec_sidecar::perf", phase = "configure_vm", elapsed_ms = __t.elapsed().as_millis() as u64, applied_mounts = applied_mounts as u64, "vm phase");
         Ok(DispatchResult {
             response: vm_configured_response(
                 request,
-                effective_mounts.len() as u32,
-                payload.software.len() as u32,
+                applied_mounts,
+                configured_software,
                 projected_commands,
             ),
             events: Vec::new(),
@@ -1282,6 +1283,17 @@ fn package_descriptors_from_wire(
         .iter()
         .map(|package| crate::package_projection::read_package_manifest(&package.dir))
         .collect()
+}
+
+fn resolve_agent_snapshot_bundle(
+    packages: &[crate::package_projection::PackageDescriptor],
+) -> Result<Option<String>, SidecarError> {
+    for package in packages {
+        if let Some(bundle) = crate::package_projection::read_agent_snapshot_bundle(package)? {
+            return Ok(Some(bundle));
+        }
+    }
+    Ok(None)
 }
 
 fn apply_package_provides_env(

@@ -77,7 +77,6 @@ const jsRuntimeSchema = z
 		moduleResolution: z.enum(["node", "relative", "none"]).optional(),
 		allowedBuiltins: stringArray.optional(),
 		highResolutionTime: z.boolean().optional(),
-		snapshotUserlandCode: z.string().optional(),
 	})
 	.strict();
 
