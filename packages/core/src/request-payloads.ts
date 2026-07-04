@@ -82,6 +82,8 @@ export type LiveRequestPayload =
 			loopback_exempt_ports?: number[];
 			packages?: LivePackageDescriptor[];
 			packages_mount_at?: string;
+			bootstrap_commands?: string[];
+			tool_shim_commands?: string[];
 	  }
 	| {
 			type: "link_package";
@@ -297,6 +299,8 @@ export function toGeneratedRequestPayload(
 						toGeneratedPackageDescriptor,
 					),
 					packagesMountAt: payload.packages_mount_at ?? "",
+					bootstrapCommands: payload.bootstrap_commands ?? [],
+					toolShimCommands: payload.tool_shim_commands ?? [],
 				},
 			};
 		case "link_package":

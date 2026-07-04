@@ -242,6 +242,8 @@ type ConfigureVmRequest struct {
   loopbackExemptPorts: list<u16>
   packages: list<PackageDescriptor>
   packagesMountAt: str
+  bootstrapCommands: list<str>
+  toolShimCommands: list<str>
 }
 
 type RegisteredHostCallbackExample struct {

@@ -1340,6 +1340,8 @@ export type ConfigureVmRequest = {
     readonly loopbackExemptPorts: Uint16Array
     readonly packages: readonly PackageDescriptor[]
     readonly packagesMountAt: string
+    readonly bootstrapCommands: readonly string[]
+    readonly toolShimCommands: readonly string[]
 }
 
 export function readConfigureVmRequest(bc: bare.ByteCursor): ConfigureVmRequest {
@@ -1354,6 +1356,8 @@ export function readConfigureVmRequest(bc: bare.ByteCursor): ConfigureVmRequest 
         loopbackExemptPorts: bare.readU16Array(bc),
         packages: read18(bc),
         packagesMountAt: bare.readString(bc),
+        bootstrapCommands: read6(bc),
+        toolShimCommands: read6(bc),
     }
 }
 
@@ -1368,6 +1372,8 @@ export function writeConfigureVmRequest(bc: bare.ByteCursor, x: ConfigureVmReque
     bare.writeU16Array(bc, x.loopbackExemptPorts)
     write18(bc, x.packages)
     bare.writeString(bc, x.packagesMountAt)
+    write6(bc, x.bootstrapCommands)
+    write6(bc, x.toolShimCommands)
 }
 
 export type RegisteredHostCallbackExample = {

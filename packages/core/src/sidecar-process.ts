@@ -476,6 +476,8 @@ export class SidecarProcess {
 			loopbackExemptPorts?: number[];
 			packages?: SidecarPackageDescriptor[];
 			packagesMountAt?: string;
+			bootstrapCommands?: string[];
+			toolShimCommands?: string[];
 		},
 	): Promise<SidecarVmConfiguredResponse> {
 		const response = await this.sendRequest({
@@ -503,6 +505,8 @@ export class SidecarProcess {
 				...(options.packagesMountAt
 					? { packages_mount_at: options.packagesMountAt }
 					: {}),
+				bootstrap_commands: options.bootstrapCommands ?? [],
+				tool_shim_commands: options.toolShimCommands ?? [],
 			},
 		});
 		if (response.payload.type !== "vm_configured") {

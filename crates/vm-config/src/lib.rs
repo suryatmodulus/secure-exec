@@ -48,6 +48,13 @@ pub struct CreateVmConfig {
     #[serde(default, rename = "jsRuntime", skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub js_runtime: Option<JsRuntimeConfig>,
+    #[serde(
+        default,
+        rename = "bootstrapCommands",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub bootstrap_commands: Option<Vec<String>>,
 }
 
 impl CreateVmConfig {
@@ -75,6 +82,9 @@ impl CreateVmConfig {
         }
         if let Some(js_runtime) = &self.js_runtime {
             js_runtime.validate()?;
+        }
+        if let Some(bootstrap_commands) = &self.bootstrap_commands {
+            validate_command_names("bootstrapCommands", bootstrap_commands)?;
         }
         Ok(())
     }
@@ -758,6 +768,23 @@ fn validate_guest_path(label: &str, path: &str) -> Result<(), VmConfigError> {
     if path.split('/').any(|part| part == "..") {
         return Err(VmConfigError::new(format!("{label} must not contain '..'")));
     }
+    Ok(())
+}
+
+fn validate_command_names(label: &str, commands: &[String]) -> Result<(), VmConfigError> {
+    for command in commands {
+        if command.is_empty()
+            || command == "."
+            || command == ".."
+            || command.contains('/')
+            || command.contains('\0')
+        {
+            return Err(VmConfigError::new(format!(
+                "{label} contains invalid command name {command:?}"
+            )));
+        }
+    }
+
     Ok(())
 }
 

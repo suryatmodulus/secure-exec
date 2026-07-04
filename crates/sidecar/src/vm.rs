@@ -294,6 +294,9 @@ where
             String::from("python3"),
             String::from(WASM_COMMAND),
         ];
+        if let Some(bootstrap_commands) = &create_config.bootstrap_commands {
+            execution_commands.extend(bootstrap_commands.iter().cloned());
+        }
         execution_commands.extend(command_guest_paths.keys().cloned());
         kernel
             .register_driver(CommandDriver::new(
@@ -482,6 +485,8 @@ where
             refresh_guest_command_path_env(&mut vm.guest_env, &vm.command_guest_paths);
             let mut execution_commands =
                 vec![String::from(JAVASCRIPT_COMMAND), String::from(WASM_COMMAND)];
+            execution_commands.extend(payload.bootstrap_commands.iter().cloned());
+            execution_commands.extend(payload.tool_shim_commands.iter().cloned());
             execution_commands.extend(vm.command_guest_paths.keys().cloned());
             vm.kernel
                 .register_driver(CommandDriver::new(

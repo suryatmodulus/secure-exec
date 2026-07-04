@@ -13,4 +13,4 @@ import type { VmListenPolicyConfig } from "./VmListenPolicyConfig.js";
  * `packages/core/src/node-runtime-options-schema.ts`; update both when a
  * public `NodeRuntime.create(...)` option changes the generated VM config.
  */
-export type CreateVmConfig = { cwd?: string, env: Record<string, string>, rootFilesystem: RootFilesystemConfig, permissions?: PermissionsPolicy, limits?: VmLimitsConfig, dns?: VmDnsConfig, nativeRoot?: NativeRootFilesystemConfig, listen?: VmListenPolicyConfig, loopbackExemptPorts: Array<number>, jsRuntime?: JsRuntimeConfig, };
+export type CreateVmConfig = { cwd?: string, env: Record<string, string>, rootFilesystem: RootFilesystemConfig, permissions?: PermissionsPolicy, limits?: VmLimitsConfig, dns?: VmDnsConfig, nativeRoot?: NativeRootFilesystemConfig, listen?: VmListenPolicyConfig, loopbackExemptPorts: Array<number>, jsRuntime?: JsRuntimeConfig, bootstrapCommands?: Array<string>, };
