@@ -284,11 +284,18 @@ export function pack(options: PackOptions): PackResult {
 		cpSync(join(tmp, "node_modules"), join(packageDir, "node_modules"), {
 			recursive: true,
 		});
-		// bin/<cmd> → ../node_modules/<name>/<entry> (relative symlink; node resolves
-		// deps from the realpath's node_modules).
+		// The sidecar resolves each command from the root package.json "bin" map to
+		// its REAL entry file in the packed closure (see package_projection
+		// binEntries) — it must NOT rely on `bin/<cmd>` symlinks: npm/pnpm publish
+		// DROP symlinks, so a `bin/<cmd>` symlink vanishes from the published tarball
+		// and the sidecar can't project the entrypoint (the adapter then resolves to
+		// `/unknown/<cmd>`). So point `bin` at the real relative entry path; also keep
+		// a `bin/<cmd>` symlink for local `$PATH`/dev use (harmless if published away).
 		const closureModules = join(packageDir, "node_modules");
+		const binMap: Record<string, string> = {};
 		for (const [cmd, entryRel] of Object.entries(bins)) {
 			const targetAbs = resolveBinTarget(closureModules, name, entryRel);
+			binMap[cmd] = relative(packageDir, targetAbs).split(/[\\/]/).join("/");
 			symlinkSync(relative(binDir, targetAbs), join(binDir, cmd));
 		}
 		if (pruneNative) {
@@ -306,12 +313,8 @@ export function pack(options: PackOptions): PackResult {
 		}
 
 		// Write a normal root package.json {name, version, bin}. The sidecar reads
-		// `version` and commands from here; JSON package metadata lives in
-		// agentos-package.json next to it.
-		const binMap: Record<string, string> = {};
-		for (const cmd of commands) {
-			binMap[cmd] = `bin/${cmd}`;
-		}
+		// `version` and commands from here (bin map → real entry file, built above);
+		// JSON package metadata lives in agentos-package.json next to it.
 		writeFileSync(
 			join(packageDir, "package.json"),
 			`${JSON.stringify({ name, version, bin: binMap }, null, 2)}\n`,
