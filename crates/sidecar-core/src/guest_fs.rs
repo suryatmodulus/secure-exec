@@ -134,9 +134,15 @@ where
                     .map_err(kernel_error)?
                     .into_iter()
                     .map(|entry| GuestDirEntry {
+                        path: if payload.path == "/" {
+                            format!("/{}", entry.name)
+                        } else {
+                            format!("{}/{}", payload.path, entry.name)
+                        },
                         name: entry.name,
                         is_directory: entry.is_directory,
                         is_symbolic_link: entry.is_symbolic_link,
+                        size: 0,
                     })
                     .collect(),
             ),
@@ -144,6 +150,46 @@ where
             exists: None,
             target: None,
         },
+        GuestFilesystemOperation::ReadDirRecursive => {
+            let max_depth = payload
+                .max_depth
+                .map(|depth| {
+                    usize::try_from(depth).map_err(|_| {
+                        SidecarCoreError::new(
+                            "guest filesystem read_dir_recursive max_depth must fit within usize",
+                        )
+                    })
+                })
+                .transpose()?;
+            GuestFilesystemResultResponse {
+                operation: payload.operation,
+                path: payload.path.clone(),
+                content: None,
+                encoding: None,
+                entries: Some(
+                    kernel
+                        .read_dir_recursive(&payload.path, max_depth)
+                        .map_err(kernel_error)?
+                        .into_iter()
+                        .map(|entry| GuestDirEntry {
+                            name: entry
+                                .path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(entry.path.as_str())
+                                .to_owned(),
+                            path: entry.path,
+                            is_directory: entry.is_directory,
+                            is_symbolic_link: entry.is_symbolic_link,
+                            size: entry.size,
+                        })
+                        .collect(),
+                ),
+                stat: None,
+                exists: None,
+                target: None,
+            }
+        }
         GuestFilesystemOperation::RemoveFile => {
             kernel.remove_file(&payload.path).map_err(kernel_error)?;
             empty_guest_filesystem_response(payload.operation, payload.path)
@@ -151,6 +197,30 @@ where
         GuestFilesystemOperation::RemoveDir => {
             kernel.remove_dir(&payload.path).map_err(kernel_error)?;
             empty_guest_filesystem_response(payload.operation, payload.path)
+        }
+        GuestFilesystemOperation::Remove => {
+            kernel
+                .remove_path(&payload.path, payload.recursive)
+                .map_err(kernel_error)?;
+            empty_guest_filesystem_response(payload.operation, payload.path)
+        }
+        GuestFilesystemOperation::Copy => {
+            let destination = payload.destination_path.ok_or_else(|| {
+                SidecarCoreError::new("guest filesystem copy requires a destination_path")
+            })?;
+            kernel
+                .copy_path(&payload.path, &destination, payload.recursive)
+                .map_err(kernel_error)?;
+            targeted_guest_filesystem_response(payload.operation, payload.path, destination)
+        }
+        GuestFilesystemOperation::Move => {
+            let destination = payload.destination_path.ok_or_else(|| {
+                SidecarCoreError::new("guest filesystem move requires a destination_path")
+            })?;
+            kernel
+                .move_path(&payload.path, &destination)
+                .map_err(kernel_error)?;
+            targeted_guest_filesystem_response(payload.operation, payload.path, destination)
         }
         GuestFilesystemOperation::Rename => {
             let destination = payload.destination_path.ok_or_else(|| {
@@ -338,6 +408,7 @@ mod tests {
             content: None,
             encoding: None,
             recursive: false,
+            max_depth: None,
             mode: None,
             uid: None,
             gid: None,

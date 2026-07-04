@@ -27,8 +27,10 @@ import {
 /** A directory child with its file type, from `read_dir` (no extra lstat). */
 export interface LiveGuestDirEntry {
 	name: string;
+	path: string;
 	isDirectory: boolean;
 	isSymbolicLink: boolean;
+	size: number;
 }
 
 export interface LiveSignalHandlerRegistration {
@@ -316,8 +318,10 @@ export function fromGeneratedResponsePayload(
 					? {
 							entries: payload.val.entries.map((entry) => ({
 								name: entry.name,
+								path: entry.path,
 								isDirectory: entry.isDirectory,
 								isSymbolicLink: entry.isSymbolicLink,
+								size: bigIntToSafeNumber(entry.size, "guest dir entry size"),
 							})),
 						}
 					: {}),

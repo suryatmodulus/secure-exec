@@ -613,6 +613,8 @@ limits_struct!(ResourceLimitsConfig {
     max_process_argv_bytes,
     max_process_env_bytes,
     max_readdir_entries,
+    max_recursive_fs_depth,
+    max_recursive_fs_entries,
     max_wasm_fuel,
     max_wasm_memory_bytes,
     max_wasm_stack_bytes,

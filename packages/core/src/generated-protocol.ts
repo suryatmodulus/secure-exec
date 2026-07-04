@@ -1568,8 +1568,12 @@ export enum GuestFilesystemOperation {
     Stat = "Stat",
     Lstat = "Lstat",
     ReadDir = "ReadDir",
+    ReadDirRecursive = "ReadDirRecursive",
     RemoveFile = "RemoveFile",
     RemoveDir = "RemoveDir",
+    Remove = "Remove",
+    Copy = "Copy",
+    Move = "Move",
     Rename = "Rename",
     Realpath = "Realpath",
     Symlink = "Symlink",
@@ -1604,30 +1608,38 @@ export function readGuestFilesystemOperation(bc: bare.ByteCursor): GuestFilesyst
         case 7:
             return GuestFilesystemOperation.ReadDir
         case 8:
-            return GuestFilesystemOperation.RemoveFile
+            return GuestFilesystemOperation.ReadDirRecursive
         case 9:
-            return GuestFilesystemOperation.RemoveDir
+            return GuestFilesystemOperation.RemoveFile
         case 10:
-            return GuestFilesystemOperation.Rename
+            return GuestFilesystemOperation.RemoveDir
         case 11:
-            return GuestFilesystemOperation.Realpath
+            return GuestFilesystemOperation.Remove
         case 12:
-            return GuestFilesystemOperation.Symlink
+            return GuestFilesystemOperation.Copy
         case 13:
-            return GuestFilesystemOperation.ReadLink
+            return GuestFilesystemOperation.Move
         case 14:
-            return GuestFilesystemOperation.Link
+            return GuestFilesystemOperation.Rename
         case 15:
-            return GuestFilesystemOperation.Chmod
+            return GuestFilesystemOperation.Realpath
         case 16:
-            return GuestFilesystemOperation.Chown
+            return GuestFilesystemOperation.Symlink
         case 17:
-            return GuestFilesystemOperation.Utimes
+            return GuestFilesystemOperation.ReadLink
         case 18:
-            return GuestFilesystemOperation.Truncate
+            return GuestFilesystemOperation.Link
         case 19:
-            return GuestFilesystemOperation.Pread
+            return GuestFilesystemOperation.Chmod
         case 20:
+            return GuestFilesystemOperation.Chown
+        case 21:
+            return GuestFilesystemOperation.Utimes
+        case 22:
+            return GuestFilesystemOperation.Truncate
+        case 23:
+            return GuestFilesystemOperation.Pread
+        case 24:
             return GuestFilesystemOperation.Pwrite
         default: {
             bc.offset = offset
@@ -1670,56 +1682,72 @@ export function writeGuestFilesystemOperation(bc: bare.ByteCursor, x: GuestFiles
             bare.writeU8(bc, 7)
             break
         }
-        case GuestFilesystemOperation.RemoveFile: {
+        case GuestFilesystemOperation.ReadDirRecursive: {
             bare.writeU8(bc, 8)
             break
         }
-        case GuestFilesystemOperation.RemoveDir: {
+        case GuestFilesystemOperation.RemoveFile: {
             bare.writeU8(bc, 9)
             break
         }
-        case GuestFilesystemOperation.Rename: {
+        case GuestFilesystemOperation.RemoveDir: {
             bare.writeU8(bc, 10)
             break
         }
-        case GuestFilesystemOperation.Realpath: {
+        case GuestFilesystemOperation.Remove: {
             bare.writeU8(bc, 11)
             break
         }
-        case GuestFilesystemOperation.Symlink: {
+        case GuestFilesystemOperation.Copy: {
             bare.writeU8(bc, 12)
             break
         }
-        case GuestFilesystemOperation.ReadLink: {
+        case GuestFilesystemOperation.Move: {
             bare.writeU8(bc, 13)
             break
         }
-        case GuestFilesystemOperation.Link: {
+        case GuestFilesystemOperation.Rename: {
             bare.writeU8(bc, 14)
             break
         }
-        case GuestFilesystemOperation.Chmod: {
+        case GuestFilesystemOperation.Realpath: {
             bare.writeU8(bc, 15)
             break
         }
-        case GuestFilesystemOperation.Chown: {
+        case GuestFilesystemOperation.Symlink: {
             bare.writeU8(bc, 16)
             break
         }
-        case GuestFilesystemOperation.Utimes: {
+        case GuestFilesystemOperation.ReadLink: {
             bare.writeU8(bc, 17)
             break
         }
-        case GuestFilesystemOperation.Truncate: {
+        case GuestFilesystemOperation.Link: {
             bare.writeU8(bc, 18)
             break
         }
-        case GuestFilesystemOperation.Pread: {
+        case GuestFilesystemOperation.Chmod: {
             bare.writeU8(bc, 19)
             break
         }
-        case GuestFilesystemOperation.Pwrite: {
+        case GuestFilesystemOperation.Chown: {
             bare.writeU8(bc, 20)
+            break
+        }
+        case GuestFilesystemOperation.Utimes: {
+            bare.writeU8(bc, 21)
+            break
+        }
+        case GuestFilesystemOperation.Truncate: {
+            bare.writeU8(bc, 22)
+            break
+        }
+        case GuestFilesystemOperation.Pread: {
+            bare.writeU8(bc, 23)
+            break
+        }
+        case GuestFilesystemOperation.Pwrite: {
+            bare.writeU8(bc, 24)
             break
         }
     }
@@ -1733,6 +1761,7 @@ export type GuestFilesystemCallRequest = {
     readonly content: string | null
     readonly encoding: RootFilesystemEntryEncoding | null
     readonly recursive: boolean
+    readonly maxDepth: u32 | null
     readonly mode: u32 | null
     readonly uid: u32 | null
     readonly gid: u32 | null
@@ -1751,6 +1780,7 @@ export function readGuestFilesystemCallRequest(bc: bare.ByteCursor): GuestFilesy
         content: read0(bc),
         encoding: read3(bc),
         recursive: bare.readBool(bc),
+        maxDepth: read2(bc),
         mode: read2(bc),
         uid: read2(bc),
         gid: read2(bc),
@@ -1769,6 +1799,7 @@ export function writeGuestFilesystemCallRequest(bc: bare.ByteCursor, x: GuestFil
     write0(bc, x.content)
     write3(bc, x.encoding)
     bare.writeBool(bc, x.recursive)
+    write2(bc, x.maxDepth)
     write2(bc, x.mode)
     write2(bc, x.uid)
     write2(bc, x.gid)
@@ -2677,22 +2708,28 @@ export function writeGuestFilesystemStat(bc: bare.ByteCursor, x: GuestFilesystem
 
 export type GuestDirEntry = {
     readonly name: string
+    readonly path: string
     readonly isDirectory: boolean
     readonly isSymbolicLink: boolean
+    readonly size: u64
 }
 
 export function readGuestDirEntry(bc: bare.ByteCursor): GuestDirEntry {
     return {
         name: bare.readString(bc),
+        path: bare.readString(bc),
         isDirectory: bare.readBool(bc),
         isSymbolicLink: bare.readBool(bc),
+        size: bare.readU64(bc),
     }
 }
 
 export function writeGuestDirEntry(bc: bare.ByteCursor, x: GuestDirEntry): void {
     bare.writeString(bc, x.name)
+    bare.writeString(bc, x.path)
     bare.writeBool(bc, x.isDirectory)
     bare.writeBool(bc, x.isSymbolicLink)
+    bare.writeU64(bc, x.size)
 }
 
 function read25(bc: bare.ByteCursor): readonly GuestDirEntry[] {

@@ -23,8 +23,12 @@ export type LiveGuestFilesystemOperation =
 	| "stat"
 	| "lstat"
 	| "read_dir"
+	| "read_dir_recursive"
 	| "remove_file"
 	| "remove_dir"
+	| "remove"
+	| "copy"
+	| "move"
 	| "rename"
 	| "realpath"
 	| "symlink"
@@ -163,10 +167,18 @@ export function toGeneratedGuestFilesystemOperation(
 			return protocol.GuestFilesystemOperation.Lstat;
 		case "read_dir":
 			return protocol.GuestFilesystemOperation.ReadDir;
+		case "read_dir_recursive":
+			return protocol.GuestFilesystemOperation.ReadDirRecursive;
 		case "remove_file":
 			return protocol.GuestFilesystemOperation.RemoveFile;
 		case "remove_dir":
 			return protocol.GuestFilesystemOperation.RemoveDir;
+		case "remove":
+			return protocol.GuestFilesystemOperation.Remove;
+		case "copy":
+			return protocol.GuestFilesystemOperation.Copy;
+		case "move":
+			return protocol.GuestFilesystemOperation.Move;
 		case "rename":
 			return protocol.GuestFilesystemOperation.Rename;
 		case "realpath":
@@ -332,10 +344,18 @@ export function fromGeneratedGuestFilesystemOperation(
 			return "lstat";
 		case protocol.GuestFilesystemOperation.ReadDir:
 			return "read_dir";
+		case protocol.GuestFilesystemOperation.ReadDirRecursive:
+			return "read_dir_recursive";
 		case protocol.GuestFilesystemOperation.RemoveFile:
 			return "remove_file";
 		case protocol.GuestFilesystemOperation.RemoveDir:
 			return "remove_dir";
+		case protocol.GuestFilesystemOperation.Remove:
+			return "remove";
+		case protocol.GuestFilesystemOperation.Copy:
+			return "copy";
+		case protocol.GuestFilesystemOperation.Move:
+			return "move";
 		case protocol.GuestFilesystemOperation.Rename:
 			return "rename";
 		case protocol.GuestFilesystemOperation.Realpath:

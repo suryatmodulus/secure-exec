@@ -440,6 +440,8 @@ fn legacy_limits_config(
         max_process_argv_bytes: legacy_u64(metadata, "resource.max_process_argv_bytes"),
         max_process_env_bytes: legacy_u64(metadata, "resource.max_process_env_bytes"),
         max_readdir_entries: legacy_u64(metadata, "resource.max_readdir_entries"),
+        max_recursive_fs_depth: legacy_u64(metadata, "resource.max_recursive_fs_depth"),
+        max_recursive_fs_entries: legacy_u64(metadata, "resource.max_recursive_fs_entries"),
         max_wasm_fuel: legacy_u64(metadata, "resource.max_wasm_fuel"),
         max_wasm_memory_bytes: legacy_u64(metadata, "resource.max_wasm_memory_bytes"),
         max_wasm_stack_bytes: legacy_u64(metadata, "resource.max_wasm_stack_bytes"),

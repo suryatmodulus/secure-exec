@@ -144,6 +144,7 @@ export type LiveRequestPayload =
 			content?: string;
 			encoding?: LiveRootFilesystemEntryEncoding;
 			recursive?: boolean;
+			max_depth?: number;
 			mode?: number;
 			uid?: number;
 			gid?: number;
@@ -380,6 +381,7 @@ export function toGeneratedRequestPayload(
 							? null
 							: toGeneratedRootFilesystemEntryEncoding(payload.encoding),
 					recursive: payload.recursive ?? false,
+					maxDepth: payload.max_depth ?? null,
 					mode: payload.mode ?? null,
 					uid: payload.uid ?? null,
 					gid: payload.gid ?? null,

@@ -295,8 +295,12 @@ type GuestFilesystemOperation enum {
   STAT
   LSTAT
   READ_DIR
+  READ_DIR_RECURSIVE
   REMOVE_FILE
   REMOVE_DIR
+  REMOVE
+  COPY
+  MOVE
   RENAME
   REALPATH
   SYMLINK
@@ -318,6 +322,7 @@ type GuestFilesystemCallRequest struct {
   content: optional<str>
   encoding: optional<RootFilesystemEntryEncoding>
   recursive: bool
+  maxDepth: optional<u32>
   mode: optional<u32>
   uid: optional<u32>
   gid: optional<u32>
@@ -537,8 +542,10 @@ type GuestFilesystemStat struct {
 
 type GuestDirEntry struct {
   name: str
+  path: str
   isDirectory: bool
   isSymbolicLink: bool
+  size: u64
 }
 
 type GuestFilesystemResultResponse struct {

@@ -38,6 +38,7 @@ import {
 	type ProtocolFramePayloadCodec,
 } from "./protocol-frames.js";
 import { type LiveRequestPayload } from "./request-payloads.js";
+import type { LiveGuestDirEntry } from "./response-payloads.js";
 import {
 	type LiveGuestFilesystemStat,
 	type LiveProcessSnapshotEntry,
@@ -864,6 +865,20 @@ export class SidecarProcess {
 		return (response.entries ?? []).map((entry) => entry.name);
 	}
 
+	async readdirRecursive(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+		path: string,
+		options?: { maxDepth?: number },
+	): Promise<LiveGuestDirEntry[]> {
+		const response = await this.guestFilesystemCall(session, vm, {
+			operation: "read_dir_recursive",
+			path,
+			max_depth: options?.maxDepth,
+		});
+		return response.entries ?? [];
+	}
+
 	async exists(
 		session: AuthenticatedSession,
 		vm: CreatedVm,
@@ -947,6 +962,48 @@ export class SidecarProcess {
 		await this.guestFilesystemCall(session, vm, {
 			operation: "remove_dir",
 			path,
+		});
+	}
+
+	async removePath(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+		path: string,
+		options?: { recursive?: boolean },
+	): Promise<void> {
+		await this.guestFilesystemCall(session, vm, {
+			operation: "remove",
+			path,
+			recursive: options?.recursive ?? false,
+		});
+	}
+
+	async copyPath(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+		fromPath: string,
+		toPath: string,
+		options?: { recursive?: boolean },
+	): Promise<void> {
+		await this.guestFilesystemCall(session, vm, {
+			operation: "copy",
+			path: fromPath,
+			destination_path: toPath,
+			recursive: options?.recursive ?? false,
+		});
+	}
+
+	async movePath(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+		fromPath: string,
+		toPath: string,
+	): Promise<void> {
+		await this.guestFilesystemCall(session, vm, {
+			operation: "move",
+			path: fromPath,
+			destination_path: toPath,
+			recursive: true,
 		});
 	}
 

@@ -29,6 +29,8 @@ pub const DEFAULT_MAX_FD_WRITE_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_PROCESS_ARGV_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_PROCESS_ENV_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_READDIR_ENTRIES: usize = 4_096;
+pub const DEFAULT_MAX_RECURSIVE_FS_DEPTH: usize = 128;
+pub const DEFAULT_MAX_RECURSIVE_FS_ENTRIES: usize = 65_536;
 pub const DEFAULT_VIRTUAL_CPU_COUNT: usize = 1;
 pub const DEFAULT_MAX_WASM_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -69,6 +71,8 @@ pub struct ResourceLimits {
     pub max_process_argv_bytes: Option<usize>,
     pub max_process_env_bytes: Option<usize>,
     pub max_readdir_entries: Option<usize>,
+    pub max_recursive_fs_depth: Option<usize>,
+    pub max_recursive_fs_entries: Option<usize>,
     pub max_wasm_fuel: Option<u64>,
     pub max_wasm_memory_bytes: Option<u64>,
     pub max_wasm_stack_bytes: Option<usize>,
@@ -94,6 +98,8 @@ impl Default for ResourceLimits {
             max_process_argv_bytes: Some(DEFAULT_MAX_PROCESS_ARGV_BYTES),
             max_process_env_bytes: Some(DEFAULT_MAX_PROCESS_ENV_BYTES),
             max_readdir_entries: Some(DEFAULT_MAX_READDIR_ENTRIES),
+            max_recursive_fs_depth: Some(DEFAULT_MAX_RECURSIVE_FS_DEPTH),
+            max_recursive_fs_entries: Some(DEFAULT_MAX_RECURSIVE_FS_ENTRIES),
             max_wasm_fuel: None,
             // Match the Workers-style default memory envelope where sensible:
             // guests are bounded unless the trusted VM config raises the cap.
@@ -184,6 +190,8 @@ struct ResourceGauges {
     socket_datagram_queue_len: Option<Arc<QueueGauge>>,
     filesystem_bytes: Option<Arc<QueueGauge>>,
     inodes: Option<Arc<QueueGauge>>,
+    recursive_fs_depth: Option<Arc<QueueGauge>>,
+    recursive_fs_entries: Option<Arc<QueueGauge>>,
 }
 
 fn register_resource_gauge(name: TrackedLimit, limit: Option<usize>) -> Option<Arc<QueueGauge>> {
@@ -223,6 +231,14 @@ impl ResourceGauges {
                 limits.max_filesystem_bytes,
             ),
             inodes: register_resource_gauge(TrackedLimit::VmInodes, limits.max_inode_count),
+            recursive_fs_depth: register_resource_gauge(
+                TrackedLimit::VmRecursiveFsDepth,
+                limits.max_recursive_fs_depth,
+            ),
+            recursive_fs_entries: register_resource_gauge(
+                TrackedLimit::VmRecursiveFsEntries,
+                limits.max_recursive_fs_entries,
+            ),
         }
     }
 }
@@ -481,11 +497,49 @@ impl ResourceAccountant {
         self.limits.max_readdir_entries
     }
 
+    pub fn max_recursive_fs_depth(&self) -> Option<usize> {
+        self.limits.max_recursive_fs_depth
+    }
+
+    pub fn max_recursive_fs_entries(&self) -> Option<usize> {
+        self.limits.max_recursive_fs_entries
+    }
+
     pub fn check_readdir_entries(&self, entries: usize) -> Result<(), ResourceError> {
         if let Some(limit) = self.limits.max_readdir_entries {
             if entries > limit {
                 return Err(ResourceError::out_of_memory(format!(
                     "directory listing with {entries} entries exceeds configured limit {limit}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn check_recursive_fs_depth(&self, depth: usize) -> Result<(), ResourceError> {
+        if let Some(gauge) = self.gauges.recursive_fs_depth.as_ref() {
+            gauge.observe_depth(depth);
+        }
+        if let Some(limit) = self.limits.max_recursive_fs_depth {
+            if depth > limit {
+                return Err(ResourceError::out_of_memory(format!(
+                    "recursive filesystem operation depth {depth} exceeds configured limit {limit}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn check_recursive_fs_entries(&self, entries: usize) -> Result<(), ResourceError> {
+        if let Some(gauge) = self.gauges.recursive_fs_entries.as_ref() {
+            gauge.observe_depth(entries);
+        }
+        if let Some(limit) = self.limits.max_recursive_fs_entries {
+            if entries > limit {
+                return Err(ResourceError::out_of_memory(format!(
+                    "recursive filesystem operation with {entries} entries exceeds configured limit {limit}"
                 )));
             }
         }
