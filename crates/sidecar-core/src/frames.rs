@@ -3,13 +3,13 @@ use secure_exec_sidecar_protocol::protocol::{
     LayerCreatedResponse, LayerSealedResponse, ListenerSnapshotResponse, OverlayCreatedResponse,
     OwnershipScope, PackageLinkedResponse, ProcessExitedEvent, ProcessKilledResponse,
     ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotResponse, ProcessStartedResponse,
-    ProtocolSchema, RejectedResponse, RequestFrame, RequestId, ResponseFrame, ResponsePayload,
-    RootFilesystemBootstrappedResponse, RootFilesystemEntry, RootFilesystemSnapshotResponse,
-    SessionOpenedResponse, SignalHandlerRegistration, SignalStateResponse,
-    SnapshotExportedResponse, SnapshotImportedResponse, SocketStateEntry, StdinClosedResponse,
-    StdinWrittenResponse, StreamChannel, StructuredEvent, VmConfiguredResponse, VmCreatedResponse,
-    VmDisposedResponse, VmLifecycleEvent, VmLifecycleState, ZombieTimerCountResponse,
-    PROTOCOL_VERSION,
+    ProjectedCommand, ProtocolSchema, RejectedResponse, RequestFrame, RequestId, ResponseFrame,
+    ResponsePayload, RootFilesystemBootstrappedResponse, RootFilesystemEntry,
+    RootFilesystemSnapshotResponse, SessionOpenedResponse, SignalHandlerRegistration,
+    SignalStateResponse, SnapshotExportedResponse, SnapshotImportedResponse, SocketStateEntry,
+    StdinClosedResponse, StdinWrittenResponse, StreamChannel, StructuredEvent,
+    VmConfiguredResponse, VmCreatedResponse, VmDisposedResponse, VmLifecycleEvent,
+    VmLifecycleState, ZombieTimerCountResponse, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 
@@ -154,20 +154,29 @@ pub fn vm_configured_response(
     request: &RequestFrame,
     applied_mounts: u32,
     applied_software: u32,
+    projected_commands: Vec<ProjectedCommand>,
 ) -> ResponseFrame {
     respond(
         request,
         ResponsePayload::VmConfigured(VmConfiguredResponse {
             applied_mounts,
             applied_software,
+            projected_commands,
         }),
     )
 }
 
-pub fn package_linked_response(request: &RequestFrame, commands: Vec<String>) -> ResponseFrame {
+pub fn package_linked_response(
+    request: &RequestFrame,
+    commands: Vec<String>,
+    projected_commands: Vec<ProjectedCommand>,
+) -> ResponseFrame {
     respond(
         request,
-        ResponsePayload::PackageLinked(PackageLinkedResponse { commands }),
+        ResponsePayload::PackageLinked(PackageLinkedResponse {
+            commands,
+            projected_commands,
+        }),
     )
 }
 
@@ -559,10 +568,11 @@ mod tests {
             RequestPayload::Authenticate(authenticate_request()),
         );
 
-        match vm_configured_response(&request, 2, 3).payload {
+        match vm_configured_response(&request, 2, 3, Vec::new()).payload {
             ResponsePayload::VmConfigured(configured) => {
                 assert_eq!(configured.applied_mounts, 2);
                 assert_eq!(configured.applied_software, 3);
+                assert!(configured.projected_commands.is_empty());
             }
             other => panic!("unexpected response payload: {other:?}"),
         }

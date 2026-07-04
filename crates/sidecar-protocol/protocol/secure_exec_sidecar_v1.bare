@@ -221,8 +221,14 @@ type LinkPackageRequest struct {
   package: PackageDescriptor
 }
 
+type ProjectedCommand struct {
+  name: str
+  guestPath: str
+}
+
 type PackageLinkedResponse struct {
   commands: list<str>
+  projectedCommands: list<ProjectedCommand>
 }
 
 type ConfigureVmRequest struct {
@@ -480,6 +486,7 @@ type RootFilesystemBootstrappedResponse struct {
 type VmConfiguredResponse struct {
   appliedMounts: u32
   appliedSoftware: u32
+  projectedCommands: list<ProjectedCommand>
 }
 
 type HostCallbacksRegisteredResponse struct {

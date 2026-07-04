@@ -151,14 +151,19 @@ fn command_targets(dir: &str) -> Result<Vec<(String, String)>, SidecarError> {
                     Some(serde_json::Value::String(path)) => {
                         if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
                             let unscoped = name.rsplit('/').next().unwrap_or(name).to_owned();
-                            return Ok(vec![(unscoped, normalize_rel(path))]);
+                            return Ok(is_projectable_command_name(&unscoped)
+                                .then(|| (unscoped, normalize_rel(path)))
+                                .into_iter()
+                                .collect());
                         }
                     }
                     Some(serde_json::Value::Object(map)) => {
                         let mut targets: Vec<(String, String)> = map
                             .iter()
                             .filter_map(|(name, path)| {
-                                path.as_str()
+                                is_projectable_command_name(name)
+                                    .then(|| path.as_str())
+                                    .flatten()
                                     .map(|path| (name.clone(), normalize_rel(path)))
                             })
                             .collect();
@@ -177,13 +182,19 @@ fn command_targets(dir: &str) -> Result<Vec<(String, String)>, SidecarError> {
         for entry in fs::read_dir(&bin).map_err(|e| io_err("read bin/", e))? {
             let entry = entry.map_err(|e| io_err("read bin/ entry", e))?;
             if let Some(name) = entry.file_name().to_str() {
-                targets.push((name.to_owned(), format!("bin/{name}")));
+                if is_projectable_command_name(name) {
+                    targets.push((name.to_owned(), format!("bin/{name}")));
+                }
             }
         }
         targets.sort_by(|a, b| a.0.cmp(&b.0));
         return Ok(targets);
     }
     Ok(Vec::new())
+}
+
+fn is_projectable_command_name(name: &str) -> bool {
+    !name.starts_with('_') && !name.starts_with('.')
 }
 
 /// Strip a leading `./` so the resulting path is a clean in-package relative path.

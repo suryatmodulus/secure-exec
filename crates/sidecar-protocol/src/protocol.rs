@@ -1387,6 +1387,7 @@ pub type GuestFilesystemCallRequest = crate::wire::GuestFilesystemCallRequest;
 pub type GuestKernelCallRequest = crate::wire::GuestKernelCallRequest;
 pub type ResizePtyRequest = crate::wire::ResizePtyRequest;
 pub type PackageDescriptor = crate::wire::PackageDescriptor;
+pub type ProjectedCommand = crate::wire::ProjectedCommand;
 pub type LinkPackageRequest = crate::wire::LinkPackageRequest;
 
 pub type GuestKernelResultResponse = crate::wire::GuestKernelResultResponse;

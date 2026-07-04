@@ -11,7 +11,7 @@ use crate::bridge::{bridge_permissions, MountPluginContext};
 use crate::protocol::{
     ConfigureVmRequest, CreateLayerRequest, CreateOverlayRequest, DisposeReason, EventFrame,
     ExportSnapshotRequest, ImportSnapshotRequest, LinkPackageRequest, MountDescriptor,
-    MountPluginDescriptor, RootFilesystemDescriptor, RootFilesystemEntry,
+    MountPluginDescriptor, ProjectedCommand, RootFilesystemDescriptor, RootFilesystemEntry,
     RootFilesystemEntryEncoding, RootFilesystemLowerDescriptor, SealLayerRequest,
     SnapshotRootFilesystemRequest, VmLifecycleState,
 };
@@ -140,6 +140,25 @@ pub(crate) const DEFAULT_GUEST_PATH_ENV: &str =
     "/usr/local/sbin:/usr/local/bin:/opt/agentos/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 #[cfg(test)]
 const KERNEL_COMMAND_STUB: &[u8] = b"#!/bin/sh\n# kernel command stub\n";
+
+fn projected_command_guest_path(command: &str) -> String {
+    format!("{}/{command}", crate::package_projection::OPT_AGENTOS_BIN)
+}
+
+fn projected_commands_from_guest_paths(
+    command_guest_paths: &BTreeMap<String, String>,
+) -> Vec<ProjectedCommand> {
+    command_guest_paths
+        .iter()
+        .filter(|(_, guest_path)| {
+            guest_path.starts_with(crate::package_projection::OPT_AGENTOS_BIN)
+        })
+        .map(|(name, guest_path)| ProjectedCommand {
+            name: name.clone(),
+            guest_path: guest_path.clone(),
+        })
+        .collect()
+}
 // ---------------------------------------------------------------------------
 // NativeSidecar VM lifecycle methods
 // ---------------------------------------------------------------------------
@@ -531,11 +550,13 @@ where
         }
 
         tracing::info!(target: "secure_exec_sidecar::perf", phase = "configure_vm", elapsed_ms = __t.elapsed().as_millis() as u64, applied_mounts = effective_mounts.len() as u64, "vm phase");
+        let projected_commands = projected_commands_from_guest_paths(&vm.command_guest_paths);
         Ok(DispatchResult {
             response: vm_configured_response(
                 request,
                 effective_mounts.len() as u32,
                 payload.software.len() as u32,
+                projected_commands,
             ),
             events: Vec::new(),
         })
@@ -561,9 +582,32 @@ where
         })?;
         let descriptor = crate::package_projection::read_package_manifest(&payload.package.dir)?;
         let commands = crate::package_projection::link_package(&descriptor, &staging_root)?;
+        for command in &commands {
+            let entrypoint = projected_command_guest_path(command);
+            vm.command_guest_paths
+                .entry(command.clone())
+                .or_insert(entrypoint);
+        }
+        refresh_guest_command_path_env(&mut vm.guest_env, &vm.command_guest_paths);
+        let mut execution_commands =
+            vec![String::from(JAVASCRIPT_COMMAND), String::from(WASM_COMMAND)];
+        execution_commands.extend(vm.command_guest_paths.keys().cloned());
+        vm.kernel
+            .register_driver(CommandDriver::new(
+                EXECUTION_DRIVER_NAME,
+                execution_commands,
+            ))
+            .map_err(kernel_error)?;
+        let projected_commands = commands
+            .iter()
+            .map(|command| ProjectedCommand {
+                name: command.clone(),
+                guest_path: projected_command_guest_path(command),
+            })
+            .collect();
 
         Ok(DispatchResult {
-            response: package_linked_response(request, commands),
+            response: package_linked_response(request, commands, projected_commands),
             events: Vec::new(),
         })
     }

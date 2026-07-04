@@ -64,6 +64,11 @@ export interface LiveResourceSnapshot {
 	queue_snapshots: LiveQueueSnapshotEntry[];
 }
 
+export interface LiveProjectedCommand {
+	name: string;
+	guest_path: string;
+}
+
 export type LiveResponsePayload =
 	| {
 			type: "authenticated";
@@ -84,10 +89,12 @@ export type LiveResponsePayload =
 			type: "vm_configured";
 			applied_mounts: number;
 			applied_software: number;
+			projected_commands: LiveProjectedCommand[];
 	  }
 	| {
 			type: "package_linked";
 			commands: string[];
+			projected_commands: LiveProjectedCommand[];
 	  }
 	| {
 			type: "host_callbacks_registered";
@@ -252,11 +259,23 @@ export function fromGeneratedResponsePayload(
 				type: "vm_configured",
 				applied_mounts: payload.val.appliedMounts,
 				applied_software: payload.val.appliedSoftware,
+				projected_commands: payload.val.projectedCommands.map(
+					(command) => ({
+						name: command.name,
+						guest_path: command.guestPath,
+					}),
+				),
 			};
 		case "PackageLinkedResponse":
 			return {
 				type: "package_linked",
 				commands: [...payload.val.commands],
+				projected_commands: payload.val.projectedCommands.map(
+					(command) => ({
+						name: command.name,
+						guest_path: command.guestPath,
+					}),
+				),
 			};
 		case "HostCallbacksRegisteredResponse":
 			return {

@@ -293,6 +293,17 @@ export interface SidecarPackageDescriptor {
 	dir: string;
 }
 
+export interface SidecarProjectedCommand {
+	name: string;
+	guestPath: string;
+}
+
+export interface SidecarVmConfiguredResponse {
+	appliedMounts: number;
+	appliedSoftware: number;
+	projectedCommands: SidecarProjectedCommand[];
+}
+
 export interface SidecarFilesystemResult {
 	operation: LiveFilesystemOperation;
 	status: string;
@@ -466,7 +477,7 @@ export class SidecarProcess {
 			packages?: SidecarPackageDescriptor[];
 			packagesMountAt?: string;
 		},
-	): Promise<void> {
+	): Promise<SidecarVmConfiguredResponse> {
 		const response = await this.sendRequest({
 			ownership: {
 				scope: "vm",
@@ -499,6 +510,14 @@ export class SidecarProcess {
 				`unexpected configure_vm response: ${response.payload.type}`,
 			);
 		}
+		return {
+			appliedMounts: response.payload.applied_mounts,
+			appliedSoftware: response.payload.applied_software,
+			projectedCommands: response.payload.projected_commands.map((command) => ({
+				name: command.name,
+				guestPath: command.guest_path,
+			})),
+		};
 	}
 
 	/**
@@ -511,7 +530,7 @@ export class SidecarProcess {
 		session: AuthenticatedSession,
 		vm: CreatedVm,
 		descriptor: SidecarPackageDescriptor,
-	): Promise<string[]> {
+	): Promise<SidecarProjectedCommand[]> {
 		const response = await this.sendRequest({
 			ownership: {
 				scope: "vm",
@@ -529,7 +548,10 @@ export class SidecarProcess {
 				`unexpected link_package response: ${response.payload.type}`,
 			);
 		}
-		return response.payload.commands;
+		return response.payload.projected_commands.map((command) => ({
+			name: command.name,
+			guestPath: command.guest_path,
+		}));
 	}
 
 	async registerHostCallbacks(
