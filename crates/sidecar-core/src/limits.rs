@@ -508,6 +508,16 @@ fn apply_resource_limits_config(
         config.max_readdir_entries,
         "limits.resources.maxReaddirEntries",
     )?;
+    set_optional_usize(
+        &mut limits.max_recursive_fs_depth,
+        config.max_recursive_fs_depth,
+        "limits.resources.maxRecursiveFsDepth",
+    )?;
+    set_optional_usize(
+        &mut limits.max_recursive_fs_entries,
+        config.max_recursive_fs_entries,
+        "limits.resources.maxRecursiveFsEntries",
+    )?;
     set_optional_u64(&mut limits.max_wasm_fuel, config.max_wasm_fuel);
     set_optional_u64(
         &mut limits.max_wasm_memory_bytes,

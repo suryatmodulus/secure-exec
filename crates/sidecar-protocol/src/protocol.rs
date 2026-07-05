@@ -209,12 +209,18 @@ fn to_generated_guest_filesystem_operation(
         GuestFilesystemOperation::Stat => generated_protocol::GuestFilesystemOperation::Stat,
         GuestFilesystemOperation::Lstat => generated_protocol::GuestFilesystemOperation::Lstat,
         GuestFilesystemOperation::ReadDir => generated_protocol::GuestFilesystemOperation::ReadDir,
+        GuestFilesystemOperation::ReadDirRecursive => {
+            generated_protocol::GuestFilesystemOperation::ReadDirRecursive
+        }
         GuestFilesystemOperation::RemoveFile => {
             generated_protocol::GuestFilesystemOperation::RemoveFile
         }
         GuestFilesystemOperation::RemoveDir => {
             generated_protocol::GuestFilesystemOperation::RemoveDir
         }
+        GuestFilesystemOperation::Remove => generated_protocol::GuestFilesystemOperation::Remove,
+        GuestFilesystemOperation::Copy => generated_protocol::GuestFilesystemOperation::Copy,
+        GuestFilesystemOperation::Move => generated_protocol::GuestFilesystemOperation::Move,
         GuestFilesystemOperation::Rename => generated_protocol::GuestFilesystemOperation::Rename,
         GuestFilesystemOperation::Realpath => {
             generated_protocol::GuestFilesystemOperation::Realpath
@@ -253,12 +259,18 @@ fn from_generated_guest_filesystem_operation(
         generated_protocol::GuestFilesystemOperation::Stat => GuestFilesystemOperation::Stat,
         generated_protocol::GuestFilesystemOperation::Lstat => GuestFilesystemOperation::Lstat,
         generated_protocol::GuestFilesystemOperation::ReadDir => GuestFilesystemOperation::ReadDir,
+        generated_protocol::GuestFilesystemOperation::ReadDirRecursive => {
+            GuestFilesystemOperation::ReadDirRecursive
+        }
         generated_protocol::GuestFilesystemOperation::RemoveFile => {
             GuestFilesystemOperation::RemoveFile
         }
         generated_protocol::GuestFilesystemOperation::RemoveDir => {
             GuestFilesystemOperation::RemoveDir
         }
+        generated_protocol::GuestFilesystemOperation::Remove => GuestFilesystemOperation::Remove,
+        generated_protocol::GuestFilesystemOperation::Copy => GuestFilesystemOperation::Copy,
+        generated_protocol::GuestFilesystemOperation::Move => GuestFilesystemOperation::Move,
         generated_protocol::GuestFilesystemOperation::Rename => GuestFilesystemOperation::Rename,
         generated_protocol::GuestFilesystemOperation::Realpath => {
             GuestFilesystemOperation::Realpath
@@ -1387,6 +1399,7 @@ pub type GuestFilesystemCallRequest = crate::wire::GuestFilesystemCallRequest;
 pub type GuestKernelCallRequest = crate::wire::GuestKernelCallRequest;
 pub type ResizePtyRequest = crate::wire::ResizePtyRequest;
 pub type PackageDescriptor = crate::wire::PackageDescriptor;
+pub type ProjectedCommand = crate::wire::ProjectedCommand;
 pub type LinkPackageRequest = crate::wire::LinkPackageRequest;
 
 pub type GuestKernelResultResponse = crate::wire::GuestKernelResultResponse;

@@ -10806,15 +10806,9 @@ fn guest_runtime_identity(
             .js_runtime
             .as_ref()
             .is_some_and(|cfg| cfg.high_resolution_time.unwrap_or(false)),
-        // Userland bundle to bake into the per-sidecar snapshot, supplied by the
-        // (trusted) client via jsRuntime.snapshotUserlandCode. The agent-os layer
-        // sets this to the agent SDK bundle for snapshot-enabled agents; `None`
-        // keeps the bridge-only snapshot.
-        snapshot_userland_code: vm
-            .configuration
-            .js_runtime
-            .as_ref()
-            .and_then(|cfg| cfg.snapshot_userland_code.clone()),
+        // Userland bundle to bake into the per-sidecar snapshot. The sidecar
+        // derives this from configured agent packages with `agent.snapshot`.
+        snapshot_userland_code: vm.configuration.snapshot_userland_code.clone(),
     }
 }
 

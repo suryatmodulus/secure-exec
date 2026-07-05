@@ -84,6 +84,8 @@ pub enum TrackedLimit {
     VmSocketDatagramQueueLen,
     VmFilesystemBytes,
     VmInodes,
+    VmRecursiveFsDepth,
+    VmRecursiveFsEntries,
     V8HeapBytes,
     V8CpuTimeMs,
     V8WallClockMs,
@@ -114,6 +116,8 @@ impl TrackedLimit {
             TrackedLimit::VmSocketDatagramQueueLen => "vm_socket_datagram_queue_len",
             TrackedLimit::VmFilesystemBytes => "vm_filesystem_bytes",
             TrackedLimit::VmInodes => "vm_inodes",
+            TrackedLimit::VmRecursiveFsDepth => "vm_recursive_fs_depth",
+            TrackedLimit::VmRecursiveFsEntries => "vm_recursive_fs_entries",
             TrackedLimit::V8HeapBytes => "v8_heap_bytes",
             TrackedLimit::V8CpuTimeMs => "v8_cpu_time_ms",
             TrackedLimit::V8WallClockMs => "v8_wall_clock_ms",
@@ -141,7 +145,9 @@ impl TrackedLimit {
             | TrackedLimit::VmSocketBufferedBytes
             | TrackedLimit::VmSocketDatagramQueueLen
             | TrackedLimit::VmFilesystemBytes
-            | TrackedLimit::VmInodes => LimitCategory::Resource,
+            | TrackedLimit::VmInodes
+            | TrackedLimit::VmRecursiveFsDepth
+            | TrackedLimit::VmRecursiveFsEntries => LimitCategory::Resource,
             TrackedLimit::V8HeapBytes | TrackedLimit::WasmMemoryBytes => LimitCategory::Memory,
             TrackedLimit::V8CpuTimeMs | TrackedLimit::V8WallClockMs | TrackedLimit::WasmFuelMs => {
                 LimitCategory::Cpu

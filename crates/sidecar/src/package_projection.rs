@@ -28,6 +28,7 @@ use serde::Deserialize;
 pub const OPT_AGENTOS_ROOT: &str = "/opt/agentos";
 /// The symlink farm on `$PATH`.
 pub const OPT_AGENTOS_BIN: &str = "/opt/agentos/bin";
+const AGENT_SNAPSHOT_BUNDLE: &str = "dist/sdk-snapshot.js";
 
 /// A package to project, derived from `<dir>/agentos-package.json`.
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ pub struct PackageDescriptor {
     pub dir: String,
     /// `bin/` command that speaks ACP, if this is an agent package.
     pub acp_entrypoint: Option<String>,
+    pub snapshot: bool,
     pub provides: Option<PackageProvidesDescriptor>,
 }
 
@@ -66,6 +68,8 @@ struct AgentosPackageManifest {
 struct PackageAgentDescriptor {
     #[serde(rename = "acpEntrypoint")]
     acp_entrypoint: String,
+    #[serde(default)]
+    snapshot: bool,
 }
 
 impl PackageDescriptor {
@@ -75,7 +79,10 @@ impl PackageDescriptor {
                 "agentos-package.json in {dir} is missing a valid \"name\""
             )));
         }
-        let acp_entrypoint = manifest.agent.map(|agent| agent.acp_entrypoint);
+        let (acp_entrypoint, snapshot) = match manifest.agent {
+            Some(agent) => (Some(agent.acp_entrypoint), agent.snapshot),
+            None => (None, false),
+        };
         if acp_entrypoint
             .as_ref()
             .is_some_and(|entry| entry.is_empty())
@@ -88,6 +95,7 @@ impl PackageDescriptor {
             name: manifest.name,
             dir: dir.to_owned(),
             acp_entrypoint,
+            snapshot,
             provides: manifest.provides,
         })
     }
@@ -110,6 +118,22 @@ pub fn read_package_manifest(dir: &str) -> Result<PackageDescriptor, SidecarErro
         SidecarError::InvalidState(format!("invalid agentos-package.json in {dir}: {e}"))
     })?;
     PackageDescriptor::from_manifest(dir, manifest)
+}
+
+/// Read the first snapshot-enabled agent package's bundled SDK snapshot source.
+pub fn read_agent_snapshot_bundle(
+    package: &PackageDescriptor,
+) -> Result<Option<String>, SidecarError> {
+    if !package.snapshot {
+        return Ok(None);
+    }
+    let path = Path::new(&package.dir).join(AGENT_SNAPSHOT_BUNDLE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| io_err("read agent snapshot bundle", e))
 }
 
 /// Read the package's `version` from its root `package.json`. A toolchain-produced
@@ -151,14 +175,19 @@ fn command_targets(dir: &str) -> Result<Vec<(String, String)>, SidecarError> {
                     Some(serde_json::Value::String(path)) => {
                         if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
                             let unscoped = name.rsplit('/').next().unwrap_or(name).to_owned();
-                            return Ok(vec![(unscoped, normalize_rel(path))]);
+                            return Ok(is_projectable_command_name(&unscoped)
+                                .then(|| (unscoped, normalize_rel(path)))
+                                .into_iter()
+                                .collect());
                         }
                     }
                     Some(serde_json::Value::Object(map)) => {
                         let mut targets: Vec<(String, String)> = map
                             .iter()
                             .filter_map(|(name, path)| {
-                                path.as_str()
+                                is_projectable_command_name(name)
+                                    .then(|| path.as_str())
+                                    .flatten()
                                     .map(|path| (name.clone(), normalize_rel(path)))
                             })
                             .collect();
@@ -177,13 +206,19 @@ fn command_targets(dir: &str) -> Result<Vec<(String, String)>, SidecarError> {
         for entry in fs::read_dir(&bin).map_err(|e| io_err("read bin/", e))? {
             let entry = entry.map_err(|e| io_err("read bin/ entry", e))?;
             if let Some(name) = entry.file_name().to_str() {
-                targets.push((name.to_owned(), format!("bin/{name}")));
+                if is_projectable_command_name(name) {
+                    targets.push((name.to_owned(), format!("bin/{name}")));
+                }
             }
         }
         targets.sort_by(|a, b| a.0.cmp(&b.0));
         return Ok(targets);
     }
     Ok(Vec::new())
+}
+
+fn is_projectable_command_name(name: &str) -> bool {
+    !name.starts_with('_') && !name.starts_with('.')
 }
 
 /// Strip a leading `./` so the resulting path is a clean in-package relative path.

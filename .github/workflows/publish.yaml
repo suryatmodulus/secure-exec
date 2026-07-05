@@ -431,8 +431,11 @@ jobs:
           done
           git add -f crates/execution/assets/generated crates/v8-runtime/assets/generated
           mkdir -p crates/kernel/assets crates/sidecar/assets
-          cp packages/core/fixtures/base-filesystem.json crates/kernel/assets/base-filesystem.json
-          cp packages/core/fixtures/base-filesystem.json crates/sidecar/assets/base-filesystem.json
+          # The single committed base filesystem lives in the vfs crate (the vfs
+          # crate embeds it via include_str!); the old packages/core/fixtures/
+          # path no longer exists, which broke this crates.io publish job.
+          cp crates/vfs/assets/base-filesystem.json crates/kernel/assets/base-filesystem.json
+          cp crates/vfs/assets/base-filesystem.json crates/sidecar/assets/base-filesystem.json
       - name: Dry-run crate publish
         if: ${{ needs.context.outputs.trigger != 'release' }}
         run: |

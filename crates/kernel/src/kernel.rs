@@ -48,7 +48,7 @@ use crate::vfs::{
 };
 use hickory_proto::rr::RecordType;
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 #[cfg(test)]
@@ -165,6 +165,14 @@ pub struct ExecOptions {
     pub parent_pid: Option<u32>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveDirEntry {
+    pub path: String,
+    pub is_directory: bool,
+    pub is_symbolic_link: bool,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1011,6 +1019,76 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             });
         }
         Ok(entries)
+    }
+
+    pub fn read_dir_recursive(
+        &mut self,
+        path: &str,
+        max_depth: Option<usize>,
+    ) -> KernelResult<Vec<RecursiveDirEntry>> {
+        self.assert_not_terminated()?;
+        let depth_limit = self.effective_recursive_fs_depth(max_depth)?;
+        let caller_limited = max_depth.is_some();
+        let mut entries = Vec::new();
+        let mut queue = VecDeque::from([(normalize_path(path), 0usize)]);
+
+        while let Some((dir_path, depth)) = queue.pop_front() {
+            self.resources.check_recursive_fs_depth(depth)?;
+            let names = self.read_dir_internal(None, &dir_path)?;
+            self.resources.check_readdir_entries(names.len())?;
+
+            for name in names {
+                if matches!(name.as_str(), "." | "..") {
+                    continue;
+                }
+                let child = join_child_path(&dir_path, &name);
+                let stat = self.lstat_internal(None, &child)?;
+                let entry = RecursiveDirEntry {
+                    path: child.clone(),
+                    is_directory: stat.is_directory,
+                    is_symbolic_link: stat.is_symbolic_link,
+                    size: stat.size,
+                };
+                entries.push(entry);
+                self.resources.check_recursive_fs_entries(entries.len())?;
+
+                if stat.is_directory && !stat.is_symbolic_link {
+                    let child_depth = depth.saturating_add(1);
+                    if child_depth <= depth_limit {
+                        queue.push_back((child, child_depth));
+                    } else if !caller_limited {
+                        self.resources.check_recursive_fs_depth(child_depth)?;
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    pub fn copy_path(&mut self, from: &str, to: &str, recursive: bool) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        let mut entries = 0usize;
+        self.copy_path_inner(from, to, recursive, 0, &mut entries)?;
+        Ok(())
+    }
+
+    pub fn remove_path(&mut self, path: &str, recursive: bool) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        let mut entries = 0usize;
+        self.remove_path_inner(path, recursive, 0, &mut entries)
+    }
+
+    pub fn move_path(&mut self, from: &str, to: &str) -> KernelResult<()> {
+        self.assert_not_terminated()?;
+        match self.rename(from, to) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == "EXDEV" => {
+                self.copy_path(from, to, true)?;
+                self.remove_path(from, true)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn remove_file(&mut self, path: &str) -> KernelResult<()> {
@@ -2424,7 +2502,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 return Err(KernelError::new(
                     "EINVAL",
                     format!("invalid whence {whence}"),
-                ))
+                ));
             }
         };
         let next = base + i128::from(offset);
@@ -3407,7 +3485,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
                 return Err(KernelError::new(
                     "ENOEXEC",
                     format!("shebang line exceeds {SHEBANG_LINE_MAX_BYTES} bytes: {path}"),
-                ))
+                ));
             }
         };
         let line = header[2..line_end]
@@ -3492,6 +3570,120 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         }
 
         Ok(self.filesystem.read_file(path)?)
+    }
+
+    fn effective_recursive_fs_depth(
+        &self,
+        requested_max_depth: Option<usize>,
+    ) -> KernelResult<usize> {
+        match (requested_max_depth, self.resources.max_recursive_fs_depth()) {
+            (Some(requested), Some(limit)) if requested > limit => Err(KernelError::new(
+                "EINVAL",
+                format!(
+                    "requested recursive filesystem max depth {requested} exceeds configured limit {limit}"
+                ),
+            )),
+            (Some(requested), _) => Ok(requested),
+            (None, Some(limit)) => Ok(limit),
+            (None, None) => Ok(usize::MAX),
+        }
+    }
+
+    fn copy_path_inner(
+        &mut self,
+        from: &str,
+        to: &str,
+        recursive: bool,
+        depth: usize,
+        entries: &mut usize,
+    ) -> KernelResult<()> {
+        self.resources.check_recursive_fs_depth(depth)?;
+        *entries = entries.saturating_add(1);
+        self.resources.check_recursive_fs_entries(*entries)?;
+        let source_stat = self.lstat_internal(None, from)?;
+
+        if source_stat.is_symbolic_link {
+            let target = self.read_link_internal(None, from)?;
+            self.symlink(&target, to)?;
+            return Ok(());
+        }
+
+        if source_stat.is_directory {
+            if !recursive {
+                return Err(KernelError::new(
+                    "EISDIR",
+                    format!("illegal operation on a directory, copy '{from}'"),
+                ));
+            }
+
+            let source_root = normalize_path(from);
+            let destination_root = normalize_path(to);
+            if destination_root.starts_with(&(source_root.clone() + "/")) {
+                return Err(KernelError::new(
+                    "EINVAL",
+                    format!("cannot copy '{from}' into its own descendant '{to}'"),
+                ));
+            }
+
+            self.mkdir(&parent_path(&destination_root), true)?;
+            if !self.exists_internal(None, &destination_root)? {
+                self.create_dir(&destination_root)?;
+            }
+            self.chmod(&destination_root, source_stat.mode)?;
+            self.chown(&destination_root, source_stat.uid, source_stat.gid)?;
+
+            let names = self.read_dir_internal(None, from)?;
+            self.resources.check_readdir_entries(names.len())?;
+            for name in names {
+                if matches!(name.as_str(), "." | "..") {
+                    continue;
+                }
+                let child_from = join_child_path(from, &name);
+                let child_to = join_child_path(to, &name);
+                self.copy_path_inner(
+                    &child_from,
+                    &child_to,
+                    true,
+                    depth.saturating_add(1),
+                    entries,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let content = self.read_file_internal(None, from)?;
+        self.write_file(to, content)?;
+        self.chmod(to, source_stat.mode)?;
+        self.chown(to, source_stat.uid, source_stat.gid)
+    }
+
+    fn remove_path_inner(
+        &mut self,
+        path: &str,
+        recursive: bool,
+        depth: usize,
+        entries: &mut usize,
+    ) -> KernelResult<()> {
+        self.resources.check_recursive_fs_depth(depth)?;
+        *entries = entries.saturating_add(1);
+        self.resources.check_recursive_fs_entries(*entries)?;
+        let stat = self.lstat_internal(None, path)?;
+        if stat.is_directory && !stat.is_symbolic_link {
+            if recursive {
+                let names = self.read_dir_internal(None, path)?;
+                self.resources.check_readdir_entries(names.len())?;
+                for name in names {
+                    if matches!(name.as_str(), "." | "..") {
+                        continue;
+                    }
+                    let child = join_child_path(path, &name);
+                    self.remove_path_inner(&child, true, depth.saturating_add(1), entries)?;
+                }
+            }
+            return self.remove_dir(path);
+        }
+
+        self.remove_file(path)
     }
 
     fn exists_internal(&self, current_pid: Option<u32>, path: &str) -> KernelResult<bool> {
@@ -4744,6 +4936,10 @@ fn join_absolute_path(parent: &str, child: &str) -> String {
     }
 }
 
+fn join_child_path(parent: &str, child: &str) -> String {
+    normalize_path(&join_absolute_path(parent, child))
+}
+
 fn is_virtual_device_storage_path(path: &str) -> bool {
     matches!(
         path,
@@ -5023,6 +5219,143 @@ mod tests {
         assert_eq!(retained.sockets.snapshot().sockets, 1);
 
         (kernel, retained)
+    }
+
+    fn recursive_fs_kernel() -> KernelVm<MemoryFileSystem> {
+        let mut config = KernelVmConfig::new("vm-recursive-fs");
+        config.permissions = Permissions::allow_all();
+        KernelVm::new(MemoryFileSystem::new(), config)
+    }
+
+    #[test]
+    fn recursive_copy_preserves_tree_metadata_and_symlinks() {
+        let mut kernel = recursive_fs_kernel();
+        kernel
+            .mkdir("/src/nested", true)
+            .expect("create source dirs");
+        kernel
+            .write_file("/src/nested/file.txt", b"hello".to_vec())
+            .expect("write source file");
+        kernel
+            .chmod("/src/nested/file.txt", 0o640)
+            .expect("chmod source file");
+        kernel
+            .chown("/src/nested/file.txt", 42, 43)
+            .expect("chown source file");
+        kernel
+            .symlink("../nested/file.txt", "/src/link")
+            .expect("create source symlink");
+
+        kernel
+            .copy_path("/src", "/dst", true)
+            .expect("recursive copy");
+
+        assert_eq!(
+            kernel
+                .read_file("/dst/nested/file.txt")
+                .expect("read copied"),
+            b"hello".to_vec()
+        );
+        let copied = kernel.lstat("/dst/nested/file.txt").expect("stat copied");
+        assert_eq!(copied.mode & 0o777, 0o640);
+        assert_eq!((copied.uid, copied.gid), (42, 43));
+        let link = kernel.lstat("/dst/link").expect("lstat copied link");
+        assert!(link.is_symbolic_link);
+        assert_eq!(
+            kernel.read_link("/dst/link").expect("read copied link"),
+            "../nested/file.txt"
+        );
+    }
+
+    #[test]
+    fn recursive_remove_deletes_subtree_but_does_not_follow_symlinks() {
+        let mut kernel = recursive_fs_kernel();
+        kernel.mkdir("/tree/dir", true).expect("create tree");
+        kernel
+            .write_file("/tree/dir/file.txt", b"tree".to_vec())
+            .expect("write tree file");
+        kernel
+            .write_file("/outside.txt", b"outside".to_vec())
+            .expect("write outside file");
+        kernel
+            .symlink("/outside.txt", "/tree/link-out")
+            .expect("create symlink out of tree");
+
+        kernel.remove_path("/tree", true).expect("recursive remove");
+
+        assert!(!kernel.exists("/tree").expect("tree existence"));
+        assert_eq!(
+            kernel.read_file("/outside.txt").expect("outside survives"),
+            b"outside".to_vec()
+        );
+    }
+
+    #[test]
+    fn read_dir_recursive_respects_user_depth_and_reports_types() {
+        let mut kernel = recursive_fs_kernel();
+        kernel.mkdir("/root/a/b", true).expect("create deep tree");
+        kernel
+            .write_file("/root/a/file.txt", b"x".to_vec())
+            .expect("write file");
+        kernel
+            .symlink("a/file.txt", "/root/link")
+            .expect("create link");
+
+        let entries = kernel
+            .read_dir_recursive("/root", Some(0))
+            .expect("recursive listing");
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "/root/a" && entry.is_directory));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "/root/link" && entry.is_symbolic_link));
+        assert!(!entries.iter().any(|entry| entry.path == "/root/a/file.txt"));
+    }
+
+    #[test]
+    fn recursive_ops_enforce_depth_and_entry_bounds() {
+        let mut depth_config = KernelVmConfig::new("vm-recursive-depth-limit");
+        depth_config.permissions = Permissions::allow_all();
+        depth_config.resources = ResourceLimits {
+            max_recursive_fs_depth: Some(1),
+            ..ResourceLimits::default()
+        };
+        let mut depth_kernel = KernelVm::new(MemoryFileSystem::new(), depth_config);
+        depth_kernel
+            .mkdir("/root/a/b", true)
+            .expect("create deep tree");
+
+        let error = depth_kernel
+            .copy_path("/root", "/copy", true)
+            .expect_err("copy should hit depth limit");
+        assert_eq!(error.code(), "ENOMEM");
+        assert!(error.to_string().contains("depth 2"));
+
+        let mut entry_config = KernelVmConfig::new("vm-recursive-entry-limit");
+        entry_config.permissions = Permissions::allow_all();
+        entry_config.resources = ResourceLimits {
+            max_recursive_fs_entries: Some(2),
+            ..ResourceLimits::default()
+        };
+        let mut entry_kernel = KernelVm::new(MemoryFileSystem::new(), entry_config);
+        entry_kernel.mkdir("/root", true).expect("create root");
+        entry_kernel
+            .write_file("/root/a.txt", b"a".to_vec())
+            .expect("write a");
+        entry_kernel
+            .write_file("/root/b.txt", b"b".to_vec())
+            .expect("write b");
+        entry_kernel
+            .write_file("/root/c.txt", b"c".to_vec())
+            .expect("write c");
+
+        let error = entry_kernel
+            .read_dir_recursive("/root", None)
+            .expect_err("listing should hit entry limit");
+        assert_eq!(error.code(), "ENOMEM");
+        assert!(error.to_string().contains("3 entries"));
     }
 
     fn assert_kernel_drop_released_resources(retained: &RetainedKernelResources) {

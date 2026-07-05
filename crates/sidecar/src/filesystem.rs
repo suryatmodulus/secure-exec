@@ -436,7 +436,11 @@ fn sync_guest_filesystem_shadow_before_call(
         | GuestFilesystemOperation::Pwrite
         | GuestFilesystemOperation::Exists
         | GuestFilesystemOperation::Stat
-        | GuestFilesystemOperation::Lstat => {
+        | GuestFilesystemOperation::Lstat
+        | GuestFilesystemOperation::ReadDirRecursive
+        | GuestFilesystemOperation::Remove
+        | GuestFilesystemOperation::Copy
+        | GuestFilesystemOperation::Move => {
             // Pwrite is a partial write that preserves the unmodified bytes, so
             // the existing shadow content must be present in the kernel before
             // the call, exactly like a read.
@@ -486,6 +490,28 @@ fn mirror_guest_filesystem_shadow_after_call(
         }
         GuestFilesystemOperation::RemoveFile | GuestFilesystemOperation::RemoveDir => {
             remove_guest_shadow_path(vm, &payload.path)?;
+        }
+        GuestFilesystemOperation::Remove => {
+            remove_guest_shadow_path(vm, &payload.path)?;
+        }
+        GuestFilesystemOperation::Copy => {
+            let destination = payload.destination_path.as_deref().ok_or_else(|| {
+                SidecarError::InvalidState(String::from(
+                    "guest filesystem copy requires a destination_path",
+                ))
+            })?;
+            remove_guest_shadow_path(vm, destination)?;
+            mirror_guest_subtree_to_shadow(vm, destination)?;
+        }
+        GuestFilesystemOperation::Move => {
+            let destination = payload.destination_path.as_deref().ok_or_else(|| {
+                SidecarError::InvalidState(String::from(
+                    "guest filesystem move requires a destination_path",
+                ))
+            })?;
+            remove_guest_shadow_path(vm, &payload.path)?;
+            remove_guest_shadow_path(vm, destination)?;
+            mirror_guest_subtree_to_shadow(vm, destination)?;
         }
         GuestFilesystemOperation::Rename => {
             let destination = payload.destination_path.as_deref().ok_or_else(|| {
@@ -548,6 +574,7 @@ fn mirror_guest_filesystem_shadow_after_call(
         | GuestFilesystemOperation::Stat
         | GuestFilesystemOperation::Lstat
         | GuestFilesystemOperation::ReadDir
+        | GuestFilesystemOperation::ReadDirRecursive
         | GuestFilesystemOperation::Realpath
         | GuestFilesystemOperation::ReadLink
         | GuestFilesystemOperation::Chown => {}
@@ -3942,6 +3969,24 @@ fn ensure_guest_path_materialized_in_shadow(
     }
 
     Ok(shadow_path)
+}
+
+fn mirror_guest_subtree_to_shadow(vm: &mut VmState, guest_path: &str) -> Result<(), SidecarError> {
+    let guest_path = normalize_path(guest_path);
+    ensure_guest_path_materialized_in_shadow(vm, &guest_path)?;
+    let stat = vm.kernel.lstat(&guest_path).map_err(kernel_error)?;
+    if !stat.is_directory || stat.is_symbolic_link {
+        return Ok(());
+    }
+
+    let entries = vm
+        .kernel
+        .read_dir_recursive(&guest_path, None)
+        .map_err(kernel_error)?;
+    for entry in entries {
+        ensure_guest_path_materialized_in_shadow(vm, &entry.path)?;
+    }
+    Ok(())
 }
 
 fn mirror_guest_symlink_to_shadow(

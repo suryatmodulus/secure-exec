@@ -82,6 +82,8 @@ export type LiveRequestPayload =
 			loopback_exempt_ports?: number[];
 			packages?: LivePackageDescriptor[];
 			packages_mount_at?: string;
+			bootstrap_commands?: string[];
+			tool_shim_commands?: string[];
 	  }
 	| {
 			type: "link_package";
@@ -142,6 +144,7 @@ export type LiveRequestPayload =
 			content?: string;
 			encoding?: LiveRootFilesystemEntryEncoding;
 			recursive?: boolean;
+			max_depth?: number;
 			mode?: number;
 			uid?: number;
 			gid?: number;
@@ -297,6 +300,8 @@ export function toGeneratedRequestPayload(
 						toGeneratedPackageDescriptor,
 					),
 					packagesMountAt: payload.packages_mount_at ?? "",
+					bootstrapCommands: payload.bootstrap_commands ?? [],
+					toolShimCommands: payload.tool_shim_commands ?? [],
 				},
 			};
 		case "link_package":
@@ -376,6 +381,7 @@ export function toGeneratedRequestPayload(
 							? null
 							: toGeneratedRootFilesystemEntryEncoding(payload.encoding),
 					recursive: payload.recursive ?? false,
+					maxDepth: payload.max_depth ?? null,
 					mode: payload.mode ?? null,
 					uid: payload.uid ?? null,
 					gid: payload.gid ?? null,

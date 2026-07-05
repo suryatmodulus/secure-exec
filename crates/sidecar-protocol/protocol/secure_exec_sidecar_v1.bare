@@ -221,8 +221,13 @@ type LinkPackageRequest struct {
   package: PackageDescriptor
 }
 
+type ProjectedCommand struct {
+  name: str
+  guestPath: str
+}
+
 type PackageLinkedResponse struct {
-  commands: list<str>
+  projectedCommands: list<ProjectedCommand>
 }
 
 type ConfigureVmRequest struct {
@@ -236,6 +241,8 @@ type ConfigureVmRequest struct {
   loopbackExemptPorts: list<u16>
   packages: list<PackageDescriptor>
   packagesMountAt: str
+  bootstrapCommands: list<str>
+  toolShimCommands: list<str>
 }
 
 type RegisteredHostCallbackExample struct {
@@ -287,8 +294,12 @@ type GuestFilesystemOperation enum {
   STAT
   LSTAT
   READ_DIR
+  READ_DIR_RECURSIVE
   REMOVE_FILE
   REMOVE_DIR
+  REMOVE
+  COPY
+  MOVE
   RENAME
   REALPATH
   SYMLINK
@@ -310,6 +321,7 @@ type GuestFilesystemCallRequest struct {
   content: optional<str>
   encoding: optional<RootFilesystemEntryEncoding>
   recursive: bool
+  maxDepth: optional<u32>
   mode: optional<u32>
   uid: optional<u32>
   gid: optional<u32>
@@ -480,6 +492,7 @@ type RootFilesystemBootstrappedResponse struct {
 type VmConfiguredResponse struct {
   appliedMounts: u32
   appliedSoftware: u32
+  projectedCommands: list<ProjectedCommand>
 }
 
 type HostCallbacksRegisteredResponse struct {
@@ -528,8 +541,10 @@ type GuestFilesystemStat struct {
 
 type GuestDirEntry struct {
   name: str
+  path: str
   isDirectory: bool
   isSymbolicLink: bool
+  size: u64
 }
 
 type GuestFilesystemResultResponse struct {

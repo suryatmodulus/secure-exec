@@ -294,6 +294,9 @@ pub(crate) struct VmConfiguration {
     /// builtin allow-list). Set at `create_vm` from `CreateVmConfig.jsRuntime`
     /// and preserved across `configure_vm`. `None` => full Node.js emulation.
     pub(crate) js_runtime: Option<vm_config::JsRuntimeConfig>,
+    /// Agent SDK bundle read by the sidecar from the configured package dir and
+    /// evaluated into the shared V8 startup snapshot.
+    pub(crate) snapshot_userland_code: Option<String>,
     pub(crate) loopback_exempt_ports: Vec<u16>,
 }
 
@@ -308,6 +311,7 @@ impl Default for VmConfiguration {
             projected_modules: Vec::new(),
             command_permissions: BTreeMap::new(),
             js_runtime: None,
+            snapshot_userland_code: None,
             loopback_exempt_ports: Vec::new(),
         }
     }

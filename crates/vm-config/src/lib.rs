@@ -48,6 +48,13 @@ pub struct CreateVmConfig {
     #[serde(default, rename = "jsRuntime", skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub js_runtime: Option<JsRuntimeConfig>,
+    #[serde(
+        default,
+        rename = "bootstrapCommands",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub bootstrap_commands: Option<Vec<String>>,
 }
 
 impl CreateVmConfig {
@@ -75,6 +82,9 @@ impl CreateVmConfig {
         }
         if let Some(js_runtime) = &self.js_runtime {
             js_runtime.validate()?;
+        }
+        if let Some(bootstrap_commands) = &self.bootstrap_commands {
+            validate_command_names("bootstrapCommands", bootstrap_commands)?;
         }
         Ok(())
     }
@@ -115,20 +125,6 @@ pub struct JsRuntimeConfig {
     )]
     #[ts(optional)]
     pub high_resolution_time: Option<bool>,
-    /// Optional userland JS (an esbuild IIFE, e.g. a bundled agent SDK) to
-    /// evaluate into the per-sidecar V8 startup snapshot alongside the bridge, so
-    /// it is loaded once per sidecar and reused across sessions instead of
-    /// re-imported on every execution. The snapshot is cached process-wide keyed
-    /// by sha256(bridge + this code). Trusted client config; `None` keeps the
-    /// bridge-only snapshot. Must be snapshot-safe (no native/External handles,
-    /// fds, timers, or non-deterministic reads at module-init).
-    #[serde(
-        default,
-        rename = "snapshotUserlandCode",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[ts(optional)]
-    pub snapshot_userland_code: Option<String>,
 }
 
 impl JsRuntimeConfig {
@@ -617,6 +613,8 @@ limits_struct!(ResourceLimitsConfig {
     max_process_argv_bytes,
     max_process_env_bytes,
     max_readdir_entries,
+    max_recursive_fs_depth,
+    max_recursive_fs_entries,
     max_wasm_fuel,
     max_wasm_memory_bytes,
     max_wasm_stack_bytes,
@@ -777,6 +775,23 @@ fn validate_guest_path(label: &str, path: &str) -> Result<(), VmConfigError> {
     if path.split('/').any(|part| part == "..") {
         return Err(VmConfigError::new(format!("{label} must not contain '..'")));
     }
+    Ok(())
+}
+
+fn validate_command_names(label: &str, commands: &[String]) -> Result<(), VmConfigError> {
+    for command in commands {
+        if command.is_empty()
+            || command == "."
+            || command == ".."
+            || command.contains('/')
+            || command.contains('\0')
+        {
+            return Err(VmConfigError::new(format!(
+                "{label} contains invalid command name {command:?}"
+            )));
+        }
+    }
+
     Ok(())
 }
 
