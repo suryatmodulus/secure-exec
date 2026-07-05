@@ -90,6 +90,9 @@ export type LiveRequestPayload =
 			package: LivePackageDescriptor;
 	  }
 	| {
+			type: "provided_commands";
+	  }
+	| {
 			type: "register_host_callbacks";
 			name: string;
 			description: string;
@@ -310,6 +313,11 @@ export function toGeneratedRequestPayload(
 				val: {
 					package: toGeneratedPackageDescriptor(payload.package),
 				},
+			};
+		case "provided_commands":
+			return {
+				tag: "ProvidedCommandsRequest",
+				val: null,
 			};
 		case "register_host_callbacks":
 			return {

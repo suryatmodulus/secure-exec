@@ -199,6 +199,17 @@ where
                     "link_package is not available in the converged browser runtime",
                 )
             }
+            RequestRoute::ProvidedCommands(payload) => {
+                // Provided command metadata is retained by the native sidecar's
+                // host-backed package projection, which the converged browser
+                // runtime does not provide.
+                let _ = payload;
+                rejected(
+                    &request,
+                    "unsupported",
+                    "provided_commands is not available in the converged browser runtime",
+                )
+            }
             RequestRoute::UnsupportedHostCallbackDirection => {
                 unsupported_host_callback_direction_dispatch(&request)
             }

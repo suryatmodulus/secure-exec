@@ -11,9 +11,10 @@ use crate::bridge::{bridge_permissions, MountPluginContext};
 use crate::protocol::{
     ConfigureVmRequest, CreateLayerRequest, CreateOverlayRequest, DisposeReason, EventFrame,
     ExportSnapshotRequest, ImportSnapshotRequest, LinkPackageRequest, MountDescriptor,
-    MountPluginDescriptor, ProjectedCommand, RootFilesystemDescriptor, RootFilesystemEntry,
-    RootFilesystemEntryEncoding, RootFilesystemLowerDescriptor, SealLayerRequest,
-    SnapshotRootFilesystemRequest, VmLifecycleState,
+    MountPluginDescriptor, PackageCommands, ProjectedCommand, ProvidedCommandsRequest,
+    RootFilesystemDescriptor, RootFilesystemEntry, RootFilesystemEntryEncoding,
+    RootFilesystemLowerDescriptor, SealLayerRequest, SnapshotRootFilesystemRequest,
+    VmLifecycleState,
 };
 use crate::service::{
     audit_fields, dirname, emit_security_audit_event, emit_structured_event, kernel_error,
@@ -46,10 +47,10 @@ use secure_exec_kernel::socket_table::{SocketReadiness, SocketReadinessKind};
 use secure_exec_sidecar_core::permissions::{allow_all_policy, deny_all_policy};
 use secure_exec_sidecar_core::{
     layer_created_response, layer_sealed_response, overlay_created_response,
-    package_linked_response, protocol_root_filesystem_mode, root_filesystem_bootstrapped_response,
-    root_filesystem_protocol_descriptor_from_config, root_filesystem_snapshot_response,
-    snapshot_exported_response, snapshot_imported_response, vm_configured_response,
-    vm_created_response, vm_disposed_response, VmLayerStore,
+    package_linked_response, protocol_root_filesystem_mode, provided_commands_response,
+    root_filesystem_bootstrapped_response, root_filesystem_protocol_descriptor_from_config,
+    root_filesystem_snapshot_response, snapshot_exported_response, snapshot_imported_response,
+    vm_configured_response, vm_created_response, vm_disposed_response, VmLayerStore,
 };
 use secure_exec_vm_config as vm_config;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -348,6 +349,7 @@ where
                 },
                 layers: VmLayerStore::default(),
                 command_guest_paths,
+                provided_commands: BTreeMap::new(),
                 command_permissions: BTreeMap::new(),
                 toolkits: BTreeMap::new(),
                 active_processes: BTreeMap::new(),
@@ -445,6 +447,13 @@ where
             let _ = fs::remove_dir_all(&old);
         }
         let package_descriptors = package_descriptors_from_wire(&payload.packages)?;
+        let mut provided_commands = BTreeMap::new();
+        for descriptor in &package_descriptors {
+            provided_commands.insert(
+                descriptor.name.clone(),
+                crate::package_projection::derive_commands(&descriptor.dir)?,
+            );
+        }
         let snapshot_userland_code = resolve_agent_snapshot_bundle(&package_descriptors)?;
         let (packages_staging_root, packages_mount) =
             build_packages_projection(&vm_id, &package_descriptors, &payload.packages_mount_at)?;
@@ -475,11 +484,13 @@ where
             // command by name -> its `/opt/agentos/bin/<cmd>` entrypoint so both the
             // kernel command table (via `execution_commands` below) and the sidecar
             // entrypoint resolver (`resolve_guest_command_entrypoint`) can find it.
-            for descriptor in &package_descriptors {
-                for command in crate::package_projection::derive_commands(&descriptor.dir)? {
+            for commands in provided_commands.values() {
+                for command in commands {
                     let entrypoint =
                         format!("{}/{command}", crate::package_projection::OPT_AGENTOS_BIN);
-                    vm.command_guest_paths.entry(command).or_insert(entrypoint);
+                    vm.command_guest_paths
+                        .entry(command.clone())
+                        .or_insert(entrypoint);
                 }
             }
             refresh_guest_command_path_env(&mut vm.guest_env, &vm.command_guest_paths);
@@ -506,11 +517,13 @@ where
                 instructions: payload.instructions.clone(),
                 projected_modules: payload.projected_modules.clone(),
                 command_permissions: payload.command_permissions.clone().into_iter().collect(),
+                provided_commands: provided_commands.clone(),
                 // jsRuntime is create-time only; preserve what create_vm stored.
                 js_runtime: vm.configuration.js_runtime.clone(),
                 snapshot_userland_code: snapshot_userland_code.clone(),
                 loopback_exempt_ports: payload.loopback_exempt_ports.clone(),
             };
+            vm.provided_commands = provided_commands;
             Ok(())
         });
         match reconfigure_result {
@@ -588,6 +601,12 @@ where
         })?;
         let descriptor = crate::package_projection::read_package_manifest(&payload.package.dir)?;
         let commands = crate::package_projection::link_package(&descriptor, &staging_root)?;
+        let package_commands = crate::package_projection::derive_commands(&descriptor.dir)?;
+        vm.provided_commands
+            .insert(descriptor.name.clone(), package_commands.clone());
+        vm.configuration
+            .provided_commands
+            .insert(descriptor.name.clone(), package_commands);
         for command in &commands {
             let entrypoint = projected_command_guest_path(command);
             vm.command_guest_paths
@@ -614,6 +633,34 @@ where
 
         Ok(DispatchResult {
             response: package_linked_response(request, projected_commands),
+            events: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn provided_commands(
+        &mut self,
+        request: &crate::protocol::RequestFrame,
+        _payload: ProvidedCommandsRequest,
+    ) -> Result<DispatchResult, SidecarError> {
+        let (connection_id, session_id, vm_id) = self.vm_scope_for(&request.ownership)?;
+        self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
+
+        let packages = self
+            .vms
+            .get(&vm_id)
+            .map(|vm| {
+                vm.provided_commands
+                    .iter()
+                    .map(|(package_name, commands)| PackageCommands {
+                        package_name: package_name.clone(),
+                        commands: commands.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(DispatchResult {
+            response: provided_commands_response(request, packages),
             events: Vec::new(),
         })
     }

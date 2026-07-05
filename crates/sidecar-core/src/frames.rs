@@ -1,15 +1,16 @@
 use secure_exec_sidecar_protocol::protocol::{
     AuthenticateRequest, AuthenticatedResponse, BoundUdpSnapshotResponse, EventFrame, EventPayload,
     LayerCreatedResponse, LayerSealedResponse, ListenerSnapshotResponse, OverlayCreatedResponse,
-    OwnershipScope, PackageLinkedResponse, ProcessExitedEvent, ProcessKilledResponse,
-    ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotResponse, ProcessStartedResponse,
-    ProjectedCommand, ProtocolSchema, RejectedResponse, RequestFrame, RequestId, ResponseFrame,
-    ResponsePayload, RootFilesystemBootstrappedResponse, RootFilesystemEntry,
-    RootFilesystemSnapshotResponse, SessionOpenedResponse, SignalHandlerRegistration,
-    SignalStateResponse, SnapshotExportedResponse, SnapshotImportedResponse, SocketStateEntry,
-    StdinClosedResponse, StdinWrittenResponse, StreamChannel, StructuredEvent,
-    VmConfiguredResponse, VmCreatedResponse, VmDisposedResponse, VmLifecycleEvent,
-    VmLifecycleState, ZombieTimerCountResponse, PROTOCOL_VERSION,
+    OwnershipScope, PackageCommands, PackageLinkedResponse, ProcessExitedEvent,
+    ProcessKilledResponse, ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotResponse,
+    ProcessStartedResponse, ProjectedCommand, ProtocolSchema, ProvidedCommandsResponse,
+    RejectedResponse, RequestFrame, RequestId, ResponseFrame, ResponsePayload,
+    RootFilesystemBootstrappedResponse, RootFilesystemEntry, RootFilesystemSnapshotResponse,
+    SessionOpenedResponse, SignalHandlerRegistration, SignalStateResponse,
+    SnapshotExportedResponse, SnapshotImportedResponse, SocketStateEntry, StdinClosedResponse,
+    StdinWrittenResponse, StreamChannel, StructuredEvent, VmConfiguredResponse, VmCreatedResponse,
+    VmDisposedResponse, VmLifecycleEvent, VmLifecycleState, ZombieTimerCountResponse,
+    PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 
@@ -172,9 +173,17 @@ pub fn package_linked_response(
 ) -> ResponseFrame {
     respond(
         request,
-        ResponsePayload::PackageLinked(PackageLinkedResponse {
-            projected_commands,
-        }),
+        ResponsePayload::PackageLinked(PackageLinkedResponse { projected_commands }),
+    )
+}
+
+pub fn provided_commands_response(
+    request: &RequestFrame,
+    packages: Vec<PackageCommands>,
+) -> ResponseFrame {
+    respond(
+        request,
+        ResponsePayload::ProvidedCommands(ProvidedCommandsResponse { packages }),
     )
 }
 
