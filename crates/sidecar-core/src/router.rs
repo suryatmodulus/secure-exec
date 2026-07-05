@@ -6,8 +6,9 @@ use secure_exec_sidecar_protocol::protocol::{
     GetProcessSnapshotRequest, GetResourceSnapshotRequest, GetSignalStateRequest,
     GetZombieTimerCountRequest, GuestFilesystemCallRequest, GuestKernelCallRequest,
     ImportSnapshotRequest, KillProcessRequest, LinkPackageRequest, OpenSessionRequest,
-    OwnershipScope, RegisterHostCallbacksRequest, RequestFrame, RequestPayload, ResizePtyRequest,
-    SealLayerRequest, SnapshotRootFilesystemRequest, VmFetchRequest, WriteStdinRequest,
+    OwnershipScope, ProvidedCommandsRequest, RegisterHostCallbacksRequest, RequestFrame,
+    RequestPayload, ResizePtyRequest, SealLayerRequest, SnapshotRootFilesystemRequest,
+    VmFetchRequest, WriteStdinRequest,
 };
 use secure_exec_sidecar_protocol::wire as generated_wire;
 
@@ -54,6 +55,7 @@ pub enum RequestRoute {
     GetSignalState(GetSignalStateRequest),
     GetZombieTimerCount(GetZombieTimerCountRequest),
     LinkPackage(LinkPackageRequest),
+    ProvidedCommands(ProvidedCommandsRequest),
     Ext(ExtEnvelope),
     UnsupportedHostCallbackDirection,
 }
@@ -100,6 +102,7 @@ pub fn route_request_payload(request: &RequestFrame) -> RequestRoute {
         RequestPayload::GetSignalState(payload) => RequestRoute::GetSignalState(payload),
         RequestPayload::GetZombieTimerCount(payload) => RequestRoute::GetZombieTimerCount(payload),
         RequestPayload::LinkPackage(payload) => RequestRoute::LinkPackage(payload),
+        RequestPayload::ProvidedCommands(payload) => RequestRoute::ProvidedCommands(payload),
         RequestPayload::HostFilesystemCall(_)
         | RequestPayload::PersistenceLoad(_)
         | RequestPayload::PersistenceFlush(_) => RequestRoute::UnsupportedHostCallbackDirection,
@@ -162,6 +165,7 @@ pub fn request_dispatch_mode(request: &RequestFrame) -> RequestDispatchMode {
         | RequestPayload::GetSignalState(_)
         | RequestPayload::GetZombieTimerCount(_)
         | RequestPayload::LinkPackage(_)
+        | RequestPayload::ProvidedCommands(_)
         | RequestPayload::HostFilesystemCall(_)
         | RequestPayload::PersistenceLoad(_)
         | RequestPayload::PersistenceFlush(_) => RequestDispatchMode::Immediate,

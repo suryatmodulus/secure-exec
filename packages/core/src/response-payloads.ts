@@ -71,6 +71,11 @@ export interface LiveProjectedCommand {
 	guest_path: string;
 }
 
+export interface LivePackageCommands {
+	package_name: string;
+	commands: string[];
+}
+
 export type LiveResponsePayload =
 	| {
 			type: "authenticated";
@@ -96,6 +101,10 @@ export type LiveResponsePayload =
 	| {
 			type: "package_linked";
 			projected_commands: LiveProjectedCommand[];
+	  }
+	| {
+			type: "provided_commands_response";
+			packages: LivePackageCommands[];
 	  }
 	| {
 			type: "host_callbacks_registered";
@@ -276,6 +285,14 @@ export function fromGeneratedResponsePayload(
 						guest_path: command.guestPath,
 					}),
 				),
+			};
+		case "ProvidedCommandsResponse":
+			return {
+				type: "provided_commands_response",
+				packages: payload.val.packages.map((pkg) => ({
+					package_name: pkg.packageName,
+					commands: [...pkg.commands],
+				})),
 			};
 		case "HostCallbacksRegisteredResponse":
 			return {

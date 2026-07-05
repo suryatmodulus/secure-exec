@@ -290,6 +290,7 @@ pub(crate) struct VmConfiguration {
     pub(crate) instructions: Vec<String>,
     pub(crate) projected_modules: Vec<ProjectedModuleDescriptor>,
     pub(crate) command_permissions: BTreeMap<String, WasmPermissionTier>,
+    pub(crate) provided_commands: BTreeMap<String, Vec<String>>,
     /// Guest JavaScript host-environment config (platform / module resolution /
     /// builtin allow-list). Set at `create_vm` from `CreateVmConfig.jsRuntime`
     /// and preserved across `configure_vm`. `None` => full Node.js emulation.
@@ -310,6 +311,7 @@ impl Default for VmConfiguration {
             instructions: Vec::new(),
             projected_modules: Vec::new(),
             command_permissions: BTreeMap::new(),
+            provided_commands: BTreeMap::new(),
             js_runtime: None,
             snapshot_userland_code: None,
             loopback_exempt_ports: Vec::new(),
@@ -339,6 +341,7 @@ pub(crate) struct VmState {
     pub(crate) configuration: VmConfiguration,
     pub(crate) layers: VmLayerStore,
     pub(crate) command_guest_paths: BTreeMap<String, String>,
+    pub(crate) provided_commands: BTreeMap<String, Vec<String>>,
     pub(crate) command_permissions: BTreeMap<String, WasmPermissionTier>,
     pub(crate) toolkits: BTreeMap<String, RegisterHostCallbacksRequest>,
     pub(crate) active_processes: BTreeMap<String, ActiveProcess>,

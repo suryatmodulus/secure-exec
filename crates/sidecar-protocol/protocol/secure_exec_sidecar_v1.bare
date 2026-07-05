@@ -221,6 +221,17 @@ type LinkPackageRequest struct {
   package: PackageDescriptor
 }
 
+type PackageCommands struct {
+  packageName: str
+  commands: list<str>
+}
+
+type ProvidedCommandsRequest void
+
+type ProvidedCommandsResponse struct {
+  packages: list<PackageCommands>
+}
+
 type ProjectedCommand struct {
   name: str
   guestPath: str
@@ -456,7 +467,8 @@ type RequestPayload union {
   GuestKernelCallRequest |
   ResizePtyRequest |
   GetResourceSnapshotRequest |
-  LinkPackageRequest
+  LinkPackageRequest |
+  ProvidedCommandsRequest
 }
 
 type RequestFrame struct {
@@ -742,7 +754,8 @@ type ResponsePayload union {
   GuestKernelResultResponse |
   PtyResizedResponse |
   ResourceSnapshotResponse |
-  PackageLinkedResponse
+  PackageLinkedResponse |
+  ProvidedCommandsResponse
 }
 
 type ResponseFrame struct {

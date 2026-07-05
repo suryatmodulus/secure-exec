@@ -299,6 +299,11 @@ export interface SidecarProjectedCommand {
 	guestPath: string;
 }
 
+export interface SidecarPackageCommands {
+	packageName: string;
+	commands: string[];
+}
+
 export interface SidecarVmConfiguredResponse {
 	appliedMounts: number;
 	appliedSoftware: number;
@@ -556,6 +561,32 @@ export class SidecarProcess {
 		return response.payload.projected_commands.map((command) => ({
 			name: command.name,
 			guestPath: command.guest_path,
+		}));
+	}
+
+	async providedCommands(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+	): Promise<SidecarPackageCommands[]> {
+		const response = await this.sendRequest({
+			ownership: {
+				scope: "vm",
+				connection_id: session.connectionId,
+				session_id: session.sessionId,
+				vm_id: vm.vmId,
+			},
+			payload: {
+				type: "provided_commands",
+			},
+		});
+		if (response.payload.type !== "provided_commands_response") {
+			throw new Error(
+				`unexpected provided_commands response: ${response.payload.type}`,
+			);
+		}
+		return response.payload.packages.map((pkg) => ({
+			packageName: pkg.package_name,
+			commands: [...pkg.commands],
 		}));
 	}
 
